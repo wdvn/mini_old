@@ -1,0 +1,11 @@
+.{
+    .name = .mini_agent,
+    .fingerprint = 0xf16dba5478d775c1,
+    .version = "1.0.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "src",
+    },
+}
