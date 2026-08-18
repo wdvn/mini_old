@@ -75,6 +75,9 @@ pub fn httpRequest(
     const uri = try std.Uri.parse(url);
     var req = try client.request(http_method, uri, .{
         .extra_headers = extra_headers.items,
+        .headers = .{
+            .accept_encoding = .omit,
+        },
         .keep_alive = false,
     });
     defer req.deinit();
@@ -102,11 +105,20 @@ pub fn httpRequest(
     errdefer out.deinit();
     const w = &out;
 
-    try w.print("HTTP {d}\n", .{@intFromEnum(response.head.status)});
-    if (std.mem.indexOf(u8, response.head.bytes, "\r\n") != null) {
-        var it = response.head.iterateHeaders();
-        while (it.next()) |header| {
-            try w.print("{s}: {s}\n", .{ header.name, header.value });
+    try w.print("HTTP {d} {s}\n", .{ @intFromEnum(response.head.status), response.head.reason });
+    if (response.head.bytes.len > 0) {
+        var lines = std.mem.splitScalar(u8, response.head.bytes, '\n');
+        _ = lines.first(); // Bỏ qua dòng status
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \r\t");
+            if (line.len == 0) break; // Hết phần headers
+            if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+                const name = std.mem.trim(u8, line[0..colon], " \t");
+                const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
+                if (name.len > 0) {
+                    try w.print("{s}: {s}\n", .{ name, val });
+                }
+            }
         }
     }
     try w.writeByte('\n');

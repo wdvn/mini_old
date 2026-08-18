@@ -61,6 +61,9 @@ pub fn post(
 
     var req = try client.request(.POST, uri, .{
         .extra_headers = extra_headers.items,
+        .headers = .{
+            .accept_encoding = .omit,
+        },
         .keep_alive = false,
     });
     defer req.deinit();
