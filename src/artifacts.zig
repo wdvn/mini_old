@@ -292,7 +292,7 @@ test "artifacts write, read and reference expansion" {
     // Write artifact
     const path = try writeArtifact(
         alloc,
-        main.g_io,
+        main.getIo(),
         "test_plan.md",
         "Kế hoạch thử nghiệm",
         "# Kế hoạch\nNội dung artifact kiểm thử",
@@ -303,15 +303,16 @@ test "artifacts write, read and reference expansion" {
     defer alloc.free(path);
 
     // Read artifact
-    const read_back = try readArtifact(alloc, main.g_io, "test_plan.md");
+    const read_back = try readArtifact(alloc, main.getIo(), "test_plan.md");
     defer alloc.free(read_back);
     try std.testing.expect(std.mem.indexOf(u8, read_back, "Nội dung artifact kiểm thử") != null);
 
     // Test expandArtifactReferences
     const prompt = "Hãy xem @artifact:test_plan.md và tiếp tục";
-    const expanded = try expandArtifactReferences(alloc, main.g_io, prompt);
+    const expanded = try expandArtifactReferences(alloc, main.getIo(), prompt);
     defer alloc.free(expanded);
     try std.testing.expect(std.mem.indexOf(u8, expanded, "--- [Artifact: test_plan.md] ---") != null);
     try std.testing.expect(std.mem.indexOf(u8, expanded, "Nội dung artifact kiểm thử") != null);
 }
+
 

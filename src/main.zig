@@ -32,6 +32,7 @@
 //! ```
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const config_mod = @import("config.zig");
 const agent_mod = @import("agent.zig");
@@ -47,6 +48,14 @@ const VERSION = "1.0.0";
 const PROMPT_PREFIX = "\x1b[1;34mYou\x1b[0m > ";
 
 pub var g_io: std.Io = undefined;
+
+/// Lấy Io instance: tự động dùng std.testing.io khi chạy test (comptime), hoặc g_io khi runtime.
+pub fn getIo() std.Io {
+    if (comptime builtin.is_test) {
+        return std.testing.io;
+    }
+    return g_io;
+}
 
 // ---------------------------------------------------------------------------
 // I/O helpers — Zig 0.15.2: File.writeAll() + bufPrint, std.debug.print
@@ -624,3 +633,8 @@ fn printHelp() void {
         \\
     ) catch {};
 }
+
+test {
+    _ = @import("artifacts.zig");
+}
+

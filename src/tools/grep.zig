@@ -55,7 +55,7 @@ pub fn searchContent(alloc: Allocator, io: std.Io, pattern: []const u8, search_p
     if (stat.kind == .file) {
         try searchFile(alloc, io, &result, &count, pattern, search_path, case_insensitive);
     } else if (stat.kind == .directory) {
-        var dir = cwd.openDir(io, search_path, .{}) catch |e| {
+        var dir = cwd.openDir(io, search_path, .{ .iterate = true }) catch |e| {
             return std.fmt.allocPrint(alloc, "Lỗi mở thư mục '{s}': {s}", .{ search_path, @errorName(e) });
         };
         defer dir.close(io);
@@ -155,3 +155,4 @@ fn isBinaryName(name: []const u8) bool {
     }
     return false;
 }
+
