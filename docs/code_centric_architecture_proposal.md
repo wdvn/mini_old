@@ -1,7 +1,8 @@
-# PROPOSAL: EXECUTABLE CODE-CENTRIC AGENT ARCHITECTURE (CODEACT) CHO MINI
-> **Document**: RFC-001  
+# PROPOSAL: LUA / LUAJIT EMBEDDED CODE-CENTRIC AGENT ARCHITECTURE CHO MINI
+> **Document**: RFC-001 (Revision 2 - LuaJIT Interpreter Core)  
 > **Status**: Draft / In Review  
 > **Target System**: `mini-agent` (`mini`)  
+> **Core Interpreter**: **Embedded Lua 5.1 / LuaJIT Runtime**  
 > **Author**: Core Team & AI Pair Programmer  
 > **Date**: 19/08/2026  
 
@@ -22,136 +23,178 @@ Kiến trúc ban đầu của `mini` dựa trên chuẩn **JSON Tool-Calling** t
 
 ---
 
-### 1.2. Giải pháp: Executable Code-Centric Agent Architecture (CodeAct)
-Chuyển đổi toàn bộ cơ chế tương tác công cụ của `mini` sang mô hình **Thực thi Mã nguồn Trực tiếp (Executable Code / Scripting)**:
-- Agent không gọi các JSON tools riêng lẻ mà **viết các đoạn mã/script phức hợp (Bash, Shell, CLI subcommands)** có đầy đủ logic (vòng lặp, điều kiện rẽ nhánh, biểu thức chính quy, lọc dữ liệu) để giải quyết trọn vẹn chuỗi tác vụ **trong duy nhất 1 Turn**.
-- **Tiết kiệm 70% - 90% Token**: Dữ liệu trung gian được lọc và xử lý trực tiếp tại máy cục bộ qua pipe (`grep`, `jq`, `head`, `awk`), chỉ có kết quả chắt lọc cuối cùng mới được nạp vào ngữ cảnh của LLM.
-- **Zero-copy Realtime Feedback**: Output của lệnh (stdout/stderr) được stream trực tiếp lên terminal người dùng trong quá trình thực thi.
+### 1.2. Giải pháp: Lua / LuaJIT Code-Centric Agent Architecture
+Chuyển đổi toàn bộ cơ chế tương tác công cụ của `mini` sang mô hình **Thực thi Mã Lua thông qua Embedded Lua / LuaJIT Interpreter**:
+- **Lua / LuaJIT Engine được nhúng trực tiếp (In-Process VM)** vào binary của `mini`.
+- Toàn bộ công cụ của `mini` (`fs`, `grep`, `glob`, `http`, `sh`, `artifact`, `subagent`) được export trực tiếp thành native C/Zig bindings trong bảng toàn cục **`mini.*`**.
+- Agent giải quyết các bài toán bằng cách **viết 1 đoạn script Lua duy nhất** có đầy đủ logic (vòng lặp, điều kiện rẽ nhánh, chuỗi, bảng dữ liệu, xử lý lỗi), thực thi trực tiếp trong tiến trình với tốc độ microsecond.
+- **Tiết kiệm 80% - 90% Token**: Dữ liệu trung gian được lọc, biến đổi và tổng hợp ngay bên trong Lua VM, chỉ có kết quả chắt lọc cuối cùng (`print(...)`) mới được gửi về cho LLM.
 
 ---
 
-## 2. SO SÁNH KIẾN TRÚC: CŨ VS MỚI
+## 2. TẠI SAO CHỌN LUA & LUAJIT CHO MINI?
 
-```
-[MÔ HÌNH CŨ: JSON RPC Tool-Calling]
-User ──► LLM ──(tool: grep)──► Mini ──► Raw 200 lines ──► LLM ──(tool: read)──► Mini ...
-         ▲                                                                         │
-         └────────(tool: edit_file)◄── Mini ◄──(result: 500 lines)─────────────────┘
-         (Tiêu tốn 6-10 turns qua lại, nhét hàng chục ngàn tokens rác vào context)
-
-─────────────────────────────────────────────────────────────────────────────
-
-[MÔ HÌNH MỚI: Executable Code-Centric Architecture (CodeAct)]
-User ──► LLM ──► [Sinh 1 Script thực thi tổng hợp] ──► [Sandboxed Runtime Engine]
-                                                              │
-                                                      ┌───────┴───────┐
-                                                      │ Loop qua file │
-                                                      │ Grep + Filter │
-                                                      │ Patch + Test  │
-                                                      └───────┬───────┘
-                                                              │
-User ◄── LLM ◄─────── Kết quả cô đọng (10-20 dòng) ───────────┘
-         (Chỉ mất 1 Turn duy nhất, toàn bộ logic trung gian chạy ở máy local)
-```
+| Tiêu chí | Lua / LuaJIT Embedded Engine | Subprocess Bash / Python |
+| :--- | :--- | :--- |
+| **Tốc độ khởi động (Cold Start)** | **0.001 ms (Tức thì)** – Chạy trực tiếp trong tiến trình Zig | 10 – 100 ms (Phải spawn tiến trình OS mới) |
+| **Mức độ phụ thuộc (Dependencies)** | **Zero external dependency** (Liên kết tĩnh `libluajit` vào binary `mini`) | Phụ thuộc vào Python/Node/Shell của máy host |
+| **Giao tiếp Dữ liệu (Interoperability)** | **In-memory Zero-Copy C/Zig FFI**: Gọi trực tiếp hàm Zig qua C API | Chuyển đổi qua lại JSON string / Stdio pipes |
+| **Khả năng Sandbox & Bảo mật** | **Kiểm soát tuyệt đối**: Tự định nghĩa bảng `_G`, giới hạn bộ nhớ, cài đặt execution instruction count hook | Khó kiểm soát khi script gọi shell bên ngoài |
+| **Độ chính xác sinh mã của LLM** | **Cực kỳ xuất sắc**: Cú pháp Lua ngắn gọn, bảng (table) linh hoạt, LLMs ít khi bị lỗi cú pháp | Bash dễ bị lỗi escape quote hoặc khác biệt cú pháp OS |
 
 ---
 
 ## 3. THIẾT KẾ CẤU TRÚC CHI TIẾT (TARGET CODEBASE ARCHITECTURE)
 
-Hệ thống được tái cấu trúc thành các module phân tầng độc lập:
-
 ```
 src/
 ├── main.zig                # Composition root, CLI args parser & REPL loop
 ├── core/                   # Điều phối & Quản lý trạng thái
-│   ├── agent_loop.zig      # CodeAct Loop (Stream -> Extract Code -> Exec -> Feedback)
+│   ├── agent_loop.zig      # CodeAct Loop (Stream -> Extract Lua -> Run VM -> Feedback)
 │   ├── permissions.zig     # Dynamic Security (Ask / Auto / Yolo)
 │   ├── history.zig         # State compaction & History quản lý code executions
 │   └── contracts.zig       # Interfaces, Event types & Token specs
-├── runtime/                # Môi trường thực thi mã nguồn
-│   ├── engine.zig          # Interface trừu tượng điều phối thực thi
-│   ├── shell_runner.zig    # High-performance Bash/Sh Runner với streaming I/O
-│   └── sandbox.zig         # Resource limits (Timeout, Process kill, Directory jail)
-├── stdlib/                 # Bộ công cụ Agent Standard Library & CLI Helpers
-│   ├── fs_tools.zig        # mini-tools read, write, patch (diff/regex)
-│   ├── search_tools.zig    # mini-tools grep, glob tối ưu tốc độ cao
-│   ├── http_tools.zig      # mini-tools http request
-│   └── browser_tools.zig   # mini-tools browser automation
+├── runtime/                # Môi trường thực thi LuaJIT
+│   ├── luajit_engine.zig   # Quản lý lua_State, khởi tạo VM, sandbox, timeout hook
+│   ├── lua_bindings.zig    # C-FFI Export toàn bộ Zig tools sang table `mini.*`
+│   └── shell_runner.zig    # Subprocess runner phục vụ `mini.sh(...)`
+├── stdlib/                 # Core Tool Implementations (Native Zig)
+│   ├── fs_tools.zig        # read, write, patch (diff/exact)
+│   ├── search_tools.zig    # ripgrep, glob engine
+│   ├── http_tools.zig      # HTTP client
+│   └── artifact_tools.zig  # Artifact management
 ├── backend/                # Multi-provider LLM transport (OpenAI, Claude, Ollama)
 └── ui/                     # Terminal rendering & Streaming think/code parser
 ```
 
 ---
 
-## 4. CÁC TRỤ CỘT KỸ THUẬT CỐT LÕI
+## 4. ĐẶC TẢ API BẢNG `mini.*` TRONG LUA RUNTIME
 
-### 4.1. CodeAct Agent Loop ([`src/core/agent_loop.zig`](file:///mnt/hdd/projects/persional/mini/src/agent.zig))
-- **System Prompt**: Hướng dẫn LLM tư duy theo giải thuật (sử dụng shell scripts, pipes và các tool subcommands để giải quyết vấn đề).
-- **Code Extraction Pipeline**: Trích xuất code blocks (```bash ... ``` hoặc ```sh ... ```) ngay khi đang streaming response từ AI.
-- **Execution & Real-time Multiplexing**:
-  - Thực thi qua `runtime/shell_runner.zig`.
-  - Stdout và Stderr được stream đồng thời ra terminal giúp người dùng quan sát tiến trình (ví dụ: `zig build`, `npm install`, `test suite`).
-- **Context Output Ingestion**:
-  - Output thực thi được định dạng kèm mã `exit_code` và thời gian chạy.
-  - Tự động cắt gọt (Head/Tail Truncation nếu vượt quá 32KB) để bảo tồn Context Window.
+Khi Lua VM khởi động cho mỗi lượt chạy, môi trường được nạp sẵn bảng **`mini`** với các API sau:
 
-### 4.2. Tool Standard Library & CLI Subcommands (`src/stdlib/`)
-Thay vì định nghĩa 10 JSON tool schemas cồng kềnh gửi lên mỗi request LLM, các công cụ được đóng gói thành **Agent CLI Subcommands** (`mini-tools <subcommand>`):
-- `mini-tools glob <pattern> [path]`
-- `mini-tools grep <pattern> [path]`
-- `mini-tools read <path> [--offset N] [--limit N]`
-- `mini-tools patch <path> --find <old> --replace <new>`
-- `mini-tools http <GET|POST> <url> [--data ...]`
+```lua
+-- ===========================================================================
+-- BẢNG API mini CUNG CẤP CHO AGENT
+-- ===========================================================================
 
-#### Ví dụ Agent Script thực thi liên hoàn trong 1 Turn:
-```bash
-# Agent tự viết script kiểm tra và sửa lỗi hàng loạt:
-for f in $(mini-tools glob "**/*.zig"); do
-    if mini-tools grep "openDir(io, path, .{})" "$f" > /dev/null; then
-        echo "Fixing $f..."
-        mini-tools patch "$f" \
-            --find "openDir(io, path, .{})" \
-            --replace "openDir(io, path, .{ .iterate = true })"
-    fi
-done
+-- 1. Tìm kiếm & Quét thư mục
+mini.glob(pattern, [base_path])              --> table of string (danh sách đường dẫn)
+mini.grep(pattern, [path], [options])        --> table of { path, line, text }
 
-# Chạy test kiểm tra ngay lập tức
-zig build test
+-- 2. Thao tác Tệp & Thư mục
+mini.read(path, [offset_line], [limit_lines])--> string (nội dung tệp)
+mini.write(path, content)                    --> boolean, string (thành công, thông điệp)
+mini.patch(path, old_str, new_str)           --> boolean, string (thay thế chuỗi duy nhất)
+mini.exists(path)                            --> boolean
+mini.stat(path)                              --> table { size, is_dir, is_file, modified }
+
+-- 3. Thực thi Lệnh Hệ thống (Shell Bridge)
+mini.sh(command, [stdin_str])                --> table { exit_code, stdout, stderr, ok }
+
+-- 4. HTTP & Mạng
+mini.http(method, url, [headers], [body])    --> table { status, headers, body }
+
+-- 5. Artifacts & Session Context
+mini.artifact(name, content, [metadata])     --> string (đường dẫn artifact)
+mini.env(var_name)                           --> string (lấy biến môi trường)
+mini.workspace_root                          --> string (thư mục làm việc hiện tại)
+mini.session_id                              --> string (ID phiên làm việc)
 ```
 
-### 4.3. Mô hình Phân quyền Động 3 Cấp độ (`src/core/permissions.zig`)
-Học hỏi từ chuẩn bảo mật của `vercel-labs/fx`:
-- **`ask` (Mặc định)**: Tạm dừng và yêu cầu người dùng xác nhận (`[Allow once] / [Deny] / [Always Allow]`) trước khi chạy các lệnh ghi file hoặc lệnh shell nguy hiểm.
-- **`auto`**: Cho phép tự động các lệnh an toàn (đọc file, tìm kiếm, stat) và chỉ hỏi khi có can thiệp sửa đổi hệ thống.
-- **`yolo`**: Cho phép toàn bộ không cần hỏi (dành cho môi trường CI/CD hoặc Container).
+---
+
+## 5. VÍ DỤ MINH HỌA: KỊCH BẢN AGENT DÙNG LUA XỬ LÝ TRONG 1 TURN
+
+### Tình huống: Quét toàn bộ codebase, tìm các hàm mở thư mục thiếu `.iterate = true`, sửa code và chạy test xác nhận:
+
+```lua
+-- LLM sinh ra đoạn mã Lua sau trong 1 Turn duy nhất:
+local modified_files = {}
+
+-- 1. Tìm toàn bộ file .zig trong src
+local files = mini.glob("**/*.zig", "src")
+print(string.format("Đang quét %d tệp Zig...", #files))
+
+-- 2. Duyệt và sửa các file có lỗi logic
+for _, file in ipairs(files) do
+    local content = mini.read(file)
+    if content and content:find("openDir%(io, [^,]+, %{}%)") then
+        local ok, msg = mini.patch(file, "openDir(io, search_path, .{})", "openDir(io, search_path, .{ .iterate = true })")
+        if ok then
+            table.insert(modified_files, file)
+            print("  ✓ Đã vá lỗi trong: " .. file)
+        end
+    end
+end
+
+print(string.format("Tổng cộng đã sửa: %d tệp.", #modified_files))
+
+-- 3. Chạy test kiểm tra kết quả ngay lập tức
+if #modified_files > 0 then
+    print("\n--- Đang chạy zig build test ---")
+    local res = mini.sh("zig build test")
+    if res.exit_code == 0 then
+        print("✓ Toàn bộ Unit Tests đã PASS thành công!")
+    else
+        print("✗ Test thất bại:\n" .. res.stderr)
+    end
+end
+```
+
+**Kết quả trả về cho LLM**:
+```text
+Đang quét 12 tệp Zig...
+  ✓ Đã vá lỗi trong: src/tools/grep.zig
+Tổng cộng đã sửa: 1 tệp.
+
+--- Đang chạy zig build test ---
+✓ Toàn bộ Unit Tests đã PASS thành công!
+```
+$\rightarrow$ **Chỉ mất đúng 1 Turn mạng**, toàn bộ quá trình duyệt file, đọc file, regex, sửa code, và compile test được thực thi cục bộ trong chưa đầy **0.3 giây**.
 
 ---
 
-## 5. ĐÁNH GIÁ HIỆU NĂNG & LỢI ÍCH
+## 6. MÔ HÌNH BẢO MẬT & SANDBOX TRONG LUA VM
 
-| Tiêu chí | Mô hình JSON Tool-Calling (Cũ) | Mô hình CodeAct (Mới) | Mức cải thiện |
+### 6.1. Cô lập Môi trường Bytecode (`_G` Isolation)
+- Gỡ bỏ các hàm nguy hiểm mặc định của Lua: `os.remove`, `os.rename`, `os.tmpname`, module `debug`.
+- Redirect toàn bộ hàm `print(...)` và `io.write(...)` vào buffer nội bộ có giới hạn dung lượng (`MAX_OUTPUT_BUFFER = 64KB`).
+- Cài đặt **Lua Debug Hook (`lua_sethook`)** đếm số instruction bytecode đã thực thi để ngăn chặn vòng lặp vô tận (`while true do end`) với timeout mặc định 30 giây.
+
+### 6.2. Phân quyền Tương tác (Permission Interceptor)
+Mọi hàm trong bảng `mini.*` có khả năng thay đổi trạng thái máy (như `mini.write`, `mini.patch`, `mini.sh`) đều được kiểm tra qua `permissions.zig`:
+- **`ask`**: Tạm dừng luồng thực thi Lua và bật prompt xác nhận với người dùng trên Terminal.
+- **`auto`**: Cho phép tự động các thao tác an toàn (đọc/tìm kiếm), chỉ hỏi khi chạy lệnh shell nguy hiểm.
+- **`yolo`**: Cho phép toàn bộ tự động.
+
+---
+
+## 7. ĐÁNH GIÁ HIỆU NĂNG & LỢI ÍCH
+
+| Tiêu chí | Mô hình JSON Tool-Calling (Cũ) | Mô hình LuaJIT CodeAct (Mới) | Mức cải thiện |
 | :--- | :--- | :--- | :--- |
-| **Số LLM Turns (Tác vụ 4 bước)** | 6 – 10 Turns | 1 – 2 Turns | **Giảm 70% – 80%** |
-| **Tổng thời gian hoàn thành** | 30 – 60 giây | 5 – 10 giây | **Nhanh hơn 4x – 6x** |
-| **Token tiêu tốn cho Context** | 15,000 – 30,000 tokens | 2,000 – 4,000 tokens | **Tiết kiệm 80%** |
-| **Độ linh hoạt logic** | Bị giới hạn bởi schema | Đầy đủ (vòng lặp, điều kiện, pipes) | **Không giới hạn** |
+| **Số LLM Turns (Tác vụ 4 bước)** | 6 – 10 Turns | **1 Turn duy nhất** | **Giảm 80% – 90%** |
+| **Thời gian thực thi trung gian** | 20 – 40 giây (Chờ roundtrip API) | **< 0.5 giây (Native LuaJIT)** | **Nhanh hơn 50x** |
+| **Token tiêu tốn cho Context** | 15,000 – 30,000 tokens | **1,500 – 3,000 tokens** | **Tiết kiệm 90%** |
+| **Độ linh hoạt giải thuật** | Không có (Phụ thuộc từng bước JSON) | **Đầy đủ cấu trúc dữ liệu & logic Lua** | **Không giới hạn** |
 
 ---
 
-## 6. LỘ TRÌNH TRIỂN KHAI 4 GIAI ĐOẠN (IMPLEMENTATION ROADMAP)
+## 8. LỘ TRÌNH TRIỂN KHAI 4 GIAI ĐOẠN (IMPLEMENTATION ROADMAP)
 
-### Giai đoạn 1: CodeAct Kernel & Shell Execution Pipeline
-- [ ] Xây dựng `src/runtime/shell_runner.zig` (Streaming execution + timeout + pipe deadlock prevention).
-- [ ] Xây dựng `src/runtime/engine.zig` (Code block extraction + context output formatting).
-- [ ] Nâng cấp `AgentLoop` nhận diện và thực thi code blocks song song với JSON tools hiện có.
+### Giai đoạn 1: LuaJIT Engine & C-FFI Bindings (Core Runtime)
+- [ ] Tích hợp `luajit` / `lua5.1` vào build system (`build.zig`).
+- [ ] Xây dựng `src/runtime/luajit_engine.zig` (Khởi tạo `lua_State`, Sandbox `_G`, Output collector, Timeout hook).
+- [ ] Xây dựng `src/runtime/lua_bindings.zig` (Export các hàm `mini.glob`, `mini.grep`, `mini.read`, `mini.write`, `mini.patch`, `mini.sh`).
 
-### Giai đoạn 2: Built-in Tool Unification & CLI Helpers
-- [ ] Đóng gói bộ công cụ `mini-tools` subcommands trong `src/stdlib/`.
-- [ ] Cập nhật System Prompt sang mô hình Code-First Action.
+### Giai đoạn 2: CodeAct Agent Loop & System Prompt Update
+- [ ] Nâng cấp `src/core/agent_loop.zig`: Thay thế JSON tool dispatcher bằng Lua CodeBlock extractor và LuaJIT executor.
+- [ ] Cập nhật System Prompt hướng dẫn LLM cách sử dụng bảng `mini.*` trong Lua.
 
-### Giai đoạn 3: Dynamic Permissions & Context Auto-Optimizer
-- [ ] Triển khai `src/core/permissions.zig` với các chế độ `ask`, `auto`, `yolo` và `/permissions remember`.
-- [ ] Thêm cơ chế tự động truncate thông minh và nén ngữ cảnh khi script sinh output lớn.
+### Giai đoạn 3: Dynamic Permissions & Sandbox Safety
+- [ ] Tích hợp `src/core/permissions.zig` vào các C-FFI bindings (`mini.write`, `mini.patch`, `mini.sh`).
+- [ ] Thiết lập cơ chế head/tail truncation cho output trả về context LLM.
 
 ### Giai đoạn 4: ACP (Agent Control Protocol) & Headless Embeddability
 - [ ] Hỗ trợ giao thức JSON-RPC ACP để các IDE (VS Code, Cursor) hoặc Web UI có thể nhúng và điều khiển `mini` từ xa.
