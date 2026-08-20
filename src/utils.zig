@@ -98,3 +98,11 @@ pub fn drainPipe(io: std.Io, pipe: std.Io.File, buf: []u8) usize {
     return stored;
 }
 
+/// Lấy epoch timestamp tính theo milliseconds
+pub fn milliTimestamp() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1000000);
+}
+
+

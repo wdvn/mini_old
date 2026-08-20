@@ -49,8 +49,22 @@ extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_
 // Config struct
 // ---------------------------------------------------------------------------
 
+pub const ExecutionMode = enum {
+    codeact,
+    tools,
+    auto,
+
+    pub fn fromString(s: []const u8) ExecutionMode {
+        if (std.mem.eql(u8, s, "codeact") or std.mem.eql(u8, s, "js")) return .codeact;
+        if (std.mem.eql(u8, s, "tools") or std.mem.eql(u8, s, "json")) return .tools;
+        return .auto;
+    }
+};
+
 /// Cấu hình đầy đủ của mini-agent, đọc từ biến môi trường.
 pub const Config = struct {
+    // Mode
+    execution_mode: ExecutionMode = .auto,
     // Backend
     /// URL OpenAI-compatible (ưu tiên cao nhất). Null = không cấu hình.
     openai_compat_url: ?[]const u8,
@@ -108,14 +122,33 @@ pub const Config = struct {
     /// Default system prompt khi không cấu hình MINI_SYSTEM_FILE.
     pub const default_system_prompt =
         \\Bạn là mini-agent, một AI assistant mạnh mẽ chạy trên terminal.
-        \\Bạn có thể dùng các tool như bash, file_read, file_write, http_request,
-        \\web_search, glob, grep để hoàn thành nhiệm vụ.
-        \\Hãy trả lời ngắn gọn, chính xác và hữu ích bằng tiếng Việt.
+        \\Bạn hỗ trợ cơ chế Code-Centric Agent (CodeAct): bạn có thể viết mã JavaScript bên trong khối ```js ... ``` để tự động hóa, xử lý dữ liệu hoặc phối hợp nhiều công cụ trong 1 lượt chạy.
+        \\
+        \\Bên trong JavaScript VM, bạn có object toàn cục `mini`:
+        \\  - `mini.read(path, offset?, limit?)`: Đọc file dạng chuỗi
+        \\  - `mini.write(path, content)`: Ghi/tạo file
+        \\  - `mini.patch(path, oldStr, newStr)`: Sửa file theo đoạn code cũ/mới
+        \\  - `mini.exists(path)`: Kiểm tra file tồn tại
+        \\  - `mini.stat(path)`: { size, isFile, isDir, modified }
+        \\  - `mini.glob(pattern, basePath?)`: Tìm file theo glob
+        \\  - `mini.grep(pattern, path?)`: Tìm chuỗi trong file [{ path, line, text }]
+        \\  - `mini.sh(command)`: Chạy lệnh shell { exitCode, stdout, stderr, ok }
+        \\  - `mini.shBackground(command)`: Chạy ngầm { jobId, pid, logPath }
+        \\  - `mini.jobStatus(jobId)`: Kiểm tra job { running, exitCode, pid }
+        \\  - `mini.jobLogs(jobId, lines?)`: Đọc log gần nhất của job
+        \\  - `mini.jobKill(jobId, signal?)`: Dừng job
+        \\  - `mini.http(method, url)`: HTTP request { status, body }
+        \\  - `mini.artifact(name, content)`: Lưu artifact
+        \\  - `mini.env(name)`: Đọc biến môi trường
+        \\  - `console.log(...)`: In kết quả ra output
+        \\
+        \\Bạn cũng có thể dùng legacy JSON tools nếu cần. Hãy trả lời ngắn gọn, chính xác và hiệu quả bằng tiếng Việt.
     ;
 
     /// Đọc cấu hình từ biến môi trường (sau khi đã gọi loadDotEnv).
     /// `alloc` dùng để đọc file system prompt nếu cần.
     pub fn load(alloc: Allocator, env_map: *const std.process.Environ.Map, io: std.Io) !Config {
+        const exec_mode = if (env_map.get("MINI_EXECUTION_MODE")) |m| ExecutionMode.fromString(m) else .auto;
         const openai_url = env_map.get("OPENAI_COMPAT_URL");
         const openai_key = env_map.get("OPENAI_COMPAT_API_KEY");
         const openai_api_header = env_map.get("OPENAI_COMPAT_API_HEADER") orelse "Authorization";
@@ -163,6 +196,7 @@ pub const Config = struct {
         };
 
         return .{
+            .execution_mode = exec_mode,
             .openai_compat_url = openai_url,
             .openai_compat_key = openai_key,
             .openai_compat_api_header = openai_api_header,

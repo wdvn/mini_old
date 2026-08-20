@@ -1,0 +1,602 @@
+//! js_bindings.zig — C-ABI Export toàn bộ công cụ của mini sang object `mini.*` trong QuickJS-ng.
+//!
+//! Cung cấp các API:
+//!   - mini.glob(pattern, basePath?)
+//!   - mini.grep(pattern, path?, opts?)
+//!   - mini.read(path, offset?, limit?)
+//!   - mini.write(path, content)
+//!   - mini.patch(path, oldStr, newStr, opts?)
+//!   - mini.exists(path)
+//!   - mini.stat(path)
+//!   - mini.sh(command, opts?)
+//!   - mini.shStream(command, opts?)
+//!   - mini.shBackground(command, opts?)
+//!   - mini.jobStatus(jobId)
+//!   - mini.jobLogs(jobId, lines?)
+//!   - mini.jobKill(jobId, signal?)
+//!   - mini.http(method, url, opts?)
+//!   - mini.artifact(name, content, metadata?)
+//!   - mini.env(varName)
+//!   - mini.workspaceRoot, mini.sessionId
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const quickjs = @import("quickjs_engine.zig");
+const process_manager = @import("process_manager.zig");
+const c = quickjs.c;
+const Engine = quickjs.Engine;
+const JS_UNDEFINED = quickjs.JS_UNDEFINED;
+const JS_NULL = quickjs.JS_NULL;
+const JS_EXCEPTION = quickjs.JS_EXCEPTION;
+
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+const bash_tool = @import("../tools/bash.zig");
+const file_tool = @import("../tools/file.zig");
+const glob_tool = @import("../tools/glob.zig");
+const grep_tool = @import("../tools/grep.zig");
+const http_tool = @import("../tools/http.zig");
+const artifact_tool = @import("../tools/artifact.zig");
+const artifacts_mod = @import("../artifacts.zig");
+const utils = @import("../utils.zig");
+const json_mod = @import("../json.zig");
+const main = @import("../main.zig");
+
+fn getEngine(ctx: ?*c.JSContext) ?*Engine {
+    const ptr = c.JS_GetContextOpaque(ctx) orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn jsStringSlice(ctx: ?*c.JSContext, val: c.JSValue, alloc: Allocator) ?[]u8 {
+    const c_str = c.JS_ToCString(ctx, val);
+    if (c_str == null) return null;
+    defer c.JS_FreeCString(ctx, c_str);
+    return alloc.dupe(u8, std.mem.span(c_str)) catch null;
+}
+
+// ---------------------------------------------------------------------------
+// mini.glob(pattern, basePath?)
+// ---------------------------------------------------------------------------
+fn jsMiniGlob(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.glob requires at least 1 argument (pattern)");
+
+    const pattern = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid pattern");
+    defer engine.alloc.free(pattern);
+
+    const base_path = if (argc >= 2 and c.JS_IsUndefined(argv[1]) == 0 and c.JS_IsNull(argv[1]) == 0)
+        jsStringSlice(ctx, argv[1], engine.alloc)
+    else
+        null;
+    defer if (base_path) |p| engine.alloc.free(p);
+
+    // Build input JSON for glob tool
+    var json_w = utils.BufWriter.init(engine.alloc);
+    defer json_w.deinit();
+    json_w.print("{{\"pattern\":\"{s}\"", .{pattern}) catch return JS_EXCEPTION;
+    if (base_path) |p| {
+        json_w.print(",\"path\":\"{s}\"", .{p}) catch return JS_EXCEPTION;
+    }
+    json_w.writeAll("}") catch return JS_EXCEPTION;
+
+    const res = glob_tool.executeTool(engine.alloc, engine.io, json_w.list.items) catch |e| {
+        return c.JS_ThrowInternalError(ctx, "glob error: %s", @errorName(e).ptr);
+    };
+    defer engine.alloc.free(res);
+
+    // Parse lines in res into JS Array of strings
+    const arr = c.JS_NewArray(ctx);
+    var it = std.mem.splitScalar(u8, res, '\n');
+    var idx: u32 = 0;
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r\t");
+        if (trimmed.len > 0 and !std.mem.startsWith(u8, trimmed, "Tìm thấy 0") and !std.mem.startsWith(u8, trimmed, "Không tìm thấy")) {
+            const str_val = c.JS_NewStringLen(ctx, trimmed.ptr, trimmed.len);
+            _ = c.JS_SetPropertyUint32(ctx, arr, idx, str_val);
+            idx += 1;
+        }
+    }
+
+    return arr;
+}
+
+// ---------------------------------------------------------------------------
+// mini.grep(pattern, path?, options?)
+// ---------------------------------------------------------------------------
+fn jsMiniGrep(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.grep requires at least 1 argument (pattern)");
+
+    const pattern = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid pattern");
+    defer engine.alloc.free(pattern);
+
+    const path = if (argc >= 2 and c.JS_IsUndefined(argv[1]) == 0 and c.JS_IsNull(argv[1]) == 0)
+        jsStringSlice(ctx, argv[1], engine.alloc)
+    else
+        null;
+    defer if (path) |p| engine.alloc.free(p);
+
+    var json_w = utils.BufWriter.init(engine.alloc);
+    defer json_w.deinit();
+    json_w.print("{{\"pattern\":\"{s}\"", .{pattern}) catch return JS_EXCEPTION;
+    if (path) |p| {
+        json_w.print(",\"path\":\"{s}\"", .{p}) catch return JS_EXCEPTION;
+    }
+    json_w.writeAll("}") catch return JS_EXCEPTION;
+
+    const res = grep_tool.executeTool(engine.alloc, engine.io, json_w.list.items) catch |e| {
+        return c.JS_ThrowInternalError(ctx, "grep error: %s", @errorName(e).ptr);
+    };
+    defer engine.alloc.free(res);
+
+    const arr = c.JS_NewArray(ctx);
+    var it = std.mem.splitScalar(u8, res, '\n');
+    var idx: u32 = 0;
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        // Parse "file:line:content"
+        var parts = std.mem.splitScalar(u8, line, ':');
+        const f = parts.next();
+        const l_str = parts.next();
+        const rest = if (f != null and l_str != null) line[f.?.len + l_str.?.len + 2 ..] else line;
+
+        const obj = c.JS_NewObject(ctx);
+        if (f) |file_path| {
+            _ = c.JS_SetPropertyStr(ctx, obj, "path", c.JS_NewStringLen(ctx, file_path.ptr, file_path.len));
+        }
+        if (l_str) |ls| {
+            const line_num = std.fmt.parseInt(i32, ls, 10) catch 0;
+            _ = c.JS_SetPropertyStr(ctx, obj, "line", c.JS_NewInt32(ctx, line_num));
+        }
+        _ = c.JS_SetPropertyStr(ctx, obj, "text", c.JS_NewStringLen(ctx, rest.ptr, rest.len));
+
+        _ = c.JS_SetPropertyUint32(ctx, arr, idx, obj);
+        idx += 1;
+    }
+
+    return arr;
+}
+
+// ---------------------------------------------------------------------------
+// mini.read(path, offsetLine?, limitLines?)
+// ---------------------------------------------------------------------------
+fn jsMiniRead(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.read requires path argument");
+
+    const path = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid path");
+    defer engine.alloc.free(path);
+
+    var offset: usize = 1;
+    var limit: usize = 2000;
+
+    if (argc >= 2 and c.JS_IsNumber(argv[1]) != 0) {
+        var v: i32 = 1;
+        _ = c.JS_ToInt32(ctx, &v, argv[1]);
+        if (v > 0) offset = @intCast(v);
+    }
+    if (argc >= 3 and c.JS_IsNumber(argv[2]) != 0) {
+        var v: i32 = 2000;
+        _ = c.JS_ToInt32(ctx, &v, argv[2]);
+        if (v > 0) limit = @intCast(v);
+    }
+
+    const content = file_tool.readFile(engine.alloc, engine.io, path, offset, limit) catch |e| {
+        return c.JS_ThrowInternalError(ctx, "read error: %s", @errorName(e).ptr);
+    };
+    defer engine.alloc.free(content);
+
+    return c.JS_NewStringLen(ctx, content.ptr, content.len);
+}
+
+// ---------------------------------------------------------------------------
+// mini.write(path, content)
+// ---------------------------------------------------------------------------
+fn jsMiniWrite(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 2) return c.JS_ThrowTypeError(ctx, "mini.write requires path and content arguments");
+
+    const path = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid path");
+    defer engine.alloc.free(path);
+
+    const content = jsStringSlice(ctx, argv[1], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid content");
+    defer engine.alloc.free(content);
+
+    const res = file_tool.writeFile(engine.alloc, engine.io, path, content) catch |e| {
+        const obj = c.JS_NewObject(ctx);
+        _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, 0));
+        const err_name = @errorName(e);
+        _ = c.JS_SetPropertyStr(ctx, obj, "message", c.JS_NewStringLen(ctx, err_name.ptr, err_name.len));
+        return obj;
+    };
+    defer engine.alloc.free(res);
+
+    const obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, 1));
+    _ = c.JS_SetPropertyStr(ctx, obj, "message", c.JS_NewStringLen(ctx, res.ptr, res.len));
+    return obj;
+}
+
+// ---------------------------------------------------------------------------
+// mini.patch(path, oldStr, newStr, opts?)
+// ---------------------------------------------------------------------------
+fn jsMiniPatch(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 3) return c.JS_ThrowTypeError(ctx, "mini.patch requires path, oldStr, and newStr arguments");
+
+    const path = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid path");
+    defer engine.alloc.free(path);
+
+    const old_str = jsStringSlice(ctx, argv[1], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid oldStr");
+    defer engine.alloc.free(old_str);
+
+    const new_str = jsStringSlice(ctx, argv[2], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid newStr");
+    defer engine.alloc.free(new_str);
+
+    const res = file_tool.editFile(engine.alloc, engine.io, path, old_str, new_str) catch |e| {
+        const obj = c.JS_NewObject(ctx);
+        _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, 0));
+        const err_name = @errorName(e);
+        _ = c.JS_SetPropertyStr(ctx, obj, "message", c.JS_NewStringLen(ctx, err_name.ptr, err_name.len));
+        return obj;
+    };
+    defer engine.alloc.free(res);
+
+    const is_ok = std.mem.indexOf(u8, res, "Đã sửa file") != null;
+    const obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, if (is_ok) 1 else 0));
+    _ = c.JS_SetPropertyStr(ctx, obj, "message", c.JS_NewStringLen(ctx, res.ptr, res.len));
+    return obj;
+}
+
+// ---------------------------------------------------------------------------
+// mini.exists(path)
+// ---------------------------------------------------------------------------
+fn jsMiniExists(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.exists requires path argument");
+
+    const path = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid path");
+    defer engine.alloc.free(path);
+
+    const cwd = std.Io.Dir.cwd();
+    const exists = if (cwd.statFile(engine.io, path, .{})) |_| true else |_| false;
+    return c.JS_NewBool(ctx, if (exists) 1 else 0);
+}
+
+// ---------------------------------------------------------------------------
+// mini.stat(path)
+// ---------------------------------------------------------------------------
+fn jsMiniStat(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.stat requires path argument");
+
+    const path = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid path");
+    defer engine.alloc.free(path);
+
+    const cwd = std.Io.Dir.cwd();
+    const stat_res = cwd.statFile(engine.io, path, .{}) catch |e| {
+        return c.JS_ThrowInternalError(ctx, "stat error: %s", @errorName(e).ptr);
+    };
+
+    const obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, obj, "size", c.JS_NewInt64(ctx, @intCast(stat_res.size)));
+    _ = c.JS_SetPropertyStr(ctx, obj, "isFile", c.JS_NewBool(ctx, if (stat_res.kind == .file) 1 else 0));
+    _ = c.JS_SetPropertyStr(ctx, obj, "isDir", c.JS_NewBool(ctx, if (stat_res.kind == .directory) 1 else 0));
+    _ = c.JS_SetPropertyStr(ctx, obj, "modified", c.JS_NewInt64(ctx, @as(i64, @truncate(stat_res.mtime.nanoseconds))));
+    return obj;
+}
+
+// ---------------------------------------------------------------------------
+// mini.sh(command, opts?)
+// ---------------------------------------------------------------------------
+fn jsMiniSh(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.sh requires command argument");
+
+    const command = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid command");
+    defer engine.alloc.free(command);
+
+    // Xây dựng JSON cho bash tool
+    var json_w = utils.BufWriter.init(engine.alloc);
+    defer json_w.deinit();
+    json_w.print("{{\"command\":\"{s}\"}}", .{command}) catch return JS_EXCEPTION;
+
+    const out = bash_tool.executeTool(engine.alloc, engine.io, json_w.list.items) catch |e| {
+        const obj = c.JS_NewObject(ctx);
+        _ = c.JS_SetPropertyStr(ctx, obj, "exitCode", c.JS_NewInt32(ctx, 1));
+        _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, 0));
+        const err_name = @errorName(e);
+        _ = c.JS_SetPropertyStr(ctx, obj, "stderr", c.JS_NewStringLen(ctx, err_name.ptr, err_name.len));
+        _ = c.JS_SetPropertyStr(ctx, obj, "stdout", c.JS_NewStringLen(ctx, "", 0));
+        return obj;
+    };
+    defer engine.alloc.free(out);
+
+    engine.renewActivity();
+
+    const obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, obj, "exitCode", c.JS_NewInt32(ctx, 0));
+    _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, 1));
+    _ = c.JS_SetPropertyStr(ctx, obj, "stdout", c.JS_NewStringLen(ctx, out.ptr, out.len));
+    _ = c.JS_SetPropertyStr(ctx, obj, "stderr", c.JS_NewStringLen(ctx, "", 0));
+    return obj;
+}
+
+// ---------------------------------------------------------------------------
+// mini.shStream(command, opts?)
+// ---------------------------------------------------------------------------
+fn jsMiniShStream(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.shStream requires command argument");
+
+    const command = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid command");
+    defer engine.alloc.free(command);
+
+    const argv_cmd = [_][]const u8{ "/bin/sh", "-c", command };
+    var child = std.process.spawn(engine.io, .{
+        .argv = &argv_cmd,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |e| {
+        return c.JS_ThrowInternalError(ctx, "shStream spawn error: %s", @errorName(e).ptr);
+    };
+
+    const term = child.wait(engine.io) catch |e| {
+        return c.JS_ThrowInternalError(ctx, "shStream wait error: %s", @errorName(e).ptr);
+    };
+
+    engine.renewActivity();
+
+    const exit_code: i32 = switch (term) {
+        .exited => |code| code,
+        .signal => |sig| @intCast(@intFromEnum(sig)),
+        else => 1,
+    };
+
+    return c.JS_NewInt32(ctx, exit_code);
+}
+
+// ---------------------------------------------------------------------------
+// mini.shBackground(command, opts?)
+// ---------------------------------------------------------------------------
+fn jsMiniShBackground(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.shBackground requires command argument");
+
+    const command = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid command");
+    defer engine.alloc.free(command);
+
+    const pm = process_manager.getProcessManager(engine.alloc);
+    const info = pm.spawnBackground(engine.io, command) catch |e| {
+        return c.JS_ThrowInternalError(ctx, "shBackground spawn error: %s", @errorName(e).ptr);
+    };
+
+    const obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, obj, "jobId", c.JS_NewStringLen(ctx, info.job_id.ptr, info.job_id.len));
+    _ = c.JS_SetPropertyStr(ctx, obj, "pid", c.JS_NewInt32(ctx, info.pid));
+    _ = c.JS_SetPropertyStr(ctx, obj, "logPath", c.JS_NewStringLen(ctx, info.log_path.ptr, info.log_path.len));
+    return obj;
+}
+
+// ---------------------------------------------------------------------------
+// mini.jobStatus(jobId)
+// ---------------------------------------------------------------------------
+fn jsMiniJobStatus(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.jobStatus requires jobId argument");
+
+    const job_id = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid jobId");
+    defer engine.alloc.free(job_id);
+
+    const pm = process_manager.getProcessManager(engine.alloc);
+    const status = pm.getJobStatus(job_id) orelse return JS_NULL;
+
+    const obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, obj, "running", c.JS_NewBool(ctx, if (status.running) 1 else 0));
+    _ = c.JS_SetPropertyStr(ctx, obj, "pid", c.JS_NewInt32(ctx, status.pid));
+    if (status.exit_code) |ec| {
+        _ = c.JS_SetPropertyStr(ctx, obj, "exitCode", c.JS_NewInt32(ctx, ec));
+    }
+    return obj;
+}
+
+// ---------------------------------------------------------------------------
+// mini.jobLogs(jobId, lines?)
+// ---------------------------------------------------------------------------
+fn jsMiniJobLogs(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.jobLogs requires jobId argument");
+
+    const job_id = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid jobId");
+    defer engine.alloc.free(job_id);
+
+    var max_lines: usize = 50;
+    if (argc >= 2 and c.JS_IsNumber(argv[1]) != 0) {
+        var v: i32 = 50;
+        _ = c.JS_ToInt32(ctx, &v, argv[1]);
+        if (v > 0) max_lines = @intCast(v);
+    }
+
+    const pm = process_manager.getProcessManager(engine.alloc);
+    const logs = pm.readJobLogs(engine.io, job_id, max_lines) catch |e| {
+        return c.JS_ThrowInternalError(ctx, "jobLogs error: %s", @errorName(e).ptr);
+    };
+    defer engine.alloc.free(logs);
+
+    return c.JS_NewStringLen(ctx, logs.ptr, logs.len);
+}
+
+// ---------------------------------------------------------------------------
+// mini.jobKill(jobId, signal?)
+// ---------------------------------------------------------------------------
+fn jsMiniJobKill(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.jobKill requires jobId argument");
+
+    const job_id = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid jobId");
+    defer engine.alloc.free(job_id);
+
+    const sig = if (argc >= 2 and c.JS_IsString(argv[1]) != 0)
+        jsStringSlice(ctx, argv[1], engine.alloc)
+    else
+        null;
+    defer if (sig) |s| engine.alloc.free(s);
+
+    const pm = process_manager.getProcessManager(engine.alloc);
+    const ok = pm.killJob(job_id, sig);
+    return c.JS_NewBool(ctx, if (ok) 1 else 0);
+}
+
+// ---------------------------------------------------------------------------
+// mini.http(method, url, opts?)
+// ---------------------------------------------------------------------------
+fn jsMiniHttp(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 2) return c.JS_ThrowTypeError(ctx, "mini.http requires method and url arguments");
+
+    const method = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid method");
+    defer engine.alloc.free(method);
+
+    const url = jsStringSlice(ctx, argv[1], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid url");
+    defer engine.alloc.free(url);
+
+    var json_w = utils.BufWriter.init(engine.alloc);
+    defer json_w.deinit();
+    json_w.print("{{\"method\":\"{s}\",\"url\":\"{s}\"}}", .{ method, url }) catch return JS_EXCEPTION;
+
+    const res = http_tool.executeTool(engine.alloc, json_w.list.items) catch |e| {
+        return c.JS_ThrowInternalError(ctx, "http error: %s", @errorName(e).ptr);
+    };
+    defer engine.alloc.free(res);
+
+    engine.renewActivity();
+
+    const obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, obj, "status", c.JS_NewInt32(ctx, 200));
+    _ = c.JS_SetPropertyStr(ctx, obj, "body", c.JS_NewStringLen(ctx, res.ptr, res.len));
+    return obj;
+}
+
+// ---------------------------------------------------------------------------
+// mini.artifact(name, content, metadata?)
+// ---------------------------------------------------------------------------
+fn jsMiniArtifact(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 2) return c.JS_ThrowTypeError(ctx, "mini.artifact requires name and content arguments");
+
+    const name = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid name");
+    defer engine.alloc.free(name);
+
+    const content = jsStringSlice(ctx, argv[1], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid content");
+    defer engine.alloc.free(content);
+
+    const escaped = json_mod.escape(engine.alloc, content) catch return JS_EXCEPTION;
+    defer engine.alloc.free(escaped);
+
+    var json_w = utils.BufWriter.init(engine.alloc);
+    defer json_w.deinit();
+    json_w.print("{{\"name\":\"{s}\",\"content\":\"{s}\"}}", .{ name, escaped }) catch return JS_EXCEPTION;
+
+    const res = artifact_tool.writeTool(engine.alloc, engine.io, json_w.list.items) catch |e| {
+        return c.JS_ThrowInternalError(ctx, "artifact error: %s", @errorName(e).ptr);
+    };
+    defer engine.alloc.free(res);
+
+    return c.JS_NewStringLen(ctx, res.ptr, res.len);
+}
+
+// ---------------------------------------------------------------------------
+// mini.env(varName)
+// ---------------------------------------------------------------------------
+fn jsMiniEnv(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.env requires varName argument");
+
+    const var_name = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid varName");
+    defer engine.alloc.free(var_name);
+
+    const var_name_z = engine.alloc.dupeZ(u8, var_name) catch return JS_EXCEPTION;
+    defer engine.alloc.free(var_name_z);
+
+    const val = getenv(var_name_z.ptr);
+    if (val) |v| {
+        const slice = std.mem.span(v);
+        return c.JS_NewStringLen(ctx, slice.ptr, slice.len);
+    }
+    return JS_NULL;
+}
+
+/// Đăng ký object toàn cục `mini` vào JSContext
+pub fn registerBindings(engine: *Engine) !void {
+    const ctx = engine.ctx.?;
+    const global_obj = c.JS_GetGlobalObject(ctx);
+    defer c.JS_FreeValue(ctx, global_obj);
+
+    const mini_obj = c.JS_NewObject(ctx);
+
+    // 1. fs & search
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "glob", c.JS_NewCFunction(ctx, jsMiniGlob, "glob", 2));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "grep", c.JS_NewCFunction(ctx, jsMiniGrep, "grep", 3));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "read", c.JS_NewCFunction(ctx, jsMiniRead, "read", 3));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "write", c.JS_NewCFunction(ctx, jsMiniWrite, "write", 2));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "patch", c.JS_NewCFunction(ctx, jsMiniPatch, "patch", 4));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "exists", c.JS_NewCFunction(ctx, jsMiniExists, "exists", 1));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "stat", c.JS_NewCFunction(ctx, jsMiniStat, "stat", 1));
+
+    // 2. shell & jobs (OpenHands Pattern)
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "sh", c.JS_NewCFunction(ctx, jsMiniSh, "sh", 2));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "shStream", c.JS_NewCFunction(ctx, jsMiniShStream, "shStream", 2));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "shBackground", c.JS_NewCFunction(ctx, jsMiniShBackground, "shBackground", 2));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "jobStatus", c.JS_NewCFunction(ctx, jsMiniJobStatus, "jobStatus", 1));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "jobLogs", c.JS_NewCFunction(ctx, jsMiniJobLogs, "jobLogs", 2));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "jobKill", c.JS_NewCFunction(ctx, jsMiniJobKill, "jobKill", 2));
+
+    // 3. network & session
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "http", c.JS_NewCFunction(ctx, jsMiniHttp, "http", 3));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "artifact", c.JS_NewCFunction(ctx, jsMiniArtifact, "artifact", 3));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "env", c.JS_NewCFunction(ctx, jsMiniEnv, "env", 1));
+
+    // 4. metadata props
+    const pwd_val = getenv("PWD");
+    const cwd_str = if (pwd_val) |p| std.mem.span(p) else ".";
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "workspaceRoot", c.JS_NewStringLen(ctx, cwd_str.ptr, cwd_str.len));
+
+    const session_id = artifacts_mod.getSessionId();
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "sessionId", c.JS_NewStringLen(ctx, session_id.ptr, session_id.len));
+
+    _ = c.JS_SetPropertyStr(ctx, global_obj, "mini", mini_obj);
+}
