@@ -1,8 +1,8 @@
-# PROPOSAL: LUA / LUAJIT EMBEDDED CODE-CENTRIC AGENT ARCHITECTURE CHO MINI
-> **Document**: RFC-001 (Revision 3 — Validated & Hardened)  
+# PROPOSAL: QUICKJS EMBEDDED CODE-CENTRIC AGENT ARCHITECTURE CHO MINI
+> **Document**: RFC-001 (Revision 4 — QuickJS-ng Engine)  
 > **Status**: Draft / In Review  
 > **Target System**: `mini-agent` (`mini`)  
-> **Core Interpreter**: **Embedded Lua 5.1 / LuaJIT Runtime (Interpreter Mode)**  
+> **Core Interpreter**: **Embedded QuickJS-ng (ES2023 JavaScript Runtime)**  
 > **Author**: Core Team & AI Pair Programmer  
 > **Date**: 19/08/2026  
 
@@ -23,48 +23,63 @@ Kiến trúc ban đầu của `mini` dựa trên chuẩn **JSON Tool-Calling** t
 
 ---
 
-### 1.2. Giải pháp: Lua / LuaJIT Code-Centric Agent Architecture
-Chuyển đổi cơ chế tương tác công cụ của `mini` sang mô hình **Hybrid: Lua CodeAct + JSON Tool Fallback**, trong đó Lua CodeAct là phương thức ưu tiên:
-- **Lua / LuaJIT Engine được nhúng trực tiếp (In-Process VM)** vào binary của `mini`.
-- Toàn bộ công cụ của `mini` (`fs`, `grep`, `glob`, `http`, `sh`, `artifact`) được export thành **in-process C-ABI bindings** trong bảng toàn cục **`mini.*`**.
-- Agent giải quyết các bài toán bằng cách **viết 1 đoạn script Lua** có đầy đủ logic (vòng lặp, điều kiện rẽ nhánh, chuỗi, bảng dữ liệu, xử lý lỗi), thực thi trực tiếp trong tiến trình.
-- Khi script lỗi, agent tự nhận error output và **tự sửa lỗi qua vòng lặp Self-Correction** (tối đa 3 lần retry trước khi fallback về JSON tool-calling).
+### 1.2. Giải pháp: QuickJS Code-Centric Agent Architecture
+Chuyển đổi cơ chế tương tác công cụ của `mini` sang mô hình **Hybrid: JavaScript CodeAct + JSON Tool Fallback**, trong đó JavaScript CodeAct là phương thức ưu tiên:
+- **QuickJS-ng Engine được nhúng trực tiếp (In-Process VM)** vào binary của `mini` — zero external dependency, ~200-300KB static link.
+- Toàn bộ công cụ của `mini` (`fs`, `grep`, `glob`, `http`, `sh`, `artifact`) được export thành **in-process C-ABI bindings** trong object toàn cục **`mini.*`**.
+- Agent giải quyết bài toán bằng cách **viết 1 đoạn script JavaScript** có đầy đủ logic (vòng lặp, điều kiện, try/catch, async/await, array methods), thực thi trực tiếp trong tiến trình.
+- Khi script lỗi, agent tự nhận error output (kèm stack trace) và **tự sửa lỗi qua vòng lặp Self-Correction** (tối đa 3 lần retry trước khi fallback về JSON tool-calling).
 
 ---
 
-## 2. TẠI SAO CHỌN LUA & LUAJIT CHO MINI?
+## 2. TẠI SAO CHỌN QUICKJS (JAVASCRIPT) CHO MINI?
 
-### 2.1. Bảng so sánh kỹ thuật
+### 2.1. Lý do lựa chọn cốt lõi
 
-| Tiêu chí | Lua / LuaJIT Embedded Engine | Subprocess Bash / Python |
-| :--- | :--- | :--- |
-| **Tốc độ khởi động (Cold Start)** | **~0.01 ms** – Chạy trực tiếp trong tiến trình Zig, không cần spawn process | 10 – 100 ms (Spawn tiến trình OS mới) |
-| **Mức độ phụ thuộc (Dependencies)** | **Zero external dependency** (Liên kết tĩnh `libluajit` vào binary `mini`) | Phụ thuộc vào Python/Node/Shell của máy host |
-| **Giao tiếp Dữ liệu (Interoperability)** | **In-process C-ABI bindings**: Gọi hàm Zig qua Lua C API, dữ liệu được marshalled qua Lua stack (nhanh hơn IPC nhiều lần, nhưng có chi phí copy string giữa Zig allocator và Lua GC) | Chuyển đổi qua lại JSON string / Stdio pipes |
-| **Khả năng Sandbox & Bảo mật** | **Kiểm soát tuyệt đối**: Tự định nghĩa bảng `_G` (whitelist), giới hạn bộ nhớ qua custom allocator, timeout qua OS-level thread kill | Khó kiểm soát khi script gọi shell bên ngoài |
+Quyết định chọn QuickJS thay vì LuaJIT dựa trên phân tích so sánh toàn diện 12 khía cạnh (xem chi tiết tại `docs/luajit_vs_quickjs_comparison.md`). Ba lý do then chốt:
 
-### 2.2. Thẳng thắn về độ chính xác sinh mã Lua của LLM
+#### A. LLM sinh mã JavaScript chính xác áp đảo so với mọi lựa chọn khác
 
-Theo các benchmark đa ngôn ngữ (MultiPL-E, HumanEval multilingual), khả năng sinh mã Lua của LLM hiện tại **thấp hơn đáng kể** so với Python và JavaScript:
+Theo benchmark MultiPL-E và HumanEval-X (2024-2025):
 
-| Ngôn ngữ | Độ chính xác tương đối | Lý do |
+| Ngôn ngữ | Pass@1 tương đối (GPT-4o) | Lý do |
 |:---|:---|:---|
-| Python | **Cao nhất** | Ngôn ngữ chính trong training data |
-| JavaScript | Cao | Lượng training data khổng lồ từ web ecosystem |
-| Bash | Trung bình / Thấp | Thiếu typing, cú pháp escape phức tạp |
-| Lua | **Thấp hơn trung bình** | Hệ sinh thái nhỏ, ít training data |
+| Python | ~85-92% | Gold standard, training data khổng lồ |
+| **JavaScript** | **~80-88%** | **Top-2, gần bằng Python** |
+| Bash | ~55-70% | Lỗi quote/escape thường xuyên |
+| Lua | ~45-60% | Ít training data, LLM hay nhầm cú pháp |
 
-**Tuy nhiên, điều này KHÔNG phủ nhận lựa chọn Lua cho `mini`** vì lý do sau:
+Trong kiến trúc CodeAct, **độ chính xác sinh mã là yếu tố sống còn**. Nếu agent sinh mã sai → cần thêm turn để debug → triệt tiêu lợi ích "1 Turn duy nhất". JavaScript có lượng training data lớn thứ 2 (sau Python) từ npm, GitHub, StackOverflow, MDN — đảm bảo LLM viết JS đúng và tự nhiên.
 
-1. **Constrained API Surface**: Agent không sinh mã Lua tổng quát (general-purpose). Agent chỉ sử dụng **đúng 12 hàm** trong bảng `mini.*` cố định. Đây là bài toán **constrained code generation** — LLM chỉ cần học 1 API surface nhỏ thay vì cả hệ sinh thái ngôn ngữ. Tương tự cách Neovim plugin sinh Lua gọi `vim.api.*` — API hẹp nhưng đủ mạnh.
+#### B. Sandbox là first-class feature của QuickJS — không cần workaround
 
-2. **Few-Shot Prompting trong System Prompt**: System prompt sẽ bao gồm 3-5 ví dụ hoàn chỉnh mô tả cách sử dụng `mini.*` API, giúp LLM nắm chắc pattern trước khi sinh mã.
+```c
+// 3 dòng code — sandbox hoàn chỉnh:
+JS_SetMemoryLimit(rt, 128 * 1024 * 1024);              // Giới hạn bộ nhớ 128MB
+JS_SetMaxStackSize(rt, 1024 * 1024);                     // Giới hạn stack 1MB
+JS_SetInterruptHandler(rt, timeout_handler, &deadline);  // Wall-clock timeout
+```
 
-3. **Self-Correction Loop**: Khi Lua VM trả lỗi syntax hoặc runtime error, error message được gửi ngược về LLM để tự sửa. Vòng lặp retry (tối đa 3 lần) + fallback JSON tools đảm bảo agent luôn hoàn thành tác vụ.
+So sánh: LuaJIT yêu cầu tắt JIT (`jit.off()`) để `lua_sethook` hoạt động (mất toàn bộ lợi thế tốc độ JIT), phải tự viết custom allocator cho memory limit, và tự build OS-level thread kill cho timeout.
+
+#### C. Portable tuyệt đối & Async/Await native
+
+- **QuickJS là pure C interpreter**: Chạy mọi nơi Zig compiler hỗ trợ — x86, ARM, RISC-V, WASM. LuaJIT JIT chỉ support x86/ARM, không hỗ trợ RISC-V.
+- **Native async/await + Promise**: Mở cánh cửa cho concurrent operations tương lai (gọi song song nhiều HTTP request, nhiều shell command).
+
+### 2.2. Bảng so sánh kỹ thuật
+
+| Tiêu chí | QuickJS-ng (JavaScript) | Subprocess Bash / Python |
+| :--- | :--- | :--- |
+| **Tốc độ khởi động** | **~0.01 ms** – Chạy trực tiếp trong tiến trình Zig | 10 – 100 ms (Spawn tiến trình OS mới) |
+| **Dependencies** | **Zero** (Static link ~200-300KB vào binary `mini`) | Phụ thuộc Python/Node/Shell của host |
+| **Giao tiếp dữ liệu** | **In-process C-ABI bindings**: Gọi hàm Zig qua QuickJS C API, dữ liệu marshalled qua JS value stack | Chuyển đổi qua lại JSON string / Stdio pipes |
+| **Sandbox** | **Native API**: `JS_SetMemoryLimit`, `JS_SetInterruptHandler`, `JS_SetMaxStackSize` | Khó kiểm soát khi script gọi shell |
+| **LLM Code Accuracy** | **Top-2** (gần bằng Python, ~80-88% Pass@1) | Bash: ~55-70% (hay lỗi escape) |
 
 ---
 
-## 3. CHIẾN LƯỢC HYBRID: LUA CODEACT + JSON TOOL FALLBACK
+## 3. CHIẾN LƯỢC HYBRID: JS CODEACT + JSON TOOL FALLBACK
 
 Proposal này **KHÔNG** xóa bỏ hệ thống JSON tool-calling hiện tại. Thay vào đó, áp dụng kiến trúc **Hybrid hai tầng**:
 
@@ -75,18 +90,18 @@ Proposal này **KHÔNG** xóa bỏ hệ thống JSON tool-calling hiện tại. 
                                         │
                     ┌───────────────────┴───────────────────┐
                     │                                       │
-          [Ưu tiên: Lua CodeAct]              [Fallback: JSON Tool-Calling]
+          [Ưu tiên: JS CodeAct]               [Fallback: JSON Tool-Calling]
           - Model mạnh (Claude 3.7,           - Model yếu/nhỏ (phi-3,
             GPT-4o, Gemini 2.0)                 llama-3, local Ollama)
           - System Prompt chứa                - Giữ nguyên JSON schema
-            mini.* API + ví dụ Lua              tools hiện tại
+            mini.* API + ví dụ JS               tools hiện tại
           - Code block extraction             - Không yêu cầu thay đổi
-            từ markdown ```lua```               model behavior
+            từ markdown ```js```                model behavior
 ```
 
 ### Cơ chế chuyển đổi:
 - **Cấu hình `execution_mode`** trong `config.zig`:
-  - `"codeact"` (mặc định cho model mạnh): LLM sinh Lua, thực thi qua VM.
+  - `"codeact"` (mặc định cho model mạnh): LLM sinh JavaScript, thực thi qua QuickJS VM.
   - `"tools"` (mặc định cho model yếu/local): Giữ nguyên JSON tool-calling.
   - `"auto"`: `mini` tự phát hiện model capability từ provider response để chọn mode.
 
@@ -98,14 +113,14 @@ Proposal này **KHÔNG** xóa bỏ hệ thống JSON tool-calling hiện tại. 
 src/
 ├── main.zig                # Composition root, CLI args parser & REPL loop
 ├── core/                   # Điều phối & Quản lý trạng thái
-│   ├── agent_loop.zig      # Hybrid Loop (Lua CodeAct ↔ JSON Tools, Self-Correction)
+│   ├── agent_loop.zig      # Hybrid Loop (JS CodeAct ↔ JSON Tools, Self-Correction)
 │   ├── permissions.zig     # Dynamic Security (Ask / Auto / Yolo)
 │   ├── history.zig         # State compaction & History quản lý code executions
 │   └── contracts.zig       # Interfaces, Event types & Token specs
-├── runtime/                # Môi trường thực thi LuaJIT
-│   ├── luajit_engine.zig   # Quản lý lua_State, khởi tạo VM, sandbox _G, timeout
-│   ├── lua_bindings.zig    # C-ABI Export toàn bộ Zig tools sang table `mini.*`
-│   └── shell_runner.zig    # Subprocess runner phục vụ `mini.sh(...)` & `mini.sh_stream(...)`
+├── runtime/                # Môi trường thực thi QuickJS
+│   ├── quickjs_engine.zig  # Quản lý JSRuntime/JSContext, sandbox, timeout, memory limit
+│   ├── js_bindings.zig     # C-ABI Export toàn bộ Zig tools sang object `mini.*`
+│   └── shell_runner.zig    # Subprocess runner phục vụ `mini.sh(...)` & `mini.shStream(...)`
 ├── stdlib/                 # Core Tool Implementations (Native Zig)
 │   ├── fs_tools.zig        # read, write, patch (diff/exact/regex)
 │   ├── search_tools.zig    # ripgrep, glob engine
@@ -118,46 +133,49 @@ src/
 
 ---
 
-## 5. ĐẶC TẢ API BẢNG `mini.*` TRONG LUA RUNTIME
+## 5. ĐẶC TẢ API OBJECT `mini.*` TRONG QUICKJS RUNTIME
 
-Khi Lua VM khởi động cho mỗi lượt chạy, môi trường được nạp sẵn bảng **`mini`** với các API sau:
+Khi QuickJS VM khởi động cho mỗi lượt chạy, môi trường được nạp sẵn object toàn cục **`mini`** với các API sau:
 
-```lua
--- ===========================================================================
--- BẢNG API mini CUNG CẤP CHO AGENT (v3 — Hardened)
--- ===========================================================================
+```javascript
+// ===========================================================================
+// API OBJECT mini CUNG CẤP CHO AGENT (QuickJS Runtime v4)
+// ===========================================================================
 
--- 1. Tìm kiếm & Quét thư mục
-mini.glob(pattern, [base_path])              --> table of string (danh sách đường dẫn)
-mini.grep(pattern, [path], [options])        --> table of { path, line, text }
+// 1. Tìm kiếm & Quét thư mục
+mini.glob(pattern, basePath?)              // → string[] (danh sách đường dẫn)
+mini.grep(pattern, path?, options?)        // → Array<{ path, line, text }>
 
--- 2. Thao tác Tệp & Thư mục
-mini.read(path, [offset_line], [limit_lines])--> string (nội dung tệp)
-mini.write(path, content)                    --> boolean, string (thành công, thông điệp)
-mini.patch(path, old_str, new_str, [opts])   --> boolean, string
-  -- opts (table, optional):
-  --   occurrence = N      (int, mặc định 1: thay thế lần xuất hiện thứ N, 0 = tất cả)
-  --   regex      = false  (boolean: nếu true, old_str là Lua pattern)
-  --   line_start = nil    (int: giới hạn tìm kiếm từ dòng này)
-  --   line_end   = nil    (int: giới hạn tìm kiếm đến dòng này)
-mini.exists(path)                            --> boolean
-mini.stat(path)                              --> table { size, is_dir, is_file, modified }
+// 2. Thao tác Tệp & Thư mục
+mini.read(path, offsetLine?, limitLines?)  // → string (nội dung tệp)
+mini.write(path, content)                  // → { ok: boolean, message: string }
+mini.patch(path, oldStr, newStr, opts?)    // → { ok: boolean, message: string }
+  // opts (object, optional):
+  //   occurrence: number   (mặc định 1: thay thế lần thứ N, 0 = tất cả)
+  //   regex: boolean       (nếu true, oldStr là regex pattern)
+  //   lineStart: number    (giới hạn tìm kiếm từ dòng này)
+  //   lineEnd: number      (giới hạn tìm kiếm đến dòng này)
+mini.exists(path)                          // → boolean
+mini.stat(path)                            // → { size, isDir, isFile, modified }
 
--- 3. Thực thi Lệnh Hệ thống (Shell Bridge)
-mini.sh(command, [stdin_str])                --> table { exit_code, stdout, stderr, ok }
-  -- Dùng cho lệnh ngắn (< 10 giây). Output được buffer rồi trả về.
-mini.sh_stream(command)                      --> int (exit_code)
-  -- Dùng cho lệnh dài (build, test). Stdout/Stderr stream real-time ra terminal.
-  -- Chỉ trả về exit_code khi lệnh kết thúc.
+// 3. Thực thi Lệnh Hệ thống (Shell Bridge)
+mini.sh(command, stdinStr?)                // → { exitCode, stdout, stderr, ok }
+  // Dùng cho lệnh ngắn (< 10 giây). Output được buffer rồi trả về.
+mini.shStream(command)                     // → number (exitCode)
+  // Dùng cho lệnh dài (build, test). Stdout/Stderr stream real-time ra terminal.
 
--- 4. HTTP & Mạng
-mini.http(method, url, [headers], [body])    --> table { status, headers, body }
+// 4. HTTP & Mạng
+mini.http(method, url, headers?, body?)    // → { status, headers, body }
 
--- 5. Artifacts & Session Context
-mini.artifact(name, content, [metadata])     --> string (đường dẫn artifact)
-mini.env(var_name)                           --> string (lấy biến môi trường)
-mini.workspace_root                          --> string (thư mục làm việc hiện tại)
-mini.session_id                              --> string (ID phiên làm việc)
+// 5. Artifacts & Session Context
+mini.artifact(name, content, metadata?)    // → string (đường dẫn artifact)
+mini.env(varName)                          // → string (lấy biến môi trường)
+mini.workspaceRoot                         // → string (thư mục làm việc)
+mini.sessionId                             // → string (ID phiên làm việc)
+
+// 6. Async Operations (Future — Giai đoạn 3+)
+// await mini.httpAsync(method, url, headers?, body?)
+// await Promise.all([mini.httpAsync(...), mini.httpAsync(...)])
 ```
 
 ---
@@ -170,28 +188,30 @@ mini.session_id                              --> string (ID phiên làm việc)
 ┌──────────────────────────────────────────────────────────────────────┐
 │                     AGENT LOOP (1 User Request)                      │
 │                                                                      │
-│  [1] LLM sinh Lua code block                                        │
+│  [1] LLM sinh JavaScript code block                                  │
 │       │                                                              │
-│  [2] Extract code từ markdown ```lua ... ```                        │
+│  [2] Extract code từ markdown ```js ... ```                         │
 │       │                                                              │
-│  [3] Chạy trong LuaJIT VM (sandbox, timeout 30s)                    │
+│  [3] Chạy trong QuickJS VM (sandbox, timeout 30s, mem 128MB)        │
 │       │                                                              │
 │       ├── SUCCESS (exit ok, có output)                               │
 │       │     └── Output được format + truncate → Gửi về LLM          │
 │       │         └── LLM phân tích kết quả → trả lời user HOẶC      │
-│       │             sinh thêm Lua code → quay lại [2]               │
+│       │             sinh thêm JS code → quay lại [2]                │
 │       │                                                              │
 │       └── ERROR (syntax error / runtime error / timeout)             │
 │             │                                                        │
 │         [4] Format error message:                                    │
-│             "[LUA ERROR] line 12: attempt to index nil value 'res'"  │
-│             + Kèm source code gốc đã sinh                           │
+│             "[JS ERROR] TypeError: mini.grpe is not a function       │
+│              at <eval>:12:15"                                        │
+│             + Stack trace tự động từ Error object                    │
+│             + Source code gốc đã sinh                                │
 │             │                                                        │
 │         [5] Gửi error context về LLM                                 │
 │             │                                                        │
-│         [6] LLM sinh Lua code sửa lỗi → quay lại [2]               │
+│         [6] LLM sinh JS code sửa lỗi → quay lại [2]                │
 │             │                                                        │
-│         [7] Nếu đã retry >= MAX_LUA_RETRIES (3):                    │
+│         [7] Nếu đã retry >= MAX_JS_RETRIES (3):                     │
 │             └── FALLBACK: Chuyển sang JSON tool-calling mode         │
 │                 cho phần còn lại của request này                     │
 └──────────────────────────────────────────────────────────────────────┘
@@ -201,82 +221,116 @@ mini.session_id                              --> string (ID phiên làm việc)
 
 | Loại lỗi | Ví dụ | Hành động |
 |:---|:---|:---|
-| **Lua Syntax Error** | `unexpected symbol near ')'` | Gửi full error + source code về LLM, yêu cầu sửa |
-| **Runtime Error** | `attempt to call nil value 'mini.grpe'` (typo) | Gửi error + gợi ý API đúng từ bảng `mini.*` |
-| **Timeout** (> 30 giây) | Vòng lặp vô tận hoặc `mini.sh()` treo | Kill VM, thông báo LLM "script exceeded 30s timeout" |
-| **Permission Denied** | User từ chối `mini.write(...)` | Gửi "user denied write to X" về LLM, LLM tự điều chỉnh kế hoạch |
-| **Retry vượt ngưỡng** | 3 lần Lua đều lỗi | Fallback về JSON tool-calling, log cảnh báo cho developer |
+| **Syntax Error** | `SyntaxError: unexpected token ')'` | Gửi error + source code + stack trace về LLM |
+| **Runtime Error** | `TypeError: mini.grpe is not a function` (typo) | Gửi error + gợi ý API đúng từ object `mini.*` |
+| **Timeout** (> 30 giây) | Vòng lặp vô tận hoặc `mini.sh()` treo | Interrupt handler dừng VM, thông báo LLM |
+| **Memory Exceeded** | Script tạo quá nhiều object | `JS_SetMemoryLimit` tự động reject allocation |
+| **Permission Denied** | User từ chối `mini.write(...)` | Gửi "user denied write to X" về LLM |
+| **Retry vượt ngưỡng** | 3 lần JS đều lỗi | Fallback về JSON tool-calling, log cảnh báo |
+
+### Lợi thế JavaScript cho Error Recovery:
+JavaScript `Error` object tự động kèm **stack trace** (`e.stack`) — giúp LLM xác định chính xác dòng lỗi mà không cần module `debug` đặc biệt. `try/catch` là pattern LLM viết cực kỳ chính xác (hàng tỷ dòng training data).
 
 ---
 
-## 7. MÔ HÌNH BẢO MẬT & SANDBOX TRONG LUA VM
+## 7. MÔ HÌNH BẢO MẬT & SANDBOX TRONG QUICKJS VM
 
-### 7.1. Cô lập Môi trường (`_G` Whitelist Isolation)
-- **Whitelist approach** (KHÔNG dùng blacklist): Tạo bảng `_G` mới hoàn toàn trống, chỉ nạp vào các module an toàn: `string`, `table`, `math`, `tonumber`, `tostring`, `type`, `pairs`, `ipairs`, `select`, `unpack`, `pcall`, `xpcall`.
-- **Loại bỏ triệt để**: `os.*` (trừ `os.clock`), `io.*`, `debug.*`, `loadfile`, `dofile`, `require`, và đặc biệt **KHÔNG expose `ffi`** (ffi cho phép truy cập bộ nhớ trực tiếp, phá vỡ hoàn toàn sandbox).
-- Redirect `print(...)` vào buffer nội bộ có giới hạn dung lượng (`MAX_OUTPUT_BUFFER = 64KB`). Khi vượt giới hạn, tự động cắt đầu (head truncation) và thêm cảnh báo `[OUTPUT TRUNCATED: showing last 64KB]`.
+### 7.1. Resource Limits (Native API)
+QuickJS cung cấp API sandbox native, không cần workaround:
 
-### 7.2. Cơ chế Timeout (OS-Level, không phụ thuộc Debug Hook)
-- **Lý do không dùng `lua_sethook`**: `lua_sethook` instruction count hook **bị bỏ qua hoàn toàn** khi LuaJIT compile code sang native machine code (JIT mode). Ngay cả khi chạy interpreter mode, hook có chi phí hiệu suất đáng kể.
-- **Giải pháp: OS-Level Thread Timeout**:
-  1. Lua script được chạy trên một **thread riêng biệt** (`std.Thread` trong Zig).
-  2. Thread chính đặt **wall-clock timer** (mặc định 30 giây).
-  3. Nếu timer hết hạn: gọi `lua_sethook` với hook báo lỗi (dùng như tín hiệu interrupt) để dừng script gracefully. Nếu vẫn không dừng trong 1 giây tiếp theo: kill thread (abort).
-  4. Bonus: LuaJIT chạy ở **interpreter mode** (`jit.off()`) cho sandboxed agent code. Mặc dù chậm hơn JIT ~5-10x, tốc độ Lua interpreter vẫn nhanh hơn subprocess rất nhiều, và đảm bảo debug hook hoạt động như cơ chế backup.
+```c
+// Trong quickjs_engine.zig — khởi tạo sandbox:
+JSRuntime *rt = JS_NewRuntime();
 
-### 7.3. Giới hạn Bộ nhớ (Custom Allocator)
-- Sử dụng **custom allocator** khi khởi tạo Lua state (`lua_newstate(alloc_fn, ud)`).
-- Allocator theo dõi tổng bộ nhớ hiện đang sử dụng, từ chối cấp phát khi vượt ngưỡng (mặc định `MAX_LUA_MEMORY = 128MB`).
-- Lưu ý: Allocator chỉ kiểm soát bộ nhớ cấp phát qua Lua API, không kiểm soát bộ nhớ từ các C library bên ngoài (nhưng trong thiết kế của `mini`, tất cả logic nặng đều chạy ở phía Zig native, Lua chỉ là lớp điều phối).
+// 1. Giới hạn bộ nhớ: 128MB
+JS_SetMemoryLimit(rt, 128 * 1024 * 1024);
+
+// 2. Giới hạn stack: 1MB (chống stack overflow / deep recursion)
+JS_SetMaxStackSize(rt, 1024 * 1024);
+
+// 3. Interrupt handler: wall-clock timeout 30 giây
+JS_SetInterruptHandler(rt, timeout_check, &deadline);
+// timeout_check(rt, opaque): return 1 khi wall-clock > 30s → VM dừng ngay
+```
+
+- **Hoạt động chính xác mọi lúc**: QuickJS là pure interpreter, không có vấn đề JIT bypass hook như LuaJIT.
+- **Deterministic memory**: QuickJS dùng reference counting + cycle detection → bộ nhớ được giải phóng xác định.
+
+### 7.2. Environment Isolation (Whitelist Approach)
+- Tạo `JSContext` mới hoàn toàn trống, chỉ nạp vào:
+  - **Allowed**: `console.log`, `JSON`, `Math`, `String`, `Array`, `Object`, `Number`, `Boolean`, `Date`, `RegExp`, `Map`, `Set`, `Promise`, `Error`, `parseInt`, `parseFloat`, `typeof`, `instanceof`.
+  - **Cho phép thận trọng**: `setTimeout` (qua interrupt handler), `TextEncoder`/`TextDecoder`.
+  - **Loại bỏ triệt để**: `eval()`, `Function()` constructor, `import()`, module system, `globalThis.Atomics`, `SharedArrayBuffer`, và bất kỳ API nào cho phép tạo code từ string.
+- **QuickJS không có FFI module** → không có attack vector truy cập memory trực tiếp (khác LuaJIT `ffi`).
+
+### 7.3. Output Buffer Limit
+- `console.log(...)` được redirect vào buffer nội bộ có giới hạn `MAX_OUTPUT_BUFFER = 64KB`.
+- Khi vượt giới hạn: tự động head truncation + cảnh báo `[OUTPUT TRUNCATED: showing last 64KB]`.
 
 ### 7.4. Phân quyền Tương tác (Permission Interceptor)
-Mọi hàm trong bảng `mini.*` có khả năng thay đổi trạng thái máy (như `mini.write`, `mini.patch`, `mini.sh`) đều được kiểm tra qua `permissions.zig`:
-- **`ask` (Mặc định)**: Tạm dừng luồng thực thi Lua (yield coroutine), bật prompt xác nhận với người dùng trên Terminal.
+Mọi hàm trong object `mini.*` có khả năng thay đổi trạng thái máy (như `mini.write`, `mini.patch`, `mini.sh`) đều được kiểm tra qua `permissions.zig`:
+- **`ask` (Mặc định)**: Tạm dừng thực thi JS (interrupt execution), bật prompt xác nhận trên Terminal.
 - **`auto`**: Cho phép tự động các thao tác an toàn (đọc/tìm kiếm), chỉ hỏi khi chạy lệnh shell nguy hiểm.
 - **`yolo`**: Cho phép toàn bộ tự động (dành cho CI/CD hoặc Container).
 
 ---
 
-## 8. VÍ DỤ MINH HỌA: KỊCH BẢN AGENT DÙNG LUA XỬ LÝ TRONG 1 TURN
+## 8. VÍ DỤ MINH HỌA: KỊCH BẢN AGENT DÙNG JS XỬ LÝ TRONG 1 TURN
 
-### Tình huống: Quét toàn bộ codebase, tìm các hàm mở thư mục thiếu `.iterate = true`, sửa code và chạy test xác nhận:
+### Tình huống: Quét codebase, tìm các hàm mở thư mục thiếu `.iterate = true`, sửa code và chạy test:
 
-```lua
--- LLM sinh ra đoạn mã Lua sau trong 1 Turn duy nhất:
-local modified_files = {}
+```javascript
+// LLM sinh ra đoạn mã JavaScript sau trong 1 Turn duy nhất:
+const files = mini.glob("**/*.zig", "src");
+console.log(`Đang quét ${files.length} tệp Zig...`);
 
--- 1. Tìm toàn bộ file .zig trong src
-local files = mini.glob("**/*.zig", "src")
-print(string.format("Đang quét %d tệp Zig...", #files))
+const modified = [];
 
--- 2. Duyệt và sửa các file có lỗi logic
-for _, file in ipairs(files) do
-    local content = mini.read(file)
-    if content and content:find("openDir%(io, [^,]+, %.{}%)") then
-        local ok, msg = mini.patch(file,
+for (const file of files) {
+    const content = mini.read(file);
+    if (content && content.includes("openDir(io, search_path, .{})")) {
+        const { ok, message } = mini.patch(
+            file,
             "openDir(io, search_path, .{})",
-            "openDir(io, search_path, .{ .iterate = true })")
-        if ok then
-            table.insert(modified_files, file)
-            print("  ✓ Đã vá lỗi trong: " .. file)
-        else
-            print("  ✗ Lỗi khi patch " .. file .. ": " .. (msg or "unknown"))
-        end
-    end
-end
+            "openDir(io, search_path, .{ .iterate = true })"
+        );
+        if (ok) {
+            modified.push(file);
+            console.log(`  ✓ Đã vá lỗi trong: ${file}`);
+        } else {
+            console.log(`  ✗ Lỗi khi patch ${file}: ${message}`);
+        }
+    }
+}
 
-print(string.format("\nTổng cộng đã sửa: %d tệp.", #modified_files))
+console.log(`\nTổng cộng đã sửa: ${modified.length} tệp.`);
 
--- 3. Chạy test kiểm tra kết quả (streaming output ra terminal)
-if #modified_files > 0 then
-    print("\n--- Đang chạy zig build test ---")
-    local exit_code = mini.sh_stream("zig build test")
-    if exit_code == 0 then
-        print("✓ Toàn bộ Unit Tests đã PASS!")
-    else
-        print("✗ Test thất bại với exit code: " .. exit_code)
-    end
-end
+// Chạy test (streaming output ra terminal)
+if (modified.length > 0) {
+    console.log("\n--- Đang chạy zig build test ---");
+    const exitCode = mini.shStream("zig build test");
+    if (exitCode === 0) {
+        console.log("✓ Toàn bộ Unit Tests đã PASS!");
+    } else {
+        console.log(`✗ Test thất bại với exit code: ${exitCode}`);
+    }
+}
+```
+
+### Tình huống nâng cao (Giai đoạn 3+): Gọi song song nhiều HTTP request:
+```javascript
+// Async/await native — pattern mà LLM viết cực kỳ chính xác:
+const urls = ["https://api.github.com/repos/a", "https://api.github.com/repos/b"];
+
+const results = await Promise.all(
+    urls.map(url => mini.httpAsync("GET", url))
+);
+
+const summary = results
+    .filter(r => r.status === 200)
+    .map(r => JSON.parse(r.body).full_name);
+
+console.log(`Tìm thấy ${summary.length} repos: ${summary.join(", ")}`);
 ```
 
 ---
@@ -285,43 +339,44 @@ end
 
 > **Lưu ý**: Các con số dưới đây là **ước lượng lý thuyết** dựa trên phân tích cấu trúc tác vụ và tham chiếu kết quả từ paper CodeAct (Wang et al., 2024 — *"Executable Code Actions Elicit Better LLM Agents"*, benchmark trên M3ToolEval). **Cần benchmark thực tế A/B trên 10-20 tác vụ thực** sau khi triển khai Giai đoạn 1 để xác nhận.
 
-| Tiêu chí | Mô hình JSON Tool-Calling (Cũ) | Mô hình LuaJIT CodeAct (Mới) | Dự kiến cải thiện |
+| Tiêu chí | Mô hình JSON Tool-Calling (Cũ) | Mô hình QuickJS CodeAct (Mới) | Dự kiến cải thiện |
 | :--- | :--- | :--- | :--- |
-| **Số LLM Turns (Tác vụ 4 bước)** | 6 – 10 Turns | 2 – 4 Turns (bao gồm retry) | **Giảm ~50% – 60%** (*) |
-| **Thời gian thực thi local** | ~0 (tool xử lý in-process) | ~0 (Lua VM in-process) | Tương đương |
-| **Token tiêu tốn cho Context** | 15,000 – 30,000 tokens (raw output) | 3,000 – 8,000 tokens (filtered output) | **Tiết kiệm ~60% – 70%** |
-| **Độ linh hoạt giải thuật** | Không có (Phụ thuộc từng bước JSON) | Đầy đủ (vòng lặp, điều kiện, tables) | **Không giới hạn** |
+| **Số LLM Turns (Tác vụ 4 bước)** | 6 – 10 Turns | 2 – 3 Turns (bao gồm retry) | **Giảm ~55% – 70%** (*) |
+| **Tỷ lệ sinh mã đúng ngay lần 1** | N/A (JSON schema) | ~80-88% (JS Pass@1) | Cao hơn Lua (~45-60%) |
+| **Token tiêu tốn cho Context** | 15,000 – 30,000 tokens | 3,000 – 8,000 tokens | **Tiết kiệm ~60% – 70%** |
+| **Độ linh hoạt giải thuật** | Không có | Đầy đủ (vòng lặp, try/catch, async, array methods) | **Không giới hạn** |
 
-(*) Paper CodeAct gốc báo cáo giảm 30-40% turn trên M3ToolEval (Python). Con số có thể cao hơn hoặc thấp hơn cho Lua do bài toán constrained API khác với general-purpose coding.
+(*) Ước lượng cao hơn Lua (~50-60%) do tỷ lệ sinh mã JS đúng cao hơn → ít retry hơn → ít turn hơn. Paper CodeAct gốc báo cáo giảm 30-40% turn với Python; dự kiến JS đạt mức tương đương do cùng tier accuracy.
 
 ---
 
 ## 10. LỘ TRÌNH TRIỂN KHAI 4 GIAI ĐOẠN (IMPLEMENTATION ROADMAP)
 
-### Giai đoạn 1: LuaJIT Engine & C-ABI Bindings (Core Runtime)
-- [ ] Tích hợp `luajit` vào build system (`build.zig`) sử dụng package `zig-luajit-build`.
-- [ ] Xây dựng `src/runtime/luajit_engine.zig`:
-  - Khởi tạo `lua_State` với custom memory allocator (giới hạn 128MB).
-  - Sandbox `_G` (whitelist approach).
-  - OS-level thread timeout (30s wall-clock).
+### Giai đoạn 1: QuickJS Engine & C-ABI Bindings (Core Runtime)
+- [ ] Tích hợp `quickjs-ng` vào `build.zig` sử dụng package `zig-quickjs-ng` (mitchellh).
+- [ ] Xây dựng `src/runtime/quickjs_engine.zig`:
+  - Khởi tạo `JSRuntime` + `JSContext`.
+  - Sandbox: `JS_SetMemoryLimit(128MB)`, `JS_SetMaxStackSize(1MB)`, `JS_SetInterruptHandler(30s)`.
+  - Whitelist `_G`: Chỉ nạp safe globals + `console.log` redirect vào output buffer.
   - Output buffer collector (64KB cap + head truncation).
-- [ ] Xây dựng `src/runtime/lua_bindings.zig`:
-  - Export tất cả hàm `mini.*` (glob, grep, read, write, patch, sh, sh_stream, http, artifact, exists, stat, env).
-  - Mỗi binding: pop args từ Lua stack → gọi Zig native → push result lên Lua stack.
+- [ ] Xây dựng `src/runtime/js_bindings.zig`:
+  - Export tất cả hàm `mini.*` (glob, grep, read, write, patch, sh, shStream, http, artifact, exists, stat, env).
+  - Mỗi binding: pop args từ JS stack → gọi Zig native → push result lên JS stack.
   - Tích hợp permission check vào write/patch/sh bindings.
-- [ ] **Benchmark A/B** (bắt buộc): So sánh 10 tác vụ thực giữa JSON tools và Lua CodeAct, đo: số turn, tổng token, wall-clock time, tỷ lệ lỗi cú pháp.
+- [ ] **Benchmark A/B** (bắt buộc): So sánh 10 tác vụ thực giữa JSON tools và JS CodeAct.
 
 ### Giai đoạn 2: CodeAct Agent Loop & Hybrid Dispatcher
 - [ ] Nâng cấp `src/core/agent_loop.zig`:
-  - Thêm Lua CodeBlock extractor (nhận diện ````lua ... ```` trong streaming response).
+  - Thêm JS CodeBlock extractor (nhận diện ````js ... ```` / ````javascript ... ```` trong streaming response).
   - Thêm Self-Correction Loop (retry tối đa 3 lần, fallback JSON tools).
   - Config `execution_mode`: `"codeact"` | `"tools"` | `"auto"`.
-- [ ] Cập nhật System Prompt: Bao gồm API reference `mini.*` + 3-5 ví dụ few-shot hoàn chỉnh.
+- [ ] Cập nhật System Prompt: Bao gồm API reference `mini.*` + 3-5 ví dụ few-shot JavaScript hoàn chỉnh.
 - [ ] **Giữ nguyên** toàn bộ JSON tool handlers hiện tại trong `src/tools/` cho fallback mode.
 
-### Giai đoạn 3: Dynamic Permissions & Output Optimization
-- [ ] Tích hợp `src/core/permissions.zig` vào C-ABI bindings (sử dụng Lua coroutine yield để tạm dừng execution khi chờ user confirm).
-- [ ] Thiết lập cơ chế smart truncation: head/tail truncation cho output > 64KB trước khi nạp vào LLM context.
+### Giai đoạn 3: Async Operations & Promise Support
+- [ ] Implement `mini.httpAsync()` trả về Promise, tích hợp job queue (`JS_ExecutePendingJob`).
+- [ ] Hỗ trợ `await Promise.all([...])` cho concurrent operations.
+- [ ] Tích hợp `src/core/permissions.zig` vào C-ABI bindings (sử dụng interrupt mechanism để tạm dừng khi chờ user confirm).
 
 ### Giai đoạn 4: ACP (Agent Control Protocol) & Headless Embeddability
 - [ ] Hỗ trợ giao thức JSON-RPC ACP để các IDE (VS Code, Cursor) hoặc Web UI có thể nhúng và điều khiển `mini` từ xa.
