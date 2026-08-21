@@ -24,9 +24,9 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const json = @import("../json.zig");
+const json = @import("../core/json.zig");
 const http = @import("http.zig");
-const utils = @import("../utils.zig");
+const utils = @import("../core/utils.zig");
 
 const DDG_LITE_URL = "https://lite.duckduckgo.com/lite/";
 const MAX_RESULTS = 10;

@@ -37,9 +37,9 @@ const glob_tool = @import("../tools/glob.zig");
 const grep_tool = @import("../tools/grep.zig");
 const http_tool = @import("../tools/http.zig");
 const artifact_tool = @import("../tools/artifact.zig");
-const artifacts_mod = @import("../artifacts.zig");
-const utils = @import("../utils.zig");
-const json_mod = @import("../json.zig");
+const artifacts_mod = @import("../core/artifacts.zig");
+const utils = @import("../core/utils.zig");
+const json_mod = @import("../core/json.zig");
 const main = @import("../main.zig");
 
 fn getEngine(ctx: ?*c.JSContext) ?*Engine {

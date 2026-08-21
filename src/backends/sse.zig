@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const main = @import("main.zig");
+const main = @import("../main.zig");
 
 // ---------------------------------------------------------------------------
 // Public API

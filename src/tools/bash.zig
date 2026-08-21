@@ -26,8 +26,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const json = @import("../json.zig");
-const utils = @import("../utils.zig");
+const json = @import("../core/json.zig");
+const utils = @import("../core/utils.zig");
 
 /// Danh sách pattern lệnh bị chặn.
 const BLOCKED_PATTERNS = [_][]const u8{

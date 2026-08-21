@@ -16,8 +16,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const json = @import("../json.zig");
-const utils = @import("../utils.zig");
+const json = @import("../core/json.zig");
+const utils = @import("../core/utils.zig");
 
 const MAX_RESULTS = 500;
 

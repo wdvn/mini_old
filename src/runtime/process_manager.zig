@@ -9,7 +9,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayListUnmanaged;
-const utils = @import("../utils.zig");
+const utils = @import("../core/utils.zig");
 
 extern fn kill(pid: std.c.pid_t, sig: c_int) c_int;
 

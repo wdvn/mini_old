@@ -22,15 +22,15 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayListUnmanaged;
-const proto = @import("protocol.zig");
-const agent_mod = @import("agent.zig");
-const config_mod = @import("config.zig");
-const history_mod = @import("history.zig");
-const hooks_mod = @import("hooks.zig");
-const json_mod = @import("json.zig");
-const utils = @import("utils.zig");
-const artifacts_mod = @import("artifacts.zig");
-const main = @import("main.zig");
+const proto = @import("../core/protocol.zig");
+const agent_mod = @import("../core/agent.zig");
+const config_mod = @import("../core/config.zig");
+const history_mod = @import("../core/history.zig");
+const hooks_mod = @import("../core/hooks.zig");
+const json_mod = @import("../core/json.zig");
+const utils = @import("../core/utils.zig");
+const artifacts_mod = @import("../core/artifacts.zig");
+const main = @import("../main.zig");
 
 pub const ACP_PROTOCOL_VERSION: i64 = 1;
 pub const AGENT_NAME = "mini-agent";

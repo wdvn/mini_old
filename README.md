@@ -705,30 +705,65 @@ mini/
 │       ├── system_prompt.md
 │       └── skill.json
 └── src/
-    ├── main.zig        # Entry point: CLI parsing, MCP/ACP init, REPL
-    ├── acp.zig         # Agent Client Protocol (JSON-RPC 2.0 server)
-    ├── agent.zig       # AgentLoop: vòng lặp chính, tool execution
-    ├── config.zig      # .env loader, Config struct
-    ├── history.zig     # In-memory conversation buffer (auto-compact)
-    ├── protocol.zig    # Shared types: Message, ContentBlock, Response, ToolDefinition
-    ├── json.zig        # JSON parser/builder không cần thư viện ngoài
-    ├── sse.zig         # HTTP/SSE transport qua std.http.Client
-    ├── mcp.zig         # MCP client manager (JSON-RPC over stdio)
-    ├── tools.zig       # Tool registry, dispatcher, policy enforcement
-    ├── backend/
+    ├── main.zig        # Composition Root: CLI parsing, DI wiring, mode dispatcher
+    ├── core/           # Tầng lõi nghiệp vụ và hệ thống
+    │   ├── agent.zig   # AgentLoop với Turn-Scoped Arena Allocator
+    │   ├── protocol.zig# Shared types: Message, ContentBlock, Response, ToolDefinition
+    │   ├── config.zig  # .env loader, Config struct
+    │   ├── history.zig # In-memory conversation buffer (auto-compact)
+    │   ├── hooks.zig   # Lifecycle, streaming & telemetry hooks
+    │   ├── artifacts.zig# Quản lý @artifact references & persistence
+    │   ├── cron.zig    # Quản lý cronjob tự động
+    │   ├── json.zig    # Minimal JSON parser/builder
+    │   └── utils.zig   # Buffer writer, I/O helpers
+    ├── tooling/        # Tầng quản trị & điều phối Tools
+    │   ├── registry.zig# Tool specs, dispatcher & policy enforcement
+    │   └── mcp.zig     # MCP client manager (JSON-RPC over stdio)
+    ├── tools/          # Triển khai các built-in tools
+    │   ├── bash.zig    # Shell execution với safety blocklist
+    │   ├── file.zig    # file_read, file_write, file_edit
+    │   ├── glob.zig    # Wildcard file finder
+    │   ├── grep.zig    # Recursive content search
+    │   ├── http.zig    # HTTP client (std.http.Client)
+    │   ├── search.zig  # DuckDuckGo web search
+    │   ├── browser.zig # Headless browser automation
+    │   ├── subagent.zig# Subagent invocation
+    │   ├── batch_subagent.zig # Batch subagent execution
+    │   └── artifact.zig# Artifact tools
+    ├── backends/       # AI Provider Transports
     │   ├── openai.zig  # OpenAI-compatible streaming client (SSE)
     │   ├── claude.zig  # Anthropic Claude streaming client (SSE)
-    │   └── ollama.zig  # Ollama local AI client (NDJSON)
-    └── tools/
-        ├── bash.zig    # Shell execution với safety blocklist
-        ├── file.zig    # file_read, file_write, file_edit
-        ├── glob.zig    # Wildcard file finder
-        ├── grep.zig    # Recursive content search
-        ├── http.zig    # HTTP client (std.http.Client)
-        └── search.zig  # DuckDuckGo web search
+    │   ├── ollama.zig  # Ollama local AI client (NDJSON)
+    │   └── sse.zig     # HTTP/SSE transport qua std.http.Client
+    ├── ui/             # Presentation Layer
+    │   ├── editor.zig  # LineEditor (ANSI raw mode, arrow navigation, history)
+    │   └── repl.zig    # Interactive terminal REPL loop & slash commands
+    ├── runtime/        # Embedded QuickJS-ng Engine cho CodeAct
+    │   ├── quickjs_engine.zig  # QuickJS context & C-bindings
+    │   ├── js_bindings.zig     # mini global APIs in JavaScript
+    │   └── process_manager.zig # Quản lý tiến trình nền
+    └── acp/            # Agent Client Protocol (ACP)
+        └── server.zig  # JSON-RPC 2.0 stdio server (Zed AI / JetBrains)
 ```
 
-### Luồng xử lý một tin nhắn
+### Module dependencies
+
+```
+main.zig (Composition Root)
+  ├── core/config.zig       (loadDotEnv, Config.load)
+  ├── tooling/mcp.zig       (McpClientManager)
+  ├── tooling/registry.zig  (setMcpManager, setPolicy)
+  ├── ui/repl.zig           (runRepl, slash commands, text streaming)
+  ├── acp/server.zig        (runServer)
+  └── core/agent.zig
+        ├── core/protocol.zig (Message, Response, ToolDefinition)
+        ├── core/history.zig  (History buffer)
+        ├── tooling/registry.zig (executeTool, getRelevantDefinitions)
+        └── backends/
+              ├── openai.zig  ──► sse.zig ──► std.http.Client
+              ├── claude.zig  ──► sse.zig ──► std.http.Client
+              └── ollama.zig  ──► sse.zig ──► std.http.Client
+```
 
 ```
 User input

@@ -34,7 +34,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const utils = @import("utils.zig");
-const main = @import("main.zig");
+const main = @import("../main.zig");
 
 
 // ---------------------------------------------------------------------------

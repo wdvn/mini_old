@@ -10,7 +10,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = @import("json.zig");
 const utils = @import("utils.zig");
-const main = @import("main.zig");
+const main = @import("../main.zig");
 
 /// Lệnh shell toàn cục cho hook. Null = không kích hoạt.
 var g_hook_cmd: ?[]const u8 = null;

@@ -31,16 +31,16 @@ const ArrayList = std.ArrayListUnmanaged;
 const proto = @import("protocol.zig");
 const config_mod = @import("config.zig");
 const history_mod = @import("history.zig");
-const tools_mod = @import("tools.zig");
+const tools_mod = @import("../tooling/registry.zig");
 const json_mod = @import("json.zig");
-const openai_mod = @import("backend/openai.zig");
-const claude_mod = @import("backend/claude.zig");
-const ollama_mod = @import("backend/ollama.zig");
+const openai_mod = @import("../backends/openai.zig");
+const claude_mod = @import("../backends/claude.zig");
+const ollama_mod = @import("../backends/ollama.zig");
 const hooks_mod = @import("hooks.zig");
-const main = @import("main.zig");
+const main = @import("../main.zig");
 const utils = @import("utils.zig");
-const quickjs = @import("runtime/quickjs_engine.zig");
-const js_bindings = @import("runtime/js_bindings.zig");
+const quickjs = @import("../runtime/quickjs_engine.zig");
+const js_bindings = @import("../runtime/js_bindings.zig");
 
 /// Số iterations tối đa trong một lần processInput.
 const MAX_ITERATIONS = 30;
@@ -365,13 +365,18 @@ pub const AgentLoop = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !void {
+        // Cấp phát ArenaAllocator riêng cho từng lượt xử lý (turn-scoped memory)
+        var turn_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer turn_arena.deinit();
+        const turn_alloc = turn_arena.allocator();
+
         // Phát pre-prompt hook
-        hooks_mod.dispatch(self.alloc, self.io, .{
+        hooks_mod.dispatch(turn_alloc, self.io, .{
             .event = "pre-prompt",
             .user_prompt = user_text,
         });
         defer {
-            hooks_mod.dispatch(self.alloc, self.io, .{
+            hooks_mod.dispatch(turn_alloc, self.io, .{
                 .event = "post-response",
                 .user_prompt = user_text,
             });
@@ -381,7 +386,7 @@ pub const AgentLoop = struct {
         try self.history.addUser(user_text);
 
         // Lấy danh sách tools phù hợp với user message
-        const tool_defs = tools_mod.getRelevantDefinitions(self.alloc, user_text);
+        const tool_defs = tools_mod.getRelevantDefinitions(turn_alloc, user_text);
 
         // Chuẩn bị đường dẫn backup file dựa trên PID
         var path_buf: [256]u8 = undefined;
