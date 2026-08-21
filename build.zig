@@ -19,6 +19,37 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const quickjs_dep = b.dependency("quickjs", .{});
+    const qjs_path = quickjs_dep.path("");
+
+    const qjs_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    qjs_mod.addCSourceFiles(.{
+        .root = qjs_path,
+        .files = &.{
+            "quickjs.c",
+            "libregexp.c",
+            "libunicode.c",
+            "cutils.c",
+            "libbf.c",
+        },
+        .flags = &.{
+            "-D_GNU_SOURCE",
+            "-DCONFIG_VERSION=\"0.8.0\"",
+            "-DCONFIG_BIGNUM",
+        },
+    });
+    qjs_mod.addIncludePath(qjs_path);
+
+    const qjs_lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "quickjs",
+        .root_module = qjs_mod,
+    });
+
     // -----------------------------------------------------------------------
     // mini-agent executable
     // -----------------------------------------------------------------------
@@ -29,8 +60,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-
-
+    exe_mod.addIncludePath(qjs_path);
+    exe_mod.linkLibrary(qjs_lib);
 
     const exe = b.addExecutable(.{
         .name = "mini",
@@ -60,7 +91,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-
+    test_mod.addIncludePath(qjs_path);
+    test_mod.linkLibrary(qjs_lib);
 
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(unit_tests);

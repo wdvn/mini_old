@@ -38,6 +38,9 @@ const claude_mod = @import("backend/claude.zig");
 const ollama_mod = @import("backend/ollama.zig");
 const hooks_mod = @import("hooks.zig");
 const main = @import("main.zig");
+const utils = @import("utils.zig");
+const quickjs = @import("runtime/quickjs_engine.zig");
+const js_bindings = @import("runtime/js_bindings.zig");
 
 /// Số iterations tối đa trong một lần processInput.
 const MAX_ITERATIONS = 30;
@@ -109,10 +112,19 @@ pub const AgentLoop = struct {
     history: history_mod.History,
     /// Config đã load.
     config: *const config_mod.Config,
+    /// QuickJS-ng embedded engine cho CodeAct.
+    engine: *quickjs.Engine,
+    /// Đếm số lần tự sửa lỗi JavaScript liên tiếp.
+    js_retry_count: usize = 0,
 
     /// Khởi tạo AgentLoop từ config.
     /// Chọn backend dựa trên config theo thứ tự ưu tiên.
     pub fn init(alloc: Allocator, io: std.Io, config: *const config_mod.Config) !AgentLoop {
+        // Khởi tạo QuickJS-ng engine & đăng ký mini bindings
+        const engine = try quickjs.Engine.init(alloc, io);
+        errdefer engine.deinit();
+        try js_bindings.registerBindings(engine);
+
         // Chọn backend theo thứ tự ưu tiên
         const backend: Backend = blk: {
             if (config.openai_compat_url) |url| {
@@ -154,12 +166,15 @@ pub const AgentLoop = struct {
             .backend = backend,
             .history = history_mod.History.init(alloc),
             .config = config,
+            .engine = engine,
+            .js_retry_count = 0,
         };
     }
 
     /// Giải phóng bộ nhớ.
     pub fn deinit(self: *AgentLoop) void {
         self.history.deinit();
+        self.engine.deinit();
     }
 
     const StepResult = enum {
@@ -232,6 +247,71 @@ pub const AgentLoop = struct {
 
         // Thêm response vào history (nếu có nội dung)
         const added_to_history = try self.history.addAssistantResponse(&response);
+
+        // 1. CodeAct: Kiểm tra có khối mã JavaScript trong response không
+        if (self.config.execution_mode != .tools) {
+            if (findJsCodeInResponse(self.alloc, &response)) |js_code| {
+                defer self.alloc.free(js_code);
+
+                main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting QuickJS-ng script...\x1b[0m ", .{});
+
+                var res = self.engine.eval(js_code, "agent_codeact.js") catch |e| {
+                    main.stderrPrint("\x1b[31m[engine error: {s}]\x1b[0m\n", .{@errorName(e)});
+                    const err_msg = try std.fmt.allocPrint(self.alloc, "[CodeAct System Error]: {s}", .{@errorName(e)});
+                    defer self.alloc.free(err_msg);
+                    try self.history.addUser(err_msg);
+                    return .continue_loop;
+                };
+                defer res.deinit();
+
+                if (!res.is_error) {
+                    main.stderrPrint("\x1b[32m[ok]\x1b[0m\n", .{});
+                    self.js_retry_count = 0;
+
+                    var out_buf = utils.BufWriter.init(self.alloc);
+                    defer out_buf.deinit();
+
+                    try out_buf.writeAll("[CodeAct Execution Output]\n");
+                    if (res.stdout.len > 0) {
+                        try out_buf.print("stdout:\n{s}\n", .{res.stdout});
+                    }
+                    if (res.return_value_json) |ret| {
+                        try out_buf.print("return value:\n{s}\n", .{ret});
+                    }
+                    if (res.stdout.len == 0 and res.return_value_json == null) {
+                        try out_buf.writeAll("(Code executed successfully with no output)\n");
+                    }
+
+                    try self.history.addUser(out_buf.list.items);
+                    return .continue_loop;
+                } else {
+                    main.stderrPrint("\x1b[31m[error]\x1b[0m\n", .{});
+                    self.js_retry_count += 1;
+
+                    var err_buf = utils.BufWriter.init(self.alloc);
+                    defer err_buf.deinit();
+
+                    try err_buf.writeAll("[CodeAct JavaScript Error]\n");
+                    if (res.error_message) |m| {
+                        try err_buf.print("Error: {s}\n", .{m});
+                    }
+                    if (res.stack_trace) |st| {
+                        try err_buf.print("Stack trace:\n{s}\n", .{st});
+                    }
+                    if (res.stdout.len > 0) {
+                        try err_buf.print("stdout before error:\n{s}\n", .{res.stdout});
+                    }
+                    if (self.js_retry_count >= 3) {
+                        try err_buf.writeAll("Notice: 3 consecutive JavaScript execution errors occurred. You may fall back to standard tool calling or simplify your code.\n");
+                    } else {
+                        try err_buf.writeAll("Please analyze the error and retry by outputting corrected JavaScript code inside ```js ... ``` block.\n");
+                    }
+
+                    try self.history.addUser(err_buf.list.items);
+                    return .continue_loop;
+                }
+            }
+        }
 
         switch (response.stop_reason) {
             .end_turn, .stop_sequence => {
@@ -503,3 +583,58 @@ pub const AgentLoop = struct {
         }
     }
 };
+
+/// Bóc tách khối mã JavaScript từ markdown text (```js ... ``` hoặc ```javascript ... ```).
+pub fn extractJsCodeBlock(alloc: Allocator, text: []const u8) ?[]const u8 {
+    const markers = [_][]const u8{
+        "```javascript\n",
+        "```js\n",
+        "```javascript\r\n",
+        "```js\r\n",
+    };
+    for (markers) |m| {
+        if (std.mem.indexOf(u8, text, m)) |start_idx| {
+            const code_start = start_idx + m.len;
+            if (std.mem.indexOf(u8, text[code_start..], "```")) |end_idx| {
+                const code = text[code_start .. code_start + end_idx];
+                const trimmed = std.mem.trim(u8, code, " \r\n\t");
+                if (trimmed.len > 0) {
+                    return alloc.dupe(u8, trimmed) catch null;
+                }
+            }
+        }
+    }
+    return null;
+}
+
+/// Tìm kiếm khối mã JavaScript trong phản hồi của Assistant
+pub fn findJsCodeInResponse(alloc: Allocator, response: *const proto.Response) ?[]const u8 {
+    for (response.content.items) |block| {
+        switch (block) {
+            .text => |t| {
+                if (extractJsCodeBlock(alloc, t)) |code| return code;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+test "agent - extractJsCodeBlock" {
+    const alloc = std.testing.allocator;
+    const md =
+        \\Dưới đây là đoạn mã thực thi:
+        \\```js
+        \\const a = 10;
+        \\const b = 20;
+        \\console.log(a + b);
+        \\```
+        \\Hãy xem kết quả bên trên.
+    ;
+
+    const extracted = extractJsCodeBlock(alloc, md);
+    try std.testing.expect(extracted != null);
+    defer alloc.free(extracted.?);
+
+    try std.testing.expectEqualStrings("const a = 10;\nconst b = 20;\nconsole.log(a + b);", extracted.?);
+}

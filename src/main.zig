@@ -43,6 +43,9 @@ const cron_mod = @import("cron.zig");
 const hooks_mod = @import("hooks.zig");
 const editor_mod = @import("editor.zig");
 const artifacts_mod = @import("artifacts.zig");
+pub const quickjs_engine = @import("runtime/quickjs_engine.zig");
+pub const js_bindings = @import("runtime/js_bindings.zig");
+pub const process_manager = @import("runtime/process_manager.zig");
 
 const VERSION = "1.0.0";
 const PROMPT_PREFIX = "\x1b[1;34mYou\x1b[0m > ";
@@ -129,6 +132,9 @@ pub fn main(init: std.process.Init) !void {
         cfg.system_prompt_buf = buf;
         cfg.system_prompt = buf[0..n];
     }
+
+    // Override execution mode từ CLI
+    if (args.mode) |m| cfg.execution_mode = config_mod.ExecutionMode.fromString(m);
 
     // Hooks setup
     if (args.hook_command) |hcmd| cfg.hook_command = hcmd;
@@ -378,6 +384,7 @@ const Args = struct {
     single: ?[]const u8 = null,
     system_file: ?[]const u8 = null,
     backend: ?[]const u8 = null,
+    mode: ?[]const u8 = null,
     cron: ?[]const u8 = null,
     hook_command: ?[]const u8 = null,
     session: ?[]const u8 = null,
@@ -401,6 +408,9 @@ fn parseArgs(args: []const []const u8) !Args {
         } else if (std.mem.eql(u8, arg, "--system")) {
             i += 1;
             if (i < args.len) result.system_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--mode") or std.mem.eql(u8, arg, "-m")) {
+            i += 1;
+            if (i < args.len) result.mode = args[i];
         } else if (std.mem.eql(u8, arg, "--install-cron")) {
             i += 1;
             if (i < args.len) result.cron = args[i];
@@ -598,6 +608,7 @@ fn printHelp() void {
         \\OPTIONS:
         \\  -e, --exec <prompt>    Chạy single-shot và thoát
         \\  --system <file>        Dùng file làm system prompt
+        \\  -m, --mode <mode>      Chế độ thực thi: codeact (QuickJS-ng JS engine), tools (JSON), auto
         \\  --session <id>         Tự động nạp/lưu session tại ~/.mini/sessions/<id>.json
         \\  --session-file <path>  Chỉ định đường dẫn file session JSON trực tiếp
         \\  --install-cron <expr>  Tạo cronjob Linux chạy tự động (cần dùng chung với -e)
@@ -636,5 +647,8 @@ fn printHelp() void {
 
 test {
     _ = @import("artifacts.zig");
+    _ = quickjs_engine;
+    _ = js_bindings;
+    _ = process_manager;
 }
 
