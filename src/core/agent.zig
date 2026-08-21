@@ -31,16 +31,16 @@ const ArrayList = std.ArrayListUnmanaged;
 const proto = @import("protocol.zig");
 const config_mod = @import("config.zig");
 const history_mod = @import("history.zig");
-const tools_mod = @import("tools.zig");
+const tools_mod = @import("../tooling/registry.zig");
 const json_mod = @import("json.zig");
-const openai_mod = @import("backend/openai.zig");
-const claude_mod = @import("backend/claude.zig");
-const ollama_mod = @import("backend/ollama.zig");
+const openai_mod = @import("../backends/openai.zig");
+const claude_mod = @import("../backends/claude.zig");
+const ollama_mod = @import("../backends/ollama.zig");
 const hooks_mod = @import("hooks.zig");
-const main = @import("main.zig");
+const main = @import("../main.zig");
 const utils = @import("utils.zig");
-const quickjs = @import("runtime/quickjs_engine.zig");
-const js_bindings = @import("runtime/js_bindings.zig");
+const quickjs = @import("../runtime/quickjs_engine.zig");
+const js_bindings = @import("../runtime/js_bindings.zig");
 
 /// Số iterations tối đa trong một lần processInput.
 const MAX_ITERATIONS = 30;
@@ -365,13 +365,18 @@ pub const AgentLoop = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !void {
+        // Cấp phát ArenaAllocator riêng cho từng lượt xử lý (turn-scoped memory)
+        var turn_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer turn_arena.deinit();
+        const turn_alloc = turn_arena.allocator();
+
         // Phát pre-prompt hook
-        hooks_mod.dispatch(self.alloc, self.io, .{
+        hooks_mod.dispatch(turn_alloc, self.io, .{
             .event = "pre-prompt",
             .user_prompt = user_text,
         });
         defer {
-            hooks_mod.dispatch(self.alloc, self.io, .{
+            hooks_mod.dispatch(turn_alloc, self.io, .{
                 .event = "post-response",
                 .user_prompt = user_text,
             });
@@ -381,7 +386,7 @@ pub const AgentLoop = struct {
         try self.history.addUser(user_text);
 
         // Lấy danh sách tools phù hợp với user message
-        const tool_defs = tools_mod.getRelevantDefinitions(self.alloc, user_text);
+        const tool_defs = tools_mod.getRelevantDefinitions(turn_alloc, user_text);
 
         // Chuẩn bị đường dẫn backup file dựa trên PID
         var path_buf: [256]u8 = undefined;
@@ -550,6 +555,14 @@ pub const AgentLoop = struct {
                         main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
                     }
 
+                    // Phát pre-tool-use hook
+                    hooks_mod.dispatch(self.alloc, self.io, .{
+                        .event = "pre-tool-use",
+                        .tool_id = tu.id,
+                        .tool_name = tu.name,
+                        .input_json = tu.input_json,
+                    });
+
                     var is_err = false;
                     const result = tools_mod.executeTool(self.alloc, self.io, tu.name, tu.input_json) catch |e| blk: {
                         is_err = true;
@@ -561,6 +574,16 @@ pub const AgentLoop = struct {
                     // Truncate nếu quá lớn
                     const max_tool_result = 64 * 1024;
                     const truncated = if (result.len > max_tool_result) result[0..max_tool_result] else result;
+
+                    // Phát post-tool-use hook
+                    hooks_mod.dispatch(self.alloc, self.io, .{
+                        .event = "post-tool-use",
+                        .tool_id = tu.id,
+                        .tool_name = tu.name,
+                        .input_json = tu.input_json,
+                        .tool_result = truncated,
+                        .is_error = is_err,
+                    });
 
                     try results.append(self.alloc, .{
                         .tool_use_id = tu.id,

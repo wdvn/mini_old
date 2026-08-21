@@ -18,11 +18,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayListUnmanaged;
-const proto = @import("../protocol.zig");
-const json = @import("../json.zig");
-const sse = @import("../sse.zig");
-const utils = @import("../utils.zig");
-const hooks = @import("../hooks.zig");
+const proto = @import("../core/protocol.zig");
+const json = @import("../core/json.zig");
+const sse = @import("sse.zig");
+const utils = @import("../core/utils.zig");
+const hooks = @import("../core/hooks.zig");
 const main = @import("../main.zig");
 
 pub const CLAUDE_API_URL = "https://api.anthropic.com/v1/messages";

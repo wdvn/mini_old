@@ -1,54 +1,31 @@
-//! main.zig — Entry point của mini-agent.
+//! main.zig — Composition Root của mini-agent.
 //!
-//! ## Luồng khởi động
-//! ```
-//! parse CLI args
-//!   → config.loadDotEnv()       load .env files
-//!   → Config.load()             đọc env vars → Config struct
-//!   → McpClientManager.init()   kết nối MCP servers (nếu không có --no-mcp)
-//!   → tools.setMcpManager()     đăng ký MCP vào tool dispatcher
-//!   → AgentLoop.init()          chọn backend, khởi tạo history
-//!   → [single-shot] -e "..."    gửi prompt, in kết quả, thoát
-//!   → [REPL]                    vòng lặp đọc stdin
-//! ```
-//!
-//! ## CLI flags
-//! ```
-//! mini-agent [options]
-//!   -e <prompt>        Chạy single-shot và thoát
-//!   --system <file>    Dùng file này làm system prompt
-//!   --no-mcp           Không kết nối MCP servers
-//!   --model <backend>  Chọn backend: openai, claude, ollama
-//!   --version          In phiên bản
-//!   --help, -h         In hướng dẫn
-//! ```
-//!
-//! ## Slash commands trong REPL
-//! ```
-//! /quit, /exit, /q   Thoát
-//! /clear             Xóa lịch sử hội thoại
-//! /help              Xem danh sách tools và lệnh
-//! /model <backend>   Đổi backend
-//! ```
+//! Khởi tạo DI, phân tích tham số CLI, nạp cấu hình và điều phối chế độ thực thi:
+//! - `--acp`: Chế độ ACP Server (Agent Client Protocol qua JSON-RPC 2.0)
+//! - `--install-cron`: Chế độ tạo cronjob tự động trên Linux
+//! - `-e` / `--single`: Chế độ chạy single-shot prompt
+//! - Mặc định: Chế độ REPL tương tác dòng lệnh qua `ui/repl.zig`
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const config_mod = @import("config.zig");
-const agent_mod = @import("agent.zig");
-const tools_mod = @import("tools.zig");
-const mcp_mod = @import("mcp.zig");
-const utils = @import("utils.zig");
-const cron_mod = @import("cron.zig");
-const hooks_mod = @import("hooks.zig");
-const editor_mod = @import("editor.zig");
-const artifacts_mod = @import("artifacts.zig");
+
+pub const config_mod = @import("core/config.zig");
+pub const agent_mod = @import("core/agent.zig");
+pub const tools_mod = @import("tooling/registry.zig");
+pub const mcp_mod = @import("tooling/mcp.zig");
+pub const utils = @import("core/utils.zig");
+pub const cron_mod = @import("core/cron.zig");
+pub const hooks_mod = @import("core/hooks.zig");
+pub const artifacts_mod = @import("core/artifacts.zig");
+pub const acp_mod = @import("acp/server.zig");
+pub const ui_repl = @import("ui/repl.zig");
+pub const resetThinkState = ui_repl.resetThinkState;
 pub const quickjs_engine = @import("runtime/quickjs_engine.zig");
 pub const js_bindings = @import("runtime/js_bindings.zig");
 pub const process_manager = @import("runtime/process_manager.zig");
 
-const VERSION = "1.0.0";
-const PROMPT_PREFIX = "\x1b[1;34mYou\x1b[0m > ";
+pub const VERSION = "1.0.0";
 
 pub var g_io: std.Io = undefined;
 
@@ -59,10 +36,6 @@ pub fn getIo() std.Io {
     }
     return g_io;
 }
-
-// ---------------------------------------------------------------------------
-// I/O helpers — Zig 0.15.2: File.writeAll() + bufPrint, std.debug.print
-// ---------------------------------------------------------------------------
 
 /// In formatted string ra stdout.
 pub fn stdoutPrint(comptime fmt: []const u8, args: anytype) void {
@@ -79,8 +52,6 @@ pub fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
     w.interface.print(fmt, args) catch return;
     w.flush() catch {};
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -106,11 +77,10 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // Thiết lập env file từ --system trước khi loadDotEnv nếu cần
-    // (MINI_SYSTEM_FILE có thể được set trong .env)
+    // Nạp biến môi trường từ .env
     config_mod.loadDotEnv(init.environ_map, init.io);
 
-    // Load config
+    // Nạp Config
     var cfg = config_mod.Config.load(alloc, init.environ_map, init.io) catch |e| {
         stderrPrint("Lỗi load config: {s}\n", .{@errorName(e)});
         std.process.exit(1);
@@ -214,15 +184,21 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // Single-shot mode
-    if (args.prompt) |prompt| {
-        const expanded = try artifacts_mod.expandArtifactReferences(alloc, init.io, prompt);
-        defer alloc.free(expanded);
-        try agent.processInput(expanded, printText, printThinkText);
+    // 1. ACP Server Mode (Agent Client Protocol over stdin/stdout)
+    if (args.acp) {
+        try acp_mod.runServer(alloc, init.io, &agent, &cfg);
         return;
     }
 
-    // Single-shot mode from file
+    // 2. Single-shot prompt mode
+    if (args.prompt) |prompt| {
+        const expanded = try artifacts_mod.expandArtifactReferences(alloc, init.io, prompt);
+        defer alloc.free(expanded);
+        try agent.processInput(expanded, ui_repl.printText, ui_repl.printThinkText);
+        return;
+    }
+
+    // 3. Single-shot prompt from file
     if (args.single) |prompt_file| {
         const cwd = std.Io.Dir.cwd();
         const file = cwd.openFile(init.io, prompt_file, .{}) catch |e| {
@@ -237,142 +213,12 @@ pub fn main(init: std.process.Init) !void {
         const file_prompt = std.mem.trim(u8, file_buf[0..n], " \t\r\n");
         const expanded = try artifacts_mod.expandArtifactReferences(alloc, init.io, file_prompt);
         defer alloc.free(expanded);
-        try agent.processInput(expanded, printText, printThinkText);
+        try agent.processInput(expanded, ui_repl.printText, ui_repl.printThinkText);
         return;
     }
 
-    // REPL mode
-    try runRepl(alloc, &agent);
-}
-
-// ---------------------------------------------------------------------------
-// REPL
-// ---------------------------------------------------------------------------
-
-fn runRepl(alloc: Allocator, agent: *agent_mod.AgentLoop) !void {
-    const stdout = std.Io.File.stdout();
-
-    var line_editor = editor_mod.LineEditor.init(alloc);
-    defer line_editor.deinit();
-
-    stdoutPrint("\x1b[1;32mmini-agent\x1b[0m {s} | {s} ({s})\n", .{
-        VERSION, agent.backend.name(), agent.backend.model(),
-    });
-    try stdout.writeStreamingAll(g_io, "Gõ /help để xem lệnh, /quit để thoát.\n\n");
-
-    while (true) {
-        const line_opt = try line_editor.readLine(g_io, PROMPT_PREFIX);
-        const line = line_opt orelse break;
-        defer alloc.free(line);
-
-        const input = std.mem.trim(u8, line, " \t");
-        if (input.len == 0) continue;
-
-        try line_editor.addHistory(input);
-
-        // Slash commands
-        if (input[0] == '/') {
-            if (handleSlashCommand(alloc, agent, input)) continue else break;
-        }
-
-        // Mở rộng tham chiếu @artifact:<name>
-        const expanded_input = try artifacts_mod.expandArtifactReferences(alloc, g_io, input);
-        defer alloc.free(expanded_input);
-
-        // Gửi đến agent
-        agent.processInput(expanded_input, printText, printThinkText) catch |e| {
-            stdoutPrint("\x1b[31m[lỗi]\x1b[0m {s}\n", .{@errorName(e)});
-        };
-    }
-
-    try stdout.writeStreamingAll(g_io, "\nTạm biệt!\n");
-}
-
-/// Xử lý slash command. Trả về true để tiếp tục, false để thoát.
-fn handleSlashCommand(alloc: Allocator, agent: *agent_mod.AgentLoop, input: []const u8) bool {
-    if (std.mem.eql(u8, input, "/quit") or
-        std.mem.eql(u8, input, "/exit") or
-        std.mem.eql(u8, input, "/q"))
-    {
-        return false;
-    }
-
-    if (std.mem.eql(u8, input, "/clear")) {
-        agent.clearHistory();
-        std.Io.File.stdout().writeStreamingAll(g_io, "\x1b[2J\x1b[H") catch {};
-        std.Io.File.stdout().writeStreamingAll(g_io, "[Lịch sử đã xóa]\n") catch {};
-        return true;
-    }
-
-    if (std.mem.startsWith(u8, input, "/artifact")) {
-        const sub = std.mem.trim(u8, input["/artifact".len..], " \t");
-        if (sub.len == 0 or std.mem.eql(u8, sub, "list")) {
-            const list = artifacts_mod.listArtifacts(alloc, g_io) catch |e| {
-                stdoutPrint("Lỗi đọc danh sách artifacts: {s}\n", .{@errorName(e)});
-                return true;
-            };
-            defer alloc.free(list);
-            stdoutPrint("{s}\n", .{list});
-            return true;
-        }
-        if (std.mem.startsWith(u8, sub, "show ") or std.mem.startsWith(u8, sub, "read ") or std.mem.startsWith(u8, sub, "view ")) {
-            const space = std.mem.indexOfScalar(u8, sub, ' ') orelse sub.len;
-            const name = std.mem.trim(u8, sub[space..], " \t");
-            const content = artifacts_mod.readArtifact(alloc, g_io, name) catch |e| {
-                stdoutPrint("Lỗi đọc artifact '{s}': {s}\n", .{ name, @errorName(e) });
-                return true;
-            };
-            defer alloc.free(content);
-            stdoutPrint("\n--- [Artifact: {s}] ---\n{s}\n--- [Hết Artifact] ---\n\n", .{ name, content });
-            return true;
-        }
-        if (std.mem.eql(u8, sub, "dir") or std.mem.eql(u8, sub, "path")) {
-            const dir = artifacts_mod.resolveArtifactsDir(alloc, g_io) catch |e| {
-                stdoutPrint("Lỗi lấy đường dẫn artifacts: {s}\n", .{@errorName(e)});
-                return true;
-            };
-            defer alloc.free(dir);
-            stdoutPrint("Thư mục Artifacts hiện tại: {s}\n", .{dir});
-            return true;
-        }
-        stdoutPrint("Cú pháp: /artifact [list | show <name> | path]\n", .{});
-        return true;
-    }
-
-    if (std.mem.eql(u8, input, "/help")) {
-        std.Io.File.stdout().writeStreamingAll(g_io,
-            \\
-            \\## Lệnh REPL
-            \\  /clear              Xóa lịch sử hội thoại
-            \\  /model <backend>    Đổi backend (openai, claude, ollama)
-            \\  /artifact [list]    Xem danh sách artifacts của session
-            \\  /artifact show <fn> Đọc nội dung một artifact
-            \\  /quit, /exit, /q    Thoát
-            \\  /help               Hiện hướng dẫn này
-            \\
-            \\## Tham chiếu Artifact
-            \\  Dùng cú pháp @artifact:<name> trực tiếp trong câu hỏi để chèn artifact vào context.
-            \\
-            \\## Tools có sẵn
-            \\  bash, file_read, file_write, file_edit, artifact_write, artifact_read, artifact_list
-            \\  glob, grep, http_request, web_search, skills, browser, invoke_subagent
-            \\
-        ) catch {};
-        return true;
-    }
-
-    if (std.mem.startsWith(u8, input, "/model ")) {
-        const backend_arg = std.mem.trim(u8, input["/model ".len..], " \t");
-        if (std.mem.indexOfScalar(u8, backend_arg, ' ')) |space| {
-            agent.switchBackend(backend_arg[0..space], backend_arg[space + 1 ..]);
-        } else {
-            agent.switchBackend(backend_arg, null);
-        }
-        return true;
-    }
-
-    stdoutPrint("Lệnh không hợp lệ: {s}. Gõ /help để xem danh sách.\n", .{input});
-    return true;
+    // 4. Interactive REPL mode
+    try ui_repl.runRepl(alloc, init.io, &agent, VERSION);
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +235,7 @@ const Args = struct {
     hook_command: ?[]const u8 = null,
     session: ?[]const u8 = null,
     session_file: ?[]const u8 = null,
+    acp: bool = false,
     no_mcp: bool = false,
     show_help: bool = false,
     show_version: bool = false,
@@ -426,6 +273,8 @@ fn parseArgs(args: []const []const u8) !Args {
         } else if (std.mem.eql(u8, arg, "--session-file")) {
             i += 1;
             if (i < args.len) result.session_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--acp") or std.mem.eql(u8, arg, "acp")) {
+            result.acp = true;
         } else if (std.mem.eql(u8, arg, "--no-mcp")) {
             result.no_mcp = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -464,102 +313,6 @@ fn resolveSessionPath(alloc: Allocator, io: std.Io, env_map: *const std.process.
         return @as(?[]u8, try std.fmt.allocPrint(alloc, "{s}/{s}.json", .{ dir_path, sid }));
     }
     return null;
-}
-
-// ---------------------------------------------------------------------------
-// Streaming callback
-// ---------------------------------------------------------------------------
-
-var is_thinking = false;
-
-pub fn printThinkText(text: []const u8) void {
-    if (!is_thinking) {
-        std.Io.File.stderr().writeStreamingAll(g_io, "\x1b[90m\n[Suy nghĩ]\n") catch {};
-        is_thinking = true;
-    }
-    std.Io.File.stderr().writeStreamingAll(g_io, text) catch {};
-}
-
-pub fn printRawText(text: []const u8) void {
-    if (is_thinking) {
-        std.Io.File.stderr().writeStreamingAll(g_io, "\x1b[0m\n\n") catch {};
-        is_thinking = false;
-    }
-    std.Io.File.stdout().writeStreamingAll(g_io, text) catch {};
-}
-
-var think_tag_buf: [16]u8 = undefined;
-var think_tag_len: usize = 0;
-var in_think_tag: bool = false;
-
-pub fn printText(text: []const u8) void {
-    var start: usize = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        const c = text[i];
-        if (in_think_tag) {
-            const expected = "</think>";
-            if (c == '<' or think_tag_len > 0) {
-                if (i > start) {
-                    printThinkText(text[start..i]);
-                }
-                think_tag_buf[think_tag_len] = c;
-                think_tag_len += 1;
-                i += 1;
-                start = i;
-
-                if (think_tag_buf[think_tag_len - 1] == expected[think_tag_len - 1]) {
-                    if (think_tag_len == expected.len) {
-                        in_think_tag = false;
-                        think_tag_len = 0;
-                        resetThinkState();
-                    }
-                } else {
-                    printThinkText(think_tag_buf[0..think_tag_len]);
-                    think_tag_len = 0;
-                }
-            } else {
-                i += 1;
-            }
-        } else {
-            const expected = "<think>";
-            if (c == '<' or think_tag_len > 0) {
-                if (i > start) {
-                    printRawText(text[start..i]);
-                }
-                think_tag_buf[think_tag_len] = c;
-                think_tag_len += 1;
-                i += 1;
-                start = i;
-
-                if (think_tag_buf[think_tag_len - 1] == expected[think_tag_len - 1]) {
-                    if (think_tag_len == expected.len) {
-                        in_think_tag = true;
-                        think_tag_len = 0;
-                    }
-                } else {
-                    printRawText(think_tag_buf[0..think_tag_len]);
-                    think_tag_len = 0;
-                }
-            } else {
-                i += 1;
-            }
-        }
-    }
-    if (start < text.len) {
-        if (in_think_tag) {
-            printThinkText(text[start..]);
-        } else {
-            printRawText(text[start..]);
-        }
-    }
-}
-
-pub fn resetThinkState() void {
-    if (is_thinking) {
-        std.Io.File.stderr().writeStreamingAll(g_io, "\x1b[0m\n") catch {};
-        is_thinking = false;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -611,6 +364,7 @@ fn printHelp() void {
         \\  -m, --mode <mode>      Chế độ thực thi: codeact (QuickJS-ng JS engine), tools (JSON), auto
         \\  --session <id>         Tự động nạp/lưu session tại ~/.mini/sessions/<id>.json
         \\  --session-file <path>  Chỉ định đường dẫn file session JSON trực tiếp
+        \\  --acp                  Chạy chế độ ACP server (Agent Client Protocol qua stdin/stdout)
         \\  --install-cron <expr>  Tạo cronjob Linux chạy tự động (cần dùng chung với -e)
         \\  --model <backend>      Chọn backend: openai, claude, ollama
         \\  --hook-command <cmd>   Lệnh prehook / monitoring hook chạy trước/sau các hành động
@@ -646,7 +400,14 @@ fn printHelp() void {
 }
 
 test {
-    _ = @import("artifacts.zig");
+    _ = @import("core/artifacts.zig");
+    _ = @import("core/agent.zig");
+    _ = @import("core/history.zig");
+    _ = @import("core/protocol.zig");
+    _ = @import("core/json.zig");
+    _ = @import("core/config.zig");
+    _ = @import("tooling/registry.zig");
+    _ = @import("acp/server.zig");
     _ = quickjs_engine;
     _ = js_bindings;
     _ = process_manager;

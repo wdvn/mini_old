@@ -10,7 +10,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = @import("json.zig");
 const utils = @import("utils.zig");
-const main = @import("main.zig");
+const main = @import("../main.zig");
+const hooks = @import("hooks.zig");
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 

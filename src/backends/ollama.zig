@@ -24,10 +24,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayListUnmanaged;
-const proto = @import("../protocol.zig");
-const json = @import("../json.zig");
-const sse = @import("../sse.zig");
-const utils = @import("../utils.zig");
+const proto = @import("../core/protocol.zig");
+const json = @import("../core/json.zig");
+const sse = @import("sse.zig");
+const utils = @import("../core/utils.zig");
 
 /// Ollama streaming client.
 pub const Client = struct {

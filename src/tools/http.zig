@@ -6,8 +6,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const json = @import("../json.zig");
-const utils = @import("../utils.zig");
+const json = @import("../core/json.zig");
+const utils = @import("../core/utils.zig");
 const main = @import("../main.zig");
 
 const MAX_RESPONSE_SIZE = 30 * 1024;

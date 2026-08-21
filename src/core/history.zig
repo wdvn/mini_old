@@ -21,7 +21,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayListUnmanaged;
 const proto = @import("protocol.zig");
-const main = @import("main.zig");
+const main = @import("../main.zig");
 const utils = @import("utils.zig");
 
 

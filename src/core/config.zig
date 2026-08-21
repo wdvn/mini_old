@@ -34,16 +34,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const utils = @import("utils.zig");
-const main = @import("main.zig");
+const main = @import("../main.zig");
 
-
-// ---------------------------------------------------------------------------
-// libc setenv (POSIX)
-// ---------------------------------------------------------------------------
-
-/// setenv(key, value, overwrite) từ libc.
-/// overwrite=0: không ghi đè nếu đã tồn tại trong env.
-extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 // ---------------------------------------------------------------------------
 // Config struct

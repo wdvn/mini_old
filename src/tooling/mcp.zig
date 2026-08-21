@@ -36,11 +36,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayListUnmanaged;
 const Child = std.process.Child;
-const proto = @import("protocol.zig");
-const json = @import("json.zig");
-const utils = @import("utils.zig");
-const main = @import("main.zig");
-const hooks = @import("hooks.zig");
+const proto = @import("../core/protocol.zig");
+const json = @import("../core/json.zig");
+const utils = @import("../core/utils.zig");
+const main = @import("../main.zig");
+const hooks = @import("../core/hooks.zig");
 
 // ---------------------------------------------------------------------------
 // I/O helper

@@ -6,9 +6,9 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const json = @import("../json.zig");
-const artifacts = @import("../artifacts.zig");
-const hooks = @import("../hooks.zig");
+const json = @import("../core/json.zig");
+const artifacts = @import("../core/artifacts.zig");
+const hooks = @import("../core/hooks.zig");
 
 /// Tool artifact_write: Tạo hoặc cập nhật một artifact.
 /// Input: {"name":"...", "content":"...", "title":"...", "type":"markdown", "summary":"...", "user_facing":true}

@@ -22,22 +22,22 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const proto = @import("protocol.zig");
-const json = @import("json.zig");
-const utils = @import("utils.zig");
+const proto = @import("../core/protocol.zig");
+const json = @import("../core/json.zig");
+const utils = @import("../core/utils.zig");
 
-const bash_tool = @import("tools/bash.zig");
-const file_tool = @import("tools/file.zig");
-const glob_tool = @import("tools/glob.zig");
-const grep_tool = @import("tools/grep.zig");
-const http_tool = @import("tools/http.zig");
-const search_tool = @import("tools/search.zig");
-const browser_tool = @import("tools/browser.zig");
-const subagent = @import("tools/subagent.zig");
-const batch_subagent = @import("tools/batch_subagent.zig");
-const artifact_tool = @import("tools/artifact.zig");
+const bash_tool = @import("../tools/bash.zig");
+const file_tool = @import("../tools/file.zig");
+const glob_tool = @import("../tools/glob.zig");
+const grep_tool = @import("../tools/grep.zig");
+const http_tool = @import("../tools/http.zig");
+const search_tool = @import("../tools/search.zig");
+const browser_tool = @import("../tools/browser.zig");
+const subagent = @import("../tools/subagent.zig");
+const batch_subagent = @import("../tools/batch_subagent.zig");
+const artifact_tool = @import("../tools/artifact.zig");
 const mcp_mod = @import("mcp.zig");
-const hooks = @import("hooks.zig");
+const hooks = @import("../core/hooks.zig");
 
 // ---------------------------------------------------------------------------
 // Global state (single-threaded)
