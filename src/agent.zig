@@ -550,6 +550,14 @@ pub const AgentLoop = struct {
                         main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
                     }
 
+                    // Phát pre-tool-use hook
+                    hooks_mod.dispatch(self.alloc, self.io, .{
+                        .event = "pre-tool-use",
+                        .tool_id = tu.id,
+                        .tool_name = tu.name,
+                        .input_json = tu.input_json,
+                    });
+
                     var is_err = false;
                     const result = tools_mod.executeTool(self.alloc, self.io, tu.name, tu.input_json) catch |e| blk: {
                         is_err = true;
@@ -561,6 +569,16 @@ pub const AgentLoop = struct {
                     // Truncate nếu quá lớn
                     const max_tool_result = 64 * 1024;
                     const truncated = if (result.len > max_tool_result) result[0..max_tool_result] else result;
+
+                    // Phát post-tool-use hook
+                    hooks_mod.dispatch(self.alloc, self.io, .{
+                        .event = "post-tool-use",
+                        .tool_id = tu.id,
+                        .tool_name = tu.name,
+                        .input_json = tu.input_json,
+                        .tool_result = truncated,
+                        .is_error = is_err,
+                    });
 
                     try results.append(self.alloc, .{
                         .tool_use_id = tu.id,

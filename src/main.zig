@@ -43,6 +43,7 @@ const cron_mod = @import("cron.zig");
 const hooks_mod = @import("hooks.zig");
 const editor_mod = @import("editor.zig");
 const artifacts_mod = @import("artifacts.zig");
+const acp_mod = @import("acp.zig");
 pub const quickjs_engine = @import("runtime/quickjs_engine.zig");
 pub const js_bindings = @import("runtime/js_bindings.zig");
 pub const process_manager = @import("runtime/process_manager.zig");
@@ -212,6 +213,12 @@ pub fn main(init: std.process.Init) !void {
                 stderrPrint("[main] Cảnh báo: Không thể lưu session file: {s}\n", .{@errorName(e)});
             };
         }
+    }
+
+    // ACP server mode (Agent Client Protocol over stdin/stdout)
+    if (args.acp) {
+        try acp_mod.runServer(alloc, init.io, &agent, &cfg);
+        return;
     }
 
     // Single-shot mode
@@ -389,6 +396,7 @@ const Args = struct {
     hook_command: ?[]const u8 = null,
     session: ?[]const u8 = null,
     session_file: ?[]const u8 = null,
+    acp: bool = false,
     no_mcp: bool = false,
     show_help: bool = false,
     show_version: bool = false,
@@ -426,6 +434,8 @@ fn parseArgs(args: []const []const u8) !Args {
         } else if (std.mem.eql(u8, arg, "--session-file")) {
             i += 1;
             if (i < args.len) result.session_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--acp") or std.mem.eql(u8, arg, "acp")) {
+            result.acp = true;
         } else if (std.mem.eql(u8, arg, "--no-mcp")) {
             result.no_mcp = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -611,6 +621,7 @@ fn printHelp() void {
         \\  -m, --mode <mode>      Chế độ thực thi: codeact (QuickJS-ng JS engine), tools (JSON), auto
         \\  --session <id>         Tự động nạp/lưu session tại ~/.mini/sessions/<id>.json
         \\  --session-file <path>  Chỉ định đường dẫn file session JSON trực tiếp
+        \\  --acp                  Chạy chế độ ACP server (Agent Client Protocol qua stdin/stdout)
         \\  --install-cron <expr>  Tạo cronjob Linux chạy tự động (cần dùng chung với -e)
         \\  --model <backend>      Chọn backend: openai, claude, ollama
         \\  --hook-command <cmd>   Lệnh prehook / monitoring hook chạy trước/sau các hành động
@@ -647,6 +658,7 @@ fn printHelp() void {
 
 test {
     _ = @import("artifacts.zig");
+    _ = @import("acp.zig");
     _ = quickjs_engine;
     _ = js_bindings;
     _ = process_manager;

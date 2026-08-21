@@ -15,6 +15,10 @@ const main = @import("main.zig");
 /// Lệnh shell toàn cục cho hook. Null = không kích hoạt.
 var g_hook_cmd: ?[]const u8 = null;
 
+/// Callback type cho in-memory hook listener.
+pub const HookListener = *const fn (payload: HookPayload) void;
+var g_hook_listener: ?HookListener = null;
+
 /// Thiết lập lệnh hook toàn cục.
 pub fn setHookCommand(cmd: ?[]const u8) void {
     g_hook_cmd = cmd;
@@ -25,9 +29,20 @@ pub fn getHookCommand() ?[]const u8 {
     return g_hook_cmd;
 }
 
+/// Thiết lập hook listener in-memory.
+pub fn setHookListener(listener: ?HookListener) void {
+    g_hook_listener = listener;
+}
+
+/// Lấy hook listener in-memory hiện tại.
+pub fn getHookListener() ?HookListener {
+    return g_hook_listener;
+}
+
 /// Struct chứa thông số dữ liệu phát ra từ sự kiện hook.
 pub const HookPayload = struct {
     event: []const u8,
+    tool_id: ?[]const u8 = null,
     tool_name: ?[]const u8 = null,
     input_json: ?[]const u8 = null,
     tool_result: ?[]const u8 = null,
@@ -50,6 +65,10 @@ pub const HookPayload = struct {
 
 /// Phát sự kiện hook. Chạy không ngắt câu lệnh chính nếu hook lỗi.
 pub fn dispatch(alloc: Allocator, io: std.Io, payload: HookPayload) void {
+    if (g_hook_listener) |listener| {
+        listener(payload);
+    }
+
     const cmd = g_hook_cmd orelse return;
     if (cmd.len == 0) return;
 

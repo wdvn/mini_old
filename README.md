@@ -40,6 +40,7 @@ You > viết cho tôi một đoạn code fibonacci bằng Python
   - [web\_search](#web_search)
   - [skills](#skills)
 - [MCP (Model Context Protocol)](#mcp-model-context-protocol)
+- [ACP (Agent Client Protocol)](#acp-agent-client-protocol)
 - [Kiến trúc mã nguồn](#kiến-trúc-mã-nguồn)
 - [Ví dụ: Newspaper Agent](#ví-dụ-newspaper-agent)
 - [Đóng góp](#đóng-góp)
@@ -55,6 +56,7 @@ You > viết cho tôi một đoạn code fibonacci bằng Python
 | **Agentic loop** | Tự động gọi tools rồi gửi kết quả lại AI (tối đa 20 vòng) |
 | **Tool system** | 10 built-in tools: bash, file, glob, grep, http, search, browser, skills |
 | **MCP** | Kết nối MCP servers bên ngoài qua JSON-RPC over stdio |
+| **ACP** | Agent Client Protocol JSON-RPC 2.0 tích hợp trực tiếp vào Zed AI, JetBrains |
 | **Policy tools** | Allowlist / blocklist để kiểm soát tool nào được phép chạy |
 | **Lịch sử** | In-memory conversation history với auto-compacting |
 | **System prompt** | Tùy chỉnh từ file `.md` bất kỳ |
@@ -652,6 +654,43 @@ MINI_HOOK_COMMAND='python3 monitor.py >> /tmp/agent_telemetry.log' mini-agent -e
 
 ---
 
+## ACP (Agent Client Protocol)
+
+mini-agent hỗ trợ giao thức chuẩn mở **Agent Client Protocol (ACP)** qua JSON-RPC 2.0 trên `stdin`/`stdout`, cho phép tích hợp trực tiếp như một External Agent trong các editor/IDE như **Zed AI**, **JetBrains**, hoặc các client ACP khác.
+
+### Khởi chạy ở chế độ ACP Server
+```bash
+mini-agent --acp
+```
+
+### Cấu hình trong Zed AI (`settings.json`)
+```json
+{
+  "agent": {
+    "external_agents": {
+      "mini": {
+        "command": "mini-agent",
+        "args": ["--acp"]
+      }
+    }
+  }
+}
+```
+
+### Các phương thức ACP được hỗ trợ:
+- `initialize`: Bắt tay đàm phán protocolVersion (v1) và capabilities.
+- `session/new`: Khởi tạo session mới với `cwd` và danh sách MCP servers.
+- `session/load`: Khôi phục session từ file lịch sử.
+- `session/prompt`: Tiếp nhận prompt từ editor, stream các thông báo `session/update` theo thời gian thực:
+  - `agent_message_chunk`: Stream nội dung phản hồi văn bản.
+  - `agent_thought_chunk`: Stream luồng suy nghĩ / reasoning.
+  - `tool_call` & `tool_call_update`: Báo cáo trạng thái gọi và thực thi tools.
+- `session/cancel`: Huỷ turn đang xử lý.
+- `session/close`: Đóng và lưu context session.
+- `ping`: Kiểm tra kết nối liveness.
+
+---
+
 ## Kiến trúc mã nguồn
 
 ```
@@ -666,7 +705,8 @@ mini/
 │       ├── system_prompt.md
 │       └── skill.json
 └── src/
-    ├── main.zig        # Entry point: CLI parsing, MCP init, REPL/single-shot
+    ├── main.zig        # Entry point: CLI parsing, MCP/ACP init, REPL
+    ├── acp.zig         # Agent Client Protocol (JSON-RPC 2.0 server)
     ├── agent.zig       # AgentLoop: vòng lặp chính, tool execution
     ├── config.zig      # .env loader, Config struct
     ├── history.zig     # In-memory conversation buffer (auto-compact)
