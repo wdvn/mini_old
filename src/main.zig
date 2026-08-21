@@ -401,8 +401,15 @@ fn printHelp() void {
 
 test {
     _ = @import("core/artifacts.zig");
+    _ = @import("core/agent.zig");
+    _ = @import("core/history.zig");
+    _ = @import("core/protocol.zig");
+    _ = @import("core/json.zig");
+    _ = @import("core/config.zig");
+    _ = @import("tooling/registry.zig");
     _ = @import("acp/server.zig");
     _ = quickjs_engine;
     _ = js_bindings;
     _ = process_manager;
 }
+
