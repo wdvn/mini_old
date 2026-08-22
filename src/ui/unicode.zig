@@ -266,6 +266,16 @@ pub fn clusterLenAt(s: []const u8, i: usize) usize {
     return c.len;
 }
 
+/// Kiểm tra codepoint có thuộc về phần "nối tiếp" của grapheme cluster đứng trước
+/// (combining mark, join control ZWJ/ZWNJ, variation selector, skin tone modifier).
+/// Dùng khi lùi cursor qua cluster: gặp cp này phải lùi tiếp về trái.
+pub fn isContinuationCp(cp: u21) bool {
+    if (isCombining(cp)) return true;
+    if (isJoinControl(cp)) return true;
+    if (cp == 0x200B) return true; // ZWSP bám cluster trước
+    return false;
+}
+
 /// Lớp ký tự dùng cho word motion.
 pub const CharClass = enum { space, word, punct };
 

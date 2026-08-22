@@ -128,6 +128,8 @@ pub const AgentLoop = struct {
     engine: *quickjs.Engine,
     /// Đếm số lần tự sửa lỗi JavaScript liên tiếp.
     js_retry_count: usize = 0,
+    /// Đếm số lần đã thử sửa lỗi role/first-message (Claude 400) trong turn.
+    role_fix_attempts: usize = 0,
     /// Trình ước lượng token (MemAct).
     token_estimator: tokens_mod.TokenEstimator,
     /// Cửa sổ ngữ cảnh (MemAct).
@@ -252,7 +254,12 @@ pub const AgentLoop = struct {
             
             const split_idx = self.context_window.findSplitIndex(&self.token_estimator, self.history.messages(), pinned_tokens);
             
-            if (split_idx > 0) {
+            // Điều kiện split_idx > 1: không bao giờ compact khi split quá nhỏ.
+            // compactMemAct (bản mới) GIỮ NGUYÊN msgs[0] (prompt gốc) và chèn/thay
+            // summary tại index 1 — nếu split < 2 sẽ làm mất cả prompt gốc lẫn
+            // summary cũ. temp_msgs build từ messages()[0..split_idx] nên đã tự
+            // chứa prompt gốc + summary cũ tại index 1 (phục vụ dồn tích lũy).
+            if (split_idx > 1) {
                 var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
                 msg_blocks[0] = .{ .text = try self.alloc.dupe(u8, 
                     "SYSTEM: Bạn là bộ nhớ MemAct. Hãy tóm tắt ngắn gọn phần hội thoại trước thành JSON, tuân thủ đúng stencil:\n" ++
@@ -266,6 +273,7 @@ pub const AgentLoop = struct {
                     "  \"files_touched\": [],\n" ++
                     "  \"next_step\": \"bước tiếp theo\"\n" ++
                     "}\n" ++
+                    "Nếu hội thoại đầu vào đã chứa block \"[MemAct Context Summary]\", hãy gộp (merge) nội dung summary cũ vào summary mới, giữ lại các thông tin quan trọng, vẫn theo đúng stencil JSON trên.\n" ++
                     "Chỉ xuất JSON, không có markdown text khác."
                 ) };
                 const sys_msg = proto.Message{ .role = .user, .content = msg_blocks };
@@ -444,6 +452,26 @@ pub const AgentLoop = struct {
                     if (std.mem.indexOf(u8, raw, "rate_limit") != null) return error.LLMRateLimitExceeded;
                 }
 
+                // Detect lỗi role/first-message: Claude từ chối do thứ tự role
+                // (ví dụ first message không phải user, hoặc role không hợp lệ).
+                if (response.http_code == 400) {
+                    if (response.raw_debug_info) |raw| {
+                        const has_first_msg = std.mem.indexOf(u8, raw, "first message") != null;
+                        const has_role_and_assistant = std.mem.indexOf(u8, raw, "role") != null and
+                            std.mem.indexOf(u8, raw, "assistant") != null;
+                        if (has_first_msg or has_role_and_assistant) {
+                            main.stderrPrint("\n\x1b[33m[agent] Claude từ chối do thứ tự role (HTTP 400). Đang sửa history...\x1b[0m\n", .{});
+                            _ = self.history.ensureClaudeCompatible();
+                            if (self.role_fix_attempts < 2) {
+                                self.role_fix_attempts += 1;
+                                // Retry executeStep với history đã sửa, không đi qua nhánh error/retry-truncate
+                                return .continue_loop;
+                            }
+                            // Vượt số lần cho phép — rơi xuống error như cũ
+                        }
+                    }
+                }
+
                 main.stderrPrint("[agent] Cảnh báo: stop_reason không xác định (HTTP {d})\n", .{response.http_code});
                 if (response.raw_debug_info) |raw| {
                     main.stderrPrint("\n--- RAW BACKEND RESPONSE ---\n{s}\n----------------------------\n", .{raw});
@@ -482,6 +510,9 @@ pub const AgentLoop = struct {
 
         // Thêm user message vào history
         try self.history.addUser(user_text);
+
+        // Reset bộ đếm retry sửa lỗi role cho turn mới
+        self.role_fix_attempts = 0;
 
         // Lấy danh sách tools phù hợp với user message
         const tool_defs = tools_mod.getRelevantDefinitions(turn_alloc, user_text);

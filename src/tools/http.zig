@@ -18,10 +18,12 @@ const MAX_RESPONSE_SIZE = 30 * 1024;
 
 /// Thực thi tool http_request.
 pub fn executeTool(alloc: Allocator, input_json: []const u8) ![]u8 {
-    const url = json.findString(input_json, "url") orelse
+    const url = (try json.findStringOwned(alloc, input_json, "url")) orelse
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'url'", .{});
+    defer alloc.free(url);
     const method = json.findString(input_json, "method") orelse "GET";
-    const body = json.findString(input_json, "body");
+    const body = try json.findStringOwned(alloc, input_json, "body");
+    defer if (body) |b| alloc.free(b);
     const headers_json = json.findObject(input_json, "headers");
 
     return httpRequest(alloc, url, method, body, headers_json);

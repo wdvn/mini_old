@@ -419,6 +419,7 @@ test {
     _ = @import("core/memact/tokens.zig");
     _ = @import("core/memact/window.zig");
     _ = @import("tooling/registry.zig");
+    _ = @import("tools/bash.zig");
     _ = @import("acp/server.zig");
     _ = @import("ui/unicode.zig");
     _ = @import("ui/history.zig");

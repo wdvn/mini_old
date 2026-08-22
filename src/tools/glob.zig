@@ -24,9 +24,12 @@ const MAX_RESULTS = 500;
 /// Tool entry point.
 /// Input: {"pattern":"**/*.zig", "path":"./src"}
 pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
-    const pattern = json.findString(input_json, "pattern") orelse
+    const pattern = (try json.findStringOwned(alloc, input_json, "pattern")) orelse
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'pattern'", .{});
-    const base_path = json.findString(input_json, "path") orelse ".";
+    defer alloc.free(pattern);
+    const base_path = (try json.findStringOwned(alloc, input_json, "path")) orelse
+        try alloc.dupe(u8, ".");
+    defer alloc.free(base_path);
 
     return searchGlob(alloc, io, pattern, base_path);
 }

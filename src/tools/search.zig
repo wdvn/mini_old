@@ -34,8 +34,9 @@ const MAX_RESULTS = 10;
 /// Tool entry point.
 /// Input: {"query":"...", "num_results":5}
 pub fn executeTool(alloc: Allocator, input_json: []const u8) ![]u8 {
-    const query = json.findString(input_json, "query") orelse
+    const query = (try json.findStringOwned(alloc, input_json, "query")) orelse
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'query'", .{});
+    defer alloc.free(query);
 
     const n_str = json.findString(input_json, "num_results") orelse "5";
     const num_results = @min(

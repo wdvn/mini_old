@@ -75,9 +75,13 @@ fn jsMiniGlob(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
     // Build input JSON for glob tool
     var json_w = utils.BufWriter.init(engine.alloc);
     defer json_w.deinit();
-    json_w.print("{{\"pattern\":\"{s}\"", .{pattern}) catch return JS_EXCEPTION;
+    const pattern_escaped = json_mod.escape(engine.alloc, pattern) catch return JS_EXCEPTION;
+    defer engine.alloc.free(pattern_escaped);
+    json_w.print("{{\"pattern\":\"{s}\"", .{pattern_escaped}) catch return JS_EXCEPTION;
     if (base_path) |p| {
-        json_w.print(",\"path\":\"{s}\"", .{p}) catch return JS_EXCEPTION;
+        const p_escaped = json_mod.escape(engine.alloc, p) catch return JS_EXCEPTION;
+        defer engine.alloc.free(p_escaped);
+        json_w.print(",\"path\":\"{s}\"", .{p_escaped}) catch return JS_EXCEPTION;
     }
     json_w.writeAll("}") catch return JS_EXCEPTION;
 
@@ -122,9 +126,13 @@ fn jsMiniGrep(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
 
     var json_w = utils.BufWriter.init(engine.alloc);
     defer json_w.deinit();
-    json_w.print("{{\"pattern\":\"{s}\"", .{pattern}) catch return JS_EXCEPTION;
+    const pattern_escaped = json_mod.escape(engine.alloc, pattern) catch return JS_EXCEPTION;
+    defer engine.alloc.free(pattern_escaped);
+    json_w.print("{{\"pattern\":\"{s}\"", .{pattern_escaped}) catch return JS_EXCEPTION;
     if (path) |p| {
-        json_w.print(",\"path\":\"{s}\"", .{p}) catch return JS_EXCEPTION;
+        const p_escaped = json_mod.escape(engine.alloc, p) catch return JS_EXCEPTION;
+        defer engine.alloc.free(p_escaped);
+        json_w.print(",\"path\":\"{s}\"", .{p_escaped}) catch return JS_EXCEPTION;
     }
     json_w.writeAll("}") catch return JS_EXCEPTION;
 
@@ -313,10 +321,13 @@ fn jsMiniSh(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JS
     const command = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid command");
     defer engine.alloc.free(command);
 
-    // Xây dựng JSON cho bash tool
+    // Xây dựng JSON cho bash tool — escape chuỗi command (có thể chứa
+    // quote/newline) để round-trip JSON được parse đúng phía tool.
     var json_w = utils.BufWriter.init(engine.alloc);
     defer json_w.deinit();
-    json_w.print("{{\"command\":\"{s}\"}}", .{command}) catch return JS_EXCEPTION;
+    const cmd_escaped = json_mod.escape(engine.alloc, command) catch return JS_EXCEPTION;
+    defer engine.alloc.free(cmd_escaped);
+    json_w.print("{{\"command\":\"{s}\"}}", .{cmd_escaped}) catch return JS_EXCEPTION;
 
     const out = bash_tool.executeTool(engine.alloc, engine.io, json_w.list.items) catch |e| {
         const obj = c.JS_NewObject(ctx);
@@ -492,7 +503,11 @@ fn jsMiniHttp(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
 
     var json_w = utils.BufWriter.init(engine.alloc);
     defer json_w.deinit();
-    json_w.print("{{\"method\":\"{s}\",\"url\":\"{s}\"}}", .{ method, url }) catch return JS_EXCEPTION;
+    const method_escaped = json_mod.escape(engine.alloc, method) catch return JS_EXCEPTION;
+    defer engine.alloc.free(method_escaped);
+    const url_escaped = json_mod.escape(engine.alloc, url) catch return JS_EXCEPTION;
+    defer engine.alloc.free(url_escaped);
+    json_w.print("{{\"method\":\"{s}\",\"url\":\"{s}\"}}", .{ method_escaped, url_escaped }) catch return JS_EXCEPTION;
 
     const res = http_tool.executeTool(engine.alloc, json_w.list.items) catch |e| {
         return c.JS_ThrowInternalError(ctx, "http error: %s", @errorName(e).ptr);
@@ -527,7 +542,9 @@ fn jsMiniArtifact(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*
 
     var json_w = utils.BufWriter.init(engine.alloc);
     defer json_w.deinit();
-    json_w.print("{{\"name\":\"{s}\",\"content\":\"{s}\"}}", .{ name, escaped }) catch return JS_EXCEPTION;
+    const name_escaped = json_mod.escape(engine.alloc, name) catch return JS_EXCEPTION;
+    defer engine.alloc.free(name_escaped);
+    json_w.print("{{\"name\":\"{s}\",\"content\":\"{s}\"}}", .{ name_escaped, escaped }) catch return JS_EXCEPTION;
 
     const res = artifact_tool.writeTool(engine.alloc, engine.io, json_w.list.items) catch |e| {
         return c.JS_ThrowInternalError(ctx, "artifact error: %s", @errorName(e).ptr);

@@ -13,10 +13,12 @@ const hooks = @import("../core/hooks.zig");
 /// Tool artifact_write: Tạo hoặc cập nhật một artifact.
 /// Input: {"name":"...", "content":"...", "title":"...", "type":"markdown", "summary":"...", "user_facing":true}
 pub fn writeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
-    const name = json.findString(input_json, "name") orelse
+    const name = (try json.findStringOwned(alloc, input_json, "name")) orelse
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'name' cho artifact", .{});
-    const content = json.findString(input_json, "content") orelse
+    defer alloc.free(name);
+    const content = (try json.findStringOwned(alloc, input_json, "content")) orelse
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'content' cho artifact", .{});
+    defer alloc.free(content);
 
     const title = json.findString(input_json, "title");
     const art_type = json.findString(input_json, "type") orelse "markdown";
@@ -28,12 +30,8 @@ pub fn writeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         if (std.mem.eql(u8, uf, "false")) user_facing = false;
     }
 
-    // Unescape content nếu cần
-    const unescaped = json.unescape(alloc, content) catch content;
-    defer if (!std.mem.eql(u8, content, unescaped)) alloc.free(unescaped);
-
     // Ghi file artifact và cập nhật metadata
-    const path = try artifacts.writeArtifact(alloc, io, name, title, unescaped, art_type, summary, user_facing);
+    const path = try artifacts.writeArtifact(alloc, io, name, title, content, art_type, summary, user_facing);
     defer alloc.free(path);
 
     // Bắn sự kiện thời gian thực qua Hooks (Level D: Live Preview / External UI)
@@ -54,8 +52,9 @@ pub fn writeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
 /// Tool artifact_read: Đọc nội dung một artifact đã lưu.
 /// Input: {"name":"..."}
 pub fn readTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
-    const name = json.findString(input_json, "name") orelse
+    const name = (try json.findStringOwned(alloc, input_json, "name")) orelse
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'name'", .{});
+    defer alloc.free(name);
 
     return artifacts.readArtifact(alloc, io, name);
 }

@@ -7,9 +7,10 @@ const utils = @import("../core/utils.zig");
 const main = @import("../main.zig");
 
 pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
-    const task = json.findString(input_json, "task") orelse {
+    const task = (try json.findStringOwned(alloc, input_json, "task")) orelse {
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu tham số 'task'", .{});
     };
+    defer alloc.free(task);
 
     const exe_path = "/proc/self/exe";
     const argv = [_][]const u8{ exe_path, "-e", task };

@@ -51,6 +51,10 @@ pub const ContextWindow = struct {
             const msg = msgs[idx];
             const tokens = est.estimateMessage(&msg);
 
+            // Guard bất biến: msgs[0] = prompt gốc, msgs[1] = summary tier .summarized
+            // sau compact — không bao giờ hạ split xuống dưới 2 khi history dài.
+            if (idx < 2 and msgs.len > 3) break;
+
             // Kiểm tra tool boundary
             var is_boundary = true;
             if (msg.role == .user) {
@@ -90,6 +94,8 @@ pub const ContextWindow = struct {
                 }
                 split_idx -= 1;
             }
+            // Guard bất biến: không để fallback hạ split xuống dưới 2 khi history dài
+            if (split_idx < 2 and msgs.len > 3) split_idx = 2;
         }
         
         // Đảm bảo chừa lại ít nhất 2 tin nhắn nếu history đang dài
@@ -167,4 +173,56 @@ test "estimateTotal cộng dồn theo message" {
         .{ .role = .user, .content = &.{.{ .text = "hello world foo bar" }} },
     };
     try std.testing.expect(window.estimateTotal(&est, &msgs) == 2 * window.estimateTotal(&est, &single));
+}
+
+test "findSplitIndex giữ nguyên prompt gốc và summary (split >= 2)" {
+    const alloc = std.testing.allocator;
+    var est = TokenEstimator.init(alloc);
+    defer est.deinit();
+
+    var window = ContextWindow{ .max_tokens = 2000 };
+    const text = "x" ** 200; // ~52 tokens/msg
+
+    // 20 message user(text) / assistant(text) xen kẽ.
+    // Sau compact, msgs[0] = prompt gốc, msgs[1] = summary tier .summarized —
+    // vòng lùi không được hạ split xuống dưới 2.
+    var msgs: [20]proto.Message = undefined;
+    var i: usize = 0;
+    while (i < 20) : (i += 2) {
+        msgs[i] = .{ .role = .user, .content = &.{.{ .text = text }} };
+        msgs[i + 1] = .{ .role = .assistant, .content = &.{.{ .text = text }} };
+    }
+
+    const split = window.findSplitIndex(&est, &msgs, 0);
+    try std.testing.expect(split >= 2 and split < 20);
+
+    // Message tại split phải là user KHÔNG chứa tool_result
+    const m = msgs[split];
+    try std.testing.expect(m.role == .user);
+    for (m.content) |b| {
+        try std.testing.expect(b != .tool_result);
+    }
+}
+
+test "findSplitIndex history ngắn với message rất lớn vẫn >= 2" {
+    const alloc = std.testing.allocator;
+    var est = TokenEstimator.init(alloc);
+    defer est.deinit();
+
+    // Window nhỏ so với từng message: target_keep ~306 token < ~1315 token/msg
+    var window = ContextWindow{ .max_tokens = 600 };
+    const big_text = "y" ** 5000;
+
+    // [0] = user prompt gốc, [1] = user summary sau compact, [2..3] = assistant.
+    // Code cũ có thể tụt split về 1 (cắt mất prompt gốc) — guard phải chặn.
+    const msgs = [_]proto.Message{
+        .{ .role = .user, .content = &.{.{ .text = big_text }} },
+        .{ .role = .user, .content = &.{.{ .text = big_text }} },
+        .{ .role = .assistant, .content = &.{.{ .text = big_text }} },
+        .{ .role = .assistant, .content = &.{.{ .text = big_text }} },
+    };
+
+    const split = window.findSplitIndex(&est, &msgs, 0);
+    try std.testing.expect(split >= 2);
+    try std.testing.expect(split != 0 and split != 1);
 }

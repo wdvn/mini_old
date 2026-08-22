@@ -58,6 +58,20 @@ pub fn findString(json: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// findString + unescape kết quả. Trả về bộ nhớ owned (caller phải free).
+/// Fast path: chuỗi không chứa backslash thì chỉ dupe.
+/// Dùng cho mọi tool input chứa nội dung do người dùng/LLM kiểm soát
+/// (command shell, pattern, nội dung file...) — nếu dùng findString thô,
+/// các escape sequence JSON (\" \\n \\t) sẽ leak thành ký tự literal,
+/// làm méo lệnh shell (ví dụ sinh file rác khi redirect 2>&1 bị parse sai).
+pub fn findStringOwned(alloc: Allocator, json: []const u8, key: []const u8) !?[]u8 {
+    const raw = findString(json, key) orelse return null;
+    if (std.mem.indexOfScalar(u8, raw, '\\') == null) {
+        return try alloc.dupe(u8, raw);
+    }
+    return try unescape(alloc, raw);
+}
+
 /// Tìm giá trị object {} của key trong JSON.
 /// Trả về slice bao gồm cả dấu `{` và `}`.
 pub fn findObject(json: []const u8, key: []const u8) ?[]const u8 {
@@ -134,6 +148,31 @@ pub fn findBool(json: []const u8, key: []const u8) bool {
     var pattern_buf: [256]u8 = undefined;
     const pattern = std.fmt.bufPrint(&pattern_buf, "\"{s}\":true", .{key}) catch return false;
     return std.mem.indexOf(u8, json, pattern) != null;
+}
+
+test "findStringOwned unescape đúng chuỗi JSON" {
+    const alloc = std.testing.allocator;
+    // Lệnh shell chứa quote — must survive JSON round-trip nguyên vẹn
+    const input = "{\"command\":\"grep -A 20 \\\"fail\\\\|error\\\" 2>&1\"}";
+    const got = (try findStringOwned(alloc, input, "command")).?;
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("grep -A 20 \"fail\\|error\" 2>&1", got);
+
+    // Fast path: không có backslash → chỉ dupe
+    const input2 = "{\"command\":\"ls -la\"}";
+    const got2 = (try findStringOwned(alloc, input2, "command")).?;
+    defer alloc.free(got2);
+    try std.testing.expectEqualStrings("ls -la", got2);
+
+    // Newline escape
+    const input3 = "{\"body\":\"line1\\nline2\"}";
+    const got3 = (try findStringOwned(alloc, input3, "body")).?;
+    defer alloc.free(got3);
+    try std.testing.expectEqualStrings("line1\nline2", got3);
+
+    // Key không tồn tại
+    const got4 = try findStringOwned(alloc, input2, "missing");
+    try std.testing.expect(got4 == null);
 }
 
 // ---------------------------------------------------------------------------
