@@ -4,183 +4,184 @@
 |---|---|
 | RFC | 003 |
 | Tên | MemAct: Context Window & Memory Management |
-| Trạng thái | Draft — chờ review |
-| Vai trò | **RFC chuẩn (normative)**: mọi RFC khác khi nói về history / context / memory đều quy chiếu về đây. Thuật ngữ chuẩn: conversation history (4 tier PINNED/RECENT/SUMMARIZED/ARCHIVED), compaction (token-aware, tool-boundary), memory (semantic/episodic/project_state). Riêng **prompt input history** của editor (RFC-000) là khái niệm độc lập, không thuộc phạm vi RFC này. |
-| Phiên bản | 0.1 |
+| Trạng thái | Implemented (M1+M2) — M3 một phần, M4/M5 deferred |
+| Vai trò | **RFC chuẩn (normative)**: mọi RFC khác khi nói về history / context / memory đều quy chiếu về đây. Thuật ngữ chuẩn: conversation history (tier PINNED/RECENT/SUMMARIZED/ARCHIVED), compaction (token-aware, drop-all + summary dồn), memory (semantic/episodic/project_state). Riêng **prompt input history** của editor (RFC-000) là khái niệm độc lập, không thuộc phạm vi RFC này. |
+| Phiên bản | 0.2 — đối chiếu lại với code thực tế sau các commit `774faad`, `1c8e721`, `8d782e9`, `373beea` |
 | Phụ thuộc | RFC-001 (Code-Centric QuickJS), RFC-002 (Event-Driven Act) |
 | Tác giả | mini-agent |
 
+> [!NOTE]
+> Bản 0.1 thiết kế compaction kiểu "sliding window" (giữ N messages gần nhất + scoring retrieval
+> cho memory). Sau khi triển khai thực tế, cả hai cơ chế này bị **bỏ**: sliding window gây vòng
+> lặp compact vô hạn với window lớn, scoring retrieval không còn ý nghĩa khi mỗi project chỉ có
+> một lượng nhỏ memory entries (chọn toàn bộ nhanh hơn và đáng tin hơn). Bản 0.2 mô tả đúng
+> những gì đã chạy trong production, kèm các use case thực tế phát sinh.
+
 ---
 
-## 1. Vấn đề (Motivation)
+## 1. Vấn đề (Motivation) — cập nhật từ thực tế triển khai
 
-Khảo sát hiện trạng code cho thấy 4 lỗ hổng trong quản lý context:
+Khảo sát hiện trạng code trước RFC này cho thấy 4 lỗ hổng, tất cả đã được xử lý ở M1+M2:
 
-### 1.1. Auto-compaction chưa được nối vào agent loop
-`src/core/history.zig` đã có đầy đủ `compact()`, `compactWithSummary()`, `needsCompaction()` — nhưng **không có call-site nào** trong `src/` invoke các hàm này. History chỉ bị cắt thủ công, không tự động.
+1. **Auto-compaction chưa được nối vào agent loop** — `compact()`/`needsCompaction()` tồn tại
+   nhưng không có call-site. → Đã wire vào `agent.zig` (mỗi turn, trước backend call).
+2. **Compaction "mù"** — ngưỡng `DEFAULT_MAX_MESSAGES = 40` đếm message thay vì token. → Đã thay
+   bằng `TokenEstimator` heuristic + ngưỡng `% context window`.
+3. **Mất ngữ cảnh khi compact** — compact cũ "giữ nửa sau", mọi quyết định ở nửa đầu biến mất.
+   → Đã thay bằng summary stencil JSON có cấu trúc, dồn tích lũy qua các lần compact.
+4. **Không có long-term memory** — mỗi session bắt đầu từ zero. → MemoryStore JSONL đã có
+   (`store.zig`) nhưng **chưa wire vào agent loop** (xem M3, deferred).
 
-### 1.2. Compaction "mù" — đếm message, không đếm token
-Ngưỡng compaction là `DEFAULT_MAX_MESSAGES = 40`. Một message 200 token và một message 20.000 token được tính như nhau. Với model có context window lớn (Claude: 200K) hoặc nhỏ (Ollama local: 4–8K), ngưỡng cố định hoặc lãng phí hoặc tràn window gây lỗi 400 từ backend.
+Ngoài ra, quá trình triển khai làm lộ thêm 2 vấn đề không nằm trong thiết kế gốc:
 
-### 1.3. Mất ngữ cảnh khi compact
-`compact()` hiện chỉ "giữ nửa sau" của history. Mọi quyết định, ràng buộc, lỗi đã học ở nửa đầu biến mất hoàn toàn giữa phiên. `compactWithSummary()` tồn tại nhưng summary rời rạc, không có cấu trúc, không được dùng để phục hồi ngữ cảnh.
-
-### 1.4. Không có long-term memory
-History là in-memory + backup file thuần (`~/.mini/sessions/sess_*.json`). Mỗi session mới bắt đầu từ zero: agent không nhớ cấu trúc project, quy ước code, lỗi đã sửa, hay quyết định kiến trúc từ session trước. Đây là khác biệt lớn so với Claude Code (CLAUDE.md + auto memory) và Cursor (project context).
+5. **Claude API 400 "first message must be user"** — session cũ compact kiểu cũ có thể để
+   assistant message ở đầu history → Claude từ chối cả turn. Cần role-fix tự động.
+6. **Vòng lặp compact vô hạn** — sliding window giữ ~60% window gần nhất: với window lớn,
+   phần giữ lại vẫn vượt ngưỡng compact → mỗi vòng lặp lại gọi LLM summary (đốt API call)
+   trong khi history không bao giờ xuống dưới ngưỡng.
 
 ---
 
 ## 2. Mục tiêu
 
 **Goals**
-1. Token-aware context window management — compaction dựa trên ước lượng token, không phải số message.
-2. Tiered context: pinned → recent → summarized → archived. Không mất thông tin quan trọng khi compact.
-3. Long-term memory: extract & lưu trữ kiến thức xuyên session (semantic, episodic, project-state).
-4. Retrieval & injection: memory liên quan được đưa vào system prompt tự động.
-5. Tích hợp không phá vỡ: dùng lại `hooks.zig` (lifecycle dispatch) và Act event model của RFC-002.
+1. Token-aware context window management — compaction dựa trên ước lượng token (đã xong).
+2. Context continuity: sau compact, agent vẫn tiếp tục đúng việc đang dở qua summary
+   `task_state`/`next_step` (đã xong).
+3. Long-term memory: extract & lưu trữ kiến thức xuyên session (deferred — store sẵn sàng).
+4. Tích hợp không phá vỡ: hooks dispatch + Act event model của RFC-002 (một phần).
 
-**Non-goals (v1)**
-- Vector database / embedding-based retrieval (deferred — dùng keyword + recency scoring trước).
-- Cross-project memory sharing.
-- Học online model weights / fine-tuning.
-- Multi-user memory isolation (giả định single-user, `~/.mini/`).
+**Non-goals (điều chỉnh ở v0.2)**
+- ~~Retrieval scoring (keyword overlap + recency + access_count)~~ — **bỏ**. Với quy mô
+  memory thực tế (< vài trăm entries/project), inject toàn bộ project_state + lọc theo
+  `MINI_MEMACT_TOP_K` bẳng đơn giản là đủ; hàm scoring 4 thành phần là over-engineering.
+- Vector database / embedding-based retrieval (vẫn deferred).
+- Cross-project memory sharing, multi-user memory isolation (giữ nguyên).
+- **Giữ N messages gần nhất khi compact (sliding window)** — **bỏ** (nguyên nhân vòng lặp
+  compact vô hạn, xem §4.2).
 
 ---
 
 ## 3. Kiến trúc tổng thể
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                      AgentLoop (agent.zig)               │
-│                                                          │
-│  ┌──────────────┐   pre-prompt    ┌───────────────────┐  │
-│  │  hooks.zig   │ ──────────────▶ │  MemAct            │  │
-│  │  (dispatch)  │                 │  ┌───────────────┐ │  │
-│  └──────┬───────┘                 │  │ TokenEstimator│ │  │
-│         │ post-response           │  ├───────────────┤ │  │
-│         ▼                         │  │ ContextWindow │ │  │
-│  ┌──────────────┐                 │  │  (4 tiers)    │ │  │
-│  │ MemAct:      │                 │  ├───────────────┤ │  │
-│  │  - extract   │ ──────────────▶ │  │ MemoryStore  │ │  │
-│  │  - compact   │                 │  │  (JSONL log)  │ │  │
-│  └──────────────┘                 │  ├───────────────┤ │  │
-│                                   │  │ Retriever     │ │  │
-│  system prompt ◀──────────────────│  └───────────────┘ │  │
-│  (memory block injected)          └───────────────────┘  │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                      AgentLoop (agent.zig)                    │
+│                                                               │
+│  mỗi turn, trước backend call:                                │
+│   pinned = est(system_prompt)                                 │
+│   if memact_enabled and msgs.len > 2                          │
+│      and window.needsCompaction(est, msgs, pinned):           │
+│        summary = LLM(stencil prompt, msgs)     ── LLM call    │
+│        history.compactMemAct(act_id, summary)  ── drop-all    │
+│        journal: memact_compacted                               │
+│                                                               │
+│  ┌───────────────┐  ┌──────────────┐  ┌────────────────────┐ │
+│  │ TokenEstimator│  │ ContextWindow│  │ MemoryStore (M3)   │ │
+│  │ tokens.zig    │  │ window.zig   │  │ store.zig — JSONL  │ │
+│  │ ✅ wired      │  │ ✅ wired     │  │ ⚠️ chưa wire       │ │
+│  └───────────────┘  └──────────────┘  └────────────────────┘ │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-MemAct là module Zig thuần (`src/core/memact/`) gồm 4 thành phần độc lập, giao tiếp qua struct + function call trực tiếp (không qua IPC):
-
-| Thành phần | File | Trách nhiệm |
-|---|---|---|
-| TokenEstimator | `memact/tokens.zig` | Ước lượng token cho message/history |
-| ContextWindow | `memact/window.zig` | 4-tier buffer, quyết định compact |
-| MemoryStore | `memact/store.zig` | Persist memory ra disk (JSONL) |
-| Retriever | `memact/retrieve.zig | Chọn memory liên quan, render vào prompt |
+| Thành phần | File | Trạng thái | Trách nhiệm |
+|---|---|---|---|
+| TokenEstimator | `memact/tokens.zig` | ✅ wired | Ước lượng token cho message/history (heuristic + cache) |
+| ContextWindow | `memact/window.zig` | ✅ wired | needsCompaction token-based, tìm split tool-boundary |
+| MemoryStore | `memact/store.zig` | ⚠️ code sẵn, chưa wire | Persist memory ra disk (JSONL append-only + index) |
+| ~~Retriever~~ | ~~`memact/retrieve.zig`~~ | ❌ bỏ | Bỏ scoring; inject đơn giản khi làm M4 |
 
 ---
 
-## 4. Thiết kế chi tiết
+## 4. Thiết kế chi tiết (theo code thực tế)
 
-### 4.1. TokenEstimator (`tokens.zig`)
+### 4.1. TokenEstimator (`tokens.zig`) — như thiết kế, đã triển khai
 
-Không nhúng tokenizer thật (bloat binary). Dùng heuristic 2 tầng:
+Heuristic 2 tầng, sai số chấp nhận ±15%, kèm cache `StringHashMap` để không duyệt lại chuỗi
+đã ước lượng:
+
+- ASCII/code: `len / 3.8` token
+- CJK/VN diacritics (codepoint > 0x2E80): `len / 1.4` token
+- Overhead cố định: `tool_use` +40, `tool_result` +20, `thinking` tính cả `signature`.
 
 ```zig
-pub const TokenEstimator = struct {
-    cache: std.StringHashMap(u32),
-
-    /// Heuristic: ~4 chars/token cho EN/code, ~1.5 chars/token cho CJK/VN diacritics.
-    pub fn estimate(self: *TokenEstimator, text: []const u8) u32 {
-        if (self.cache.get(text)) |v| return v;
-        const n_cjk = countWideChars(text);   // codepoint > 0x2E80
-        const n_ascii = text.len - n_cjk;
-        const tokens = @as(u32, @intFromFloat(@as(f64, @floatFromInt(n_ascii)) / 3.8))
-                     + @as(u32, @intFromFloat(@as(f64, @floatFromInt(n_cjk)) / 1.4));
-        self.cachePut(text, tokens);
-        return tokens;
-    }
-
-    pub fn estimateMessage(msg: *Message) u32;  // content + tool_use overhead (~40 tok/call)
-    pub fn estimateHistory(hist: *History) u32;
-};
+pub fn estimate(self: *TokenEstimator, text: []const u8) u32
+pub fn estimateMessage(self: *TokenEstimator, msg: *const proto.Message) u32
 ```
 
-Sai số chấp nhận được: ±15%. Kết hợp với **safety margin 15%** khi so với budget là đủ an toàn.
+### 4.2. Compaction — DROP-ALL (bài học lớn nhất của v0.2)
 
-### 4.2. ContextWindow — 4 tiers (`window.zig`)
+**Thiết kế v0.1 (SAI, đã bỏ):** giữ N messages gần nhất (~60% window), phần cũ thành summary.
+**Thực tế:** với window lớn, 60% giữ lại vẫn vượt ngưỡng 85% → compact chạy mỗi vòng lặp
+(LLM call mỗi iteration) mà history không bao giờ giảm → vòng lặp compact vô hạn, đốt API.
 
-Thay thế quan niệm "history = 1 list phẳng". Mỗi message được gán vào 1 tier:
-
-| Tier | Vai trò | Biên giới |
-|---|---|---|
-| **PINNED** | System prompt, memory block, ràng buộc user, @file quan trọng | Không bao giờ bị compact. Budget riêng. |
-| **RECENT** | N message gần nhất nguyên vẹn | Chiếm phần lớn budget còn lại |
-| **SUMMARIZED** | History cũ đã được LLM tóm tắt thành 1 summary message có cấu trúc | 1 message, ~800–2000 token |
-| **ARCHIVED** | Message cũ hơn nữa, ghi ra disk, out of context | Không tiêu tốn budget |
-
-**Compaction algorithm** (chạy trước mỗi lần call backend, trong `pre-prompt` hook slot):
+**Cơ chế thực tế (`compactMemAct`):** khi vượt ngưỡng, history thu về đúng 2 messages:
 
 ```
-budget = context_window - reserved_for_response - pinned_tokens
-if estimate(recent) > budget * 0.85:          # sớm, không đợi tràn
-    split = tìm điểm cắt ở tool-boundary gần budget * 0.6
-    summary_old = llm.summarize(recent[0..split], last_summary)   # gộp dồn
-    move recent[0..split] -> archived (append JSONL)
-    recent = [summary_old] ++ recent[split..]
+trước: [prompt gốc, (summary cũ?), msgs... 40+ messages]
+sau:   [prompt gốc (tier .pinned), summary mới (role .user, tier .summarized)]
 ```
 
-Điểm quan trọng:
-- **Cắt tại tool-call boundary**, không cắt giữa một cặp `tool_use`/`tool_result` (gây lỗi protocol với Claude/OpenAI).
-- Summary **dồn tích lũy** (mỗi lần compact gộp với summary cũ) → context dài hàng trăm iteration chỉ tốn ~2K token summary.
-- `history.compact()/compactWithSummary()` hiện có được deprecate, thay bằng `window.compactWith(estimator, budget)`.
+- **msgs[0] (user prompt gốc) không bao giờ bị drop** — invariant của mọi lần compact.
+- Summary mới **merge** summary cũ (nếu msgs[1] đã là tier `.summarized`) → dồn tích lũy,
+  context dài bao nhiêu iteration cũng chỉ tốn 1 summary message.
+- Trạng thái "đang ở bước nào" nằm trong `task_state`/`next_step` của summary nên model
+  tiếp tục đúng chỗ mà không cần message gốc.
+- Guard trong agent loop: chỉ compact khi `msgs.len > 2` — history đã ở dạng tối thiểu
+  `[prompt, summary]` mà vẫn vượt ngưỡng (prompt/summary quá lớn) thì không compact nữa,
+  chỉ log cảnh báo, tránh gọi LLM summary vô nghĩa mỗi vòng.
 
-### 4.3. Cấu trúc summary có stencil
+**Tool-boundary split (`findSplitIndex`)** vẫn được giữ trong `window.zig` cho tương lai
+(tách cặp `tool_use`/`tool_result`), nhưng drop-all hiện tại khiến nó không còn call-site
+trong agent loop — an toàn tuyệt đối về protocol vì không bao giờ chừa lại tool_use mồ côi.
 
-Summary không phải văn bản tự do — dùng stencil để LLM điền, đảm bảo machine-parseable:
+### 4.3. Summary stencil — như thiết kế, đã triển khai
+
+LLM nhận prompt yêu cầu xuất JSON theo stencil:
 
 ```json
 {
   "type": "context_summary",
-  "iteration_range": [4, 27],
-  "task_state": "đang refactor src/core/agent.zig, xong 60%",
-  "decisions": [
-    "Dùng union-tagged Backend thay vì interface vtable",
-    "Giữ QuickJS engine, không thêm Lua"
-  ],
-  "open_questions": ["chưa xử lý streaming cho ollama backend"],
-  "learned_errors": ["build.zig: dependency 'zap' cần version >=0.9"],
-  "files_touched": ["src/core/agent.zig", "src/core/history.zig"],
-  "next_step": "wire memact vào pre-prompt hook"
+  "iteration_range": [1, 99],
+  "task_state": "mô tả tiến độ",
+  "decisions": ["quyết định 1"],
+  "open_questions": [],
+  "learned_errors": [],
+  "files_touched": [],
+  "next_step": "bước tiếp theo"
 }
 ```
 
-### 4.4. MemoryStore (`store.zig`) — event-log JSONL
+- Summary được bọc marker `[MemAct Context Summary]\n{json}` khi chèn vào history.
+- Prompt tường minh: "hãy gộp (merge) nội dung summary cũ vào summary mới" → dồn tích lũy.
+- **Fallback**: LLM không trả về text block nào → dùng `history.compact()` cũ (giữ nửa sau,
+  không summary). Đường fallback này không theo stencil — chấp nhận được vì hiếm, nhưng là
+  điểm yếu đã biết.
 
-Tái dùng pattern của `artifacts.zig` (thư mục + metadata), nhưng là **append-only event log**:
+### 4.4. Role-fix Claude 400 (use case thực tế, không có trong v0.1)
+
+Session cũ compact kiểu cũ có thể bắt đầu bằng assistant message → Claude trả 400
+"first message must be user". Xử lý:
+
+- `ensureClaudeCompatible()`: đổi role message đầu thành `.user` nếu cần.
+- Agent loop phát hiện HTTP 400 role/first-message → gọi role-fix → retry tối đa 2 lần/turn
+  (`role_fix_attempts`).
+
+### 4.5. MemoryStore (`store.zig`) — code hoàn chỉnh, chưa wire
 
 ```
 ~/.mini/memory/
   <project_hash>/
     memory.jsonl          # append-only, mỗi dòng 1 event
-    index.json            # materialized view: type → [ids], keyword → [ids]
+    index.json            # materialized view: entries hiện hành (có áp supersedes)
 ```
 
-3 loại memory:
-
-| Type | Ví dụ | TTL | Extraction trigger |
-|---|---|---|---|
-| `semantic` | "Project dùng Zig 0.13 + Build.zig, test bằng `zig build test`" | vĩnh viễn | post-response hook, batch cuối session |
-| `episodic` | "Session 2025-01-15: đã fix leak trong ollama streaming" | 30 ngày | end-of-session |
-| `project_state` | "Branch `feat/memact`, đang dở milestone M2" | tới khi bị update | mỗi pre-prompt |
-
-Event schema (1 dòng JSONL):
+Event schema (đã implement đủ field):
 
 ```json
 {
-  "id": "mem_a1b2c3",
-  "ts": "2025-06-01T10:00:00Z",
+  "id": "mem_<hex ts>_<hex counter>_<hex pid>",
+  "ts": 1692700000000,
   "type": "semantic",
   "content": "…",
   "keywords": ["zig", "build", "test"],
@@ -188,123 +189,133 @@ Event schema (1 dòng JSONL):
   "confidence": 0.9,
   "supersedes": "mem_older_id",
   "access_count": 3,
-  "last_access": "…"
+  "last_access": 1692700000000
 }
 ```
 
-Quy tắc:
-- `supersedes`: memory mới cùng chủ đề **thay thế** cũ trong index (giống compaction của event-sourcing) — không xóa dòng cũ, giữ audit trail.
-- Extraction prompt chạy **async/batch** (cuối session hoặc N response 1 lần) để không thêm latency vào mỗi turn.
-- Extraction là 1 LLM call riêng, rẻ (model nhỏ nếu backend hỗ trợ dual-model).
+3 loại memory giữ nguyên: `semantic` (vĩnh viễn), `episodic` (30 ngày),
+`project_state` (tới khi bị supersedes).
 
-### 4.5. Retriever (`retrieve.zig`) — scoring & injection
+Quy tắc supersedes giữ nguyên: entry mới thay thế entry cũ trong index, không xóa dòng cũ
+trong JSONL (audit trail).
 
-Score mỗi memory khi build system prompt:
-
-```
-score = 2.0 * keyword_overlap(last_user_msg)
-      + 1.0 * recency_decay(last_access, half_life=7d)
-      + 0.5 * min(access_count, 5)/5
-      + 1.5 * (type == project_state)      # luôn ưu tiên state hiện tại
-```
-
-Top-K (K=8, tunable) được render vào **memory block** trong system prompt:
-
-```
-<memory>
-<project_state priority="high">…</project_state>
-<semantic>…</semantic>
-<episodic>…</episodic>
-</memory>
-
-<context_summary>…summary dồn từ window tier…</context_summary>
-```
-
-Memory block thuộc tier PINNED → không bao giờ bị compact. Budget cho memory block: ~2000 token, trừ đi khi tính budget của RECENT.
+**Thay đổi so với v0.1:** bỏ hàm scoring của Retriever. Khi M4 được làm, việc chọn memory
+inject vào system prompt chỉ là: load index → lọc theo type + `confidence >= 0.7` → sort
+theo `ts` → cắt Top-K. Không cần keyword-overlap/recency/access_count scoring — `matchKeyword()`
+giữ lại trong `store.zig` như tiện ích lọc thô, không phải thành phần kiến trúc.
 
 ### 4.6. Wire vào hệ thống hiện có
 
-**hooks.zig** — thêm 2 hook point (dùng cơ chế dispatch shell + env vars sẵn có):
-
-| Hook | Timing | Env vars |
+| Hook / Event | Thiết kế v0.1 | Thực tế |
 |---|---|---|
-| `pre-context-build` | trước khi assemble messages cho backend | `MINI_CTX_BUDGET`, `MINI_CTX_USED` |
-| `post-session-end` | khi session kết thúc | `MINI_SESSION_FILE`, `MINI_MEMORY_DIR` |
+| `pre-prompt` dispatch | (đã có sẵn) | ✅ dùng làm timing kiểm tra compact |
+| `pre-context-build` hook + `MINI_CTX_BUDGET`/`MINI_CTX_USED` | hook mới | ⚠️ payload fields + env export đã có trong `hooks.zig`, **chưa dispatch** — cần khi làm M4 |
+| `post-session-end` hook + `MINI_SESSION_FILE`/`MINI_MEMORY_DIR` | hook mới | ⚠️ idem, infra sẵn sàng, chưa có call-site |
+| Act event `memact_compacted` | 1 trong 3 events | ✅ có trong `journal.zig`; `memact_memory_extracted`, `memact_memory_recalled` chờ M4/M5 |
+| Field `tier` trong `Message` | optional, non-breaking | ✅ `protocol.zig` (`pinned/recent/summarized/archived`, null = tạo kiểu cũ) |
+| Archived JSONL (undo log cho Act rollback) | message cũ ghi ra disk | ❌ chưa làm — drop-all hiện tại mất message gốc vĩnh viễn sau compact |
 
-**RFC-002 Act integration**: MemAct phát event `memact.compacted`, `memact.memory_extracted`, `memact.memory_recalled` vào event bus của Act model → có thể rollback/mirror/x-replay việc compact như mọi action khác. Compaction trở thành **observable & reversible** (archived JSONL chính là undo log).
-
-**history.zig**: giữ làm storage layer, thêm field `tier` vào `Message`. Không breaking change với session file format cũ (field mới optional).
+**Kiểm soát rollback:** `History.last_compaction_act_id` ghi lại Act ID lần compact gần nhất
+để block rollback vượt quá mốc này (history đã bị drop, không dựng lại được từ RAM).
 
 ---
 
 ## 5. Configuration
 
-Env vars mới:
+Env vars (đã parse đủ trong `config.zig`):
 
 ```bash
 MINI_CONTEXT_WINDOW=128000        # override auto-detect từ backend
-MINI_CTX_SAFETY_MARGIN=0.15       # % budget giữ cho response
-MINI_CTX_COMPACT_THRESHOLD=0.85   # compact khi recent > 85% budget
-MINI_MEMACT_ENABLED=1             # tổng switch
-MINI_MEMACT_MEMORY_DIR=~/.mini/memory
-MINI_MEMACT_TOP_K=8               # số memory inject vào prompt
-MINI_MEMACT_MEMORY_BUDGET=2000    # token budget cho memory block
-MINI_MEMACT_EXTRACT=async         # async | sync | off
+MINI_CTX_SAFETY_MARGIN=0.15       # phần budget giữ cho response
+MINI_CTX_COMPACT_THRESHOLD=0.85   # compact khi recent > 85% available
+MINI_MEMACT_ENABLED=1             # "0" → fallback về compact kiểu cũ theo message count
+MINI_MEMACT_TOP_K=8               # (M4) số memory inject vào prompt
+MINI_MEMACT_MEMORY_BUDGET=2000    # (M4) token budget cho memory block
+MINI_MEMACT_EXTRACT=async         # (M5) async | sync | off
+MINI_MEMORY_DIR=~/.mini/memory    # (M3) thư mục memory store
 ```
 
-Auto-detect window theo backend khi không set: `openai → 128000`, `claude → 200000`, `ollama → query /api/tags hoặc default 8192`.
+Auto-detect window theo backend khi không set: `openai → 128000`, `claude → 200000`,
+`ollama → query /api/tags hoặc default 8192`. ✅ đã implement.
+
+Ghi chú thực tế: `MINI_MEMACT_TOP_K`, `MINI_MEMACT_MEMORY_BUDGET`, `MINI_MEMACT_EXTRACT`,
+`MINI_MEMORY_DIR` hiện là **dead config** — parse xong chưa ai đọc; sẽ sống lại khi M3/M4/M5
+được wire.
 
 ---
 
-## 6. Milestones
+## 6. Milestones — cập nhật theo commit thực tế
 
-| M | Nội dung | Deliverable | Ước tính |
+| M | Nội dung | Trạng thái | Commit |
 |---|---|---|---|
-| **M1** | TokenEstimator + ContextWindow 4 tiers, thay `needsCompaction` bằng token-based; wire vào agent loop | Compact tự chạy, cắt đúng boundary | 1–2 ngày |
-| **M2** | Structured summary stencil + LLM summarization dồn tích lũy | `context_summary` message hoạt động | 1 ngày |
-| **M3** | MemoryStore JSONL + index + project-hash scoping | Memory persist xuyên session | 1–2 ngày |
-| **M4** | Retriever scoring + injection vào system prompt (memory block) | Auto-recall khi start session mới | 1 ngày |
-| **M5** | Extraction pipeline (post-session-end hook) + Act events + docs | End-to-end: session N nhớ session N−1 | 1–2 ngày |
+| **M1** | TokenEstimator + ContextWindow token-based + wire vào agent loop | ✅ xong | `774faad` |
+| **M2a** | Giữ prompt gốc qua compact + role-fix Claude 400 + guards | ✅ xong | `1c8e721` |
+| **M2b** | Drop-all thay sliding window + summary dồn tích lũy | ✅ xong | `8d782e9` |
+| **M3** | MemoryStore JSONL + index + supersedes | ⚠️ code xong (`373beea`), **chưa wire vào agent** | — |
+| **M4** | Inject memory vào system prompt (không scoring — chỉ lọc + Top-K) | ❌ chưa làm | — |
+| **M5** | Extraction pipeline + hook `pre-context-build`/`post-session-end` + Act events memory | ❌ chưa làm | — |
 
-M1+M2 độc lập với M3–M5: có thể ship context management trước, memory sau.
+M1+M2 đã ship: context management chạy production. M3–M5 là memory cross-session, độc lập,
+làm sau.
 
 ---
 
 ## 7. Acceptance criteria
 
-1. **Token safety**: chạy 200+ iterations với tool calls dày đặc (mỗi turn >5K token) không bao giờ gặp context-length error từ backend.
-2. **No mid-pair split**: không có `tool_use` nào bị tách khỏi `tool_result` sau compact (property test với generator message ngẫu nhiên).
-3. **Context continuity**: sau compact, agent vẫn trả lời đúng câu hỏi về quyết định ở phần đã summarize (eval scripted: đặt fact ở iteration 5, hỏi lại ở iteration 80).
-4. **Cross-session recall**: session mới trong cùng project → memory block chứa project_state + ≥1 semantic memory relevant.
-5. **Latency**: memory retrieval + scoring <5ms cho 1.000 memory entries (keyword-based, no LLM call).
-6. **Hook compat**: tất cả hook hiện có vẫn dispatch đúng; `MINI_MEMACT_ENABLED=0` tắt hoàn toàn, behavior fallback = hiện trạng.
-7. **Disk format**: memory.jsonl đọc lại được bằng `jq`, index.json rebuild được từ jsonl (idempotent).
+Đã đạt:
+
+1. ✅ **Token safety** — compact token-based với safety margin 15%, chạy trước mỗi backend call.
+2. ✅ **No mid-pair split** — drop-all không chừa lại `tool_use` mồ côi (an toàn tuyệt đối;
+   boundary-split giữ lại trong `window.zig` cho tương lai).
+3. ✅ **Context continuity** — summary stencil `task_state`/`next_step` + dồn tích lũy; unit
+   test xác nhận msgs[0] nguyên vẹn qua nhiều lần compact.
+4. ✅ **Hook compat** — `MINI_MEMACT_ENABLED=0` fallback đúng về behavior cũ (compact theo
+   message count); 4 hook hiện có dispatch đúng.
+5. ✅ **Claude 400 role-fix** — ensureClaudeCompatible + retry 2 lần/turn.
+
+Chưa đạt (chờ M3/M4/M5):
+
+6. ⬜ **Cross-session recall** — session mới cùng project → memory block chứa project_state.
+7. ⬜ **Disk format** — memory.jsonl đọc được bằng `jq`, index rebuild từ jsonl (idempotent)
+   — logic có trong `store.zig` kèm unit test, nhưng chưa chạy end-to-end.
+8. ⬜ **Latency** — retrieval <5ms/1.000 entries — chuẩn bị kiểm chứng khi M4 wire.
+
+Kiểm chứng hiện tại: `zig build test` — 40/40 pass, trong đó 14 test thuộc memact/history
+(tokens 1, window 7, store 5, history 4).
 
 ---
 
-## 8. Risks & mitigation
+## 8. Risks & mitigation — cập nhật
 
 | Rủi ro | Mitigation |
 |---|---|
-| Token estimate sai → tràn window thật | safety margin 15% + auto-đo từ error response backend để hiệu chỉnh heuristic |
-| Summary LLM hallucination làm hỏng context | stencil bắt buộc + chỉ summarize facts/tool results, không suy diễn; summary luôn kèm `iteration_range` để user audit |
-| Extraction tốn thêm LLM call | batch async cuối session; `MINI_MEMACT_EXTRACT=off` cho môi trường nghèo |
-| Memory stale gây nhiễu prompt | `supersedes` + recency decay + confidence threshold 0.7 |
-| Keyword retrieval kém với từ đồng nghĩa | chấp nhận v1; thiết kế interface `Retriever` để swap sang embedding ở v2 không đổi call-site |
+| Token estimate sai → tràn window thật | safety margin 15%; guard `msgs.len > 2` chặn compact lặp vô hạn kể cả khi estimate lệch |
+| Summary LLM hallucination làm hỏng context | stencil bắt buộc + merge tường minh trong prompt; summary kèm `iteration_range` để audit |
+| LLM summary không trả text → fallback `compact()` cũ mất stencil | chấp nhận (hiếm); cải thiện sau bằng retry hoặc dùng block cuối bất kỳ |
+| Drop-all mất message gốc vĩnh viễn (không undo log) | `last_compaction_act_id` chặn rollback vượt mốc; archived JSONL là việc còn thiếu nếu cần reversible hoàn toàn |
+| Memory stale gây nhiễu prompt | `supersedes` + confidence threshold 0.7 (khi M4 wire) |
+| Dead config gây hiểu nhầm đã bật memory | §5 ghi rõ config nào đang sống; giữ lại để M3–M5 dùng lại nguyên |
 
 ---
 
 ## 9. Alternatives considered
 
-1. **Dùng tiktoken-clTokenCount WASM** — chính xác hơn nhưng thêm ~2MB binary + init cost; heuristic + margin đủ cho mục tiêu "không tràn".
-2. **SQLite thay JSONL** — query mạnh hơn nhưng thêm dependency, khó đọc bằng tool Unix; JSONL + index materialized đủ cho quy mô <10K entries/project.
-3. **RAG với embedding local** — đúng hướng v2 nhưng blocking cho v1 (build complexity, model download).
+1. **tiktoken WASM tokenizer** — chính xác hơn nhưng +2MB binary + init cost; heuristic + margin đủ.
+2. **SQLite thay JSONL** — query mạnh hơn nhưng thêm dependency; JSONL + index đủ cho <10K entries.
+3. **RAG với embedding local** — đúng hướng v2, blocking cho v1.
+4. **(Mới v0.2) Giữ sliding window + hạ threshold** — đã thử trong đầu: chỉ đổi "vòng lặp
+   compact" thành "compact sớm hơn nhưng vẫn lặp"; gốc vấn đề là phần giữ lại tỷ lệ thuận
+   với window. Drop-all giải quyết triệt để.
 
 ---
 
 ## 10. Future work (v2+)
 
-- Embedding-based retrieval (`all-MiniLM` qua ONNX), giữ keyword làm hybrid rank.
+- Wire MemoryStore vào agent loop (M3): init theo project-hash, persist cuối session.
+- Inject memory block vào system prompt (M4): lọc + Top-K, không scoring.
+- Dispatch `pre-context-build` / `post-session-end` hooks; Act events memory (M5).
+- Archived JSONL khi compact — biến drop-all thành reversible (undo log cho Act rollback).
+- Embedding-based retrieval nếu quy mô memory vượt ~1.000 entries/project (khi đó scoring
+  mới trở lại có ý nghĩa).
 - Memory inspector CLI: `mini memory list|prune|export`.
-- User-editable memory (như CLAUDE.md) — file `MINI.md` tự động vào tier PINNED.
-- Multi-agent shared memory namespace.
+- User-editable memory — file `MINI.md` tự động vào tier PINNED.
