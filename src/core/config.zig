@@ -235,30 +235,51 @@ pub const Config = struct {
 const SpResult = struct { buf: ?[]u8, text: []const u8 };
 
 fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, io: std.Io) SpResult {
-    const path = env_map.get("MINI_SYSTEM_FILE") orelse
-        return .{ .buf = null, .text = Config.default_system_prompt };
+    var base_buf: ?[]u8 = null;
+    var base_text: []const u8 = Config.default_system_prompt;
+
+    if (env_map.get("MINI_SYSTEM_FILE")) |path| {
+        const cwd = std.Io.Dir.cwd();
+        if (cwd.openFile(io, path, .{})) |file| {
+            defer file.close(io);
+            if (file.stat(io)) |stat| {
+                if (stat.size > 0 and stat.size <= 64 * 1024) {
+                    if (alloc.alloc(u8, @intCast(stat.size))) |buf| {
+                        if (utils.readAll(io, file, buf)) |n| {
+                            base_buf = buf;
+                            base_text = buf[0..n];
+                            main.stderrPrint("[config] System prompt: {s} ({d} bytes)\n", .{ path, n });
+                        } else |_| {
+                            alloc.free(buf);
+                        }
+                    } else |_| {}
+                }
+            } else |_| {}
+        } else |_| {
+            main.stderrPrint("[config] Không mở được system prompt: {s}, dùng default.\n", .{path});
+        }
+    }
 
     const cwd = std.Io.Dir.cwd();
-    const file = cwd.openFile(io, path, .{}) catch {
-        main.stderrPrint("[config] Không mở được system prompt: {s}, dùng default.\n", .{path});
-        return .{ .buf = null, .text = Config.default_system_prompt };
+    const agents_md_file = cwd.openFile(io, "AGENTS.md", .{}) catch {
+        return .{ .buf = base_buf, .text = base_text };
     };
-    defer file.close(io);
+    defer agents_md_file.close(io);
 
-    const stat = file.stat(io) catch return .{ .buf = null, .text = Config.default_system_prompt };
-    if (stat.size == 0 or stat.size > 64 * 1024)
-        return .{ .buf = null, .text = Config.default_system_prompt };
+    const stat = agents_md_file.stat(io) catch return .{ .buf = base_buf, .text = base_text };
+    if (stat.size == 0 or stat.size > 128 * 1024) return .{ .buf = base_buf, .text = base_text };
 
-    const buf = alloc.alloc(u8, @intCast(stat.size)) catch
-        return .{ .buf = null, .text = Config.default_system_prompt };
+    const agents_buf = alloc.alloc(u8, @intCast(stat.size)) catch return .{ .buf = base_buf, .text = base_text };
+    defer alloc.free(agents_buf);
 
-    const n = utils.readAll(io, file, buf) catch {
-        alloc.free(buf);
-        return .{ .buf = null, .text = Config.default_system_prompt };
-    };
+    const n = utils.readAll(io, agents_md_file, agents_buf) catch return .{ .buf = base_buf, .text = base_text };
+    const agents_text = agents_buf[0..n];
 
-    main.stderrPrint("[config] System prompt: {s} ({d} bytes)\n", .{ path, n });
-    return .{ .buf = buf, .text = buf[0..n] };
+    const combined_text = std.fmt.allocPrint(alloc, "{s}\n\n<RULE[AGENTS.md]>\n{s}\n</RULE[AGENTS.md]>\n", .{ base_text, agents_text }) catch return .{ .buf = base_buf, .text = base_text };
+
+    if (base_buf) |b| alloc.free(b);
+    main.stderrPrint("[config] Loaded AGENTS.md ({d} bytes)\n", .{n});
+    return .{ .buf = combined_text, .text = combined_text };
 }
 
 // ---------------------------------------------------------------------------

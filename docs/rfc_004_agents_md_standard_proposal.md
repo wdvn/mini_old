@@ -66,7 +66,7 @@ Quy ước mới được ghi vào AGENTS.md: *"Proposals/design docs đặt ở
 - [x] **Phase 0** — Tạo `AGENTS.md` root (done).
 - [ ] **Phase 1** — Review nội dung bởi maintainer, chốt v0.1.
 - [ ] **Phase 2** (optional) — Nested `AGENTS.md` cho subfolder phức tạp khi chúng to lên (ví dụ `src/runtime/AGENTS.md` mô tả chi tiết JS bindings), chỉ làm khi độ phức tạp thực sự cần.
-- [ ] **Phase 3** (optional) — mini-agent tự động đọc `AGENTS.md` của project đích khi chạy trong workspace người dùng (tích hợp vào system prompt / context bootstrapping). Đây là điểm nâng giá trị lớn nhất: mini vừa **tuân thủ** chuẩn (có AGENTS.md riêng), vừa **tiêu thụ** chuẩn khi làm việc trên repo khác.
+- [x] **Phase 3** (optional) — mini-agent tự động đọc `AGENTS.md` của project đích khi chạy trong workspace người dùng (tích hợp vào system prompt / context bootstrapping). Đây là điểm nâng giá trị lớn nhất: mini vừa **tuân thủ** chuẩn (có AGENTS.md riêng), vừa **tiêu thụ** chuẩn khi làm việc trên repo khác. *Ghi chú: nội dung AGENTS.md khi nạp vào system prompt thuộc tier **PINNED** theo mô hình context của RFC-003 (như future work `MINI.md` của RFC-003 đã dự kiến).*
 
 ## 4. Rủi ro & lưu ý
 

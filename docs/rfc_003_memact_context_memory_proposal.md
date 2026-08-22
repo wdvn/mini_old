@@ -5,6 +5,7 @@
 | RFC | 003 |
 | Tên | MemAct: Context Window & Memory Management |
 | Trạng thái | Draft — chờ review |
+| Vai trò | **RFC chuẩn (normative)**: mọi RFC khác khi nói về history / context / memory đều quy chiếu về đây. Thuật ngữ chuẩn: conversation history (4 tier PINNED/RECENT/SUMMARIZED/ARCHIVED), compaction (token-aware, tool-boundary), memory (semantic/episodic/project_state). Riêng **prompt input history** của editor (RFC-000) là khái niệm độc lập, không thuộc phạm vi RFC này. |
 | Phiên bản | 0.1 |
 | Phụ thuộc | RFC-001 (Code-Centric QuickJS), RFC-002 (Event-Driven Act) |
 | Tác giả | mini-agent |

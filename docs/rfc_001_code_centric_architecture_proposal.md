@@ -283,6 +283,8 @@ Yếu tố cốt lõi của kiến trúc CodeAct là khả năng **tự debug v�
 
 ## 8. TỰ ĐỘNG THEO DÕI NGỮ CẢNH & BỘ NHỚ DÀI HẠN (OPENVIKING HOOK PATTERN)
 
+> **Phạm vi**: Về quản lý context window, compaction và long-term memory, RFC-003 (MemAct) là **chuẩn normative**. Mục này chỉ mô tả **tầng transport/bridge OpenViking** — một backend memory bên ngoài, bổ sung (không thay thế) MemoryStore của RFC-003. Nếu bridge OpenViking không khả dụng, mini vẫn có memory đầy đủ qua RFC-003.
+
 Để khắc phục nhược điểm mất ngữ cảnh khi History bị compact (`DEFAULT_MAX_MESSAGES = 40`), `mini` tích hợp sâu với **OpenViking Context Database** thông qua hệ thống **Lifecycle Hooks** (`src/hooks.zig`):
 
 ```mermaid

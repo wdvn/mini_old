@@ -94,7 +94,7 @@ Không có hệ thống nào không lỗi. Trong một task chạy dài (Long-Ho
 | **Provider Overloaded (500/502/503)** | Server AI gặp sự cố hoặc timeout kết nối mạng | - Ghi Event `LLMProviderError`.<br>- Thử lại với cơ chế retry có timeout.<br>- Nếu sau $N$ lần vẫn sập $\rightarrow$ Kích hoạt Fallback sang Backup Model (ví dụ OpenAI $\to$ Claude hoặc local Ollama) hoặc `Yield` chờ mạng. |
 | **Malformed Tool Call / Invalid JSON** | LLM sinh JSON thiếu dấu ngoặc, sai schema, hoặc tên tool không tồn tại | - Ghi Event `LLMOutputMalformed`.<br>- **Self-Correction Feedback**: Inject ngay vào context: `"[System Error: Invalid Tool Call JSON: {err}. Please output valid JSON format.]"`.<br>- LLM tự động sửa lại cú pháp ở lượt thử tiếp theo (tối đa 3 lần). |
 | **Output bị ngắt cụt (Max Tokens Truncation)** | LLM sinh phản hồi quá dài vượt `max_tokens` dẫn đến JSON bị cắt ngang | - Ghi Event `LLMOutputTruncated`.<br>- Yêu cầu LLM chia nhỏ nội dung hoặc tiếp tục sinh phần còn lại. |
-| **Context Window Exceeded (400 Context Overflow)** | Trajectory quá dài vượt quá context window của model | - Ghi Event `ContextOverflowDetected`.<br>- **Emergency Context Compaction**: Dùng State Projection nén ngay lập tức các Acts cũ, giải phóng 70-80% token, rồi gọi lại LLM. |
+| **Context Window Exceeded (400 Context Overflow)** | Trajectory quá dài vượt quá context window của model | - Ghi Event `ContextOverflowDetected`.<br>- **Emergency Context Compaction**: gọi `window.compactWith()` của **RFC-003** (đã chạy proactive ở ngưỡng 85% nên nhánh này chỉ là fallback); guard: nếu compaction không giảm đủ budget → abort act, không retry vô hạn. |
 
 ---
 
@@ -405,6 +405,8 @@ Mục đích 2 của proposal ("Rollback chính xác cả History") — **chưa 
 ### 7.3. Mâu thuẫn chưa xử lý: Rollback vs Compaction
 
 `History.compactWithSummary()` **xóa vĩnh viễn** messages cũ và thay bằng summary (history.zig:251–267). Trong task dài, compaction chắc chắn xảy ra trước khi rollback.
+
+> **Cập nhật**: RFC-003 giải quyết mâu thuẫn này — messages bị compact chuyển sang tier **ARCHIVED** ghi ra disk (JSONL append-only), không bị xóa. Archived JSONL chính là undo log cho rollback: kèm checkpoint đánh dấu "last compactable point", rollback giới hạn về mốc checkpoint gần nhất (điều kiện #4 của mục 7.9 đã thỏa). `window.compactWith()` của RFC-003 thay thế `performEmergencyCompaction()` tự chế.
 
 Hệ quả:
 - Sau compaction, "mốc Act 30" không còn tồn tại trong History → rollback về Act 30 bất khả thi.

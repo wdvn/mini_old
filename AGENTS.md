@@ -38,7 +38,7 @@ test*.zig             — standalone test scratch files (không thuộc build ch
 - Mỗi module `.zig` có doc-comment `//!` mô tả trách nhiệm ở đầu file.
 - Không thêm dependency ngoài nếu chưa được thảo luận trong proposal — nếu cần, mở proposal trước.
 - File `test*.zig` ở root là scratch experiments, không xóa, không đưa vào build.
-- Proposals/design docs đặt ở `docs/`, tên file snake_case: `*_proposal.md`.
+- Proposals/design docs đặt ở `docs/`, format: `rfc_NNN_<tên>_proposal.md` (RFC đánh số tăng dần, snake_case; ví dụ `rfc_005_agent_folder_proposal.md`). Doc tham khảo/thuần kiến thức (không phải proposal) giữ tên snake_case thường.
 
 ## Lưu ý kiến trúc
 

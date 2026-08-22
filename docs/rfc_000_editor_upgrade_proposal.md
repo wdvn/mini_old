@@ -39,7 +39,7 @@ Editor hiện tại là **single-line, byte-based**:
 | 2 | **Buffer động** | `ArrayList(u8)` thay `[8192]u8` | Dễ | 🔴 P0 |
 | 3 | **Word motion** | word_left/right, delete_word_left/right, text_boundaries | Dễ | 🔴 P0 |
 | 4 | **Multiline composer** | Alt+Enter insert_newline, visual_up/down, page_up/down, paragraph_up/down, draft navigation, preferred-column, composer_line_continuation (backslash) | Khó | 🔴 P0 |
-| 5 | **Persistent history** | Lưu JSONL ra disk: text + pasted blocks + skill tokens; Ctrl+P/N | Trung bình | 🟠 P1 |
+| 5 | **Persistent history** | Lưu JSONL ra disk: text + pasted blocks + skill tokens; Ctrl+P/N. *Ghi chú: đây là **prompt input history** (những gì user gõ vào composer, theo mô hình `prompt_history_store` của fx) — không phải conversation history; semantics conversation history tuân theo RFC-003.* | Trung bình | 🟠 P1 |
 | 6 | **Large-paste placeholder** | Paste >1000 chars → `[pasted block]`, expand khi submit | Trung bình | 🟠 P1 |
 | 7 | **Undo/Redo + Kill ring** | Ctrl+Z/Y edit_history snapshot; Ctrl+W/K cut, Ctrl+Y yank (ring 5 mục) | Trung bình | 🟠 P1 |
 | 8 | **Input limit + reject** | max_message_bytes, hiển thị lỗi rõ ràng thay vì truncate im lặng | Dễ | 🟠 P1 |
@@ -60,7 +60,7 @@ src/ui/
   editor.zig          → giữ làm orchestrator, nhận input event
   composer.zig        → MỚI: multiline state (dòng, cursor 2D, anchor selection)
   unicode.zig         → MỚI: display_width, grapheme iteration, tab stops
-  history.zig         → MỚI: persistent JSONL + in-memory ring
+  history.zig         → MỚI: persistent JSONL + in-memory ring (prompt input history — RFC-003 không áp dụng)
   edit_history.zig    → MỚI: undo/redo snapshots
   escape_parser.zig   → MỚI: thay thế manual escape parsing, hỗ trợ kitty protocol
   paste.zig           → MỚI: bracketed paste + placeholder + block store
