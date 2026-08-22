@@ -420,6 +420,8 @@ test {
     _ = @import("core/memact/window.zig");
     _ = @import("tooling/registry.zig");
     _ = @import("acp/server.zig");
+    _ = @import("ui/unicode.zig");
+    _ = @import("ui/history.zig");
     _ = quickjs_engine;
     _ = js_bindings;
     _ = process_manager;

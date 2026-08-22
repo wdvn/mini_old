@@ -1,7 +1,7 @@
 //! build.zig — Build system cho mini-agent.
 //!
 //! ## Targets
-//!   zig build              → zig-out/bin/mini-agent (native)
+//!   zig build              → zig-out/bin/mini (native)
 //!   zig build run          → build và chạy interactive REPL
 //!   zig build run -- -e .. → build và chạy single-shot
 //!
