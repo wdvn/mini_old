@@ -317,19 +317,30 @@ fn isCoreTool(name: []const u8) bool {
     return false;
 }
 
+/// So khớp 1 entry policy (đã trim whitespace) với tên tool.
+/// Entry kết thúc bằng '*' → wildcard prefix match trên phần trước '*'.
+/// Entry thường → exact match.
+fn matchesEntry(entry_trimmed: []const u8, name: []const u8) bool {
+    // Wildcard prefix: entry = "mcp*" match mọi name bắt đầu bằng "mcp"
+    if (entry_trimmed.len > 0 and entry_trimmed[entry_trimmed.len - 1] == '*') {
+        return std.mem.startsWith(u8, name, entry_trimmed[0 .. entry_trimmed.len - 1]);
+    }
+    return std.mem.eql(u8, entry_trimmed, name);
+}
+
 fn isPermitted(name: []const u8) bool {
     if (g_allowlist) |list| {
         // Allowlist: CHỈ cho phép những tool được liệt kê
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |entry| {
-            if (std.mem.eql(u8, std.mem.trim(u8, entry, " \t"), name)) return true;
+            if (matchesEntry(std.mem.trim(u8, entry, " \t"), name)) return true;
         }
         return false; // không có trong allowlist
     }
     if (g_blocklist) |list| {
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |entry| {
-            if (std.mem.eql(u8, std.mem.trim(u8, entry, " \t"), name)) return false;
+            if (matchesEntry(std.mem.trim(u8, entry, " \t"), name)) return false;
         }
     }
     return true;

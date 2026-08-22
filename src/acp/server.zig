@@ -134,7 +134,11 @@ pub const AcpServer = struct {
         const stdin_file = std.Io.File.stdin();
 
         while (true) {
-            const line_opt = try readLineAlloc(self.alloc, self.io, stdin_file);
+            // Xử lý client đóng stdin (EOF) như kết thúc bình thường thay vì propagate error
+            const line_opt = readLineAlloc(self.alloc, self.io, stdin_file) catch |e| switch (@as(anyerror, e)) {
+                error.EndOfStream, error.BrokenPipe => null,
+                else => return e,
+            };
             const line = line_opt orelse break;
             defer self.alloc.free(line);
 

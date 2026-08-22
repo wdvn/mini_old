@@ -127,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
     var mcp = mcp_mod.McpClientManager.init(alloc);
     defer mcp.deinit();
     if (!args.no_mcp) {
-        mcp.loadFromConfig(init.environ_map, init.io, cfg.mcp_config_path);
+        mcp.loadFromConfig(init.environ_map, init.io, args.mcp_config orelse cfg.mcp_config_path);
         tools_mod.setMcpManager(&mcp);
         if (mcp.toolCount() > 0) {
             stderrPrint("[main] MCP: {d} tools từ {d} server(s)\n", .{ mcp.toolCount(), mcp.servers.items.len });
@@ -247,6 +247,7 @@ const Args = struct {
     session_file: ?[]const u8 = null,
     acp: bool = false,
     no_mcp: bool = false,
+    mcp_config: ?[]const u8 = null,
     show_help: bool = false,
     show_version: bool = false,
 };
@@ -287,6 +288,9 @@ fn parseArgs(args: []const []const u8) !Args {
             result.acp = true;
         } else if (std.mem.eql(u8, arg, "--no-mcp")) {
             result.no_mcp = true;
+        } else if (std.mem.eql(u8, arg, "--mcp-config")) {
+            i += 1;
+            if (i < args.len) result.mcp_config = args[i];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             result.show_help = true;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
@@ -379,6 +383,7 @@ fn printHelp() void {
         \\  --model <backend>      Chọn backend: openai, claude, ollama
         \\  --hook-command <cmd>   Lệnh prehook / monitoring hook chạy trước/sau các hành động
         \\  --no-mcp               Không kết nối MCP servers
+        \\  --mcp-config <path>     Đường dẫn file mcp.json (override MINI_MCP_CONFIG)
         \\  --version, -v          In phiên bản
         \\  --help, -h             In hướng dẫn này
         \\
