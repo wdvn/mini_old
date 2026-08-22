@@ -143,6 +143,10 @@ pub const AgentLoop = struct {
     cas: cas_mod.CAS,
     /// Act Journal (RFC-002). Null nếu chưa processInput.
     journal: ?journal_mod.ActJournal = null,
+    /// HTTP code của lỗi backend gần nhất (đưa vào journal ErrorDetail).
+    last_backend_http_code: u32 = 0,
+    /// Raw body lỗi backend gần nhất (bản dupe, agent sở hữu — đưa vào journal).
+    last_backend_raw_error: ?[]u8 = null,
 
     pub const Error = error{
         LLMRateLimitExceeded,
@@ -227,6 +231,18 @@ pub const AgentLoop = struct {
         self.token_estimator.deinit();
         self.cas.deinit();
         if (self.journal) |*j| j.deinit();
+        if (self.last_backend_raw_error) |raw| self.alloc.free(raw);
+    }
+
+    /// Lưu ngữ cảnh lỗi backend gần nhất để journal recordError dùng sau đó.
+    /// Dupe raw (response bị deinit trước khi error bubble lên processInput).
+    fn setLastErrorContext(self: *AgentLoop, http_code: u32, raw: ?[]const u8) void {
+        self.last_backend_http_code = http_code;
+        if (self.last_backend_raw_error) |old| self.alloc.free(old);
+        self.last_backend_raw_error = null;
+        if (raw) |r| {
+            self.last_backend_raw_error = self.alloc.dupe(u8, r) catch null;
+        }
     }
 
     const StepResult = enum {
@@ -456,7 +472,11 @@ pub const AgentLoop = struct {
                 return .continue_loop;
             },
             .unknown => {
-                // Phân loại lỗi HTTP
+                // Phân loại lỗi HTTP. Capture ngữ cảnh trước để error bubble lên
+                // processInput vẫn ghi đủ journal (response bị deinit trên đường).
+                if (response.http_code >= 400) {
+                    self.setLastErrorContext(response.http_code, response.raw_debug_info);
+                }
                 if (response.http_code == 429) return error.LLMRateLimitExceeded;
                 if (response.http_code == 500 or response.http_code == 502 or response.http_code == 503) return error.LLMProviderUnavailable;
                 if (response.http_code == 400) {
@@ -498,6 +518,8 @@ pub const AgentLoop = struct {
                 } else {
                     main.stderrPrint("\n--- RAW BACKEND RESPONSE ---\n(Không có nội dung trả về từ server)\n----------------------------\n", .{});
                 }
+                // Đảm bảo ngữ cảnh đã capture (HTTP < 400 nhưng response rác)
+                self.setLastErrorContext(response.http_code, response.raw_debug_info);
                 return error.UnknownStopReason;
             },
         }
@@ -562,7 +584,26 @@ pub const AgentLoop = struct {
                 const result = self.executeStep(act_id, tool_defs, text_cb, think_cb) catch |e| {
                     switch (e) {
                         error.LLMRateLimitExceeded, error.LLMProviderUnavailable => {
-                            if (self.journal) |*j| j.recordEvent(self.io, act_id, .llm_call_throttled, "LLM rate limit / 503") catch {};
+                            // Journal: đủ ngữ cảnh debug — backend, model, error name,
+                            // HTTP code (classify từ response), lần thử, raw body server.
+                            if (self.journal) |*j| {
+                                const ev_type: journal_mod.ActEventType = if (e == error.LLMRateLimitExceeded)
+                                    .llm_call_throttled
+                                else
+                                    .llm_provider_error;
+                                const desc = if (e == error.LLMRateLimitExceeded)
+                                    "Rate limit (429) từ backend"
+                                else
+                                    "Backend lỗi (5xx / provider unavailable)";
+                                j.recordError(self.io, act_id, ev_type, desc, .{
+                                    .backend = self.backend.name(),
+                                    .model = self.backend.model(),
+                                    .error_name = @errorName(e),
+                                    .http_code = self.last_backend_http_code,
+                                    .attempt = rate_limit_retries + 1,
+                                    .raw_snippet = self.last_backend_raw_error,
+                                }) catch {};
+                            }
                             
                             rate_limit_retries += 1;
                             if (rate_limit_retries > 5) return e; // Giới hạn 5 lần
@@ -577,12 +618,27 @@ pub const AgentLoop = struct {
                             continue;
                         },
                         error.LLMContextWindowExceeded => {
-                            if (self.journal) |*j| j.recordEvent(self.io, act_id, .llm_context_overflow, "Context overflow") catch {};
+                            if (self.journal) |*j| j.recordError(self.io, act_id, .llm_context_overflow, "Context overflow", .{
+                                .backend = self.backend.name(),
+                                .model = self.backend.model(),
+                                .error_name = @errorName(e),
+                                .http_code = self.last_backend_http_code,
+                                .attempt = try_count + 1,
+                                .raw_snippet = self.last_backend_raw_error,
+                            }) catch {};
                             return e;
                         },
                         else => {
                             if (try_count == max_retries) {
                                 main.stderrPrint("\n[agent] Act {d} lỗi liên tiếp {d} lần. Ngắt tiến trình: {s}\n", .{ act_id, max_retries + 1, @errorName(e) });
+                                if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Act lỗi terminal — abort", .{
+                                    .backend = self.backend.name(),
+                                    .model = self.backend.model(),
+                                    .error_name = @errorName(e),
+                                    .http_code = self.last_backend_http_code,
+                                    .attempt = try_count + 1,
+                                    .raw_snippet = self.last_backend_raw_error,
+                                }) catch {};
                                 if (self.history.last_compaction_act_id < act_id) {
                                     self.history.truncate(history_len);
                                     if (self.journal) |*j| j.recordEvent(self.io, act_id, .rollback_completed, "Rollback state due to terminal error") catch {};
@@ -591,6 +647,15 @@ pub const AgentLoop = struct {
                             }
 
                             main.stderrPrint("\n[agent] Act {d} gặp sự cố ({s}). Rollback (lần {d}/{d})...\n", .{ act_id, @errorName(e), try_count + 1, max_retries });
+                            
+                            if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Act lỗi — rollback & retry", .{
+                                .backend = self.backend.name(),
+                                .model = self.backend.model(),
+                                .error_name = @errorName(e),
+                                .http_code = self.last_backend_http_code,
+                                .attempt = try_count + 1,
+                                .raw_snippet = self.last_backend_raw_error,
+                            }) catch {};
                             
                             if (self.history.last_compaction_act_id < act_id) {
                                 self.history.truncate(history_len);
@@ -697,7 +762,25 @@ pub const AgentLoop = struct {
                 if (fallback.sendMessage(system_prompt, msgs, tool_defs, text_cb, think_cb)) |resp| {
                     main.stderrPrint("[agent] Ollama fallback thành công\n", .{});
                     return resp;
-                } else |_| {}
+                } else |fb_err| {
+                    // Journal: fallback cũng thất bại — ghi cả 2 lỗi để debug
+                    // (primary + ollama fallback) trong cùng 1 event.
+                    if (self.journal) |*j| {
+                        const desc = std.fmt.allocPrint(
+                            self.alloc,
+                            "Primary {s} lỗi ({s}), fallback Ollama cũng lỗi ({s})",
+                            .{ self.backend.name(), @errorName(e), @errorName(fb_err) },
+                        ) catch "Primary + fallback đều lỗi";
+                        defer self.alloc.free(desc);
+                        j.recordError(self.io, 0, .llm_provider_error, desc, .{
+                            .backend = self.backend.name(),
+                            .model = self.backend.model(),
+                            .error_name = @errorName(fb_err),
+                            .attempt = 1,
+                            .raw_snippet = self.last_backend_raw_error,
+                        }) catch {};
+                    }
+                }
             }
             return e;
         }

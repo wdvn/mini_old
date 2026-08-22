@@ -39,6 +39,23 @@ pub const FileSnapshot = struct {
     previous_content_hash: ?[]const u8,
 };
 
+/// Chi tiết lỗi backend (RFC-002): đủ ngữ cảnh để debug sau này từ journal —
+/// backend/model nào, lỗi gì, HTTP code, lần thử thứ mấy, raw body (nếu có).
+pub const ErrorDetail = struct {
+    /// Tên backend ("openai-compat" / "claude" / "ollama").
+    backend: []const u8,
+    /// Model đang gọi.
+    model: []const u8,
+    /// Zig error name (ví dụ "LLMRateLimitExceeded").
+    error_name: []const u8,
+    /// HTTP status code (0 nếu không phải lỗi HTTP).
+    http_code: u32 = 0,
+    /// Lần thử thứ mấy trong chuỗi retry (bắt đầu từ 1).
+    attempt: usize = 1,
+    /// Raw body/response từ server, truncate ngắn để journal không phình.
+    raw_snippet: ?[]const u8 = null,
+};
+
 pub const StateDelta = struct {
     act_id: usize,
     /// File snapshot (để rollback).
@@ -51,6 +68,9 @@ pub const ActEvent = struct {
     timestamp: i64,
     description: []const u8,
     delta: ?StateDelta = null,
+    /// Chi tiết lỗi backend khi event_type là lỗi LLM/provider.
+    /// Null với các event khác để JSONL không phình.
+    error_detail: ?ErrorDetail = null,
 };
 
 pub const ActJournal = struct {
@@ -124,6 +144,35 @@ pub const ActJournal = struct {
             .delta = delta,
         });
     }
+
+    /// Ghi event lỗi backend với đầy đủ ErrorDetail để debug trong session.
+    /// `desc` mô tả ngắn (hiển thị khi scan journal), chi tiết nằm trong error_detail.
+    /// Raw snippet được truncate tại đây để không phình file JSONL.
+    pub fn recordError(
+        self: *ActJournal,
+        io: std.Io,
+        act_id: usize,
+        event_type: ActEventType,
+        desc: []const u8,
+        detail_in: ErrorDetail,
+    ) !void {
+        var detail = detail_in;
+        if (detail.raw_snippet) |raw| {
+            if (raw.len > max_raw_snippet_len) {
+                detail.raw_snippet = raw[0..max_raw_snippet_len];
+            }
+        }
+        try self.appendEvent(io, .{
+            .act_id = act_id,
+            .event_type = event_type,
+            .timestamp = utils.milliTimestamp(),
+            .description = desc,
+            .error_detail = detail,
+        });
+    }
+
+    /// Độ dài tối đa raw body lưu trong journal (kích thước bytes).
+    const max_raw_snippet_len = 2048;
 
     /// Ghi 1 dòng (đã kết thúc '\n') vào cuối file JSONL + fsync.
     /// Tạo file nếu chưa tồn tại (parent journal có thể chưa được init).
@@ -221,6 +270,44 @@ test "appendEvent mirror sang parent journal qua MINI_PARENT_JOURNAL" {
 
     std.Io.Dir.deleteFileAbsolute(io, main_path) catch {};
     std.Io.Dir.deleteFileAbsolute(io, parent_path) catch {};
+}
+
+test "recordError ghi đủ ErrorDetail vào journal JSONL" {
+    // Backend lỗi phải log đủ ngữ cảnh trong session để debug sau này
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/tmp/journal_recorderror_test.jsonl";
+    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+
+    var j = try ActJournal.init(alloc, io, path);
+    defer j.deinit();
+
+    // Raw body dài — recordError phải truncate còn max_raw_snippet_len
+    const long_raw = "x" ** 5000;
+    try j.recordError(io, 3, .llm_provider_error, "Backend lỗi (5xx / provider unavailable)", .{
+        .backend = "openai-compat",
+        .model = "gpt-4o",
+        .error_name = "LLMProviderUnavailable",
+        .http_code = 503,
+        .attempt = 2,
+        .raw_snippet = long_raw,
+    });
+
+    const content = try readWholeFile(alloc, io, path);
+    defer alloc.free(content);
+
+    // Đủ các trường debug quan trọng trong 1 dòng JSON
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"llm_provider_error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"openai-compat\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"gpt-4o\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"LLMProviderUnavailable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"http_code\":503") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"attempt\":2") != null);
+    // JSON 1 dòng + có raw snippet đã truncate
+    try std.testing.expect(std.mem.count(u8, content, "\n") == 1);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"raw_snippet\"") != null);
+    try std.testing.expect(content.len < 5000);
 }
 
 test "writeLineTo append đúng vị trí và tạo nội dung tuần tự" {
