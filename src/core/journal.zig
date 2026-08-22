@@ -1,5 +1,9 @@
 //! journal.zig — Act Journal
 //! Durable Write-Ahead Log (WAL) cho Event-Driven Act Architecture.
+//!
+//! Retention: mỗi process sinh 1 file `journal_<pid>.jsonl` trong thư mục
+//! sessions — `init` tự động prune file cũ, chỉ giữ lại `max_journal_files`
+//! file mới nhất (override bằng env `MINI_JOURNAL_KEEP`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -103,6 +107,11 @@ pub const ActJournal = struct {
             }
         }
 
+        // Prune journal cũ ngay sau khi tạo file mới của process này:
+        // mỗi process chạy sinh 1 file journal_<pid>.jsonl → nếu không prune,
+        // thư mục sessions phình nhanh (spam). Giữ lại N file mới nhất.
+        pruneOldJournals(alloc, io, path_dup);
+
         // Cache đường dẫn parent journal (subagent merge). Chỉ mirror khi hợp lệ:
         // env tồn tại, khác rỗng, và khác chính journal này (tránh self-loop).
         var parent_path: ?[]u8 = null;
@@ -117,6 +126,68 @@ pub const ActJournal = struct {
             .file_path = path_dup,
             .parent_path = parent_path,
         };
+    }
+
+    /// Số file journal tối đa giữ lại (mặc định 30, override env MINI_JOURNAL_KEEP).
+    pub const default_max_journal_files: usize = 30;
+
+    /// Prune các file `journal_*.jsonl` CÙNG thư mục với `self_path`,
+    /// giữ lại `max_journal_files` file mới nhất theo mtime.
+    /// File của process hiện tại luôn được giữ (vừa được tạo/ghi).
+    /// Best-effort: mọi lỗi bỏ qua im lặng — prune không được làm hỏng agent.
+    pub fn pruneOldJournals(alloc: Allocator, io: std.Io, self_path: []const u8) void {
+        const dir_path = std.fs.path.dirname(self_path) orelse ".";
+
+        const cwd = std.Io.Dir.cwd();
+        var dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch return;
+        defer dir.close(io);
+
+        const max_keep = blk: {
+            const s = getEnvVar("MINI_JOURNAL_KEEP") orelse break :blk default_max_journal_files;
+            const v = std.fmt.parseInt(usize, s, 10) catch break :blk default_max_journal_files;
+            break :blk if (v == 0) default_max_journal_files else v;
+        };
+
+        // Thu thập {name, mtime} của mọi journal_*.jsonl trong thư mục.
+        const Item = struct { name: []u8, mtime_ns: i96 };
+        var items: std.ArrayList(Item) = .empty;
+        defer {
+            for (items.items) |it_| alloc.free(it_.name);
+            items.deinit(alloc);
+        }
+
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.startsWith(u8, entry.name, "journal_") or !std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+            const name_dup = alloc.dupe(u8, entry.name) catch continue;
+            const mtime_ns: i96 = blk2: {
+                const st = dir.statFile(io, entry.name, .{}) catch {
+                    alloc.free(name_dup);
+                    continue;
+                };
+                break :blk2 st.mtime.nanoseconds;
+            };
+            items.append(alloc, .{ .name = name_dup, .mtime_ns = mtime_ns }) catch {
+                alloc.free(name_dup);
+                continue;
+            };
+        }
+
+        if (items.items.len <= max_keep) return;
+
+        // Sort giảm dần theo mtime (mới nhất lên đầu) — giữ `max_keep` đầu.
+        std.mem.sort(Item, items.items, {}, struct {
+            fn lt(_: void, a: Item, b: Item) bool {
+                return a.mtime_ns > b.mtime_ns;
+            }
+        }.lt);
+
+        for (items.items[max_keep..]) |old| {
+            // Không bao giờ xóa journal của process hiện tại
+            if (std.mem.eql(u8, old.name, std.fs.path.basename(self_path))) continue;
+            dir.deleteFile(io, old.name) catch {};
+        }
     }
 
     pub fn deinit(self: *ActJournal) void {
@@ -310,8 +381,67 @@ test "recordError ghi đủ ErrorDetail vào journal JSONL" {
     try std.testing.expect(content.len < 5000);
 }
 
-test "writeLineTo append đúng vị trí và tạo nội dung tuần tự" {
+test "pruneOldJournals giữ lại N file mới nhất, không xóa file hiện tại" {
     const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Thư mục test riêng — không đụng ~/.mini/sessions thật
+    var buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_journal_prune_test_{d}", .{std.os.linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, dir);
+
+    // Tạo 5 file journal cũ + 1 file "hiện tại" + 1 file không phải journal
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        var pbuf: [256]u8 = undefined;
+        const p = try std.fmt.bufPrint(&pbuf, "{s}/journal_old{s}.jsonl", .{ dir, [_]u8{'0' + @as(u8, @intCast(i))} });
+        const f = try cwd.createFile(io, p, .{});
+        f.close(io);
+        // mtime phân biệt: file i cũ hơn file i+1 (sleep nhỏ cho chắc chắn khác ns)
+        std.Io.sleep(io, .{ .nanoseconds = 2 * std.time.ns_per_ms }, .real) catch {};
+    }
+    var curbuf: [256]u8 = undefined;
+    const cur = try std.fmt.bufPrint(&curbuf, "{s}/journal_current.jsonl", .{dir});
+    {
+        const f = try cwd.createFile(io, cur, .{});
+        f.close(io);
+    }
+    var otherbuf: [256]u8 = undefined;
+    const other = try std.fmt.bufPrint(&otherbuf, "{s}/conv_data.json", .{dir});
+    {
+        const f = try cwd.createFile(io, other, .{});
+        f.close(io);
+    }
+
+    // Env override giữ 3 file
+    _ = setenv("MINI_JOURNAL_KEEP", "3", 1);
+    defer _ = unsetenv("MINI_JOURNAL_KEEP");
+
+    ActJournal.pruneOldJournals(alloc, io, cur);
+
+    // Đếm lại journal còn lại trong thư mục
+    var d2 = try cwd.openDir(io, dir, .{ .iterate = true });
+    defer d2.close(io);
+    var n: usize = 0;
+    var has_current = false;
+    var has_other = false;
+    var it2 = d2.iterate();
+    while (it2.next(io) catch null) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "journal_") and std.mem.endsWith(u8, entry.name, ".jsonl")) {
+            n += 1;
+            if (std.mem.eql(u8, entry.name, "journal_current.jsonl")) has_current = true;
+        } else if (std.mem.eql(u8, entry.name, "conv_data.json")) has_other = true;
+    }
+
+    // 5 cũ + 1 current = 6 → giữ 3; current luôn sống; file ngoài scope không đụng
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expect(has_current);
+    try std.testing.expect(has_other);
+}
+
+test "writeLineTo append đúng vị trí và tạo nội dung tuần tự" {    const alloc = std.testing.allocator;
     const io = std.testing.io;
     const path = "/tmp/journal_writeline_test.jsonl";
     std.Io.Dir.deleteFileAbsolute(io, path) catch {};
