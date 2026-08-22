@@ -58,6 +58,8 @@ fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
 const MAX_ITERATIONS = 30;
 /// Số lần retry tối đa khi gặp rate limit.
 const MAX_RATE_LIMIT_RETRIES = 5;
+/// Số lần tối đa yêu cầu model tiếp tục sau khi response bị cắt (max_tokens).
+const MAX_TOKENS_CONTINUES = 3;
 /// Thời gian chờ ban đầu khi gặp rate limit (giây).
 const RATE_LIMIT_BASE_DELAY_S: u64 = 5;
 
@@ -128,8 +130,11 @@ pub const AgentLoop = struct {
     engine: *quickjs.Engine,
     /// Đếm số lần tự sửa lỗi JavaScript liên tiếp.
     js_retry_count: usize = 0,
-    /// Đếm số lần đã thử sửa lỗi role/first-message (Claude 400) trong turn.
+    /// Đếm số lần sửa lỗi role/first-message (Claude 400) trong turn.
     role_fix_attempts: usize = 0,
+    /// Đếm số lần liên tiếp response bị cắt do max_tokens trong turn.
+    /// Vượt MAX_TOKENS_CONTINUES thì mới chấp nhận dừng.
+    max_tokens_continues: usize = 0,
     /// Trình ước lượng token (MemAct).
     token_estimator: tokens_mod.TokenEstimator,
     /// Cửa sổ ngữ cảnh (MemAct).
@@ -427,7 +432,22 @@ pub const AgentLoop = struct {
                 return .exit_loop;
             },
             .max_tokens => {
-                main.stderrPrint("\n\x1b[33m[agent] ⚠️ Cảnh báo: Đạt giới hạn max_tokens. Dừng sớm.\x1b[0m\n", .{});
+                // Response bị cắt giữa chừng. KHÔNG exit ngay — chèn observation
+                // yêu cầu model tiếp tục đúng từ chỗ dừng (không lặp lại phần đã
+                // viết) để hoàn thành khối đang dở (JS block / tool_use / văn bản).
+                self.max_tokens_continues += 1;
+                if (self.max_tokens_continues <= MAX_TOKENS_CONTINUES) {
+                    main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response bị cắt (max_tokens), yêu cầu tiếp tục ({d}/{d})...\x1b[0m\n", .{ self.max_tokens_continues, MAX_TOKENS_CONTINUES });
+                    var buf = utils.BufWriter.init(self.alloc);
+                    defer buf.deinit();
+                    try buf.print(
+                        "[System] Phản hồi vừa rồi bị cắt do đạt giới hạn max_tokens (lần {d}/{d}). Hãy tiếp tục ĐÚNG từ chỗ dừng — không lặp lại phần đã viết, không giới thiệu lại. Nếu khối ```js ... ``` hoặc tool call đang dở dang, viết tiếp phần còn lại để hoàn thành.",
+                        .{ self.max_tokens_continues, MAX_TOKENS_CONTINUES },
+                    );
+                    try self.history.addUser(buf.list.items);
+                    return .continue_loop;
+                }
+                main.stderrPrint("\n\x1b[33m[agent] ⚠️ Cảnh báo: Đạt giới hạn max_tokens sau {d} lần tiếp tục. Dừng sớm.\x1b[0m\n", .{MAX_TOKENS_CONTINUES});
                 return .exit_loop;
             },
             .tool_use => {
@@ -513,6 +533,8 @@ pub const AgentLoop = struct {
 
         // Reset bộ đếm retry sửa lỗi role cho turn mới
         self.role_fix_attempts = 0;
+        // Reset bộ đếm continue-max_tokens cho turn mới
+        self.max_tokens_continues = 0;
 
         // Lấy danh sách tools phù hợp với user message
         const tool_defs = tools_mod.getRelevantDefinitions(turn_alloc, user_text);

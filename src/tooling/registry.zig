@@ -38,6 +38,7 @@ const batch_subagent = @import("../tools/batch_subagent.zig");
 const artifact_tool = @import("../tools/artifact.zig");
 const mcp_mod = @import("mcp.zig");
 const hooks = @import("../core/hooks.zig");
+const skills_mod = @import("../core/skills.zig");
 
 // ---------------------------------------------------------------------------
 // Global state (single-threaded)
@@ -84,7 +85,7 @@ fn executeToolInternal(alloc: Allocator, io: std.Io, name: []const u8, input_jso
     if (std.mem.eql(u8, name, "artifact_write")) return artifact_tool.writeTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "artifact_read"))  return artifact_tool.readTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "artifact_list"))  return artifact_tool.listTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "skills"))        return executeSkills(alloc, input_json);
+    if (std.mem.eql(u8, name, "skills"))        return executeSkills(alloc, io, input_json);
 
     // MCP fallback: tên có dạng "server__toolname"
     if (g_mcp) |mgr| {
@@ -210,8 +211,8 @@ pub const definitions = [_]proto.ToolDefinition{
     },
     .{
         .name = "skills",
-        .description = "Xem danh sách tool đang có. operation=\"list\" để liệt kê, operation=\"detail\" với name=<tool> để xem chi tiết.",
-        .input_schema_json = \\{"type":"object","properties":{"operation":{"type":"string","enum":["list","detail"],"description":"list hoặc detail"},"name":{"type":"string","description":"Tên tool (cho detail)"}},"required":[]}
+        .description = "Xem danh sách skills (convention packages tại ~/.mini/skills) và tools. operation=\"list\" để liệt kê tất cả, operation=\"detail\" với name=<skill|tool> để xem chi tiết. Skill là các quy ước/hướng dẫn viết sẵn (SKILL.md); tool là hàm thực thi.",
+        .input_schema_json = \\{"type":"object","properties":{"operation":{"type":"string","enum":["list","detail"],"description":"list hoặc detail"},"name":{"type":"string","description":"Tên skill hoặc tool (cho detail)"}},"required":[]}
         ,
     },
     .{
@@ -350,31 +351,75 @@ fn containsCI(text: []const u8, kw: []const u8) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Skills tool (liệt kê tools)
+// Skills tool (liệt kê skills từ ~/.mini/skills + tools)
 // ---------------------------------------------------------------------------
 
-fn executeSkills(alloc: Allocator, input_json: []const u8) ![]u8 {
+/// Đọc nội dung file SKILL.md (hoặc RULES.md) của một skill.
+/// Trả về null nếu không đọc được.
+fn readSkillFile(alloc: Allocator, io: std.Io, skill_path: []const u8) ?[]u8 {
+    const cwd = std.Io.Dir.cwd();
+    const file = cwd.openFile(io, skill_path, .{}) catch return null;
+    defer file.close(io);
+    const stat = file.stat(io) catch return null;
+    if (stat.size == 0 or stat.size > 128 * 1024) return null;
+    const buf = alloc.alloc(u8, @intCast(stat.size)) catch return null;
+    const n = utils.readAll(io, file, buf) catch {
+        alloc.free(buf);
+        return null;
+    };
+    return buf[0..n];
+}
+
+fn executeSkills(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     const operation = json.findString(input_json, "operation") orelse "list";
 
     if (std.mem.eql(u8, operation, "detail")) {
         const name = json.findString(input_json, "name") orelse
             return std.fmt.allocPrint(alloc, "Lỗi: cần trường 'name' cho operation detail", .{});
+
+        // 1. Thử match skill thật trong ~/.mini/skills
+        if (skills_mod.getSkills()) |skills| {
+            for (skills) |s| {
+                if (std.mem.eql(u8, s.name, name)) {
+                    if (readSkillFile(alloc, io, s.path)) |content| {
+                        defer alloc.free(content);
+                        return std.fmt.allocPrint(alloc,
+                            "## Skill: {s}\n\nPath: `{s}`\n\n{s}",
+                            .{ s.name, s.path, content },
+                        );
+                    }
+                    return std.fmt.allocPrint(alloc, "Skill '{s}' tồn tại nhưng không đọc được `{s}`.", .{ s.name, s.path });
+                }
+            }
+        }
+
+        // 2. Fallback: match tool trong registry
         for (&definitions) |*td| {
             if (std.mem.eql(u8, td.name, name)) {
                 return std.fmt.allocPrint(alloc,
-                    "## {s}\n\n{s}\n\n**Schema:**\n```json\n{s}\n```",
+                    "## Tool: {s}\n\n{s}\n\n**Schema:**\n```json\n{s}\n```",
                     .{ td.name, td.description, td.input_schema_json },
                 );
             }
         }
-        return std.fmt.allocPrint(alloc, "Không tìm thấy tool '{s}'.", .{name});
+        return std.fmt.allocPrint(alloc, "Không tìm thấy skill hoặc tool '{s}'.", .{name});
     }
 
-    // List all
+    // List all: skills trước, tools sau
     var buf = utils.BufWriter.init(alloc);
     errdefer buf.deinit();
     const w = &buf;
-    try w.writeAll("## Danh sách tools\n\n");
+
+    if (skills_mod.getSkills()) |skills| {
+        try w.writeAll("## Skills (~/.mini/skills)\n\n");
+        try w.writeAll("Skill = quy ước/hướng dẫn (SKILL.md). Dùng `skills` operation=detail để xem nội dung, hoặc file_read trực tiếp path.\n\n");
+        for (skills) |s| {
+            try w.print("  📄 **{s}** — {s}\n  ↳ `{s}`\n", .{ s.name, s.description, s.path });
+        }
+        try w.writeAll("\n");
+    }
+
+    try w.writeAll("## Tools\n\n");
     for (&definitions) |*td| {
         const permitted = isPermitted(td.name);
         const status = if (permitted) "✓" else "✗";

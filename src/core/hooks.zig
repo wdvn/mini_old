@@ -61,6 +61,11 @@ pub const HookPayload = struct {
     artifact_path: ?[]const u8 = null,
     artifact_type: ?[]const u8 = null,
     artifact_title: ?[]const u8 = null,
+    // Trường cho hook events RFC-003 §4.6 (session/memory context)
+    ctx_budget: ?u64 = null,
+    ctx_used: ?u64 = null,
+    session_file: ?[]const u8 = null,
+    memory_dir: ?[]const u8 = null,
 };
 
 /// Phát sự kiện hook. Chạy không ngắt câu lệnh chính nếu hook lỗi.
@@ -101,6 +106,11 @@ pub fn dispatch(alloc: Allocator, io: std.Io, payload: HookPayload) void {
     if (payload.artifact_path) |v| appendJsonString(alloc, &json_w, "artifact_path", v);
     if (payload.artifact_type) |v| appendJsonString(alloc, &json_w, "artifact_type", v);
     if (payload.artifact_title) |v| appendJsonString(alloc, &json_w, "artifact_title", v);
+    // Serialize trường context RFC-003 §4.6: số in trực tiếp, chuỗi qua appendJsonString
+    if (payload.ctx_budget) |v| json_w.print(",\"ctx_budget\":{d}", .{v}) catch return;
+    if (payload.ctx_used) |v| json_w.print(",\"ctx_used\":{d}", .{v}) catch return;
+    if (payload.session_file) |v| appendJsonString(alloc, &json_w, "session_file", v);
+    if (payload.memory_dir) |v| appendJsonString(alloc, &json_w, "memory_dir", v);
 
     json_w.writeAll("}\n") catch return;
     const json_bytes = json_w.list.items;
@@ -130,6 +140,11 @@ pub fn dispatch(alloc: Allocator, io: std.Io, payload: HookPayload) void {
     appendEnvString(alloc, &sh_w, "MINI_ARTIFACT_PATH", payload.artifact_path);
     appendEnvString(alloc, &sh_w, "MINI_ARTIFACT_TYPE", payload.artifact_type);
     appendEnvString(alloc, &sh_w, "MINI_ARTIFACT_TITLE", payload.artifact_title);
+    // Export env cho context RFC-003 §4.6: số in thủ công theo pattern sh_w.print
+    if (payload.ctx_budget) |v| sh_w.print("export MINI_CTX_BUDGET='{d}'; ", .{v}) catch return;
+    if (payload.ctx_used) |v| sh_w.print("export MINI_CTX_USED='{d}'; ", .{v}) catch return;
+    appendEnvString(alloc, &sh_w, "MINI_SESSION_FILE", payload.session_file);
+    appendEnvString(alloc, &sh_w, "MINI_MEMORY_DIR", payload.memory_dir);
 
     sh_w.writeAll(cmd) catch return;
     const sh_cmd = sh_w.list.items;
