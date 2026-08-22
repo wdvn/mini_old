@@ -19,8 +19,8 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
     var line_editor = editor_mod.LineEditor.init(alloc);
     defer line_editor.deinit();
 
-    main.stdoutPrint("\x1b[1;32mmini-agent\x1b[0m {s} | {s} ({s})\n", .{
-        version, agent.backend.name(), agent.backend.model(),
+    main.stdoutPrint("\x1b[1;32mmini-agent\x1b[0m {s} \x1b[90m(build {s})\x1b[0m | {s} ({s})\n", .{
+        version, main.BUILD_TIME, agent.backend.name(), agent.backend.model(),
     });
     try stdout.writeStreamingAll(io, "Gõ /help để xem lệnh, /quit để thoát.\n\n");
 

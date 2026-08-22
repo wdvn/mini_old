@@ -76,9 +76,13 @@ pub const ContentBlock = union(enum) {
     tool_result: ToolResultBlock,
 };
 
-// ---------------------------------------------------------------------------
-// Message
-// ---------------------------------------------------------------------------
+/// Cấp bậc ngữ cảnh (MemAct RFC-003).
+pub const Tier = enum {
+    pinned,
+    recent,
+    summarized,
+    archived,
+};
 
 /// Một tin nhắn trong lịch sử hội thoại.
 /// `content` là slice sở hữu bởi History — không tự free.
@@ -86,6 +90,8 @@ pub const Message = struct {
     role: Role,
     /// Các content block của tin nhắn này.
     content: []const ContentBlock,
+    /// Phân cấp ngữ cảnh (MemAct). Null nếu tạo theo cách cũ.
+    tier: ?Tier = null,
 };
 
 // ---------------------------------------------------------------------------

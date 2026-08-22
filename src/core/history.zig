@@ -35,6 +35,8 @@ pub const History = struct {
     msgs: ArrayList(proto.Message),
     /// Ngưỡng tự động compact.
     max_messages: usize,
+    /// ID của Act tại lần compact gần nhất (để block rollback vượt quá mốc này).
+    last_compaction_act_id: usize,
 
     /// Khởi tạo History rỗng.
     pub fn init(alloc: Allocator) History {
@@ -42,6 +44,7 @@ pub const History = struct {
             .alloc = alloc,
             .msgs = .empty,
             .max_messages = DEFAULT_MAX_MESSAGES,
+            .last_compaction_act_id = 0,
         };
     }
 
@@ -134,6 +137,7 @@ pub const History = struct {
             try self.msgs.append(self.alloc, .{
                 .role = msg.role,
                 .content = content_copy,
+                .tier = msg.tier,
             });
         }
     }
@@ -145,7 +149,7 @@ pub const History = struct {
         const text_copy = try self.alloc.dupe(u8, text);
         const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
         blocks[0] = .{ .text = text_copy };
-        try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks });
+        try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks, .tier = .recent });
     }
 
     /// Thêm tin nhắn của assistant (text response).
@@ -153,7 +157,7 @@ pub const History = struct {
         const text_copy = try self.alloc.dupe(u8, text);
         const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
         blocks[0] = .{ .text = text_copy };
-        try self.msgs.append(self.alloc, .{ .role = .assistant, .content = blocks });
+        try self.msgs.append(self.alloc, .{ .role = .assistant, .content = blocks, .tier = .recent });
     }
 
     /// Thêm phản hồi đầy đủ từ AI (có thể chứa text + tool_use).
@@ -180,7 +184,7 @@ pub const History = struct {
                 }},
             };
         }
-        try self.msgs.append(self.alloc, .{ .role = .assistant, .content = blocks });
+        try self.msgs.append(self.alloc, .{ .role = .assistant, .content = blocks, .tier = .recent });
         return true;
     }
 
@@ -195,7 +199,7 @@ pub const History = struct {
                 .is_error = r.is_error,
             }};
         }
-        try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks });
+        try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks, .tier = .recent });
     }
 
     /// Trả về slice tin nhắn hiện tại (không owned).
@@ -220,6 +224,24 @@ pub const History = struct {
         const last = self.msgs.items[self.msgs.items.len - 1];
         freeContentBlocks(self.alloc, last.content);
         self.msgs.items.len -= 1;
+    }
+
+    /// Xóa các tin nhắn từ index được chỉ định trở đi (Rollback)
+    pub fn truncate(self: *History, target_len: usize) void {
+        if (target_len >= self.msgs.items.len) return;
+        for (self.msgs.items[target_len..]) |msg| {
+            freeContentBlocks(self.alloc, msg.content);
+        }
+        self.msgs.items.len = target_len;
+    }
+
+    /// Thêm thông báo lỗi hệ thống từ Agent
+    pub fn addSystemErrorObservation(self: *History, err_msg: []const u8) !void {
+        const text_copy = try self.alloc.dupe(u8, err_msg);
+        const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+        blocks[0] = .{ .text = text_copy };
+        // Phải là .user để LLM có thể đọc như một observation
+        try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks, .tier = .recent });
     }
 
     /// Compact: giữ lại chỉ một nửa các tin nhắn gần nhất.
@@ -261,8 +283,36 @@ pub const History = struct {
         const summary_copy = try self.alloc.dupe(u8, summary);
         const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
         blocks[0] = .{ .text = summary_copy };
-        try self.msgs.append(self.alloc, .{ .role = .assistant, .content = blocks });
+        try self.msgs.append(self.alloc, .{ .role = .assistant, .content = blocks, .tier = .summarized });
 
         main.stderrPrint("\n[history] Đã dọn dẹp bộ nhớ và lưu tóm tắt ngữ cảnh.\n", .{});
+    }
+
+    /// Compact theo logic MemAct: cắt đi phần từ 0..split_idx,
+    /// chèn một message tóm tắt vào đầu phần giữ lại.
+    pub fn compactMemAct(self: *History, act_id: usize, split_idx: usize, summary: []const u8) !void {
+        if (split_idx >= self.msgs.items.len) return;
+
+        // Cập nhật mốc compact
+        self.last_compaction_act_id = act_id;
+
+        // Free các message bị bỏ
+        for (self.msgs.items[0..split_idx]) |msg| freeContentBlocks(self.alloc, msg.content);
+
+        // Tạo summary message
+        const summary_copy = try self.alloc.dupe(u8, summary);
+        const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+        blocks[0] = .{ .text = summary_copy };
+        const summary_msg = proto.Message{ .role = .assistant, .content = blocks, .tier = .summarized };
+
+        const keep = self.msgs.items.len - split_idx;
+        // Shift left phần giữ lại về index 1 (chừa chỗ index 0 cho summary)
+        std.mem.copyForwards(proto.Message, self.msgs.items[1 .. keep + 1], self.msgs.items[split_idx..]);
+        
+        // Đặt summary ở vị trí 0
+        self.msgs.items[0] = summary_msg;
+        self.msgs.items.len = keep + 1;
+
+        main.stderrPrint("\n[history] Đã nén ngữ cảnh (MemAct): giữ lại {d} messages gốc.\n", .{ keep });
     }
 };

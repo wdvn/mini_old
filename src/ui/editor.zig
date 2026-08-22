@@ -37,15 +37,22 @@ pub const LineEditor = struct {
 
         const orig_termios = try std.posix.tcgetattr(stdin_fd);
         var raw = orig_termios;
-        
+
         raw.lflag.ECHO = false;
         raw.lflag.ICANON = false;
-        raw.lflag.ISIG = true; 
+        raw.lflag.ISIG = true;
         raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
         raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-        
+
         try std.posix.tcsetattr(stdin_fd, .FLUSH, raw);
-        defer std.posix.tcsetattr(stdin_fd, .FLUSH, orig_termios) catch {};
+        defer {
+            // Tắt bracketed paste mode trước khi khôi phục termios
+            stdout_file.writeStreamingAll(io, "\x1b[?2004l") catch {};
+            std.posix.tcsetattr(stdin_fd, .FLUSH, orig_termios) catch {};
+        }
+
+        // Bật bracketed paste mode: terminal bọc nội dung paste trong \x1b[200~ ... \x1b[201~
+        stdout_file.writeStreamingAll(io, "\x1b[?2004h") catch {};
 
         var buf: [8192]u8 = undefined;
         var len: usize = 0;
@@ -123,6 +130,16 @@ pub const LineEditor = struct {
                                 pos -= 1;
                                 self.redraw(io, prompt, &buf, len, pos);
                             }
+                        } else if (seq[1] == '2') {
+                            // Bracketed paste: ESC [ 2 0 0 ~ <nội dung> ESC [ 2 0 1 ~
+                            var marker: [3]u8 = undefined;
+                            var got: usize = 0;
+                            while (got < 3) : (got += 1) {
+                                if ((stdin_file.readStreaming(io, &.{marker[got .. got + 1]}) catch 0) == 0) break;
+                            }
+                            if (got == 3 and std.mem.eql(u8, &marker, "00~")) {
+                                self.readPastedContent(io, stdin_file, prompt, &buf, &len, &pos);
+                            }
                         } else if (seq[1] == '3') { 
                             var tilde: [1]u8 = undefined;
                             _ = stdin_file.readStreaming(io, &.{&tilde}) catch 0;
@@ -155,6 +172,61 @@ pub const LineEditor = struct {
         }
         
         return null;
+    }
+
+    /// Đọc nội dung bracketed paste cho tới khi gặp ESC [ 2 0 1 ~.
+    /// Newline trong nội dung paste được chuyển thành khoảng trắng để giữ 1 dòng
+    /// (buffer của readLine là single-line). Trả về khi kết thúc paste.
+    fn readPastedContent(self: *LineEditor, io: std.Io, stdin_file: std.Io.File, prompt: []const u8, buf: []u8, len: *usize, pos: *usize) void {
+        var pending: [6]u8 = undefined; // bộ đệm đối chiếu ESC [ 2 0 1 ~
+        var pending_len: usize = 0;
+
+        while (true) {
+            var char_buf: [1]u8 = undefined;
+            const n = stdin_file.readStreaming(io, &.{&char_buf}) catch 0;
+            if (n == 0) break;
+            const c = char_buf[0];
+
+            // Đang trong quá trình đối chiếu chuỗi kết thúc "\x1b[201~"
+            if (pending_len > 0) {
+                pending[pending_len] = c;
+                pending_len += 1;
+                const end_marker = "\x1b[201~";
+                if (pending_len == end_marker.len) {
+                    if (std.mem.eql(u8, pending[0..pending_len], end_marker)) {
+                        self.redraw(io, prompt, buf, len.*, pos.*);
+                        return; // kết thúc paste
+                    }
+                    // Không phải chuỗi kết thúc: xả toàn bộ byte đã tích lũy vào buffer
+                    self.insertPasted(io, stdin_file, prompt, buf, len, pos, pending[0..pending_len]) catch {};
+                    pending_len = 0;
+                }
+                continue;
+            }
+
+            if (c == 27) {
+                pending[0] = c;
+                pending_len = 1;
+                continue;
+            }
+
+            self.insertPasted(io, stdin_file, prompt, buf, len, pos, &.{c}) catch {};
+        }
+    }
+
+    fn insertPasted(self: *LineEditor, io: std.Io, stdin_file: std.Io.File, prompt: []const u8, buf: []u8, len: *usize, pos: *usize, bytes: []const u8) !void {
+        _ = stdin_file;
+        for (bytes) |c| {
+            if (len.* >= buf.len) break;
+            // Newline / CR trong paste -> khoảng trắng, giữ input trên một dòng
+            const ch: u8 = if (c == '\n' or c == '\r') ' ' else c;
+            if (ch < 32 and ch != ' ') continue;
+            std.mem.copyBackwards(u8, buf[pos.* + 1 .. len.* + 1], buf[pos.*..len.*]);
+            buf[pos.*] = ch;
+            pos.* += 1;
+            len.* += 1;
+        }
+        self.redraw(io, prompt, buf, len.*, pos.*);
     }
 
     fn redraw(self: *LineEditor, io: std.Io, p: []const u8, b: []const u8, l: usize, c: usize) void {
