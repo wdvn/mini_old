@@ -288,31 +288,186 @@ pub const History = struct {
         main.stderrPrint("\n[history] Đã dọn dẹp bộ nhớ và lưu tóm tắt ngữ cảnh.\n", .{});
     }
 
-    /// Compact theo logic MemAct: cắt đi phần từ 0..split_idx,
-    /// chèn một message tóm tắt vào đầu phần giữ lại.
+    /// Compact theo logic MemAct (bản mới): GIỮ NGUYÊN msgs.items[0] (user prompt gốc),
+    /// đặt summary message tại index 1, dồn phần giữ lại [split_idx..] về từ index 2.
+    ///
+    /// Nếu msgs.items[1] đã là summary từ lần compact trước (tier .summarized)
+    /// thì summary cũ nằm trong vùng drop và được thay thế bởi summary mới (dồn tích lũy).
     pub fn compactMemAct(self: *History, act_id: usize, split_idx: usize, summary: []const u8) !void {
-        if (split_idx >= self.msgs.items.len) return;
+        // No-op: split quá nhỏ (sẽ làm mất prompt gốc) hoặc history quá ngắn
+        if (split_idx <= 1) return;
+        if (self.msgs.items.len <= 2) return;
+        if (split_idx > self.msgs.items.len) return;
 
         // Cập nhật mốc compact
         self.last_compaction_act_id = act_id;
 
-        // Free các message bị bỏ
-        for (self.msgs.items[0..split_idx]) |msg| freeContentBlocks(self.alloc, msg.content);
+        // Nếu msgs[1] là summary từ lần compact trước → thay thế; ngược lại → chèn mới.
+        // Cả hai trường hợp drop_start đều là 1 (summary cũ nằm trong vùng drop).
+        const drop_start: usize = 1;
+        const replace_old_summary = self.msgs.items[1].tier == .summarized;
 
-        // Tạo summary message
-        const summary_copy = try self.alloc.dupe(u8, summary);
+        // Free các message bị bỏ (không đụng tới msgs[0] — prompt gốc)
+        for (self.msgs.items[drop_start..split_idx]) |msg| freeContentBlocks(self.alloc, msg.content);
+
+        // Tạo summary message. Role phải là .user để Claude API không từ chối
+        // với lỗi 400 "first message must be user" (session cũ compact kiểu cũ).
+        const summary_text = try std.fmt.allocPrint(self.alloc, "[MemAct Context Summary]\n{s}", .{summary});
+        errdefer self.alloc.free(summary_text);
         const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
-        blocks[0] = .{ .text = summary_copy };
-        const summary_msg = proto.Message{ .role = .assistant, .content = blocks, .tier = .summarized };
+        errdefer self.alloc.free(blocks);
+        blocks[0] = .{ .text = summary_text };
+        const summary_msg = proto.Message{ .role = .user, .content = blocks, .tier = .summarized };
 
-        const keep = self.msgs.items.len - split_idx;
-        // Shift left phần giữ lại về index 1 (chừa chỗ index 0 cho summary)
-        std.mem.copyForwards(proto.Message, self.msgs.items[1 .. keep + 1], self.msgs.items[split_idx..]);
-        
-        // Đặt summary ở vị trí 0
-        self.msgs.items[0] = summary_msg;
-        self.msgs.items.len = keep + 1;
+        // Dồn phần giữ lại [split_idx..] về index 2, summary đặt tại index 1
+        const old_len = self.msgs.items.len;
+        const keep = old_len - split_idx;
+        std.mem.copyForwards(proto.Message, self.msgs.items[2 .. keep + 2], self.msgs.items[split_idx..old_len]);
 
-        main.stderrPrint("\n[history] Đã nén ngữ cảnh (MemAct): giữ lại {d} messages gốc.\n", .{ keep });
+        self.msgs.items[1] = summary_msg;
+        self.msgs.items.len = keep + 2;
+
+        main.stderrPrint("\n[history] Đã nén ngữ cảnh (MemAct): giữ prompt gốc (index 0), {s} summary tại index 1, giữ lại {d} messages gần nhất.\n", .{ if (replace_old_summary) "thay thế" else "chèn mới", keep });
+    }
+
+    /// Đảm bảo history tương thích Claude API (message đầu tiên phải có role .user).
+    /// Session cũ compact kiểu cũ có thể có msgs[0].role == .assistant → đổi thành .user.
+    /// KHÔNG đụng vào content. Trả về true nếu đã sửa, false nếu không cần.
+    pub fn ensureClaudeCompatible(self: *History) bool {
+        if (self.msgs.items.len > 0 and self.msgs.items[0].role == .assistant) {
+            self.msgs.items[0].role = .user;
+            return true;
+        }
+        return false;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+test "compactMemAct giữ msgs[0], summary .user/.summarized ở index 1, dồn đúng" {
+    // compactMemAct log qua main.stderrPrint dùng g_io — trong test mode g_io
+    // chưa được init (chỉ set trong main()) → gán std.testing.io cho an toàn.
+    main.g_io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var h = History.init(alloc);
+    defer h.deinit();
+
+    try h.addUser("prompt gốc");
+    try h.addAssistantText("trả lời 1");
+    try h.addUser("câu hỏi 2");
+    try h.addAssistantText("trả lời 2");
+    try h.addUser("câu hỏi 3");
+    try h.addAssistantText("trả lời 3");
+
+    try h.compactMemAct(7, 3, "tóm tắt ngữ cảnh");
+
+    // keep = 6 - 3 = 3 → new len = keep + 2 = 5
+    try std.testing.expectEqual(@as(usize, 5), h.msgs.items.len);
+
+    // msgs[0] nguyên vẹn: role .user, text prompt gốc
+    try std.testing.expect(h.msgs.items[0].role == .user);
+    try std.testing.expectEqualStrings("prompt gốc", h.msgs.items[0].content[0].text);
+
+    // Summary tại index 1: role .user (Claude-compatible), tier .summarized, có prefix
+    try std.testing.expect(h.msgs.items[1].role == .user);
+    try std.testing.expect(h.msgs.items[1].tier == .summarized);
+    try std.testing.expectEqualStrings("[MemAct Context Summary]\ntóm tắt ngữ cảnh", h.msgs.items[1].content[0].text);
+
+    // Phần [split_idx..] = [trả lời 2, câu hỏi 3, trả lời 3] dồn vào từ index 2
+    try std.testing.expectEqualStrings("trả lời 2", h.msgs.items[2].content[0].text);
+    try std.testing.expect(h.msgs.items[2].role == .assistant);
+    try std.testing.expectEqualStrings("câu hỏi 3", h.msgs.items[3].content[0].text);
+    try std.testing.expect(h.msgs.items[3].role == .user);
+    try std.testing.expectEqualStrings("trả lời 3", h.msgs.items[4].content[0].text);
+
+    try std.testing.expect(h.last_compaction_act_id == 7);
+}
+
+test "compactMemAct lần 2 dồn tích lũy: thay summary cũ, msgs[0] vẫn nguyên, không leak" {
+    main.g_io = std.testing.io; // xem comment test phía trên
+    const alloc = std.testing.allocator;
+    var h = History.init(alloc);
+    defer h.deinit(); // std.testing.allocator bắt leak nếu compact xử lý bộ nhớ sai
+
+    try h.addUser("prompt gốc");
+    try h.addAssistantText("trả lời 1");
+    try h.addUser("câu hỏi 2");
+    try h.addAssistantText("trả lời 2");
+    try h.addUser("câu hỏi 3");
+    try h.addAssistantText("trả lời 3");
+
+    // Compact lần 1
+    try h.compactMemAct(3, 3, "summary v1");
+    try std.testing.expectEqual(@as(usize, 5), h.msgs.items.len);
+
+    // Compact lần 2: msgs[1] đang là summary (tier .summarized) → phải bị thay thế
+    try h.compactMemAct(9, 4, "summary v2 merged");
+
+    // keep = 5 - 4 = 1 → new len = 3
+    try std.testing.expectEqual(@as(usize, 3), h.msgs.items.len);
+
+    // msgs[0] vẫn nguyên vẹn qua cả 2 lần compact
+    try std.testing.expect(h.msgs.items[0].role == .user);
+    try std.testing.expectEqualStrings("prompt gốc", h.msgs.items[0].content[0].text);
+
+    // msgs[1] là summary MỚI (thay thế summary cũ đã được free đúng)
+    try std.testing.expect(h.msgs.items[1].role == .user);
+    try std.testing.expect(h.msgs.items[1].tier == .summarized);
+    try std.testing.expectEqualStrings("[MemAct Context Summary]\nsummary v2 merged", h.msgs.items[1].content[0].text);
+
+    // Phần giữ lại [4..5] = [trả lời 3] dồn về index 2
+    try std.testing.expectEqualStrings("trả lời 3", h.msgs.items[2].content[0].text);
+
+    try std.testing.expect(h.last_compaction_act_id == 9);
+}
+
+test "compactMemAct no-op khi split_idx <= 1 hoặc history quá ngắn" {
+    const alloc = std.testing.allocator;
+    var h = History.init(alloc);
+    defer h.deinit();
+
+    try h.addUser("a");
+    try h.addAssistantText("b");
+    try h.addUser("c");
+
+    // split_idx <= 1 → no-op
+    try h.compactMemAct(5, 0, "sum");
+    try h.compactMemAct(5, 1, "sum");
+    try std.testing.expectEqual(@as(usize, 3), h.msgs.items.len);
+    try std.testing.expectEqualStrings("a", h.msgs.items[0].content[0].text);
+    try std.testing.expect(h.last_compaction_act_id == 0); // không cập nhật mốc
+
+    // History <= 2 messages → no-op
+    var h2 = History.init(alloc);
+    defer h2.deinit();
+    try h2.addUser("chỉ prompt");
+    try h2.addAssistantText("một trả lời");
+    try h2.compactMemAct(2, 2, "sum");
+    try std.testing.expectEqual(@as(usize, 2), h2.msgs.items.len);
+    try std.testing.expect(h2.last_compaction_act_id == 0);
+}
+
+test "ensureClaudeCompatible đổi role assistant đầu tiên và trả đúng bool" {
+    const alloc = std.testing.allocator;
+    var h = History.init(alloc);
+    defer h.deinit();
+
+    // Trường hợp không cần sửa: history rỗng
+    try std.testing.expect(h.ensureClaudeCompatible() == false);
+
+    // Session cũ compact kiểu cũ: msgs[0].role == .assistant
+    try h.addAssistantText("summary cũ assistant-first");
+    try h.addUser("câu hỏi mới");
+
+    try std.testing.expect(h.ensureClaudeCompatible() == true);
+    try std.testing.expect(h.msgs.items[0].role == .user);
+    // Content không bị đụng tới
+    try std.testing.expectEqualStrings("summary cũ assistant-first", h.msgs.items[0].content[0].text);
+    try std.testing.expect(h.msgs.items[1].role == .user);
+
+    // Lần gọi thứ hai: msgs[0] đã là .user → không sửa, trả false
+    try std.testing.expect(h.ensureClaudeCompatible() == false);
+    try std.testing.expect(h.msgs.items[0].role == .user);
+}
