@@ -4,6 +4,41 @@ const std = @import("std");
 const proto = @import("../protocol.zig");
 const TokenEstimator = @import("tokens.zig").TokenEstimator;
 
+/// Message có chứa block tool_use không (assistant gọi tool).
+fn hasToolUse(msg: *const proto.Message) bool {
+    if (msg.role != .assistant) return false;
+    for (msg.content) |b| {
+        if (b == .tool_use) return true;
+    }
+    return false;
+}
+
+/// Message có chứa block tool_result không (user trả lời tool_use).
+fn hasToolResult(msg: *const proto.Message) bool {
+    for (msg.content) |b| {
+        if (b == .tool_result) return true;
+    }
+    return false;
+}
+
+/// Dịch split lùi 1 bước nếu message NGAY TRƯỚC split (msgs[split-1]) là
+/// assistant chứa tool_use còn chưa được trả lời — cắt tại đó sẽ để lại
+/// tool_use mồ côi trong phần GIỮ LẠI (tool_result của nó nằm trong phần
+/// bị drop). Lặp đến khi msgs[split-1] không phải assistant-tool_use.
+/// Floor 2: không hạ split xuống dưới 2 khi history dài (guard bất biến
+/// msgs[0] = prompt gốc, msgs[1] = summary tier .summarized).
+fn retreatPastUnansweredToolUse(msgs: []const proto.Message, split: usize) usize {
+    var idx = split;
+    const floor: usize = if (msgs.len > 3) 2 else 0;
+    while (idx > floor) {
+        const prev = &msgs[idx - 1];
+        if (hasToolUse(prev)) {
+            idx -= 1;
+        } else break;
+    }
+    return idx;
+}
+
 pub const ContextWindow = struct {
     max_tokens: u32,
     safety_margin: f32 = 0.15,
@@ -58,11 +93,7 @@ pub const ContextWindow = struct {
             // Kiểm tra tool boundary
             var is_boundary = true;
             if (msg.role == .user) {
-                var has_tool_result = false;
-                for (msg.content) |b| {
-                    if (b == .tool_result) has_tool_result = true;
-                }
-                if (has_tool_result) is_boundary = false;
+                if (hasToolResult(&msg)) is_boundary = false;
             } else {
                 is_boundary = false; // Không cắt trước assistant
             }
@@ -85,19 +116,23 @@ pub const ContextWindow = struct {
             // Ráng dời split_idx tới một tin nhắn user không có tool_result
             while (split_idx > 0) {
                 const m = msgs[split_idx];
-                if (m.role == .user) {
-                    var has_tool_result = false;
-                    for (m.content) |b| {
-                        if (b == .tool_result) has_tool_result = true;
-                    }
-                    if (!has_tool_result) break;
-                }
+                if (m.role == .user and !hasToolResult(&m)) break;
                 split_idx -= 1;
             }
             // Guard bất biến: không để fallback hạ split xuống dưới 2 khi history dài
             if (split_idx < 2 and msgs.len > 3) split_idx = 2;
         }
         
+        // Boundary chặt chẽ hơn (RFC-003 §4.2): nếu msgs[split-1] là assistant
+        // chứa tool_use mà message user tại split KHÔNG trả lời (user thuần,
+        // không có tool_result tương ứng) → cắt tại split sẽ để tool_use mồ côi
+        // trong phần giữ lại. Dịch split lùi 1 bước rồi re-check, floor 2.
+        if (split_idx > 0 and split_idx < msgs.len) {
+            const at_split = &msgs[split_idx];
+            const unanswered = at_split.role == .user and !hasToolResult(at_split);
+            if (unanswered) split_idx = retreatPastUnansweredToolUse(msgs, split_idx);
+        }
+
         // Đảm bảo chừa lại ít nhất 2 tin nhắn nếu history đang dài
         if (split_idx >= msgs.len and msgs.len > 2) {
             split_idx = msgs.len - 2;
@@ -225,4 +260,79 @@ test "findSplitIndex history ngắn với message rất lớn vẫn >= 2" {
     const split = window.findSplitIndex(&est, &msgs, 0);
     try std.testing.expect(split >= 2);
     try std.testing.expect(split != 0 and split != 1);
+}
+
+test "findSplitIndex dịch lùi khi msgs[split-1] là assistant tool_use chưa trả lời" {
+    const alloc = std.testing.allocator;
+    var est = TokenEstimator.init(alloc);
+    defer est.deinit();
+
+    var window = ContextWindow{ .max_tokens = 2000 };
+    const small = "x" ** 200; // ~52 tokens/msg
+    const big = "x" ** 4000; // ~1052 tokens — đẩy vượt target_keep (~1020)
+
+    // target_keep = 2000 * 0.85 * 0.6 = 1020 tokens. Đi lùi từ cuối,
+    // 4 message small (~208 tokens) chưa đủ; tới msgs[7] (user thuần, big)
+    // thì vượt → split candidate = 7. Nhưng msgs[6] là assistant chứa
+    // tool_use mà msgs[7] KHÔNG trả lời (user thuần) → phải dịch lùi
+    // qua assistant đó: split = 6, msgs[5] = user(tool_result) không
+    // chứa tool_use → dừng.
+    const msgs = [_]proto.Message{
+        .{ .role = .user, .content = &.{.{ .text = "prompt gốc" }} },
+        .{ .role = .user, .content = &.{.{ .text = "summary" }} },
+        .{ .role = .assistant, .content = &.{.{ .tool_use = .{ .id = "1", .name = "t", .input_json = "{}" } }} },
+        .{ .role = .user, .content = &.{.{ .tool_result = .{ .tool_use_id = "1", .content = "ok", .is_error = false } }} },
+        .{ .role = .assistant, .content = &.{.{ .tool_use = .{ .id = "2", .name = "t", .input_json = "{}" } }} },
+        .{ .role = .user, .content = &.{.{ .tool_result = .{ .tool_use_id = "2", .content = "ok", .is_error = false } }} },
+        .{ .role = .assistant, .content = &.{.{ .tool_use = .{ .id = "3", .name = "t", .input_json = "{}" } }} }, // tool_use mồ côi nếu cắt tại 7
+        .{ .role = .user, .content = &.{.{ .text = big }} }, // split candidate (user thuần)
+        .{ .role = .assistant, .content = &.{.{ .text = small }} },
+        .{ .role = .user, .content = &.{.{ .text = small }} },
+        .{ .role = .assistant, .content = &.{.{ .text = small }} },
+        .{ .role = .user, .content = &.{.{ .text = small }} },
+    };
+
+    const split = window.findSplitIndex(&est, &msgs, 0);
+    // Đã dịch lùi ít nhất 1 bước qua assistant tool_use
+    try std.testing.expect(split == 6);
+    try std.testing.expect(split >= 2); // guard floor 2
+
+    // msgs[split-1] phải KHÔNG chứa tool_use (không còn tool_use mồ côi)
+    const prev = &msgs[split - 1];
+    try std.testing.expect(!hasToolUse(prev));
+    try std.testing.expect(prev.role == .user);
+}
+
+test "findSplitIndex giữ nguyên split khi msgs[split-1] không chứa tool_use" {
+    const alloc = std.testing.allocator;
+    var est = TokenEstimator.init(alloc);
+    defer est.deinit();
+
+    var window = ContextWindow{ .max_tokens = 2000 };
+    const small = "x" ** 200;
+    const big = "x" ** 4000;
+
+    // Giống test trên nhưng msgs[6] là assistant text thuần —
+    // không cần dịch lùi, split giữ nguyên tại 7.
+    const msgs = [_]proto.Message{
+        .{ .role = .user, .content = &.{.{ .text = "prompt gốc" }} },
+        .{ .role = .user, .content = &.{.{ .text = "summary" }} },
+        .{ .role = .assistant, .content = &.{.{ .text = small }} },
+        .{ .role = .user, .content = &.{.{ .text = small }} },
+        .{ .role = .assistant, .content = &.{.{ .text = small }} },
+        .{ .role = .user, .content = &.{.{ .text = small }} },
+        .{ .role = .assistant, .content = &.{.{ .text = small }} }, // không có tool_use
+        .{ .role = .user, .content = &.{.{ .text = big }} }, // split candidate
+        .{ .role = .assistant, .content = &.{.{ .text = small }} },
+        .{ .role = .user, .content = &.{.{ .text = small }} },
+        .{ .role = .assistant, .content = &.{.{ .text = small }} },
+        .{ .role = .user, .content = &.{.{ .text = small }} },
+    };
+
+    const split = window.findSplitIndex(&est, &msgs, 0);
+    try std.testing.expect(split == 7);
+
+    const prev = &msgs[split - 1];
+    try std.testing.expect(!hasToolUse(prev));
+    try std.testing.expect(prev.role == .assistant);
 }

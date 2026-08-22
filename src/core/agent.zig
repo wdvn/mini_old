@@ -58,6 +58,8 @@ fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
 const MAX_ITERATIONS = 30;
 /// Số lần retry tối đa khi gặp rate limit.
 const MAX_RATE_LIMIT_RETRIES = 5;
+/// Số lần tối đa yêu cầu model tiếp tục sau khi response bị cắt (max_tokens).
+const MAX_TOKENS_CONTINUES = 3;
 /// Thời gian chờ ban đầu khi gặp rate limit (giây).
 const RATE_LIMIT_BASE_DELAY_S: u64 = 5;
 
@@ -128,8 +130,11 @@ pub const AgentLoop = struct {
     engine: *quickjs.Engine,
     /// Đếm số lần tự sửa lỗi JavaScript liên tiếp.
     js_retry_count: usize = 0,
-    /// Đếm số lần đã thử sửa lỗi role/first-message (Claude 400) trong turn.
+    /// Đếm số lần sửa lỗi role/first-message (Claude 400) trong turn.
     role_fix_attempts: usize = 0,
+    /// Đếm số lần liên tiếp response bị cắt do max_tokens trong turn.
+    /// Vượt MAX_TOKENS_CONTINUES thì mới chấp nhận dừng.
+    max_tokens_continues: usize = 0,
     /// Trình ước lượng token (MemAct).
     token_estimator: tokens_mod.TokenEstimator,
     /// Cửa sổ ngữ cảnh (MemAct).
@@ -248,18 +253,21 @@ pub const AgentLoop = struct {
         // Hiện tại tạm dùng cứng 1500 tokens cho system_prompt, sau sẽ add TokenEstimator cho nó.
         const pinned_tokens = self.token_estimator.estimate(self.config.system_prompt);
 
-        if (self.config.memact_enabled and self.context_window.needsCompaction(&self.token_estimator, self.history.messages(), pinned_tokens)) {
+        if (self.config.memact_enabled and self.history.messages().len > 2 and self.context_window.needsCompaction(&self.token_estimator, self.history.messages(), pinned_tokens)) {
+            // Guard: history đã ở dạng tối thiểu [prompt gốc, summary] nhưng vẫn
+            // vượt ngưỡng (prompt gốc/summary quá lớn) — compactMemAct không thể
+            // giảm thêm (chỉ thay summary bằng summary mới). Tránh gọi LLM summary
+            // mỗi vòng lặp (đốt API call, history không giảm), chỉ log cảnh báo.
             const threshold_pct = @as(u32, @intFromFloat(self.context_window.compact_threshold * 100.0));
             main.stderrPrint("\n\x1b[33m[agent] Lịch sử đạt {d}% window, nén MemAct...\x1b[0m\n", .{threshold_pct});
-            
-            const split_idx = self.context_window.findSplitIndex(&self.token_estimator, self.history.messages(), pinned_tokens);
-            
-            // Điều kiện split_idx > 1: không bao giờ compact khi split quá nhỏ.
-            // compactMemAct (bản mới) GIỮ NGUYÊN msgs[0] (prompt gốc) và chèn/thay
-            // summary tại index 1 — nếu split < 2 sẽ làm mất cả prompt gốc lẫn
-            // summary cũ. temp_msgs build từ messages()[0..split_idx] nên đã tự
-            // chứa prompt gốc + summary cũ tại index 1 (phục vụ dồn tích lũy).
-            if (split_idx > 1) {
+
+            // compactMemAct (bản mới) GIỮ NGUYÊN msgs[0] (prompt gốc) và DROP toàn bộ
+            // phần còn lại, chỉ chèn/thay summary tại index 1. KHÔNG giữ N messages
+            // gần nhất — với window lớn phần giữ lại (~60% window) vẫn vượt ngưỡng
+            // compact → mỗi vòng lặp lại nén (tốn LLM call, history không bao giờ
+            // xuống dưới ngưỡng). Trạng thái "đang ở bước nào" nằm trong summary
+            // (task_state/next_step) nên model vẫn tiếp tục đúng chỗ.
+            {
                 var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
                 msg_blocks[0] = .{ .text = try self.alloc.dupe(u8, 
                     "SYSTEM: Bạn là bộ nhớ MemAct. Hãy tóm tắt ngắn gọn phần hội thoại trước thành JSON, tuân thủ đúng stencil:\n" ++
@@ -284,16 +292,16 @@ pub const AgentLoop = struct {
                 
                 var temp_msgs = std.ArrayListUnmanaged(proto.Message).empty;
                 defer temp_msgs.deinit(self.alloc);
-                try temp_msgs.appendSlice(self.alloc, self.history.messages()[0..split_idx]);
+                try temp_msgs.appendSlice(self.alloc, self.history.messages());
                 try temp_msgs.append(self.alloc, sys_msg);
-                
+
                 var summary_resp = try self.sendToBackend(self.config.system_prompt, temp_msgs.items, &[_]proto.ToolDefinition{}, null, null);
                 defer summary_resp.deinit();
-                
+
                 var compacted = false;
                 for (summary_resp.content.items) |block| {
                     if (block == .text) {
-                        try self.history.compactMemAct(act_id, split_idx, block.text);
+                        try self.history.compactMemAct(act_id, block.text);
                         compacted = true;
                         break;
                     }
@@ -302,9 +310,6 @@ pub const AgentLoop = struct {
                     main.stderrPrint("[agent] Cảnh báo: LLM không trả về text summary, fallback.\n", .{});
                     self.history.compact();
                 }
-            } else {
-                main.stderrPrint("[agent] Không tìm được split_idx hợp lý, giữ nguyên.\n", .{});
-                self.history.compact();
             }
         } else if (!self.config.memact_enabled and self.history.needsCompaction()) {
             main.stderrPrint("\n\x1b[33m[agent] Lịch sử quá dài (MemAct tắt), đang nén cũ...\x1b[0m\n", .{});
@@ -427,7 +432,22 @@ pub const AgentLoop = struct {
                 return .exit_loop;
             },
             .max_tokens => {
-                main.stderrPrint("\n\x1b[33m[agent] ⚠️ Cảnh báo: Đạt giới hạn max_tokens. Dừng sớm.\x1b[0m\n", .{});
+                // Response bị cắt giữa chừng. KHÔNG exit ngay — chèn observation
+                // yêu cầu model tiếp tục đúng từ chỗ dừng (không lặp lại phần đã
+                // viết) để hoàn thành khối đang dở (JS block / tool_use / văn bản).
+                self.max_tokens_continues += 1;
+                if (self.max_tokens_continues <= MAX_TOKENS_CONTINUES) {
+                    main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response bị cắt (max_tokens), yêu cầu tiếp tục ({d}/{d})...\x1b[0m\n", .{ self.max_tokens_continues, MAX_TOKENS_CONTINUES });
+                    var buf = utils.BufWriter.init(self.alloc);
+                    defer buf.deinit();
+                    try buf.print(
+                        "[System] Phản hồi vừa rồi bị cắt do đạt giới hạn max_tokens (lần {d}/{d}). Hãy tiếp tục ĐÚNG từ chỗ dừng — không lặp lại phần đã viết, không giới thiệu lại. Nếu khối ```js ... ``` hoặc tool call đang dở dang, viết tiếp phần còn lại để hoàn thành.",
+                        .{ self.max_tokens_continues, MAX_TOKENS_CONTINUES },
+                    );
+                    try self.history.addUser(buf.list.items);
+                    return .continue_loop;
+                }
+                main.stderrPrint("\n\x1b[33m[agent] ⚠️ Cảnh báo: Đạt giới hạn max_tokens sau {d} lần tiếp tục. Dừng sớm.\x1b[0m\n", .{MAX_TOKENS_CONTINUES});
                 return .exit_loop;
             },
             .tool_use => {
@@ -513,6 +533,8 @@ pub const AgentLoop = struct {
 
         // Reset bộ đếm retry sửa lỗi role cho turn mới
         self.role_fix_attempts = 0;
+        // Reset bộ đếm continue-max_tokens cho turn mới
+        self.max_tokens_continues = 0;
 
         // Lấy danh sách tools phù hợp với user message
         const tool_defs = tools_mod.getRelevantDefinitions(turn_alloc, user_text);

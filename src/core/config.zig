@@ -24,6 +24,18 @@
 //!   `MINI_SYSTEM_FILE`      Đường dẫn file system prompt (.md)
 //!   `MINI_NO_HISTORY`       "1" để tắt lưu lịch sử in-memory
 //!
+//! ### MemAct (RFC-003)
+//!   `MINI_MEMACT_ENABLED`       "0" để tắt MemAct (mặc định: bật)
+//!   `MINI_CONTEXT_WINDOW`       Context window tokens; nếu không set sẽ
+//!                               auto-detect theo backend (openai-compat 128000,
+//!                               anthropic 200000, ollama 8192)
+//!   `MINI_CTX_SAFETY_MARGIN`    Hệ số biên an toàn (mặc định: 0.15)
+//!   `MINI_CTX_COMPACT_THRESHOLD` Ngưỡng nén lịch sử (mặc định: 0.85)
+//!   `MINI_MEMACT_TOP_K`         Số memory item tối đa inject (mặc định: 8)
+//!   `MINI_MEMACT_MEMORY_BUDGET` Ngân sách token cho memory block (mặc định: 2000)
+//!   `MINI_MEMACT_EXTRACT`       Chế độ extract memory: async|sync|off (mặc định: async)
+//!   `MINI_MEMORY_DIR`           Thư mục memory (mặc định: ~/.mini/memory)
+//!
 //! ### Tools
 //!   `MINI_TOOL_ALLOWLIST`   Chỉ cho phép các tool này (comma-separated)
 //!   `MINI_TOOL_BLOCKLIST`   Chặn các tool này (comma-separated)
@@ -34,6 +46,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const utils = @import("utils.zig");
+const skills_mod = @import("skills.zig");
 const main = @import("../main.zig");
 
 
@@ -96,6 +109,14 @@ pub const Config = struct {
     context_window: u32,
     ctx_safety_margin: f32,
     ctx_compact_threshold: f32,
+    /// Số memory item tối đa inject vào prompt (RFC-003).
+    memact_top_k: u32 = 8,
+    /// Ngân sách token dành cho memory block (RFC-003).
+    memact_memory_budget: u32 = 2000,
+    /// Chế độ extract memory: async | sync | off (RFC-003).
+    memact_extract: []const u8 = "async",
+    /// Thư mục memory. Null = caller tự build ~/.mini/memory.
+    memory_dir: ?[]const u8 = null,
 
     // Budget Limits (RFC-002)
     budget_max_tokens: usize,
@@ -188,9 +209,16 @@ pub const Config = struct {
             break :blk std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
         };
 
+        // Auto-detect context window (RFC-003 §5) khi MINI_CONTEXT_WINDOW không set:
+        // chọn theo backend sẽ dùng, đúng thứ tự ưu tiên như AgentLoop.init —
+        // openai_compat_url → anthropic → ollama.
         const context_window: u32 = blk: {
-            const s = env_map.get("MINI_CONTEXT_WINDOW") orelse break :blk 128000;
-            break :blk std.fmt.parseInt(u32, s, 10) catch 128000;
+            if (env_map.get("MINI_CONTEXT_WINDOW")) |s| {
+                break :blk std.fmt.parseInt(u32, s, 10) catch 128000;
+            }
+            if (openai_url != null) break :blk 128000;
+            if (anthropic_key != null) break :blk 200000;
+            break :blk 8192; // fallback Ollama
         };
 
         const ctx_safety_margin: f32 = blk: {
@@ -202,6 +230,26 @@ pub const Config = struct {
             const s = env_map.get("MINI_CTX_COMPACT_THRESHOLD") orelse break :blk 0.85;
             break :blk std.fmt.parseFloat(f32, s) catch 0.85;
         };
+
+        const memact_top_k: u32 = blk: {
+            const s = env_map.get("MINI_MEMACT_TOP_K") orelse break :blk 8;
+            break :blk std.fmt.parseInt(u32, s, 10) catch 8;
+        };
+
+        const memact_memory_budget: u32 = blk: {
+            const s = env_map.get("MINI_MEMACT_MEMORY_BUDGET") orelse break :blk 2000;
+            break :blk std.fmt.parseInt(u32, s, 10) catch 2000;
+        };
+
+        const memact_extract: []const u8 = blk: {
+            const s = env_map.get("MINI_MEMACT_EXTRACT") orelse break :blk "async";
+            // Chỉ chấp nhận async|sync|off, giá trị lạ fallback về async.
+            if (std.mem.eql(u8, s, "sync") or std.mem.eql(u8, s, "off")) break :blk s;
+            if (std.mem.eql(u8, s, "async")) break :blk s;
+            break :blk "async";
+        };
+
+        const memory_dir: ?[]const u8 = env_map.get("MINI_MEMORY_DIR");
 
         const budget_max_tokens: usize = blk: {
             const s = env_map.get("MINI_BUDGET_MAX_TOKENS") orelse break :blk 10_000_000; // default large budget
@@ -229,6 +277,12 @@ pub const Config = struct {
         main.stderrPrint("[config] Build: {s} | {s} | {s} | zig {s}\n", .{
             main.BUILD_TIME, main.BUILD_OPTIMIZE, main.BUILD_TARGET, main.ZIG_VERSION,
         });
+        if (memact_enabled) {
+            const window_src = if (env_map.get("MINI_CONTEXT_WINDOW") != null) "env" else "auto/backend";
+            main.stderrPrint("[config] MemAct: window={d} ({s}), top_k={d}, budget={d}, extract={s}\n", .{
+                context_window, window_src, memact_top_k, memact_memory_budget, memact_extract,
+            });
+        }
 
         return .{
             .execution_mode = exec_mode,
@@ -250,6 +304,10 @@ pub const Config = struct {
             .context_window = context_window,
             .ctx_safety_margin = ctx_safety_margin,
             .ctx_compact_threshold = ctx_compact_threshold,
+            .memact_top_k = memact_top_k,
+            .memact_memory_budget = memact_memory_budget,
+            .memact_extract = memact_extract,
+            .memory_dir = memory_dir,
             .budget_max_tokens = budget_max_tokens,
             .mcp_config_path = env_map.get("MINI_MCP_CONFIG"),
             .history_enabled = history_enabled,
@@ -260,13 +318,14 @@ pub const Config = struct {
         };
     }
 
-    /// Giải phóng bộ nhớ được cấp phát (chỉ system_prompt_buf).
+    /// Giải phóng bộ nhớ được cấp phát (system_prompt_buf + skills arena).
     pub fn deinit(self: *Config, alloc: Allocator) void {
         if (self.system_prompt_buf) |buf| {
             alloc.free(buf);
             self.system_prompt_buf = null;
             self.system_prompt = default_system_prompt;
         }
+        skills_mod.deinitSkills();
     }
 };
 
@@ -302,26 +361,50 @@ fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, i
         }
     }
 
+    var result = SpResult{ .buf = base_buf, .text = base_text };
+
     const cwd = std.Io.Dir.cwd();
     const agents_md_file = cwd.openFile(io, "AGENTS.md", .{}) catch {
-        return .{ .buf = base_buf, .text = base_text };
+        return appendSkillsBlock(alloc, env_map, io, result);
     };
     defer agents_md_file.close(io);
 
-    const stat = agents_md_file.stat(io) catch return .{ .buf = base_buf, .text = base_text };
-    if (stat.size == 0 or stat.size > 128 * 1024) return .{ .buf = base_buf, .text = base_text };
+    const stat = agents_md_file.stat(io) catch return appendSkillsBlock(alloc, env_map, io, result);
+    if (stat.size == 0 or stat.size > 128 * 1024) return appendSkillsBlock(alloc, env_map, io, result);
 
-    const agents_buf = alloc.alloc(u8, @intCast(stat.size)) catch return .{ .buf = base_buf, .text = base_text };
+    const agents_buf = alloc.alloc(u8, @intCast(stat.size)) catch return appendSkillsBlock(alloc, env_map, io, result);
     defer alloc.free(agents_buf);
 
-    const n = utils.readAll(io, agents_md_file, agents_buf) catch return .{ .buf = base_buf, .text = base_text };
+    const n = utils.readAll(io, agents_md_file, agents_buf) catch return appendSkillsBlock(alloc, env_map, io, result);
     const agents_text = agents_buf[0..n];
 
-    const combined_text = std.fmt.allocPrint(alloc, "{s}\n\n<RULE[AGENTS.md]>\n{s}\n</RULE[AGENTS.md]>\n", .{ base_text, agents_text }) catch return .{ .buf = base_buf, .text = base_text };
+    const combined_text = std.fmt.allocPrint(alloc, "{s}\n\n<RULE[AGENTS.md]>\n{s}\n</RULE[AGENTS.md]>\n", .{ result.text, agents_text }) catch return appendSkillsBlock(alloc, env_map, io, result);
 
-    if (base_buf) |b| alloc.free(b);
+    if (result.buf) |b| alloc.free(b);
     main.stderrPrint("[config] Loaded AGENTS.md ({d} bytes)\n", .{n});
-    return .{ .buf = combined_text, .text = combined_text };
+    result = .{ .buf = combined_text, .text = combined_text };
+    return appendSkillsBlock(alloc, env_map, io, result);
+}
+
+/// Inject skills block vào cuối system prompt.
+/// Load skills từ đĩa trước (loadSkills), rồi build block và nối vào.
+/// Trả về SpResult mới; nếu không có skill nào, trả về nguyên bản.
+fn appendSkillsBlock(alloc: Allocator, env_map: *const std.process.Environ.Map, io: std.Io, prev: SpResult) SpResult {
+    const n = skills_mod.loadSkills(alloc, io, env_map);
+    if (n == 0) return prev;
+
+    const block = skills_mod.buildSkillsBlock(alloc) catch return prev;
+    if (block) |b| {
+        const combined = std.fmt.allocPrint(alloc, "{s}\n{s}", .{ prev.text, b }) catch {
+            alloc.free(b);
+            return prev;
+        };
+        alloc.free(b);
+        if (prev.buf) |old| alloc.free(old);
+        main.stderrPrint("[config] Loaded {d} skill(s) into system prompt\n", .{n});
+        return .{ .buf = combined, .text = combined };
+    }
+    return prev;
 }
 
 // ---------------------------------------------------------------------------
