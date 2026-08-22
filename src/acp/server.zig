@@ -307,11 +307,7 @@ pub const AcpServer = struct {
         var stop_reason: []const u8 = "end_turn";
         self.agent.processInput(expanded_prompt, acpTextCallback, acpThinkCallback) catch |e| {
             main.stderrPrint("[acp] Agent error during prompt: {s}\n", .{@errorName(e)});
-            if (e == agent_mod.AgentError.MaxIterationsReached) {
-                stop_reason = "max_tokens";
-            } else {
-                stop_reason = "error";
-            }
+            stop_reason = "error";
         };
 
         if (self.is_cancelled) {

@@ -21,10 +21,6 @@
 //! ## Fallback
 //! Nếu primary backend lỗi, agent thử các backend còn lại.
 //!
-//! ## Giới hạn
-//! Tối đa `MAX_ITERATIONS` iterations mỗi lần gọi processInput.
-//! Ngăn vòng lặp vô tận khi AI liên tục gọi tool.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayListUnmanaged;
@@ -54,18 +50,10 @@ fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
     return null;
 }
 
-/// Số iterations tối đa trong một lần processInput.
-const MAX_ITERATIONS = 30;
 /// Số lần retry tối đa khi gặp rate limit.
 const MAX_RATE_LIMIT_RETRIES = 5;
-/// Số lần tối đa yêu cầu model tiếp tục sau khi response bị cắt (max_tokens).
-const MAX_TOKENS_CONTINUES = 3;
 /// Thời gian chờ ban đầu khi gặp rate limit (giây).
 const RATE_LIMIT_BASE_DELAY_S: u64 = 5;
-
-pub const AgentError = error{
-    MaxIterationsReached,
-};
 
 // ---------------------------------------------------------------------------
 // Backend union
@@ -133,7 +121,6 @@ pub const AgentLoop = struct {
     /// Đếm số lần sửa lỗi role/first-message (Claude 400) trong turn.
     role_fix_attempts: usize = 0,
     /// Đếm số lần liên tiếp response bị cắt do max_tokens trong turn.
-    /// Vượt MAX_TOKENS_CONTINUES thì mới chấp nhận dừng.
     max_tokens_continues: usize = 0,
     /// Trình ước lượng token (MemAct).
     token_estimator: tokens_mod.TokenEstimator,
@@ -448,23 +435,19 @@ pub const AgentLoop = struct {
                 return .exit_loop;
             },
             .max_tokens => {
-                // Response bị cắt giữa chừng. KHÔNG exit ngay — chèn observation
+                // Response bị cắt giữa chừng. KHÔNG exit — chèn observation
                 // yêu cầu model tiếp tục đúng từ chỗ dừng (không lặp lại phần đã
                 // viết) để hoàn thành khối đang dở (JS block / tool_use / văn bản).
                 self.max_tokens_continues += 1;
-                if (self.max_tokens_continues <= MAX_TOKENS_CONTINUES) {
-                    main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response bị cắt (max_tokens), yêu cầu tiếp tục ({d}/{d})...\x1b[0m\n", .{ self.max_tokens_continues, MAX_TOKENS_CONTINUES });
-                    var buf = utils.BufWriter.init(self.alloc);
-                    defer buf.deinit();
-                    try buf.print(
-                        "[System] Phản hồi vừa rồi bị cắt do đạt giới hạn max_tokens (lần {d}/{d}). Hãy tiếp tục ĐÚNG từ chỗ dừng — không lặp lại phần đã viết, không giới thiệu lại. Nếu khối ```js ... ``` hoặc tool call đang dở dang, viết tiếp phần còn lại để hoàn thành.",
-                        .{ self.max_tokens_continues, MAX_TOKENS_CONTINUES },
-                    );
-                    try self.history.addUser(buf.list.items);
-                    return .continue_loop;
-                }
-                main.stderrPrint("\n\x1b[33m[agent] ⚠️ Cảnh báo: Đạt giới hạn max_tokens sau {d} lần tiếp tục. Dừng sớm.\x1b[0m\n", .{MAX_TOKENS_CONTINUES});
-                return .exit_loop;
+                main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response bị cắt (max_tokens), yêu cầu tiếp tục (lần {d})...\x1b[0m\n", .{self.max_tokens_continues});
+                var buf = utils.BufWriter.init(self.alloc);
+                defer buf.deinit();
+                try buf.print(
+                    "[System] Phản hồi vừa rồi bị cắt do đạt giới hạn max_tokens (lần {d}). Hãy tiếp tục ĐÚNG từ chỗ dừng — không lặp lại phần đã viết, không giới thiệu lại. Nếu khối ```js ... ``` hoặc tool call đang dở dang, viết tiếp phần còn lại để hoàn thành.",
+                    .{self.max_tokens_continues},
+                );
+                try self.history.addUser(buf.list.items);
+                return .continue_loop;
             },
             .tool_use => {
                 try self.executeTools(act_id, &response);
