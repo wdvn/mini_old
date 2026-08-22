@@ -298,7 +298,7 @@ pub const AgentLoop = struct {
                 try temp_msgs.appendSlice(self.alloc, self.history.messages());
                 try temp_msgs.append(self.alloc, sys_msg);
 
-                var summary_resp = try self.sendToBackend(self.config.system_prompt, temp_msgs.items, &[_]proto.ToolDefinition{}, null, null);
+                var summary_resp = try self.sendToBackend(act_id, self.config.system_prompt, temp_msgs.items, &[_]proto.ToolDefinition{}, null, null);
                 defer summary_resp.deinit();
 
                 var compacted = false;
@@ -330,7 +330,7 @@ pub const AgentLoop = struct {
             try temp_msgs.appendSlice(self.alloc, self.history.messages());
             try temp_msgs.append(self.alloc, sys_msg);
             
-            var summary_resp = try self.sendToBackend(self.config.system_prompt, temp_msgs.items, &[_]proto.ToolDefinition{}, null, null);
+            var summary_resp = try self.sendToBackend(act_id, self.config.system_prompt, temp_msgs.items, &[_]proto.ToolDefinition{}, null, null);
             defer summary_resp.deinit();
             
             var compacted = false;
@@ -348,6 +348,7 @@ pub const AgentLoop = struct {
 
         // Gửi lên AI backend (streaming)
         var response = try self.sendToBackend(
+            act_id,
             self.config.system_prompt,
             self.history.messages(),
             tool_defs,
@@ -724,6 +725,7 @@ pub const AgentLoop = struct {
 
     fn sendToBackend(
         self: *AgentLoop,
+        act_id: usize,
         system_prompt: []const u8,
         msgs: []const proto.Message,
         tool_defs: []const proto.ToolDefinition,
@@ -744,6 +746,19 @@ pub const AgentLoop = struct {
                 );
                 if (fallback.sendMessage(system_prompt, msgs, tool_defs, text_cb, think_cb)) |resp| {
                     main.stderrPrint("[agent] Ollama fallback thành công\n", .{});
+                    // Journal: primary lỗi (transport/parse — vd ReadFailed) nhưng
+                    // fallback thành công. Turn vẫn tiếp tục, nhưng phải ghi lại
+                    // lỗi primary để debug từ journal (stderr là ephemeral).
+                    if (self.journal) |*j| {
+                        j.recordError(self.io, act_id, .llm_provider_error, "Primary backend lỗi, fallback Ollama thành công — tiếp tục turn", .{
+                            .backend = self.backend.name(),
+                            .model = self.backend.model(),
+                            .error_name = @errorName(e),
+                            .http_code = self.last_backend_http_code,
+                            .attempt = 1,
+                            .raw_snippet = self.last_backend_raw_error,
+                        }) catch {};
+                    }
                     return resp;
                 } else |fb_err| {
                     // Journal: fallback cũng thất bại — ghi cả 2 lỗi để debug
@@ -755,7 +770,7 @@ pub const AgentLoop = struct {
                             .{ self.backend.name(), @errorName(e), @errorName(fb_err) },
                         ) catch "Primary + fallback đều lỗi";
                         defer self.alloc.free(desc);
-                        j.recordError(self.io, 0, .llm_provider_error, desc, .{
+                        j.recordError(self.io, act_id, .llm_provider_error, desc, .{
                             .backend = self.backend.name(),
                             .model = self.backend.model(),
                             .error_name = @errorName(fb_err),
