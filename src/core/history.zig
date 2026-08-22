@@ -289,26 +289,29 @@ pub const History = struct {
     }
 
     /// Compact theo logic MemAct (bản mới): GIỮ NGUYÊN msgs.items[0] (user prompt gốc),
-    /// đặt summary message tại index 1, dồn phần giữ lại [split_idx..] về từ index 2.
+    /// đặt summary message tại index 1, DROP toàn bộ phần còn lại.
+    ///
+    /// Không còn giữ N messages gần nhất: với window lớn, phần giữ lại (~60% window)
+    /// vẫn vượt ngưỡng compact → mỗi vòng lặp lại nén (tốn LLM call, history không
+    /// bao giờ xuống dưới ngưỡng). Trạng thái "đang ở bước nào" được đưa vào
+    /// summary (task_state/next_step) nên model vẫn tiếp tục đúng chỗ.
     ///
     /// Nếu msgs.items[1] đã là summary từ lần compact trước (tier .summarized)
-    /// thì summary cũ nằm trong vùng drop và được thay thế bởi summary mới (dồn tích lũy).
-    pub fn compactMemAct(self: *History, act_id: usize, split_idx: usize, summary: []const u8) !void {
-        // No-op: split quá nhỏ (sẽ làm mất prompt gốc) hoặc history quá ngắn
-        if (split_idx <= 1) return;
-        if (self.msgs.items.len <= 2) return;
-        if (split_idx > self.msgs.items.len) return;
+    /// thì summary cũ bị thay thế bởi summary mới (dồn tích lũy).
+    pub fn compactMemAct(self: *History, act_id: usize, summary: []const u8) !void {
+        // No-op: không có gì để nén (chưa qua prompt gốc)
+        if (self.msgs.items.len <= 1) return;
 
         // Cập nhật mốc compact
         self.last_compaction_act_id = act_id;
 
         // Nếu msgs[1] là summary từ lần compact trước → thay thế; ngược lại → chèn mới.
-        // Cả hai trường hợp drop_start đều là 1 (summary cũ nằm trong vùng drop).
-        const drop_start: usize = 1;
         const replace_old_summary = self.msgs.items[1].tier == .summarized;
 
-        // Free các message bị bỏ (không đụng tới msgs[0] — prompt gốc)
-        for (self.msgs.items[drop_start..split_idx]) |msg| freeContentBlocks(self.alloc, msg.content);
+        // Free toàn bộ messages từ index 1 trở đi (không đụng tới msgs[0] — prompt gốc)
+        const dropped = self.msgs.items.len - 1;
+        for (self.msgs.items[1..]) |msg| freeContentBlocks(self.alloc, msg.content);
+        self.msgs.items.len = 1;
 
         // Tạo summary message. Role phải là .user để Claude API không từ chối
         // với lỗi 400 "first message must be user" (session cũ compact kiểu cũ).
@@ -318,16 +321,9 @@ pub const History = struct {
         errdefer self.alloc.free(blocks);
         blocks[0] = .{ .text = summary_text };
         const summary_msg = proto.Message{ .role = .user, .content = blocks, .tier = .summarized };
+        try self.msgs.append(self.alloc, summary_msg);
 
-        // Dồn phần giữ lại [split_idx..] về index 2, summary đặt tại index 1
-        const old_len = self.msgs.items.len;
-        const keep = old_len - split_idx;
-        std.mem.copyForwards(proto.Message, self.msgs.items[2 .. keep + 2], self.msgs.items[split_idx..old_len]);
-
-        self.msgs.items[1] = summary_msg;
-        self.msgs.items.len = keep + 2;
-
-        main.stderrPrint("\n[history] Đã nén ngữ cảnh (MemAct): giữ prompt gốc (index 0), {s} summary tại index 1, giữ lại {d} messages gần nhất.\n", .{ if (replace_old_summary) "thay thế" else "chèn mới", keep });
+        main.stderrPrint("\n[history] Đã nén ngữ cảnh (MemAct): giữ prompt gốc (index 0), {s} summary tại index 1, drop {d} messages.\n", .{ if (replace_old_summary) "thay thế" else "chèn mới", dropped });
     }
 
     /// Đảm bảo history tương thích Claude API (message đầu tiên phải có role .user).
@@ -346,7 +342,7 @@ pub const History = struct {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "compactMemAct giữ msgs[0], summary .user/.summarized ở index 1, dồn đúng" {
+test "compactMemAct giữ msgs[0], summary .user/.summarized ở index 1, drop toàn bộ phần sau" {
     // compactMemAct log qua main.stderrPrint dùng g_io — trong test mode g_io
     // chưa được init (chỉ set trong main()) → gán std.testing.io cho an toàn.
     main.g_io = std.testing.io;
@@ -361,10 +357,10 @@ test "compactMemAct giữ msgs[0], summary .user/.summarized ở index 1, dồn 
     try h.addUser("câu hỏi 3");
     try h.addAssistantText("trả lời 3");
 
-    try h.compactMemAct(7, 3, "tóm tắt ngữ cảnh");
+    try h.compactMemAct(7, "tóm tắt ngữ cảnh");
 
-    // keep = 6 - 3 = 3 → new len = keep + 2 = 5
-    try std.testing.expectEqual(@as(usize, 5), h.msgs.items.len);
+    // Chỉ còn prompt gốc + summary
+    try std.testing.expectEqual(@as(usize, 2), h.msgs.items.len);
 
     // msgs[0] nguyên vẹn: role .user, text prompt gốc
     try std.testing.expect(h.msgs.items[0].role == .user);
@@ -374,13 +370,6 @@ test "compactMemAct giữ msgs[0], summary .user/.summarized ở index 1, dồn 
     try std.testing.expect(h.msgs.items[1].role == .user);
     try std.testing.expect(h.msgs.items[1].tier == .summarized);
     try std.testing.expectEqualStrings("[MemAct Context Summary]\ntóm tắt ngữ cảnh", h.msgs.items[1].content[0].text);
-
-    // Phần [split_idx..] = [trả lời 2, câu hỏi 3, trả lời 3] dồn vào từ index 2
-    try std.testing.expectEqualStrings("trả lời 2", h.msgs.items[2].content[0].text);
-    try std.testing.expect(h.msgs.items[2].role == .assistant);
-    try std.testing.expectEqualStrings("câu hỏi 3", h.msgs.items[3].content[0].text);
-    try std.testing.expect(h.msgs.items[3].role == .user);
-    try std.testing.expectEqualStrings("trả lời 3", h.msgs.items[4].content[0].text);
 
     try std.testing.expect(h.last_compaction_act_id == 7);
 }
@@ -395,18 +384,17 @@ test "compactMemAct lần 2 dồn tích lũy: thay summary cũ, msgs[0] vẫn ng
     try h.addAssistantText("trả lời 1");
     try h.addUser("câu hỏi 2");
     try h.addAssistantText("trả lời 2");
+
+    // Compact lần 1: còn [prompt gốc, summary v1]
+    try h.compactMemAct(3, "summary v1");
+    try std.testing.expectEqual(@as(usize, 2), h.msgs.items.len);
+
+    // Thêm hội thoại mới rồi compact lần 2: summary cũ bị thay thế
     try h.addUser("câu hỏi 3");
     try h.addAssistantText("trả lời 3");
+    try h.compactMemAct(9, "summary v2 merged");
 
-    // Compact lần 1
-    try h.compactMemAct(3, 3, "summary v1");
-    try std.testing.expectEqual(@as(usize, 5), h.msgs.items.len);
-
-    // Compact lần 2: msgs[1] đang là summary (tier .summarized) → phải bị thay thế
-    try h.compactMemAct(9, 4, "summary v2 merged");
-
-    // keep = 5 - 4 = 1 → new len = 3
-    try std.testing.expectEqual(@as(usize, 3), h.msgs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), h.msgs.items.len);
 
     // msgs[0] vẫn nguyên vẹn qua cả 2 lần compact
     try std.testing.expect(h.msgs.items[0].role == .user);
@@ -417,35 +405,25 @@ test "compactMemAct lần 2 dồn tích lũy: thay summary cũ, msgs[0] vẫn ng
     try std.testing.expect(h.msgs.items[1].tier == .summarized);
     try std.testing.expectEqualStrings("[MemAct Context Summary]\nsummary v2 merged", h.msgs.items[1].content[0].text);
 
-    // Phần giữ lại [4..5] = [trả lời 3] dồn về index 2
-    try std.testing.expectEqualStrings("trả lời 3", h.msgs.items[2].content[0].text);
-
     try std.testing.expect(h.last_compaction_act_id == 9);
 }
 
-test "compactMemAct no-op khi split_idx <= 1 hoặc history quá ngắn" {
+test "compactMemAct no-op khi history quá ngắn (chỉ prompt gốc hoặc rỗng)" {
     const alloc = std.testing.allocator;
     var h = History.init(alloc);
     defer h.deinit();
 
     try h.addUser("a");
-    try h.addAssistantText("b");
-    try h.addUser("c");
-
-    // split_idx <= 1 → no-op
-    try h.compactMemAct(5, 0, "sum");
-    try h.compactMemAct(5, 1, "sum");
-    try std.testing.expectEqual(@as(usize, 3), h.msgs.items.len);
+    try h.compactMemAct(5, "sum");
+    try std.testing.expectEqual(@as(usize, 1), h.msgs.items.len);
     try std.testing.expectEqualStrings("a", h.msgs.items[0].content[0].text);
     try std.testing.expect(h.last_compaction_act_id == 0); // không cập nhật mốc
 
-    // History <= 2 messages → no-op
+    // History rỗng → no-op
     var h2 = History.init(alloc);
     defer h2.deinit();
-    try h2.addUser("chỉ prompt");
-    try h2.addAssistantText("một trả lời");
-    try h2.compactMemAct(2, 2, "sum");
-    try std.testing.expectEqual(@as(usize, 2), h2.msgs.items.len);
+    try h2.compactMemAct(2, "sum");
+    try std.testing.expectEqual(@as(usize, 0), h2.msgs.items.len);
     try std.testing.expect(h2.last_compaction_act_id == 0);
 }
 

@@ -253,18 +253,21 @@ pub const AgentLoop = struct {
         // Hiện tại tạm dùng cứng 1500 tokens cho system_prompt, sau sẽ add TokenEstimator cho nó.
         const pinned_tokens = self.token_estimator.estimate(self.config.system_prompt);
 
-        if (self.config.memact_enabled and self.context_window.needsCompaction(&self.token_estimator, self.history.messages(), pinned_tokens)) {
+        if (self.config.memact_enabled and self.history.messages().len > 2 and self.context_window.needsCompaction(&self.token_estimator, self.history.messages(), pinned_tokens)) {
+            // Guard: history đã ở dạng tối thiểu [prompt gốc, summary] nhưng vẫn
+            // vượt ngưỡng (prompt gốc/summary quá lớn) — compactMemAct không thể
+            // giảm thêm (chỉ thay summary bằng summary mới). Tránh gọi LLM summary
+            // mỗi vòng lặp (đốt API call, history không giảm), chỉ log cảnh báo.
             const threshold_pct = @as(u32, @intFromFloat(self.context_window.compact_threshold * 100.0));
             main.stderrPrint("\n\x1b[33m[agent] Lịch sử đạt {d}% window, nén MemAct...\x1b[0m\n", .{threshold_pct});
-            
-            const split_idx = self.context_window.findSplitIndex(&self.token_estimator, self.history.messages(), pinned_tokens);
-            
-            // Điều kiện split_idx > 1: không bao giờ compact khi split quá nhỏ.
-            // compactMemAct (bản mới) GIỮ NGUYÊN msgs[0] (prompt gốc) và chèn/thay
-            // summary tại index 1 — nếu split < 2 sẽ làm mất cả prompt gốc lẫn
-            // summary cũ. temp_msgs build từ messages()[0..split_idx] nên đã tự
-            // chứa prompt gốc + summary cũ tại index 1 (phục vụ dồn tích lũy).
-            if (split_idx > 1) {
+
+            // compactMemAct (bản mới) GIỮ NGUYÊN msgs[0] (prompt gốc) và DROP toàn bộ
+            // phần còn lại, chỉ chèn/thay summary tại index 1. KHÔNG giữ N messages
+            // gần nhất — với window lớn phần giữ lại (~60% window) vẫn vượt ngưỡng
+            // compact → mỗi vòng lặp lại nén (tốn LLM call, history không bao giờ
+            // xuống dưới ngưỡng). Trạng thái "đang ở bước nào" nằm trong summary
+            // (task_state/next_step) nên model vẫn tiếp tục đúng chỗ.
+            {
                 var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
                 msg_blocks[0] = .{ .text = try self.alloc.dupe(u8, 
                     "SYSTEM: Bạn là bộ nhớ MemAct. Hãy tóm tắt ngắn gọn phần hội thoại trước thành JSON, tuân thủ đúng stencil:\n" ++
@@ -289,16 +292,16 @@ pub const AgentLoop = struct {
                 
                 var temp_msgs = std.ArrayListUnmanaged(proto.Message).empty;
                 defer temp_msgs.deinit(self.alloc);
-                try temp_msgs.appendSlice(self.alloc, self.history.messages()[0..split_idx]);
+                try temp_msgs.appendSlice(self.alloc, self.history.messages());
                 try temp_msgs.append(self.alloc, sys_msg);
-                
+
                 var summary_resp = try self.sendToBackend(self.config.system_prompt, temp_msgs.items, &[_]proto.ToolDefinition{}, null, null);
                 defer summary_resp.deinit();
-                
+
                 var compacted = false;
                 for (summary_resp.content.items) |block| {
                     if (block == .text) {
-                        try self.history.compactMemAct(act_id, split_idx, block.text);
+                        try self.history.compactMemAct(act_id, block.text);
                         compacted = true;
                         break;
                     }
@@ -307,9 +310,6 @@ pub const AgentLoop = struct {
                     main.stderrPrint("[agent] Cảnh báo: LLM không trả về text summary, fallback.\n", .{});
                     self.history.compact();
                 }
-            } else {
-                main.stderrPrint("[agent] Không tìm được split_idx hợp lý, giữ nguyên.\n", .{});
-                self.history.compact();
             }
         } else if (!self.config.memact_enabled and self.history.needsCompaction()) {
             main.stderrPrint("\n\x1b[33m[agent] Lịch sử quá dài (MemAct tắt), đang nén cũ...\x1b[0m\n", .{});
