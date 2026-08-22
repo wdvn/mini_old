@@ -30,8 +30,9 @@ const MAX_LINES_PER_READ = 2000;
 /// Tool file_read: đọc nội dung file với line numbers.
 /// Input: {"path":"...", "offset":10, "limit":50}
 pub fn readTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
-    const path = json.findString(input_json, "path") orelse
+    const path = (try json.findStringOwned(alloc, input_json, "path")) orelse
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'path'", .{});
+    defer alloc.free(path);
 
     const offset: usize = blk: {
         const s = json.findString(input_json, "offset") orelse break :blk 0;
@@ -48,32 +49,28 @@ pub fn readTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
 /// Tool file_write: ghi nội dung vào file (tạo mới hoặc ghi đè).
 /// Input: {"path":"...", "content":"..."}
 pub fn writeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
-    const path = json.findString(input_json, "path") orelse
+    const path = (try json.findStringOwned(alloc, input_json, "path")) orelse
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'path'", .{});
-    const content = json.findString(input_json, "content") orelse
+    defer alloc.free(path);
+    const content = (try json.findStringOwned(alloc, input_json, "content")) orelse
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'content'", .{});
+    defer alloc.free(content);
 
-    // Unescape nội dung (API gửi dưới dạng JSON string)
-    const unescaped = json.unescape(alloc, content) catch content;
-    defer if (!std.mem.eql(u8, content, unescaped)) alloc.free(unescaped);
-
-    return writeFile(alloc, io, path, unescaped);
+    return writeFile(alloc, io, path, content);
 }
 
 /// Tool file_edit: tìm old_string (phải duy nhất) và thay bằng new_string.
 /// Input: {"path":"...", "old_string":"...", "new_string":"..."}
 pub fn editTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
-    const path = json.findString(input_json, "path") orelse
+    const path = (try json.findStringOwned(alloc, input_json, "path")) orelse
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'path'", .{});
-    const old_s = json.findString(input_json, "old_string") orelse
+    defer alloc.free(path);
+    const old_str = (try json.findStringOwned(alloc, input_json, "old_string")) orelse
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'old_string'", .{});
-    const new_s = json.findString(input_json, "new_string") orelse
+    defer alloc.free(old_str);
+    const new_str = (try json.findStringOwned(alloc, input_json, "new_string")) orelse
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'new_string'", .{});
-
-    const old_str = json.unescape(alloc, old_s) catch old_s;
-    defer if (!std.mem.eql(u8, old_s, old_str)) alloc.free(old_str);
-    const new_str = json.unescape(alloc, new_s) catch new_s;
-    defer if (!std.mem.eql(u8, new_s, new_str)) alloc.free(new_str);
+    defer alloc.free(new_str);
 
     return editFile(alloc, io, path, old_str, new_str);
 }

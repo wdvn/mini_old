@@ -28,6 +28,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = @import("../core/json.zig");
 const utils = @import("../core/utils.zig");
+const main = @import("../main.zig");
 
 /// Danh sách pattern lệnh bị chặn.
 const BLOCKED_PATTERNS = [_][]const u8{
@@ -54,8 +55,12 @@ const MAX_OUTPUT = 128 * 1024;
 /// Input: JSON string với trường "command".
 /// Output: stdout/stderr của lệnh, hoặc thông báo lỗi.
 pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
-    const command = json.findString(input_json, "command") orelse
+    // Unescape chuỗi JSON: lệnh chứa \" \\n phải về đúng dạng literal
+    // trước khi đưa vào /bin/sh, nếu không shell sẽ parse sai (quote thành
+    // literal, redirect 2>&1 bị tách token...).
+    const command = (try json.findStringOwned(alloc, input_json, "command")) orelse
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'command'", .{});
+    defer alloc.free(command);
 
     // Safety check
     for (&BLOCKED_PATTERNS) |pattern| {
@@ -67,7 +72,8 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         }
     }
 
-    const stdin_str = json.findString(input_json, "stdin");
+    const stdin_str = try json.findStringOwned(alloc, input_json, "stdin");
+    defer if (stdin_str) |s| alloc.free(s);
 
     return executeCommand(alloc, io, command, stdin_str);
 }
@@ -104,6 +110,17 @@ fn drainStderrThread(io: std.Io, pipe: std.Io.File, buf: []u8, len_out: *usize) 
 // ---------------------------------------------------------------------------
 // Command execution
 // ---------------------------------------------------------------------------
+
+test "bash tool: command JSON escape được unescape trước khi chạy" {
+    const alloc = std.testing.allocator;
+    // LLM gửi JSON chuẩn: command chứa quote + backslash-pipe + redirect.
+    // Trước fix: findString trả chuỗi chưa unescape → shell thấy echo \"...\"
+    // → in ra kèm quote literal. Sau fix: in đúng hello world.
+    const input = "{\"command\":\"echo \\\"hello world\\\"\"}";
+    const res = try executeTool(alloc, main.getIo(), input);
+    defer alloc.free(res);
+    try std.testing.expectEqualStrings("hello world", std.mem.trim(u8, res, " \n\r\t\""));
+}
 
 /// Chạy lệnh shell và thu thập output.
 /// Dùng thread riêng đọc stderr song song với stdout để tránh deadlock pipe.

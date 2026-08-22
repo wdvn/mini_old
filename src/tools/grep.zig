@@ -30,9 +30,12 @@ const MAX_FILE_SIZE = 1024 * 1024;
 /// Tool entry point.
 /// Input: {"pattern":"...", "path":".", "case_insensitive":"false"}
 pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
-    const pattern = json.findString(input_json, "pattern") orelse
+    const pattern = (try json.findStringOwned(alloc, input_json, "pattern")) orelse
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'pattern'", .{});
-    const search_path = json.findString(input_json, "path") orelse ".";
+    defer alloc.free(pattern);
+    const search_path = (try json.findStringOwned(alloc, input_json, "path")) orelse
+        try alloc.dupe(u8, ".");
+    defer alloc.free(search_path);
     const ci_str = json.findString(input_json, "case_insensitive") orelse "false";
     const case_insensitive = std.mem.eql(u8, ci_str, "true");
 
