@@ -97,6 +97,9 @@ pub const Config = struct {
     ctx_safety_margin: f32,
     ctx_compact_threshold: f32,
 
+    // Budget Limits (RFC-002)
+    budget_max_tokens: usize,
+
     // MCP
     /// Đường dẫn file mcp.json. Null = dùng default ~/.mini/mcp.json.
     mcp_config_path: ?[]const u8,
@@ -200,6 +203,11 @@ pub const Config = struct {
             break :blk std.fmt.parseFloat(f32, s) catch 0.85;
         };
 
+        const budget_max_tokens: usize = blk: {
+            const s = env_map.get("MINI_BUDGET_MAX_TOKENS") orelse break :blk 10_000_000; // default large budget
+            break :blk std.fmt.parseInt(usize, s, 10) catch 10_000_000;
+        };
+
         const history_enabled = blk: {
             const v = env_map.get("MINI_NO_HISTORY") orelse break :blk true;
             break :blk !std.mem.eql(u8, v, "1");
@@ -217,6 +225,9 @@ pub const Config = struct {
             openai_url orelse "(null)",
             openai_model,
             env_map.get("MINI_HOME") orelse "(null)",
+        });
+        main.stderrPrint("[config] Build: {s} | {s} | {s} | zig {s}\n", .{
+            main.BUILD_TIME, main.BUILD_OPTIMIZE, main.BUILD_TARGET, main.ZIG_VERSION,
         });
 
         return .{
@@ -239,6 +250,7 @@ pub const Config = struct {
             .context_window = context_window,
             .ctx_safety_margin = ctx_safety_margin,
             .ctx_compact_threshold = ctx_compact_threshold,
+            .budget_max_tokens = budget_max_tokens,
             .mcp_config_path = env_map.get("MINI_MCP_CONFIG"),
             .history_enabled = history_enabled,
             .hook_command = hook_cmd,

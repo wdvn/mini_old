@@ -35,6 +35,8 @@ pub const History = struct {
     msgs: ArrayList(proto.Message),
     /// Ngưỡng tự động compact.
     max_messages: usize,
+    /// ID của Act tại lần compact gần nhất (để block rollback vượt quá mốc này).
+    last_compaction_act_id: usize,
 
     /// Khởi tạo History rỗng.
     pub fn init(alloc: Allocator) History {
@@ -42,6 +44,7 @@ pub const History = struct {
             .alloc = alloc,
             .msgs = .empty,
             .max_messages = DEFAULT_MAX_MESSAGES,
+            .last_compaction_act_id = 0,
         };
     }
 
@@ -223,6 +226,24 @@ pub const History = struct {
         self.msgs.items.len -= 1;
     }
 
+    /// Xóa các tin nhắn từ index được chỉ định trở đi (Rollback)
+    pub fn truncate(self: *History, target_len: usize) void {
+        if (target_len >= self.msgs.items.len) return;
+        for (self.msgs.items[target_len..]) |msg| {
+            freeContentBlocks(self.alloc, msg.content);
+        }
+        self.msgs.items.len = target_len;
+    }
+
+    /// Thêm thông báo lỗi hệ thống từ Agent
+    pub fn addSystemErrorObservation(self: *History, err_msg: []const u8) !void {
+        const text_copy = try self.alloc.dupe(u8, err_msg);
+        const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+        blocks[0] = .{ .text = text_copy };
+        // Phải là .user để LLM có thể đọc như một observation
+        try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks, .tier = .recent });
+    }
+
     /// Compact: giữ lại chỉ một nửa các tin nhắn gần nhất.
     /// Luôn giữ theo cặp chẵn (user + assistant) để không phá vỡ cấu trúc.
     pub fn compact(self: *History) void {
@@ -269,8 +290,11 @@ pub const History = struct {
 
     /// Compact theo logic MemAct: cắt đi phần từ 0..split_idx,
     /// chèn một message tóm tắt vào đầu phần giữ lại.
-    pub fn compactMemAct(self: *History, split_idx: usize, summary: []const u8) !void {
+    pub fn compactMemAct(self: *History, act_id: usize, split_idx: usize, summary: []const u8) !void {
         if (split_idx >= self.msgs.items.len) return;
+
+        // Cập nhật mốc compact
+        self.last_compaction_act_id = act_id;
 
         // Free các message bị bỏ
         for (self.msgs.items[0..split_idx]) |msg| freeContentBlocks(self.alloc, msg.content);

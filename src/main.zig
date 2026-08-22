@@ -27,6 +27,14 @@ pub const process_manager = @import("runtime/process_manager.zig");
 
 pub const VERSION = "1.0.0";
 
+/// Build info được inject lúc build (build.zig → options module `build_info`).
+/// Đổi theo mỗi lần `zig build`, giúp nhận diện binary đang chạy là bản build nào.
+pub const build_info = @import("build_info");
+pub const BUILD_TIME = build_info.build_time;
+pub const BUILD_OPTIMIZE = build_info.optimize_mode;
+pub const BUILD_TARGET = build_info.target_triple;
+pub const ZIG_VERSION = build_info.zig_version;
+
 pub var g_io: std.Io = undefined;
 
 /// Lấy Io instance: tự động dùng std.testing.io khi chạy test (comptime), hoặc g_io khi runtime.
@@ -73,7 +81,9 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.show_version) {
-        stdoutPrint("mini-agent {s}\n", .{VERSION});
+        stdoutPrint("mini-agent {s}\nbuild:   {s}\ntarget:  {s} ({s})\nzig:     {s}\n", .{
+            VERSION, BUILD_TIME, BUILD_TARGET, BUILD_OPTIMIZE, ZIG_VERSION,
+        });
         return;
     }
 

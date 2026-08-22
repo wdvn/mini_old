@@ -14,10 +14,23 @@
 //!   libsqlite3 — (reserved cho future history persistence)
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // -----------------------------------------------------------------------
+    // Build info: timestamp + metadata, inject vào binary qua options module.
+    // Giá trị đổi theo mỗi lần chạy `zig build` → cache luôn bị invalidate,
+    // binary luôn mang timestamp của lần build gần nhất.
+    // -----------------------------------------------------------------------
+    const now_ts = std.Io.Timestamp.now(b.graph.io, .real);
+    const build_info = b.addOptions();
+    build_info.addOption([]const u8, "build_time", formatBuildTime(b.allocator, now_ts.toSeconds()));
+    build_info.addOption([]const u8, "optimize_mode", @tagName(optimize));
+    build_info.addOption([]const u8, "target_triple", target.result.zigTriple(b.allocator) catch "unknown");
+    build_info.addOption([]const u8, "zig_version", builtin.zig_version_string);
 
     const quickjs_dep = b.dependency("quickjs", .{});
     const qjs_path = quickjs_dep.path("");
@@ -62,6 +75,7 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addIncludePath(qjs_path);
     exe_mod.linkLibrary(qjs_lib);
+    exe_mod.addOptions("build_info", build_info);
 
     const exe = b.addExecutable(.{
         .name = "mini",
@@ -93,9 +107,29 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addIncludePath(qjs_path);
     test_mod.linkLibrary(qjs_lib);
+    test_mod.addOptions("build_info", build_info);
 
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Chạy unit tests");
     test_step.dependOn(&run_tests.step);
+}
+
+/// Format Unix timestamp thành "YYYY-MM-DD HH:MM:SS UTC" (không phụ thuộc libc).
+fn formatBuildTime(alloc: std.mem.Allocator, ts: i64) []const u8 {
+    const epoch: u64 = if (ts > 0) @intCast(ts) else 0;
+    const es = std.time.epoch.EpochSeconds{ .secs = epoch };
+    const day = es.getEpochDay();
+    const yd = day.calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+
+    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC", .{
+        yd.year,
+        md.month.numeric(),
+        md.day_index + 1,
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+    }) catch "unknown";
 }

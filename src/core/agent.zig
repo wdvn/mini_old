@@ -43,6 +43,16 @@ const quickjs = @import("../runtime/quickjs_engine.zig");
 const js_bindings = @import("../runtime/js_bindings.zig");
 const tokens_mod = @import("memact/tokens.zig");
 const window_mod = @import("memact/window.zig");
+const cas_mod = @import("cas.zig");
+const journal_mod = @import("journal.zig");
+
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
+    if (getenv(name)) |ptr| {
+        return std.mem.span(ptr);
+    }
+    return null;
+}
 
 /// Số iterations tối đa trong một lần processInput.
 const MAX_ITERATIONS = 30;
@@ -122,6 +132,19 @@ pub const AgentLoop = struct {
     token_estimator: tokens_mod.TokenEstimator,
     /// Cửa sổ ngữ cảnh (MemAct).
     context_window: window_mod.ContextWindow,
+    /// Content-Addressed Storage (RFC-002).
+    cas: cas_mod.CAS,
+    /// Act Journal (RFC-002). Null nếu chưa processInput.
+    journal: ?journal_mod.ActJournal = null,
+
+    pub const Error = error{
+        LLMRateLimitExceeded,
+        LLMProviderUnavailable,
+        LLMMalformedJsonOutput,
+        LLMContextWindowExceeded,
+        UnknownStopReason,
+        UserCancelled,
+    };
 
     /// Khởi tạo AgentLoop từ config.
     /// Chọn backend dựa trên config theo thứ tự ưu tiên.
@@ -166,6 +189,11 @@ pub const AgentLoop = struct {
         // Thiết lập tool policy
         tools_mod.setPolicy(config.tool_allowlist, config.tool_blocklist);
 
+        var path_buf: [256]u8 = undefined;
+        const home_dir = getEnvVar("HOME") orelse ".";
+        const cas_path = try std.fmt.bufPrint(&path_buf, "{s}/.mini/cas", .{home_dir});
+        const cas = try cas_mod.CAS.init(alloc, io, cas_path);
+
         return .{
             .alloc = alloc,
             .io = io,
@@ -180,6 +208,8 @@ pub const AgentLoop = struct {
                 .safety_margin = config.ctx_safety_margin,
                 .compact_threshold = config.ctx_compact_threshold,
             },
+            .cas = cas,
+            .journal = null,
         };
     }
 
@@ -188,6 +218,8 @@ pub const AgentLoop = struct {
         self.history.deinit();
         self.engine.deinit();
         self.token_estimator.deinit();
+        self.cas.deinit();
+        if (self.journal) |*j| j.deinit();
     }
 
     const StepResult = enum {
@@ -197,14 +229,13 @@ pub const AgentLoop = struct {
 
     fn executeStep(
         self: *AgentLoop,
-        iteration: usize,
+        act_id: usize,
         tool_defs: []const proto.ToolDefinition,
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
-        rate_limit_retries: *usize,
     ) !StepResult {
-        if (iteration > 0) {
-            main.stderrPrint("\x1b[90m[agent] --- Vòng lặp {d} ---\x1b[0m\n", .{iteration + 1});
+        if (act_id > 1) {
+            main.stderrPrint("\x1b[90m[agent] --- Vòng lặp {d} ---\x1b[0m\n", .{act_id});
         } else {
             main.stderrPrint("\n\x1b[90m[agent] --- Bắt đầu quy trình ---\x1b[0m\n", .{});
         }
@@ -254,7 +285,7 @@ pub const AgentLoop = struct {
                 var compacted = false;
                 for (summary_resp.content.items) |block| {
                     if (block == .text) {
-                        try self.history.compactMemAct(split_idx, block.text);
+                        try self.history.compactMemAct(act_id, split_idx, block.text);
                         compacted = true;
                         break;
                     }
@@ -315,7 +346,7 @@ pub const AgentLoop = struct {
         try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
 
         // Thêm response vào history (nếu có nội dung)
-        const added_to_history = try self.history.addAssistantResponse(&response);
+        _ = try self.history.addAssistantResponse(&response);
 
         // 1. CodeAct: Kiểm tra có khối mã JavaScript trong response không
         if (self.config.execution_mode != .tools) {
@@ -384,7 +415,7 @@ pub const AgentLoop = struct {
 
         switch (response.stop_reason) {
             .end_turn, .stop_sequence => {
-                main.stderrPrint("\n\x1b[92m[agent] ✓ Hoàn thành sau {d} vòng lặp.\x1b[0m\n", .{iteration + 1});
+                main.stderrPrint("\n\x1b[92m[agent] ✓ Hoàn thành sau {d} vòng lặp.\x1b[0m\n", .{act_id});
                 return .exit_loop;
             },
             .max_tokens => {
@@ -392,27 +423,25 @@ pub const AgentLoop = struct {
                 return .exit_loop;
             },
             .tool_use => {
-                try self.executeTools(&response);
+                try self.executeTools(act_id, &response);
                 main.stderrPrint("\n", .{});
                 return .continue_loop;
             },
             .unknown => {
-                // Detect rate limit: HTTP 429 or "rate_limit" in raw body
-                const is_rate_limit = blk: {
-                    if (response.http_code == 429) break :blk true;
+                // Phân loại lỗi HTTP
+                if (response.http_code == 429) return error.LLMRateLimitExceeded;
+                if (response.http_code == 500 or response.http_code == 502 or response.http_code == 503) return error.LLMProviderUnavailable;
+                if (response.http_code == 400) {
                     if (response.raw_debug_info) |raw| {
-                        if (std.mem.indexOf(u8, raw, "rate_limit") != null) break :blk true;
+                        if (std.mem.indexOf(u8, raw, "context_length_exceeded") != null or 
+                            std.mem.indexOf(u8, raw, "max_tokens") != null) {
+                            return error.LLMContextWindowExceeded;
+                        }
                     }
-                    break :blk false;
-                };
+                }
 
-                if (is_rate_limit and rate_limit_retries.* < MAX_RATE_LIMIT_RETRIES) {
-                    rate_limit_retries.* += 1;
-                    const delay = RATE_LIMIT_BASE_DELAY_S * (@as(u64, 1) << @intCast(rate_limit_retries.* - 1));
-                    main.stderrPrint("\n\x1b[33m[agent] ⚠ Rate limit! Thử lại {d}/{d} sau {d}s...\x1b[0m\n", .{ rate_limit_retries.*, MAX_RATE_LIMIT_RETRIES, delay });
-                    std.Io.sleep(self.io, std.Io.Duration.fromSeconds(@intCast(delay)), .awake) catch {};
-                    if (added_to_history) self.history.popLast();
-                    return .continue_loop;
+                if (response.raw_debug_info) |raw| {
+                    if (std.mem.indexOf(u8, raw, "rate_limit") != null) return error.LLMRateLimitExceeded;
                 }
 
                 main.stderrPrint("[agent] Cảnh báo: stop_reason không xác định (HTTP {d})\n", .{response.http_code});
@@ -457,50 +486,86 @@ pub const AgentLoop = struct {
         // Lấy danh sách tools phù hợp với user message
         const tool_defs = tools_mod.getRelevantDefinitions(turn_alloc, user_text);
 
-        // Chuẩn bị đường dẫn backup file dựa trên PID
-        var path_buf: [256]u8 = undefined;
-        const backup_path = std.fmt.bufPrint(&path_buf, "/tmp/mini_agent_backup_{d}.json", .{std.os.linux.getpid()}) catch "/tmp/mini_agent_backup.json";
-
-        var iteration: usize = 0;
-        var rate_limit_retries: usize = 0;
-        while (iteration < MAX_ITERATIONS) : (iteration += 1) {
-            var try_count: usize = 0;
-            const max_retries = 3;
-            while (try_count <= max_retries) : (try_count += 1) {
-                // 1. Backup state hiện tại trước khi thực hiện step
-                self.history.backupToFile(self.io, backup_path) catch |e| {
-                    main.stderrPrint("[agent] Cảnh báo: Không thể tạo backup file: {s}\n", .{@errorName(e)});
-                };
-
-                // 2. Chạy step
-                const result = self.executeStep(iteration, tool_defs, text_cb, think_cb, &rate_limit_retries) catch |e| {
-                    if (try_count == max_retries) {
-                        main.stderrPrint("\n[agent] Lỗi bước {d} liên tiếp {d} lần. Dừng quy trình. Lỗi: {s}\n", .{ iteration + 1, max_retries + 1, @errorName(e) });
-                        std.Io.Dir.cwd().deleteFile(self.io, backup_path) catch {};
-                        return e;
-                    }
-                    main.stderrPrint("\n[agent] Bước {d} gặp lỗi ({s}). Khôi phục từ backup và thử lại (lần {d}/{d})...\n", .{ iteration + 1, @errorName(e), try_count + 1, max_retries });
-                    
-                    // 3. Khôi phục từ backup file
-                    self.history.restoreFromFile(self.io, backup_path) catch |restore_err| {
-                        main.stderrPrint("[agent] Lỗi nghiêm trọng: Không thể khôi phục từ backup: {s}\n", .{@errorName(restore_err)});
-                        return restore_err;
-                    };
-                    continue;
-                };
-
-                // Nếu chạy thành công
-                if (result == .exit_loop) {
-                    std.Io.Dir.cwd().deleteFile(self.io, backup_path) catch {};
-                    return;
-                }
-                break;
-            }
+        if (self.journal == null) {
+            var path_buf: [256]u8 = undefined;
+            const home_dir = getEnvVar("HOME") orelse ".";
+            const journal_path = std.fmt.bufPrint(&path_buf, "{s}/.mini/sessions/journal_{d}.jsonl", .{ home_dir, std.os.linux.getpid() }) catch "/tmp/mini_journal.jsonl";
+            self.journal = journal_mod.ActJournal.init(self.alloc, self.io, journal_path) catch null;
         }
 
-        main.stderrPrint("[agent] Đạt giới hạn {d} iterations\n", .{MAX_ITERATIONS});
-        std.Io.Dir.cwd().deleteFile(self.io, backup_path) catch {};
-        return error.MaxIterationsReached;
+        var act_id: usize = 1;
+        var rate_limit_retries: usize = 0;
+        const max_retries = 3;
+
+        // Không giới hạn số act — model tự quyết định khi nào dừng (exit_loop).
+        while (true) : (act_id += 1) {
+            var try_count: usize = 0;
+
+            while (try_count <= max_retries) : (try_count += 1) {
+                if (self.journal) |*j| j.recordEvent(self.io, act_id, .act_started, "Bắt đầu Act") catch {};
+
+                const history_len = self.history.messages().len;
+
+                const result = self.executeStep(act_id, tool_defs, text_cb, think_cb) catch |e| {
+                    switch (e) {
+                        error.LLMRateLimitExceeded, error.LLMProviderUnavailable => {
+                            if (self.journal) |*j| j.recordEvent(self.io, act_id, .llm_call_throttled, "LLM rate limit / 503") catch {};
+                            
+                            rate_limit_retries += 1;
+                            if (rate_limit_retries > 5) return e; // Giới hạn 5 lần
+                            
+                            const backoff_s: u64 = (@as(u64, 1) << @as(u6, @intCast(rate_limit_retries))) * 2;
+                            main.stderrPrint("\n\x1b[33m[agent] ⚠ Rate limit / 503! Thử lại sau {d}s...\x1b[0m\n", .{ backoff_s });
+                            std.Io.sleep(self.io, std.Io.Duration.fromSeconds(@intCast(backoff_s)), .awake) catch {};
+                            
+                            if (self.history.last_compaction_act_id < act_id) {
+                                self.history.truncate(history_len);
+                            }
+                            continue;
+                        },
+                        error.LLMContextWindowExceeded => {
+                            if (self.journal) |*j| j.recordEvent(self.io, act_id, .llm_context_overflow, "Context overflow") catch {};
+                            return e;
+                        },
+                        else => {
+                            if (try_count == max_retries) {
+                                main.stderrPrint("\n[agent] Act {d} lỗi liên tiếp {d} lần. Ngắt tiến trình: {s}\n", .{ act_id, max_retries + 1, @errorName(e) });
+                                if (self.history.last_compaction_act_id < act_id) {
+                                    self.history.truncate(history_len);
+                                    if (self.journal) |*j| j.recordEvent(self.io, act_id, .rollback_completed, "Rollback state due to terminal error") catch {};
+                                }
+                                return e;
+                            }
+
+                            main.stderrPrint("\n[agent] Act {d} gặp sự cố ({s}). Rollback (lần {d}/{d})...\n", .{ act_id, @errorName(e), try_count + 1, max_retries });
+                            
+                            if (self.history.last_compaction_act_id < act_id) {
+                                self.history.truncate(history_len);
+                                try self.history.addSystemErrorObservation(@errorName(e));
+                                if (self.journal) |*j| j.recordEvent(self.io, act_id, .rollback_completed, "Rollback state due to error") catch {};
+                            } else {
+                                main.stderrPrint("[agent] Không thể rollback vì đã qua mốc nén bộ nhớ.\n", .{});
+                                return e;
+                            }
+                            continue;
+                        }
+                    }
+                };
+
+                if (self.journal) |*j| {
+                    j.recordActComplete(self.io, act_id, .{
+                        .act_id = act_id,
+                        .file_snapshots = &.{}, 
+                    }) catch {};
+                }
+
+                if (result == .exit_loop) {
+                    if (self.journal) |*j| j.recordEvent(self.io, act_id, .task_completed, "Nhiệm vụ hoàn thành") catch {};
+                    return;
+                }
+                break; 
+            }
+        }
     }
 
     /// Xóa lịch sử hội thoại (bắt đầu conversation mới).
@@ -586,9 +651,18 @@ pub const AgentLoop = struct {
     }
 
     /// Thực thi tất cả tool_use blocks trong response.
-    fn executeTools(self: *AgentLoop, response: *const proto.Response) !void {
+    fn executeTools(self: *AgentLoop, act_id: usize, response: *const proto.Response) !void {
         var results = ArrayList(proto.ToolResult).empty;
         defer results.deinit(self.alloc);
+        
+        var file_snaps = ArrayList(journal_mod.FileSnapshot).empty;
+        defer {
+            for (file_snaps.items) |fs| {
+                self.alloc.free(fs.path);
+                if (fs.previous_content_hash) |h| self.alloc.free(h);
+            }
+            file_snaps.deinit(self.alloc);
+        }
         
         var allocated_strings = ArrayList([]u8).empty;
         defer {
@@ -632,6 +706,36 @@ pub const AgentLoop = struct {
                         .input_json = tu.input_json,
                     });
 
+                    // Snapshot file nếu là công cụ chỉnh sửa
+                    if (std.mem.eql(u8, tu.name, "file_edit") or std.mem.eql(u8, tu.name, "file_write")) {
+                        if (json_mod.findString(tu.input_json, "path")) |path| {
+                            const cwd = std.Io.Dir.cwd();
+                            var prev_hash: ?[]u8 = null;
+                            if (cwd.openFile(self.io, path, .{})) |file| {
+                                defer file.close(self.io);
+                                if (file.stat(self.io)) |stat| {
+                                    if (self.alloc.alloc(u8, @intCast(stat.size))) |buf| {
+                                        defer self.alloc.free(buf);
+                                        if (utils.readAll(self.io, file, buf)) |read_len| {
+                                            if (self.cas.store(self.io, buf[0..read_len])) |h| {
+                                                prev_hash = h;
+                                            } else |_| {}
+                                        } else |_| {}
+                                    } else |_| {}
+                                } else |_| {}
+                            } else |_| {}
+                            
+                            if (self.alloc.dupe(u8, path)) |p| {
+                                file_snaps.append(self.alloc, .{
+                                    .path = p,
+                                    .previous_content_hash = prev_hash,
+                                }) catch {};
+                            } else |_| {
+                                if (prev_hash) |h| self.alloc.free(h);
+                            }
+                        }
+                    }
+
                     var is_err = false;
                     const result = tools_mod.executeTool(self.alloc, self.io, tu.name, tu.input_json) catch |e| blk: {
                         is_err = true;
@@ -672,6 +776,15 @@ pub const AgentLoop = struct {
 
         if (results.items.len > 0) {
             try self.history.addToolResults(results.items);
+        }
+
+        // Ghi StateDelta
+        if (self.journal) |*j| {
+            // Allocate a stable slice for file_snaps because recordActComplete serializes it
+            j.recordActComplete(self.io, act_id, .{
+                .act_id = act_id,
+                .file_snapshots = file_snaps.items,
+            }) catch {};
         }
     }
 };
