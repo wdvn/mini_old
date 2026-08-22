@@ -211,19 +211,23 @@ pub const AcpServer = struct {
     }
 
     fn handleSessionNew(self: *AcpServer, id_opt: ?JsonId, params_json: ?[]const u8) !void {
+        var req_session_id: ?[]const u8 = null;
         // Tùy chọn cwd và mcpServers từ params
         if (params_json) |p| {
             if (json_mod.findString(p, "cwd")) |cwd_path| {
                 main.stderrPrint("[acp] Session new cwd: {s}\n", .{cwd_path});
             }
+            req_session_id = json_mod.findString(p, "sessionId");
         }
 
-        // Tạo sessionId mới
-        self.session_counter += 1;
-        var ts: std.os.linux.timespec = undefined;
-        _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
-
-        const new_id = try std.fmt.allocPrint(self.alloc, "sess_{d}_{d}", .{ ts.sec, self.session_counter });
+        const new_id = if (req_session_id) |sid|
+            try self.alloc.dupe(u8, sid)
+        else blk: {
+            self.session_counter += 1;
+            var ts: std.os.linux.timespec = undefined;
+            _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+            break :blk try std.fmt.allocPrint(self.alloc, "sess_{d}_{d}", .{ ts.sec, self.session_counter });
+        };
         if (self.current_session_id) |old| self.alloc.free(old);
         self.current_session_id = new_id;
 
@@ -655,12 +659,17 @@ pub fn extractPromptText(alloc: Allocator, params_json: []const u8) ![]u8 {
         }
     }
 
-    // 2. Kiểm tra nếu có params.message string trực tiếp
+    // 2. Kiểm tra nếu có params.prompt string trực tiếp
+    if (json_mod.findString(params_json, "prompt")) |pr| {
+        return try alloc.dupe(u8, pr);
+    }
+
+    // 3. Kiểm tra nếu có params.message string trực tiếp
     if (json_mod.findString(params_json, "message")) |msg| {
         return try alloc.dupe(u8, msg);
     }
 
-    // 3. Kiểm tra nếu có params.text string trực tiếp
+    // 4. Kiểm tra nếu có params.text string trực tiếp
     if (json_mod.findString(params_json, "text")) |txt| {
         return try alloc.dupe(u8, txt);
     }

@@ -187,6 +187,12 @@ pub const Config = struct {
             break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
         };
 
+        main.stderrPrint("[config] Env bindings: OPENAI_COMPAT_URL={s}, OPENAI_COMPAT_MODEL={s}, MINI_HOME={s}\n", .{
+            openai_url orelse "(null)",
+            openai_model,
+            env_map.get("MINI_HOME") orelse "(null)",
+        });
+
         return .{
             .execution_mode = exec_mode,
             .openai_compat_url = openai_url,
