@@ -41,6 +41,8 @@ const main = @import("../main.zig");
 const utils = @import("utils.zig");
 const quickjs = @import("../runtime/quickjs_engine.zig");
 const js_bindings = @import("../runtime/js_bindings.zig");
+const tokens_mod = @import("memact/tokens.zig");
+const window_mod = @import("memact/window.zig");
 
 /// Số iterations tối đa trong một lần processInput.
 const MAX_ITERATIONS = 30;
@@ -116,6 +118,10 @@ pub const AgentLoop = struct {
     engine: *quickjs.Engine,
     /// Đếm số lần tự sửa lỗi JavaScript liên tiếp.
     js_retry_count: usize = 0,
+    /// Trình ước lượng token (MemAct).
+    token_estimator: tokens_mod.TokenEstimator,
+    /// Cửa sổ ngữ cảnh (MemAct).
+    context_window: window_mod.ContextWindow,
 
     /// Khởi tạo AgentLoop từ config.
     /// Chọn backend dựa trên config theo thứ tự ưu tiên.
@@ -168,6 +174,12 @@ pub const AgentLoop = struct {
             .config = config,
             .engine = engine,
             .js_retry_count = 0,
+            .token_estimator = tokens_mod.TokenEstimator.init(alloc),
+            .context_window = .{
+                .max_tokens = config.context_window,
+                .safety_margin = config.ctx_safety_margin,
+                .compact_threshold = config.ctx_compact_threshold,
+            },
         };
     }
 
@@ -175,6 +187,7 @@ pub const AgentLoop = struct {
     pub fn deinit(self: *AgentLoop) void {
         self.history.deinit();
         self.engine.deinit();
+        self.token_estimator.deinit();
     }
 
     const StepResult = enum {
@@ -198,8 +211,64 @@ pub const AgentLoop = struct {
 
         main.stderrPrint("\x1b[36m[agent]\x1b[0m \x1b[93mĐang suy nghĩ / Phân tích yêu cầu... \x1b[0m\n", .{});
 
-        if (self.history.needsCompaction()) {
-            main.stderrPrint("\n\x1b[33m[agent] Lịch sử quá dài, đang nén ngữ cảnh...\x1b[0m\n", .{});
+        // 0. Tính token pinned (cho system prompt, memory block...)
+        // Hiện tại tạm dùng cứng 1500 tokens cho system_prompt, sau sẽ add TokenEstimator cho nó.
+        const pinned_tokens = self.token_estimator.estimate(self.config.system_prompt);
+
+        if (self.config.memact_enabled and self.context_window.needsCompaction(&self.token_estimator, self.history.messages(), pinned_tokens)) {
+            const threshold_pct = @as(u32, @intFromFloat(self.context_window.compact_threshold * 100.0));
+            main.stderrPrint("\n\x1b[33m[agent] Lịch sử đạt {d}% window, nén MemAct...\x1b[0m\n", .{threshold_pct});
+            
+            const split_idx = self.context_window.findSplitIndex(&self.token_estimator, self.history.messages(), pinned_tokens);
+            
+            if (split_idx > 0) {
+                var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+                msg_blocks[0] = .{ .text = try self.alloc.dupe(u8, 
+                    "SYSTEM: Bạn là bộ nhớ MemAct. Hãy tóm tắt ngắn gọn phần hội thoại trước thành JSON, tuân thủ đúng stencil:\n" ++
+                    "{\n" ++
+                    "  \"type\": \"context_summary\",\n" ++
+                    "  \"iteration_range\": [1, 99],\n" ++
+                    "  \"task_state\": \"mô tả tiến độ\",\n" ++
+                    "  \"decisions\": [\"quyết định 1\"],\n" ++
+                    "  \"open_questions\": [],\n" ++
+                    "  \"learned_errors\": [],\n" ++
+                    "  \"files_touched\": [],\n" ++
+                    "  \"next_step\": \"bước tiếp theo\"\n" ++
+                    "}\n" ++
+                    "Chỉ xuất JSON, không có markdown text khác."
+                ) };
+                const sys_msg = proto.Message{ .role = .user, .content = msg_blocks };
+                defer {
+                    self.alloc.free(sys_msg.content[0].text);
+                    self.alloc.free(sys_msg.content);
+                }
+                
+                var temp_msgs = std.ArrayListUnmanaged(proto.Message).empty;
+                defer temp_msgs.deinit(self.alloc);
+                try temp_msgs.appendSlice(self.alloc, self.history.messages()[0..split_idx]);
+                try temp_msgs.append(self.alloc, sys_msg);
+                
+                var summary_resp = try self.sendToBackend(self.config.system_prompt, temp_msgs.items, &[_]proto.ToolDefinition{}, null, null);
+                defer summary_resp.deinit();
+                
+                var compacted = false;
+                for (summary_resp.content.items) |block| {
+                    if (block == .text) {
+                        try self.history.compactMemAct(split_idx, block.text);
+                        compacted = true;
+                        break;
+                    }
+                }
+                if (!compacted) {
+                    main.stderrPrint("[agent] Cảnh báo: LLM không trả về text summary, fallback.\n", .{});
+                    self.history.compact();
+                }
+            } else {
+                main.stderrPrint("[agent] Không tìm được split_idx hợp lý, giữ nguyên.\n", .{});
+                self.history.compact();
+            }
+        } else if (!self.config.memact_enabled and self.history.needsCompaction()) {
+            main.stderrPrint("\n\x1b[33m[agent] Lịch sử quá dài (MemAct tắt), đang nén cũ...\x1b[0m\n", .{});
             
             var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
             msg_blocks[0] = .{ .text = try self.alloc.dupe(u8, "SYSTEM: Lịch sử đã đầy. Hãy tóm tắt trạng thái công việc hiện tại (đã làm gì, kết quả ra sao, cần làm gì tiếp). Không gọi tool, chỉ trả về văn bản tóm tắt.") };

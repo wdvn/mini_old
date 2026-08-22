@@ -406,6 +406,8 @@ test {
     _ = @import("core/protocol.zig");
     _ = @import("core/json.zig");
     _ = @import("core/config.zig");
+    _ = @import("core/memact/tokens.zig");
+    _ = @import("core/memact/window.zig");
     _ = @import("tooling/registry.zig");
     _ = @import("acp/server.zig");
     _ = quickjs_engine;

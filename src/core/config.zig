@@ -91,6 +91,12 @@ pub const Config = struct {
     /// Comma-separated blocklist. Null = không chặn gì.
     tool_blocklist: ?[]const u8,
 
+    // MemAct Config
+    memact_enabled: bool,
+    context_window: u32,
+    ctx_safety_margin: f32,
+    ctx_compact_threshold: f32,
+
     // MCP
     /// Đường dẫn file mcp.json. Null = dùng default ~/.mini/mcp.json.
     mcp_config_path: ?[]const u8,
@@ -174,6 +180,26 @@ pub const Config = struct {
             break :blk std.fmt.parseInt(u32, s, 10) catch 8192;
         };
 
+        const memact_enabled = blk: {
+            const s = env_map.get("MINI_MEMACT_ENABLED") orelse "1";
+            break :blk std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
+        };
+
+        const context_window: u32 = blk: {
+            const s = env_map.get("MINI_CONTEXT_WINDOW") orelse break :blk 128000;
+            break :blk std.fmt.parseInt(u32, s, 10) catch 128000;
+        };
+
+        const ctx_safety_margin: f32 = blk: {
+            const s = env_map.get("MINI_CTX_SAFETY_MARGIN") orelse break :blk 0.15;
+            break :blk std.fmt.parseFloat(f32, s) catch 0.15;
+        };
+
+        const ctx_compact_threshold: f32 = blk: {
+            const s = env_map.get("MINI_CTX_COMPACT_THRESHOLD") orelse break :blk 0.85;
+            break :blk std.fmt.parseFloat(f32, s) catch 0.85;
+        };
+
         const history_enabled = blk: {
             const v = env_map.get("MINI_NO_HISTORY") orelse break :blk true;
             break :blk !std.mem.eql(u8, v, "1");
@@ -209,6 +235,10 @@ pub const Config = struct {
             .system_prompt_buf = sp_result.buf,
             .tool_allowlist = env_map.get("MINI_TOOL_ALLOWLIST"),
             .tool_blocklist = env_map.get("MINI_TOOL_BLOCKLIST"),
+            .memact_enabled = memact_enabled,
+            .context_window = context_window,
+            .ctx_safety_margin = ctx_safety_margin,
+            .ctx_compact_threshold = ctx_compact_threshold,
             .mcp_config_path = env_map.get("MINI_MCP_CONFIG"),
             .history_enabled = history_enabled,
             .hook_command = hook_cmd,
