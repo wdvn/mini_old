@@ -14,7 +14,7 @@
 //!   - mini.jobStatus(jobId)
 //!   - mini.jobLogs(jobId, lines?)
 //!   - mini.jobKill(jobId, signal?)
-//!   - mini.http(method, url, opts?)
+//!   - mini.http(method, url, opts?) → { status, body, truncated, headers }
 //!   - mini.artifact(name, content, metadata?)
 //!   - mini.env(varName)
 //!   - mini.workspaceRoot, mini.sessionId
@@ -35,7 +35,7 @@ const bash_tool = @import("../tools/bash.zig");
 const file_tool = @import("../tools/file.zig");
 const glob_tool = @import("../tools/glob.zig");
 const grep_tool = @import("../tools/grep.zig");
-const http_tool = @import("../tools/http.zig");
+const http_lib = @import("../lib/http_request.zig");
 const artifact_tool = @import("../tools/artifact.zig");
 const artifacts_mod = @import("../core/artifacts.zig");
 const utils = @import("../core/utils.zig");
@@ -488,7 +488,36 @@ fn jsMiniJobKill(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c
 
 // ---------------------------------------------------------------------------
 // mini.http(method, url, opts?)
+//   opts: { body?: string, headers?: {k:v}, max_body_size?: int, timeout_s?: int }
+//   Trả về: { status: int, body: string, truncated: bool, headers: {k:v} }
 // ---------------------------------------------------------------------------
+/// Đọc property string từ JS object. Trả null nếu property không tồn tại.
+fn jsOptString(ctx: ?*c.JSContext, obj: c.JSValue, key: [*:0]const u8, alloc: Allocator) ?[]u8 {
+    const v = c.JS_GetPropertyStr(ctx, obj, key);
+    defer c.JS_FreeValue(ctx, v);
+    if (c.JS_IsUndefined(v) != 0 or c.JS_IsNull(v) != 0) return null;
+    return jsStringSlice(ctx, v, alloc);
+}
+
+/// Đọc property int từ JS object. Trả null nếu property không tồn tại / lỗi.
+fn jsOptInt(ctx: ?*c.JSContext, obj: c.JSValue, key: [*:0]const u8) ?i64 {
+    const v = c.JS_GetPropertyStr(ctx, obj, key);
+    defer c.JS_FreeValue(ctx, v);
+    if (c.JS_IsUndefined(v) != 0 or c.JS_IsNull(v) != 0) return null;
+    var out: i64 = 0;
+    if (c.JS_ToInt64(ctx, &out, v) != 0) return null;
+    return out;
+}
+
+/// Stringify JS object (argv) thành JSON string cho headers_json của lib.
+/// Dùng JS_JSONStringify của QuickJS — đảm bảo escape đúng mọi giá trị.
+fn jsObjectToJsonString(ctx: ?*c.JSContext, obj: c.JSValue, alloc: Allocator) ?[]u8 {
+    const s = c.JS_JSONStringify(ctx, obj, JS_UNDEFINED, JS_UNDEFINED);
+    defer c.JS_FreeValue(ctx, s);
+    if (c.JS_IsString(s) == 0) return null;
+    return jsStringSlice(ctx, s, alloc);
+}
+
 fn jsMiniHttp(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
     _ = this_val;
     const engine = getEngine(ctx) orelse return JS_UNDEFINED;
@@ -501,24 +530,61 @@ fn jsMiniHttp(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
     const url = jsStringSlice(ctx, argv[1], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid url");
     defer engine.alloc.free(url);
 
-    var json_w = utils.BufWriter.init(engine.alloc);
-    defer json_w.deinit();
-    const method_escaped = json_mod.escape(engine.alloc, method) catch return JS_EXCEPTION;
-    defer engine.alloc.free(method_escaped);
-    const url_escaped = json_mod.escape(engine.alloc, url) catch return JS_EXCEPTION;
-    defer engine.alloc.free(url_escaped);
-    json_w.print("{{\"method\":\"{s}\",\"url\":\"{s}\"}}", .{ method_escaped, url_escaped }) catch return JS_EXCEPTION;
+    // opts: { body?, headers?, max_body_size?, timeout_s? }
+    var body_opt: ?[]u8 = null;
+    defer if (body_opt) |b| engine.alloc.free(b);
+    var headers_json_opt: ?[]u8 = null;
+    defer if (headers_json_opt) |h| engine.alloc.free(h);
+    var max_body_size_opt: ?usize = null;
+    var timeout_s_opt: ?u32 = null;
 
-    const res = http_tool.executeTool(engine.alloc, json_w.list.items) catch |e| {
+    if (argc >= 3 and c.JS_IsObject(argv[2]) != 0) {
+        const opts = argv[2];
+        body_opt = jsOptString(ctx, opts, "body", engine.alloc);
+        const hv = c.JS_GetPropertyStr(ctx, opts, "headers");
+        defer c.JS_FreeValue(ctx, hv);
+        if (c.JS_IsObject(hv) != 0) {
+            headers_json_opt = jsObjectToJsonString(ctx, hv, engine.alloc);
+        }
+        if (jsOptInt(ctx, opts, "max_body_size")) |v| {
+            if (v > 0) max_body_size_opt = @intCast(v);
+        }
+        if (jsOptInt(ctx, opts, "timeout_s")) |v| {
+            if (v > 0) timeout_s_opt = @intCast(v);
+        }
+    }
+
+    var res = http_lib.fetch(engine.alloc, engine.io, .{
+        .url = url,
+        .method = method,
+        .body = body_opt,
+        .headers_json = headers_json_opt,
+        .max_body_size = max_body_size_opt orelse http_lib.DEFAULT_MAX_BODY_SIZE,
+        .timeout_s = timeout_s_opt orelse http_lib.DEFAULT_TIMEOUT_S,
+    }) catch |e| {
         return c.JS_ThrowInternalError(ctx, "http error: %s", @errorName(e).ptr);
     };
-    defer engine.alloc.free(res);
+    defer res.deinit(engine.alloc);
 
     engine.renewActivity();
 
     const obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, obj, "status", c.JS_NewInt32(ctx, 200));
-    _ = c.JS_SetPropertyStr(ctx, obj, "body", c.JS_NewStringLen(ctx, res.ptr, res.len));
+    _ = c.JS_SetPropertyStr(ctx, obj, "status", c.JS_NewInt32(ctx, @intCast(res.status)));
+    _ = c.JS_SetPropertyStr(ctx, obj, "body", c.JS_NewStringLen(ctx, res.body.ptr, res.body.len));
+    _ = c.JS_SetPropertyStr(ctx, obj, "truncated", c.JS_NewBool(ctx, if (res.truncated) 1 else 0));
+
+    const headers_obj = c.JS_NewObject(ctx);
+    for (res.headers) |h| {
+        // JS_SetProperty steal val và không steal atom — theo chuẩn QuickJS:
+        // tạo string → chuyển atom (atom giữ string sống) → set → free atom ref.
+        const name = c.JS_NewStringLen(ctx, h.name.ptr, h.name.len);
+        const atom = c.JS_ValueToAtom(ctx, name);
+        c.JS_FreeValue(ctx, name);
+        const val = c.JS_NewStringLen(ctx, h.value.ptr, h.value.len);
+        _ = c.JS_SetProperty(ctx, headers_obj, atom, val); // steal val
+        c.JS_FreeAtom(ctx, atom);
+    }
+    _ = c.JS_SetPropertyStr(ctx, obj, "headers", headers_obj);
     return obj;
 }
 

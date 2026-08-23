@@ -386,3 +386,81 @@ test "quickjs_engine - background job management" {
     try std.testing.expect(std.mem.indexOf(u8, res.stdout, "spawned: true pid: true") != null);
 }
 
+
+// --- Test helper: HTTP server 1-request chạy trên thread riêng cho mini.http ---
+
+const HttpTestServer = struct {
+    io: std.Io,
+    port: u16,
+    thread: ?std.Thread,
+    done: std.Io.Event,
+
+    fn run(self: *@This()) void {
+        const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", self.port) catch return;
+        var server = addr.listen(self.io, .{ .reuse_address = true }) catch return;
+        defer server.deinit(self.io);
+
+        var stream = server.accept(self.io) catch return;
+        defer stream.close(self.io);
+
+        var read_buf: [16384]u8 = undefined;
+        var s_reader = stream.reader(self.io, &read_buf);
+        var write_buf: [16384]u8 = undefined;
+        var s_writer = stream.writer(self.io, &write_buf);
+
+        _ = s_reader.interface.peekGreedy(1) catch {};
+        const body = "{\"ok\":true}";
+        s_writer.interface.print(
+            "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\nx-custom: hi\r\ncontent-length: {d}\r\n\r\n{s}",
+            .{ body.len, body },
+        ) catch {};
+        s_writer.interface.flush() catch {};
+        self.done.set(self.io);
+    }
+};
+
+test "quickjs_engine - mini.http trả status/headers/body qua lib" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const js_bindings = @import("js_bindings.zig");
+    const http_lib = @import("../lib/http_request.zig");
+    _ = http_lib; // đảm bảo lib được link vào test root
+
+    // Bind ephemeral port rồi đóng để tái sử dụng
+    const probe_addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
+    var probe = probe_addr.listen(io, .{ .reuse_address = true }) catch unreachable;
+    const port = probe.socket.address.getPort();
+    probe.deinit(io);
+
+    var srv = HttpTestServer{ .io = io, .port = port, .thread = null, .done = .unset };
+    srv.thread = std.Thread.spawn(.{}, HttpTestServer.run, .{&srv}) catch unreachable;
+    defer {
+        srv.done.waitUncancelable(io);
+        srv.thread.?.join();
+    }
+
+    var engine = try Engine.init(alloc, io);
+    defer engine.deinit();
+    try js_bindings.registerBindings(engine);
+
+    const code = try std.fmt.allocPrint(alloc,
+        \\const r = mini.http("GET", "http://127.0.0.1:{d}/ping");
+        \\console.log("status=" + r.status);
+        \\console.log("truncated=" + r.truncated);
+        \\console.log("ct=" + r.headers["content-type"]);
+        \\console.log("xc=" + r.headers["x-custom"]);
+        \\console.log("body=" + r.body);
+        \\r.status;
+    , .{port});
+    defer alloc.free(code);
+
+    var res = try engine.eval(code, "test_mini_http.js");
+    defer res.deinit();
+
+    try std.testing.expect(!res.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "status=201") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "truncated=false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "ct=application/json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "xc=hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "body={\"ok\":true}") != null);
+}

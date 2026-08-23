@@ -332,6 +332,12 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
     const base = try alloc.alloc(u8, total_len);
     errdefer alloc.free(base);
 
+    // Copy xong sẽ free các bản dupe tạm trong header_list (tránh leak).
+    defer for (header_list.items) |h| {
+        alloc.free(h.name);
+        alloc.free(h.value);
+    };
+
     var off: usize = 0;
     // reason
     @memcpy(base[off .. off + reason.len], reason);
@@ -550,7 +556,7 @@ test "parseHeadersJson: escape sequences" {
     try testing.expectEqualStrings("line1\nline2", headers[1].value);
     try testing.expectEqualStrings("tab\there", headers[2].value);
     try testing.expectEqualStrings("\\slash/", headers[3].value);
-    try testing.expectEqualStrings("Aừa", headers[4].value);
+    try testing.expectEqualStrings("Aầ", headers[4].value);
 }
 
 test "parseHeadersJson: UTF-8 giữ nguyên" {
@@ -578,7 +584,7 @@ test "formatResponseText: status + headers + body + truncate note" {
         .status = 404,
         .reason = "Not Found",
         .headers = &.{.{ .name = "content-type", .value = "text/plain" }},
-        .body = @constCast("không có gì"),
+        .body = @constCast("không có gì"), // 14 bytes UTF-8
         .total_body_bytes = 100,
         .truncated = true,
     };
@@ -590,7 +596,8 @@ test "formatResponseText: status + headers + body + truncate note" {
     try testing.expect(std.mem.startsWith(u8, text, "HTTP 404 Not Found\n"));
     try testing.expect(std.mem.indexOf(u8, text, "content-type: text/plain\n") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\n\nkhông có gì") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "... [truncated 90 bytes]") != null);
+    // omitted = total_body_bytes - body.len = 100 - 14 = 86
+    try testing.expect(std.mem.indexOf(u8, text, "... [truncated 86 bytes]") != null);
 }
 
 test "formatResponseText: 200 không truncate" {
@@ -642,9 +649,9 @@ test "fetch GET: status/headers/body tách bạch — regression bug body lẫn 
         "HTTP/1.1 200 OK\r\n" ++
         "content-type: application/json\r\n" ++
         "x-custom: hello\r\n" ++
-        "content-length: 25\r\n" ++
+        "content-length: 28\r\n" ++
         "\r\n" ++
-        "{\"msg\":\"xin chào 🇻🇳\"}"; // 25 bytes UTF-8
+        "{\"msg\":\"xin chào 🇻🇳\"}"; // 28 bytes UTF-8 (flag = 4+4 codepoints)
 
     var h = try FetchHarness.init(io, response, 1);
     defer h.deinit();
@@ -666,7 +673,7 @@ test "fetch GET: status/headers/body tách bạch — regression bug body lẫn 
     // Body phải CHỈ là body — bug cũ trả cả status line + headers trong body
     try testing.expectEqualStrings("{\"msg\":\"xin chào 🇻🇳\"}", res.body);
     try testing.expect(!res.truncated);
-    try testing.expectEqual(@as(usize, 25), res.total_body_bytes);
+    try testing.expectEqual(@as(usize, 28), res.total_body_bytes);
 }
 
 test "fetch POST: gửi body + custom headers, server nhận đủ" {

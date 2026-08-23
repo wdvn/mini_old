@@ -25,7 +25,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = @import("../core/json.zig");
-const http = @import("http.zig");
+const http_lib = @import("../lib/http_request.zig");
+const main = @import("../main.zig");
 const utils = @import("../core/utils.zig");
 
 const DDG_LITE_URL = "https://lite.duckduckgo.com/lite/";
@@ -58,8 +59,13 @@ fn searchDDG(alloc: Allocator, query: []const u8, num_results: usize) ![]u8 {
 
     // Gửi request với User-Agent trình duyệt
     const headers_json = "{\"User-Agent\":\"Mozilla/5.0\",\"Accept\":\"text/html\"}";
-    const raw_html = try http.httpRequest(alloc, url, "GET", null, headers_json);
-    defer alloc.free(raw_html);
+    var res = try http_lib.fetch(alloc, main.getIo(), .{
+        .url = url,
+        .method = "GET",
+        .headers_json = headers_json,
+    });
+    defer res.deinit(alloc);
+    const raw_html = res.body;
 
     return parseHtml(alloc, raw_html, num_results);
 }
