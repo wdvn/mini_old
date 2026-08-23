@@ -444,24 +444,13 @@ const StreamCtx = struct {
                         }
                     }
                     if (delta.tool_calls) |tool_calls| {
+                        // Gộp theo index (chuẩn OpenAI streaming): DeepSeek và đa số
+                        // provider compat chỉ gửi id ở chunk đầu, các chunk sau chỉ có
+                        // index + arguments — không được append mù vào item cuối.
                         for (tool_calls) |tc_obj| {
-                            if (tc_obj.id) |id| {
-                                _ = try self.findOrCreateToolCall(id);
-                            }
-                            if (tc_obj.function) |func| {
-                                if (func.name) |name| {
-                                    if (self.tool_calls.items.len > 0) {
-                                        const last = &self.tool_calls.items[self.tool_calls.items.len - 1];
-                                        try last.name.appendSlice(self.alloc, name);
-                                    }
-                                }
-                                if (func.arguments) |args| {
-                                    if (self.tool_calls.items.len > 0) {
-                                        const last = &self.tool_calls.items[self.tool_calls.items.len - 1];
-                                        try last.args.appendSlice(self.alloc, args);
-                                    }
-                                }
-                            }
+                            const fname = if (tc_obj.function) |f| f.name else null;
+                            const fargs = if (tc_obj.function) |f| f.arguments else null;
+                            try self.mergeToolCallDelta(tc_obj.index, tc_obj.id, fname, fargs);
                         }
                     }
                 }
@@ -478,21 +467,59 @@ const StreamCtx = struct {
         }
     }
 
-    fn findOrCreateToolCall(self: *StreamCtx, id: []const u8) !usize {
-        for (self.tool_calls.items, 0..) |tc, i| {
-            if (std.mem.eql(u8, tc.id.items, id)) return i;
+    /// Gộp 1 tool_call delta vào danh sách, định vị slot theo index (chuẩn
+    /// OpenAI streaming). Fallback: match id, rồi item cuối. DeepSeek-style:
+    /// chunk đầu mang id+name, các chunk sau chỉ index+arguments.
+    fn mergeToolCallDelta(self: *StreamCtx, index: ?u32, id: ?[]const u8, name: ?[]const u8, args: ?[]const u8) !void {
+        var slot: ?usize = null;
+
+        if (index) |idx| {
+            // Index nằm trong phạm vi → đúng slot; ngoài phạm vi → tạo mới bên dưới
+            if (idx < self.tool_calls.items.len) slot = idx;
+        } else if (id) |tcid| {
+            for (self.tool_calls.items, 0..) |tc, i| {
+                if (tc.id.items.len > 0 and std.mem.eql(u8, tc.id.items, tcid)) {
+                    slot = i;
+                    break;
+                }
+            }
         }
-        var tc = PartialToolCall.init();
-        try tc.id.appendSlice(self.alloc, id);
-        try self.tool_calls.append(self.alloc, tc);
-        return self.tool_calls.items.len - 1;
+        // Fallback cuối: chunk không mang index lẫn id → item đang mở (nếu có)
+        if (slot == null and index == null and id == null and self.tool_calls.items.len > 0) {
+            slot = self.tool_calls.items.len - 1;
+        }
+
+        // Chưa có slot → tạo item mới
+        if (slot == null) {
+            var tc = PartialToolCall.init();
+            if (id) |tcid| try tc.id.appendSlice(self.alloc, tcid);
+            try self.tool_calls.append(self.alloc, tc);
+            slot = self.tool_calls.items.len - 1;
+        } else if (id) |tcid| {
+            // Slot đã tồn tại nhưng chưa có id → cập nhật
+            const tc = &self.tool_calls.items[slot.?];
+            if (tc.id.items.len == 0) try tc.id.appendSlice(self.alloc, tcid);
+        }
+
+        const tc = &self.tool_calls.items[slot.?];
+        if (name) |n| {
+            if (n.len > 0) try tc.name.appendSlice(self.alloc, n);
+        }
+        if (args) |a| {
+            if (a.len > 0) try tc.args.appendSlice(self.alloc, a);
+        }
     }
 
     fn finalizeToolCalls(self: *StreamCtx) !void {
-        for (self.tool_calls.items) |*tc| {
+        for (self.tool_calls.items, 0..) |*tc, ti| {
             defer tc.deinit(self.alloc);
             if (tc.name.items.len == 0) continue;
-            const id = try self.alloc.dupe(u8, tc.id.items);
+            // Provider không gửi id (một số compat/proxy) → sinh id dự phòng
+            // để tool_result luôn khớp tool_call_id (tránh 400 từ API).
+            const id = if (tc.id.items.len > 0)
+                try self.alloc.dupe(u8, tc.id.items)
+            else
+                try std.fmt.allocPrint(self.alloc, "call_{d}", .{ti});
             const name = try self.alloc.dupe(u8, tc.name.items);
             const args = if (tc.args.items.len > 0)
                 try self.alloc.dupe(u8, tc.args.items)
@@ -517,6 +544,79 @@ const StreamCtx = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+// --- Tests: streaming tool_calls gop theo index (DeepSeek style) ---
+
+fn feedLines(ctx: anytype, lines: []const []const u8) !void {
+    for (lines) |ln| try ctx.processLine(ln);
+}
+
+test "openai stream: parallel tool calls gop theo index (DeepSeek style)" {
+    const alloc = testing.allocator;
+    var resp = proto.Response.init(alloc);
+    defer resp.deinit();
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = resp,
+        .line_buf = .empty,
+        .tool_calls = .empty,
+    };
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.tool_calls.deinit(alloc);
+
+    // Chunk dau: id+name; cac chunk sau chi index+arguments (DeepSeek khong lap id)
+    try feedLines(&ctx, &.{
+        \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"bash","arguments":"{\"com"}}]}}]}
+        \\data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"file_read","arguments":"{\"pa"}}]}}]}
+        \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"mand\":\"ls\"}"}}]}}]}
+        \\data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"th\":\"a.zig\"}"}}]}}]}
+        \\data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+        \\data: [DONE]
+    });
+
+    try ctx.finalizeToolCalls();
+    try testing.expectEqual(proto.StopReason.tool_use, ctx.response.stop_reason);
+    try testing.expectEqual(@as(usize, 2), ctx.response.content.len);
+
+    const first = ctx.response.content[0].tool_use;
+    try testing.expectEqualStrings("bash", first.name);
+    try testing.expectEqualStrings("call_a", first.id);
+    try testing.expectEqualStrings("{\"command\":\"ls\"}", first.input_json);
+
+    const second = ctx.response.content[1].tool_use;
+    try testing.expectEqualStrings("file_read", second.name);
+    try testing.expectEqualStrings("call_b", second.id);
+    try testing.expectEqualStrings("{\"path\":\"a.zig\"}", second.input_json);
+}
+
+test "openai stream: tool call khong co id — sinh id du phong" {
+    const alloc = testing.allocator;
+    var resp = proto.Response.init(alloc);
+    defer resp.deinit();
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = resp,
+        .line_buf = .empty,
+        .tool_calls = .empty,
+    };
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.tool_calls.deinit(alloc);
+
+    // Provider compat khong gui id, chi index
+    try feedLines(&ctx, &.{
+        \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"glob","arguments":"{\"pat"}}]}}]}
+        \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"tern\":\"*.zig\"}"}}]}}]}
+        \\data: [DONE]
+    });
+
+    try ctx.finalizeToolCalls();
+    try testing.expectEqual(proto.StopReason.tool_use, ctx.response.stop_reason);
+    try testing.expectEqual(@as(usize, 1), ctx.response.content.len);
+    const tu = ctx.response.content[0].tool_use;
+    try testing.expectEqualStrings("glob", tu.name);
+    try testing.expectEqualStrings("{\"pattern\":\"*.zig\"}", tu.input_json);
+    try testing.expect(std.mem.startsWith(u8, tu.id, "call_"));
+}
 
 test "openai buildRequestBody includes stream_options, static tools prefix and clean system message" {
     const alloc = testing.allocator;
