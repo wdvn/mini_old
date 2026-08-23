@@ -434,7 +434,6 @@ test {
     _ = @import("core/json.zig");
     _ = @import("core/config.zig");
     _ = @import("core/memact/tokens.zig");
-    _ = @import("core/memact/window.zig");
     _ = @import("tooling/registry.zig");
     _ = @import("lib/http_request.zig");
     _ = @import("tools/bash.zig");

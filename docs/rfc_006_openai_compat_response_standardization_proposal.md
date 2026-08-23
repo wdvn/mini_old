@@ -217,13 +217,36 @@ Flag `self.disable_stream_options: bool` same pattern như `disable_reasoning_ef
 Usage sẽ bằng 0 với các endpoint này — chấp nhận được, fallback logic estimation của
 MemAct (RFC-003 TokenEstimator) vẫn chạy độc lập.
 
+### 3.7. Tối ưu hóa cho Agent Loop & MemAct (Agent Optimizations)
+
+Việc chuẩn hóa parse `usage`, `reasoning` và `finish_reason` từ response của OpenAI-compat backend mở ra các cơ hội tối ưu trực tiếp cho hành vi của Agent Loop và cơ chế **MemAct mới (RFC-003 updated)**:
+
+1. **Hiệu chỉnh bộ đếm & thuật toán Compaction của MemAct bằng Usage thực tế (Real Token Feedback Calibration)**:
+   - *Cơ chế MemAct mới*: Nén lịch sử theo nguyên tắc **giữ nguyên `msgs[0]` (User prompt gốc)**, cập nhật/chèn **Context Summary tại `msgs[1]` (tier `.summarized`)**, và **drop toàn bộ phần lịch sử hội thoại nằm giữa** để giải phóng ngữ cảnh.
+   - *Hiệu chỉnh với Usage thực tế*: Khi backend trả về `response.usage.prompt_tokens` thực tế, `AgentLoop` sẽ dùng thông tin này để phản hồi trực tiếp vào `TokenEstimator` (`src/core/memact/tokens.zig`) và `ContextWindow` (`src/core/memact/window.zig`). Nhờ có số đo thực tế từ LLM provider, thuật toán `findSplitIndex()` và `needsCompaction()` của MemAct tính toán chính xác điểm cắt và kích hoạt nén `compactMemAct()` đúng thời điểm đạt ngưỡng `MINI_CTX_COMPACT_THRESHOLD` (85%), triệt tiêu hoàn toàn sai số do ước tính heuristic byte-per-token.
+
+2. **Giám sát & Đánh giá Hiệu quả Prompt Cache-Hit Rate sau khi MemAct Compaction**:
+   - `cached_tokens` cho biết số lượng token được provider tái sử dụng nhờ prompt caching.
+   - Nhờ MemAct mới **giữ cố định `msgs[0]` (prompt gốc)** và dồn tích lũy summary tại `msgs[1]`, cấu trúc prefix của request gửi tới LLM đạt tính ổn định rất cao.
+   - `AgentLoop` tính toán tỷ lệ cache-hit (`cached_tokens / prompt_tokens`) và ghi nhận vào Journal. Tỷ lệ cache-hit cao sau mỗi lần nén xác nhận rằng mô hình nén ngữ cảnh MemAct (prompt gốc + summary) vừa tối ưu dung lượng vừa tận dụng tối đa lợi thế Prompt Caching của các provider (như DeepSeek, OpenAI, Claude).
+
+3. **Quản lý Ngân sách Reasoning Tokens (Reasoning Budgeting)**:
+   - Các model suy luận (DeepSeek Reasoner, OpenAI o-series) tiêu tốn `reasoning_tokens` trong giai đoạn suy nghĩ.
+   - `AgentLoop` phân định rõ chi phí token dành cho "suy nghĩ" vs "kết quả", giúp điều chỉnh `max_tokens` linh hoạt và cảnh báo nếu model tiêu tốn quá nhiều ngân sách token cho phần suy nghĩ trước khi sinh mã.
+
+4. **Xử lý Tác vụ bị Ngắt do Content Filter / Refusal**:
+   - Việc map chính xác `finish_reason` giúp `AgentLoop` phân biệt được tác vụ bị ngắt do chính sách an toàn (`content_filter`/`refusal`) thay vì nhầm thành lỗi transport/mạng (`.unknown`). Agent có thể đưa ra thông báo rõ ràng cho người dùng thay vì retry vô ích.
+
+5. **Trừ Ngân sách Token Session Chính xác (Session Token Budgeting)**:
+   - Trừ trực tiếp `usage.total_tokens` thực tế vào `budget_max_tokens` của session thay vì tính dựa trên chuỗi ước tính.
+
 ## 4. Cấu trúc code thay đổi
 
 | File | Thay đổi |
 |---|---|
 | `src/core/protocol.zig` | Thêm `Usage` struct + field `usage` vào `Response` (additive) |
 | `src/backends/openai.zig` | `UsageJson` nested parse; `reasoning` alias; finish_reason map đầy đủ; error branch sớm; retry pattern `stream_options` |
-| `src/core/agent.zig` | Wire usage ra journal (1 dòng `[usage] prompt=X completion=Y cache_hit=Z`), chỉ khi `usage.total_tokens > 0` |
+| `src/core/agent.zig` | Wire usage ra journal (1 dòng `[usage] prompt=X completion=Y cache_hit=Z`), hiệu chỉnh MemAct token feedback & trừ budget session |
 | `testcases/test_openai_response_parse.zig` | Mới — table-driven SSE fixtures cho 4 biến thể provider |
 
 Test fixtures (giả lập chunk SSE, feed vào `StreamCtx.onChunk`):
@@ -241,13 +264,14 @@ Test fixtures (giả lập chunk SSE, feed vào `StreamCtx.onChunk`):
 | M2 | `reasoning` alias + fixture 3 | openai.zig |
 | M3 | finish_reason map + error branch + fixtures 4–5 | openai.zig |
 | M4 | Retry `stream_options` adaptive | openai.zig |
-| M5 | Journal usage line + (tùy chọn) hiển thị cache-hit% khi !quiet | agent.zig |
+| M5 | Journal usage line + MemAct usage feedback calibration + cache-hit% display | agent.zig, history.zig |
 
 M1–M3 là lõi, M4–M5 nice-to-have. Mỗi milestone chạy `zig build test` phải pass.
 
 ## 6. Acceptance criteria
 
 - [ ] Stream OpenAI thật (hoặc fixture) có usage: `response.usage.total_tokens > 0`.
+- [ ] MemAct nhận phản hồi `usage` thực tế để hiệu chỉnh bộ đếm token ngữ cảnh.
 - [ ] DeepSeek: reasoning land vào `ThinkingBlock`, `cached_tokens` > 0 khi provider báo.
 - [ ] `delta.reasoning` (không suffix) được parse thành thinking.
 - [ ] `finish_reason: "content_filter"` → `.unknown` + debug info, KHÔNG phải `.end_turn`.

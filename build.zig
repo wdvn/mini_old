@@ -109,10 +109,26 @@ pub fn build(b: *std.Build) void {
     test_mod.linkLibrary(qjs_lib);
     test_mod.addOptions("build_info", build_info);
 
+    // Module "mini" cho testcases/ import (rooted tại src/main.zig)
+    const testcase_mod = b.createModule(.{
+        .root_source_file = b.path("testcases/test_codeact_security.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    testcase_mod.addImport("mini", test_mod);
+    testcase_mod.addIncludePath(qjs_path);
+    testcase_mod.linkLibrary(qjs_lib);
+
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(unit_tests);
+
+    const testcase_tests = b.addTest(.{ .root_module = testcase_mod });
+    const run_testcase_tests = b.addRunArtifact(testcase_tests);
+
     const test_step = b.step("test", "Chạy unit tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_testcase_tests.step);
 }
 
 /// Format Unix timestamp thành "YYYY-MM-DD HH:MM:SS UTC" (không phụ thuộc libc).

@@ -224,10 +224,14 @@ test "parseSkillFile frontmatter" {
     // Tạo thư mục tạm + SKILL.md
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "my-skill");
+
+
     try tmp.dir.writeFile(testing.io, .{
         .sub_path = "my-skill/SKILL.md",
         .data = "---\nname: my-skill\ndescription: Use when writing docs\n---\n\n# Content",
     });
+
     // cwd của tmpDir khác cwd process — test qua hàm parse trực tiếp không khả thi
     // (parseSkillFile mở theo cwd). Test logic frontmatter qua helper riêng.
 }

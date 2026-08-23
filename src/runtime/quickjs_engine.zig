@@ -63,21 +63,11 @@ pub const Engine = struct {
         const self = try alloc.create(Engine);
         errdefer alloc.destroy(self);
 
-        const rt = c.JS_NewRuntime() orelse return error.QuickJSRuntimeInitFailed;
-        errdefer c.JS_FreeRuntime(rt);
-
-        // 1. Resource Limits (128MB RAM, 1MB Stack)
-        c.JS_SetMemoryLimit(rt, 128 * 1024 * 1024);
-        c.JS_SetMaxStackSize(rt, 1024 * 1024);
-
-        const ctx = c.JS_NewContext(rt) orelse return error.QuickJSContextInitFailed;
-        errdefer c.JS_FreeContext(ctx);
-
         self.* = Engine{
             .alloc = alloc,
             .io = io,
-            .rt = rt,
-            .ctx = ctx,
+            .rt = null,
+            .ctx = null,
             .output_buf = .empty,
             .last_activity_time = utils.milliTimestamp(),
             .is_paused = false,
@@ -85,16 +75,40 @@ pub const Engine = struct {
             .max_cpu_burst_ms = 5000,
         };
 
-        // Thiết lập interrupt handler cho watchdog
-        c.JS_SetInterruptHandler(rt, interruptCallback, self);
-
-        // Thiết lập opaque data cho context
-        c.JS_SetContextOpaque(ctx, self);
-
-        // Thiết lập standard built-in objects & console
-        try self.setupEnvironment();
+        // Khởi tạo runtime & context sạch ban đầu
+        try self.resetContext();
 
         return self;
+    }
+
+    /// Khởi tạo mới JSRuntime & JSContext sạch trước mỗi lượt eval để đảm bảo cô lập 100% (Per-Act VM Isolation)
+    pub fn resetContext(self: *Engine) !void {
+        if (self.ctx) |ctx| {
+            c.JS_FreeContext(ctx);
+            self.ctx = null;
+        }
+        if (self.rt) |rt| {
+            c.JS_FreeRuntime(rt);
+            self.rt = null;
+        }
+
+        const rt = c.JS_NewRuntime() orelse return error.QuickJSRuntimeInitFailed;
+        errdefer c.JS_FreeRuntime(rt);
+
+        c.JS_SetMemoryLimit(rt, 128 * 1024 * 1024);
+        c.JS_SetMaxStackSize(rt, 1024 * 1024);
+
+        const ctx = c.JS_NewContext(rt) orelse return error.QuickJSContextInitFailed;
+        errdefer c.JS_FreeContext(ctx);
+
+        self.rt = rt;
+        self.ctx = ctx;
+
+        c.JS_SetInterruptHandler(rt, interruptCallback, self);
+        c.JS_SetContextOpaque(ctx, self);
+        try self.setupEnvironment();
+        const js_bindings = @import("js_bindings.zig");
+        try js_bindings.registerBindings(self);
     }
 
     pub fn deinit(self: *Engine) void {
@@ -205,6 +219,7 @@ pub const Engine = struct {
 
     /// Thực thi đoạn mã JavaScript trong engine
     pub fn eval(self: *Engine, code: []const u8, filename: []const u8) !ExecutionResult {
+        try self.resetContext();
         const ctx = self.ctx.?;
         self.output_buf.clearRetainingCapacity();
         self.renewActivity();
@@ -463,4 +478,91 @@ test "quickjs_engine - mini.http trả status/headers/body qua lib" {
     try std.testing.expect(std.mem.indexOf(u8, res.stdout, "ct=application/json") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.stdout, "xc=hi") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.stdout, "body={\"ok\":true}") != null);
+}
+
+test "quickjs_engine - per-act fresh context isolation (no top-level const collision)" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var engine = try Engine.init(alloc, io);
+    defer engine.deinit();
+
+    // Turn 1: Khai báo const ở top-level
+    var res1 = try engine.eval("const data = 'turn 1'; console.log(data);", "turn1.js");
+    defer res1.deinit();
+    try std.testing.expect(!res1.is_error);
+    try std.testing.expectEqualStrings("turn 1\n", res1.stdout);
+
+    // Turn 2: Khai báo const CÙNG TÊN 'data' ở top-level (không bị trùng scope nhờ resetContext)
+    var res2 = try engine.eval("const data = 'turn 2'; console.log(data);", "turn2.js");
+    defer res2.deinit();
+    try std.testing.expect(!res2.is_error);
+    try std.testing.expectEqualStrings("turn 2\n", res2.stdout);
+}
+
+
+// ---------------------------------------------------------------------------
+// ISSUE-CODEACT-001 M2/M3: policy + hook qua mini.* bindings
+// ---------------------------------------------------------------------------
+
+var g_hook_log_buf: [1024]u8 = undefined;
+var g_hook_log_len: usize = 0;
+
+fn testHookListener(payload: @import("../core/hooks.zig").HookPayload) void {
+    const s = std.fmt.bufPrint(g_hook_log_buf[g_hook_log_len..], "{s}:{s}|", .{ payload.event, payload.tool_name orelse "?" }) catch return;
+    g_hook_log_len += s.len;
+}
+
+test "codeact security - blocklist chan mini.sh va mini.write (M2)" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const js_bindings = @import("js_bindings.zig");
+    const registry = @import("../tooling/registry.zig");
+
+    registry.setPolicy(null, "bash,file_write");
+    defer registry.setPolicy(null, null);
+
+    var engine = try Engine.init(alloc, io);
+    defer engine.deinit();
+    try js_bindings.registerBindings(engine);
+
+    var res = try engine.eval(
+        \\let sh_blocked = false, wr_blocked = false;
+        \\try { mini.sh("echo x"); } catch (e) { sh_blocked = true; }
+        \\try { mini.write("/tmp/mini_m2_test.txt", "x"); } catch (e) { wr_blocked = true; }
+        \\"sh=" + sh_blocked + " write=" + wr_blocked;
+    , "test_policy_block.js");
+    defer res.deinit();
+
+    try std.testing.expect(!res.is_error);
+    if (res.return_value_json) |rv| {
+        try std.testing.expect(std.mem.indexOf(u8, rv, "sh=true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rv, "write=true") != null);
+    }
+}
+
+test "codeact hooks - pre/post hook quanh mini.write (M3)" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const js_bindings = @import("js_bindings.zig");
+    const hooks = @import("../core/hooks.zig");
+
+    hooks.setHookListener(testHookListener);
+    defer hooks.setHookListener(null);
+    g_hook_log_len = 0;
+
+    var engine = try Engine.init(alloc, io);
+    defer engine.deinit();
+    try js_bindings.registerBindings(engine);
+
+    var res = try engine.eval(
+        \\const w = mini.write("/tmp/mini_hook_test_m3.txt", "hello");
+        \\w.ok;
+    , "test_hook_write.js");
+    defer res.deinit();
+
+    try std.testing.expect(!res.is_error);
+    const log = g_hook_log_buf[0..g_hook_log_len];
+    try std.testing.expect(std.mem.indexOf(u8, log, "pre-tool-use:file_write") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "post-tool-use:file_write") != null);
 }

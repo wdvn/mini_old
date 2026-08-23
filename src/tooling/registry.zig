@@ -39,6 +39,7 @@ const artifact_tool = @import("../tools/artifact.zig");
 const mcp_mod = @import("mcp.zig");
 const hooks = @import("../core/hooks.zig");
 const skills_mod = @import("../core/skills.zig");
+const quickjs = @import("../runtime/quickjs_engine.zig");
 
 // ---------------------------------------------------------------------------
 // Global state (single-threaded)
@@ -86,6 +87,7 @@ fn executeToolInternal(alloc: Allocator, io: std.Io, name: []const u8, input_jso
     if (std.mem.eql(u8, name, "artifact_read"))  return artifact_tool.readTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "artifact_list"))  return artifact_tool.listTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "skills"))        return executeSkills(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "codeact"))       return executeCodeActTool(alloc, io, input_json);
 
     // MCP fallback: tên có dạng "server__toolname"
     if (g_mcp) |mgr| {
@@ -96,6 +98,44 @@ fn executeToolInternal(alloc: Allocator, io: std.Io, name: []const u8, input_jso
         "Tool không tồn tại: '{s}'. Dùng tool 'skills' để xem danh sách.", .{name},
     );
 }
+
+fn executeCodeActTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
+    const code = json.findString(input_json, "code") orelse return error.MissingCodeArgument;
+    const engine = try quickjs.Engine.init(alloc, io);
+    defer engine.deinit();
+
+    var res = try engine.eval(code, "agent_codeact.js");
+    defer res.deinit();
+
+    var out_buf = utils.BufWriter.init(alloc);
+    errdefer out_buf.deinit();
+
+    if (!res.is_error) {
+        try out_buf.writeAll("[CodeAct Execution Output]\n");
+        if (res.stdout.len > 0) {
+            try out_buf.print("stdout:\n{s}\n", .{res.stdout});
+        }
+        if (res.return_value_json) |ret| {
+            try out_buf.print("return value:\n{s}\n", .{ret});
+        }
+        if (res.stdout.len == 0 and res.return_value_json == null) {
+            try out_buf.writeAll("(Code executed successfully with no output)\n");
+        }
+    } else {
+        try out_buf.writeAll("[CodeAct Error]\n");
+        if (res.error_message) |msg| {
+            try out_buf.print("message: {s}\n", .{msg});
+        }
+        if (res.stack_trace) |st| {
+            try out_buf.print("stack trace:\n{s}\n", .{st});
+        }
+        if (res.error_message == null and res.stack_trace == null) {
+            try out_buf.print("stdout:\n{s}\n", .{res.stdout});
+        }
+    }
+    return out_buf.toOwnedSlice();
+}
+
 
 /// Thực thi tool theo tên.
 /// Trả về kết quả dạng string. Caller phải free.
@@ -143,6 +183,13 @@ pub fn executeTool(alloc: Allocator, io: std.Io, name: []const u8, input_json: [
 /// Danh sách định nghĩa tất cả built-in tools.
 /// Được gửi lên AI API trong mỗi request.
 pub const definitions = [_]proto.ToolDefinition{
+    .{
+        .name = "codeact",
+        .description = "Thực thi mã JavaScript trong máy ảo QuickJS nhúng với đối tượng toàn cục mini.* (mini.sh, mini.read, mini.write, mini.patch, mini.http). Dùng khi cần tự động hóa nhiều bước phức tạp hoặc xử lý dữ liệu.",
+        .input_schema_json = \\{"type":"object","properties":{"code":{"type":"string","description":"Mã JavaScript cần thực thi trong QuickJS VM"}},"required":["code"]}
+        ,
+    },
+
     .{
         .name = "bash",
         .description = "Chạy lệnh shell và trả về stdout/stderr. Dùng cho git, lệnh hệ thống, chạy script.",
@@ -328,7 +375,7 @@ fn matchesEntry(entry_trimmed: []const u8, name: []const u8) bool {
     return std.mem.eql(u8, entry_trimmed, name);
 }
 
-fn isPermitted(name: []const u8) bool {
+pub fn isPermitted(name: []const u8) bool {
     if (g_allowlist) |list| {
         // Allowlist: CHỈ cho phép những tool được liệt kê
         var it = std.mem.splitScalar(u8, list, ',');
@@ -448,3 +495,33 @@ fn executeSkills(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     }
     return buf.toOwnedSlice();
 }
+
+test "codeact as native tool: codeact in registry" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Verify codeact definition exists in built-in definitions
+    var found_def = false;
+    for (definitions) |td| {
+        if (std.mem.eql(u8, td.name, "codeact")) {
+            found_def = true;
+            try std.testing.expect(std.mem.indexOf(u8, td.description, "QuickJS") != null);
+            break;
+        }
+    }
+    try std.testing.expect(found_def);
+
+    // Test executeTool with codeact
+    const input_json =
+        \\{"code":"console.log('Hello from codeact native tool'); 10 + 20;"}
+    ;
+
+    const output = try executeTool(alloc, io, "codeact", input_json);
+    defer alloc.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "[CodeAct Execution Output]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Hello from codeact native tool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "30") != null);
+}
+
+

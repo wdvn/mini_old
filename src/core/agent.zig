@@ -38,7 +38,7 @@ const utils = @import("utils.zig");
 const quickjs = @import("../runtime/quickjs_engine.zig");
 const js_bindings = @import("../runtime/js_bindings.zig");
 const tokens_mod = @import("memact/tokens.zig");
-const window_mod = @import("memact/window.zig");
+const snapshot_mod = @import("snapshot.zig");
 const cas_mod = @import("cas.zig");
 const journal_mod = @import("journal.zig");
 
@@ -124,12 +124,12 @@ pub const AgentLoop = struct {
     max_tokens_continues: usize = 0,
     /// Trình ước lượng token (MemAct).
     token_estimator: tokens_mod.TokenEstimator,
-    /// Cửa sổ ngữ cảnh (MemAct).
-    context_window: window_mod.ContextWindow,
     /// Content-Addressed Storage (RFC-002).
     cas: cas_mod.CAS,
     /// Act Journal (RFC-002). Null nếu chưa processInput.
     journal: ?journal_mod.ActJournal = null,
+    /// Snapshot tracker (RFC-002/ISSUE-CODEACT-001 M4) — track mini.write/patch/sh.
+    snapshot_tracker: ?snapshot_mod.SnapshotTracker = null,
     /// HTTP code của lỗi backend gần nhất (đưa vào journal ErrorDetail).
     last_backend_http_code: u32 = 0,
     /// Raw body lỗi backend gần nhất (bản dupe, agent sở hữu — đưa vào journal).
@@ -201,11 +201,6 @@ pub const AgentLoop = struct {
             .engine = engine,
             .js_retry_count = 0,
             .token_estimator = tokens_mod.TokenEstimator.init(alloc),
-            .context_window = .{
-                .max_tokens = config.context_window,
-                .safety_margin = config.ctx_safety_margin,
-                .compact_threshold = config.ctx_compact_threshold,
-            },
             .cas = cas,
             .journal = null,
         };
@@ -213,6 +208,10 @@ pub const AgentLoop = struct {
 
     /// Giải phóng bộ nhớ.
     pub fn deinit(self: *AgentLoop) void {
+        if (self.snapshot_tracker) |*t| {
+            snapshot_mod.setTracker(null);
+            t.deinit();
+        }
         self.history.deinit();
         self.engine.deinit();
         self.token_estimator.deinit();
@@ -252,99 +251,8 @@ pub const AgentLoop = struct {
 
         main.stderrPrint("\x1b[36m[agent]\x1b[0m \x1b[93mĐang suy nghĩ / Phân tích yêu cầu... \x1b[0m\n", .{});
 
-        // 0. Tính token pinned (cho system prompt, memory block...)
-        // Hiện tại tạm dùng cứng 1500 tokens cho system_prompt, sau sẽ add TokenEstimator cho nó.
-        const pinned_tokens = self.token_estimator.estimate(self.config.system_prompt);
+        // Gửi lên AI backend (streaming) — không tự ý nén ngữ cảnh trước khi model thực sự báo quá tải
 
-        if (self.config.memact_enabled and self.history.messages().len > 2 and self.context_window.needsCompaction(&self.token_estimator, self.history.messages(), pinned_tokens)) {
-            // Guard: history đã ở dạng tối thiểu [prompt gốc, summary] nhưng vẫn
-            // vượt ngưỡng (prompt gốc/summary quá lớn) — compactMemAct không thể
-            // giảm thêm (chỉ thay summary bằng summary mới). Tránh gọi LLM summary
-            // mỗi vòng lặp (đốt API call, history không giảm), chỉ log cảnh báo.
-            const threshold_pct = @as(u32, @intFromFloat(self.context_window.compact_threshold * 100.0));
-            main.stderrPrint("\n\x1b[33m[agent] Lịch sử đạt {d}% window, nén MemAct...\x1b[0m\n", .{threshold_pct});
-
-            // compactMemAct (bản mới) GIỮ NGUYÊN msgs[0] (prompt gốc) và DROP toàn bộ
-            // phần còn lại, chỉ chèn/thay summary tại index 1. KHÔNG giữ N messages
-            // gần nhất — với window lớn phần giữ lại (~60% window) vẫn vượt ngưỡng
-            // compact → mỗi vòng lặp lại nén (tốn LLM call, history không bao giờ
-            // xuống dưới ngưỡng). Trạng thái "đang ở bước nào" nằm trong summary
-            // (task_state/next_step) nên model vẫn tiếp tục đúng chỗ.
-            {
-                var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
-                msg_blocks[0] = .{ .text = try self.alloc.dupe(u8, 
-                    "SYSTEM: Bạn là bộ nhớ MemAct. Hãy tóm tắt ngắn gọn phần hội thoại trước thành JSON, tuân thủ đúng stencil:\n" ++
-                    "{\n" ++
-                    "  \"type\": \"context_summary\",\n" ++
-                    "  \"iteration_range\": [1, 99],\n" ++
-                    "  \"task_state\": \"mô tả tiến độ\",\n" ++
-                    "  \"decisions\": [\"quyết định 1\"],\n" ++
-                    "  \"open_questions\": [],\n" ++
-                    "  \"learned_errors\": [],\n" ++
-                    "  \"files_touched\": [],\n" ++
-                    "  \"next_step\": \"bước tiếp theo\"\n" ++
-                    "}\n" ++
-                    "Nếu hội thoại đầu vào đã chứa block \"[MemAct Context Summary]\", hãy gộp (merge) nội dung summary cũ vào summary mới, giữ lại các thông tin quan trọng, vẫn theo đúng stencil JSON trên.\n" ++
-                    "Chỉ xuất JSON, không có markdown text khác."
-                ) };
-                const sys_msg = proto.Message{ .role = .user, .content = msg_blocks };
-                defer {
-                    self.alloc.free(sys_msg.content[0].text);
-                    self.alloc.free(sys_msg.content);
-                }
-                
-                var temp_msgs = std.ArrayListUnmanaged(proto.Message).empty;
-                defer temp_msgs.deinit(self.alloc);
-                try temp_msgs.appendSlice(self.alloc, self.history.messages());
-                try temp_msgs.append(self.alloc, sys_msg);
-
-                var summary_resp = try self.sendToBackend(act_id, self.config.system_prompt, temp_msgs.items, &[_]proto.ToolDefinition{}, null, null);
-                defer summary_resp.deinit();
-
-                var compacted = false;
-                for (summary_resp.content.items) |block| {
-                    if (block == .text) {
-                        try self.history.compactMemAct(act_id, block.text);
-                        compacted = true;
-                        break;
-                    }
-                }
-                if (!compacted) {
-                    main.stderrPrint("[agent] Cảnh báo: LLM không trả về text summary, fallback.\n", .{});
-                    self.history.compact();
-                }
-            }
-        } else if (!self.config.memact_enabled and self.history.needsCompaction()) {
-            main.stderrPrint("\n\x1b[33m[agent] Lịch sử quá dài (MemAct tắt), đang nén cũ...\x1b[0m\n", .{});
-            
-            var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
-            msg_blocks[0] = .{ .text = try self.alloc.dupe(u8, "SYSTEM: Lịch sử đã đầy. Hãy tóm tắt trạng thái công việc hiện tại (đã làm gì, kết quả ra sao, cần làm gì tiếp). Không gọi tool, chỉ trả về văn bản tóm tắt.") };
-            const sys_msg = proto.Message{ .role = .user, .content = msg_blocks };
-            defer {
-                self.alloc.free(sys_msg.content[0].text);
-                self.alloc.free(sys_msg.content);
-            }
-            
-            var temp_msgs = std.ArrayListUnmanaged(proto.Message).empty;
-            defer temp_msgs.deinit(self.alloc);
-            try temp_msgs.appendSlice(self.alloc, self.history.messages());
-            try temp_msgs.append(self.alloc, sys_msg);
-            
-            var summary_resp = try self.sendToBackend(act_id, self.config.system_prompt, temp_msgs.items, &[_]proto.ToolDefinition{}, null, null);
-            defer summary_resp.deinit();
-            
-            var compacted = false;
-            for (summary_resp.content.items) |block| {
-                if (block == .text) {
-                    try self.history.compactWithSummary(block.text);
-                    compacted = true;
-                    break;
-                }
-            }
-            if (!compacted) {
-                self.history.compact();
-            }
-        }
 
         // Gửi lên AI backend (streaming)
         var response = try self.sendToBackend(
@@ -462,7 +370,8 @@ pub const AgentLoop = struct {
                     self.setLastErrorContext(response.http_code, response.raw_debug_info);
                 }
                 if (response.http_code == 429) return error.LLMRateLimitExceeded;
-                if (response.http_code == 500 or response.http_code == 502 or response.http_code == 503) return error.LLMProviderUnavailable;
+                if (response.http_code >= 500 and response.http_code < 600) return error.LLMProviderUnavailable;
+
                 if (response.http_code == 400) {
                     if (response.raw_debug_info) |raw| {
                         if (std.mem.indexOf(u8, raw, "context_length_exceeded") != null or 
@@ -542,14 +451,34 @@ pub const AgentLoop = struct {
         // Reset bộ đếm continue-max_tokens cho turn mới
         self.max_tokens_continues = 0;
 
-        // Lấy danh sách tools phù hợp với user message
-        const tool_defs = tools_mod.getRelevantDefinitions(turn_alloc, user_text);
+        // Lấy danh sách tools phù hợp với user message dựa trên execution_mode
+        const tool_defs = switch (self.config.execution_mode) {
+            .codeact => &[_]proto.ToolDefinition{}, // Tắt 100% mảng tools gửi lên API khi ở mode codeact để ép LLM viết JS CodeAct
+            .tools => blk: {
+                const all_defs = tools_mod.getRelevantDefinitions(turn_alloc, user_text);
+                var list = std.ArrayListUnmanaged(proto.ToolDefinition).empty;
+                for (all_defs) |td| {
+                    if (!std.mem.eql(u8, td.name, "codeact")) {
+                        list.append(turn_alloc, td) catch {};
+                    }
+                }
+                break :blk list.items;
+            },
+            .auto => tools_mod.getRelevantDefinitions(turn_alloc, user_text),
+        };
+
 
         if (self.journal == null) {
             var path_buf: [256]u8 = undefined;
             const home_dir = getEnvVar("HOME") orelse ".";
             const journal_path = std.fmt.bufPrint(&path_buf, "{s}/.mini/sessions/journal_{d}.jsonl", .{ home_dir, std.os.linux.getpid() }) catch "/tmp/mini_journal.jsonl";
             self.journal = journal_mod.ActJournal.init(self.alloc, self.io, journal_path) catch null;
+        }
+
+        // ISSUE-CODEACT-001 M4: snapshot tracker dùng chung CAS, global cho mini.* bindings
+        if (self.snapshot_tracker == null) {
+            self.snapshot_tracker = snapshot_mod.SnapshotTracker.init(self.alloc, self.io, &self.cas, if (self.journal != null) &self.journal.? else null);
+            snapshot_mod.setTracker(if (self.snapshot_tracker != null) &self.snapshot_tracker.? else null);
         }
 
         var act_id: usize = 1;
@@ -602,7 +531,8 @@ pub const AgentLoop = struct {
                             continue;
                         },
                         error.LLMContextWindowExceeded => {
-                            if (self.journal) |*j| j.recordError(self.io, act_id, .llm_context_overflow, "Context overflow", .{
+                            main.stderrPrint("\n\x1b[33m[agent] ⚠️ Model báo vượt quá context limit (HTTP 400)! Đang nén MemAct khẩn cấp...\x1b[0m\n", .{});
+                            if (self.journal) |*j| j.recordError(self.io, act_id, .llm_context_overflow, "Model báo quá tải context — nén MemAct khẩn cấp", .{
                                 .backend = self.backend.name(),
                                 .model = self.backend.model(),
                                 .error_name = @errorName(e),
@@ -610,8 +540,17 @@ pub const AgentLoop = struct {
                                 .attempt = try_count + 1,
                                 .raw_snippet = self.last_backend_raw_error,
                             }) catch {};
-                            return e;
+
+                            self.compactContext(act_id) catch {
+                                self.history.compact();
+                            };
+
+                            if (self.history.last_compaction_act_id < act_id) {
+                                self.history.truncate(history_len);
+                            }
+                            continue;
                         },
+
                         else => {
                             if (try_count == max_retries) {
                                 main.stderrPrint("\n[agent] Act {d} lỗi liên tiếp {d} lần. Ngắt tiến trình: {s}\n", .{ act_id, max_retries + 1, @errorName(e) });
@@ -653,6 +592,12 @@ pub const AgentLoop = struct {
                         }
                     }
                 };
+
+                // Flush toàn bộ snapshot mini.write/patch/sh đã track trong act này (M4)
+                if (self.snapshot_tracker) |*t| {
+                    t.flush(act_id);
+                    t.reset();
+                }
 
                 if (self.journal) |*j| {
                     j.recordActComplete(self.io, act_id, .{
@@ -784,7 +729,93 @@ pub const AgentLoop = struct {
         }
     }
 
+    /// Thực hiện nén ngữ cảnh (MemAct compaction) khi model thực sự trả về lỗi quá context limit.
+    pub fn compactContext(self: *AgentLoop, act_id: usize) !void {
+        if (self.history.messages().len <= 2) {
+            self.history.compact();
+            return;
+        }
+
+        main.stderrPrint("\x1b[33m[agent] Đang tổng hợp tóm tắt ngữ cảnh (MemAct compaction)...\x1b[0m\n", .{});
+
+        if (self.config.memact_enabled) {
+            var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+            msg_blocks[0] = .{ .text = try self.alloc.dupe(u8, 
+                "SYSTEM: Bạn là bộ nhớ MemAct. Hãy tóm tắt ngắn gọn phần hội thoại trước thành JSON, tuân thủ đúng stencil:\n" ++
+                "{\n" ++
+                "  \"type\": \"context_summary\",\n" ++
+                "  \"iteration_range\": [1, 99],\n" ++
+                "  \"task_state\": \"mô tả tiến độ\",\n" ++
+                "  \"decisions\": [\"quyết định 1\"],\n" ++
+                "  \"open_questions\": [],\n" ++
+                "  \"learned_errors\": [],\n" ++
+                "  \"files_touched\": [],\n" ++
+                "  \"next_step\": \"bước tiếp theo\"\n" ++
+                "}\n" ++
+                "Nếu hội thoại đầu vào đã chứa block \"[MemAct Context Summary]\", hãy gộp (merge) nội dung summary cũ vào summary mới, giữ lại các thông tin quan trọng, vẫn theo đúng stencil JSON trên.\n" ++
+                "Chỉ xuất JSON, không có markdown text khác."
+            ) };
+            const sys_msg = proto.Message{ .role = .user, .content = msg_blocks };
+            defer {
+                self.alloc.free(sys_msg.content[0].text);
+                self.alloc.free(sys_msg.content);
+            }
+            
+            var temp_msgs = std.ArrayListUnmanaged(proto.Message).empty;
+            defer temp_msgs.deinit(self.alloc);
+            try temp_msgs.appendSlice(self.alloc, self.history.messages());
+            try temp_msgs.append(self.alloc, sys_msg);
+
+            var summary_resp = try self.sendToBackend(act_id, self.config.system_prompt, temp_msgs.items, &[_]proto.ToolDefinition{}, null, null);
+            defer summary_resp.deinit();
+
+            var compacted = false;
+            for (summary_resp.content.items) |block| {
+                if (block == .text) {
+                    try self.history.compactMemAct(act_id, block.text);
+                    compacted = true;
+                    break;
+                }
+            }
+            if (!compacted) {
+                main.stderrPrint("[agent] Cảnh báo: LLM không trả về text summary, fallback.\n", .{});
+                self.history.compact();
+            }
+        } else {
+            main.stderrPrint("\n\x1b[33m[agent] Lịch sử quá dài (MemAct tắt), đang nén cũ...\x1b[0m\n", .{});
+            
+            var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+            msg_blocks[0] = .{ .text = try self.alloc.dupe(u8, "SYSTEM: Lịch sử đã đầy. Hãy tóm tắt trạng thái công việc hiện tại (đã làm gì, kết quả ra sao, cần làm gì tiếp). Không gọi tool, chỉ trả về văn bản tóm tắt.") };
+            const sys_msg = proto.Message{ .role = .user, .content = msg_blocks };
+            defer {
+                self.alloc.free(sys_msg.content[0].text);
+                self.alloc.free(sys_msg.content);
+            }
+            
+            var temp_msgs = std.ArrayListUnmanaged(proto.Message).empty;
+            defer temp_msgs.deinit(self.alloc);
+            try temp_msgs.appendSlice(self.alloc, self.history.messages());
+            try temp_msgs.append(self.alloc, sys_msg);
+            
+            var summary_resp = try self.sendToBackend(act_id, self.config.system_prompt, temp_msgs.items, &[_]proto.ToolDefinition{}, null, null);
+            defer summary_resp.deinit();
+            
+            var compacted = false;
+            for (summary_resp.content.items) |block| {
+                if (block == .text) {
+                    try self.history.compactWithSummary(block.text);
+                    compacted = true;
+                    break;
+                }
+            }
+            if (!compacted) {
+                self.history.compact();
+            }
+        }
+    }
+
     /// Thực thi tất cả tool_use blocks trong response.
+
     fn executeTools(self: *AgentLoop, act_id: usize, response: *const proto.Response) !void {
         var results = ArrayList(proto.ToolResult).empty;
         defer results.deinit(self.alloc);
@@ -828,9 +859,13 @@ pub const AgentLoop = struct {
                         } else {
                             main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
                         }
+                    } else if (std.mem.eql(u8, tu.name, "codeact")) {
+                        main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting QuickJS-ng script...\x1b[0m ", .{});
                     } else {
+
                         main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
                     }
+
 
                     // Phát pre-tool-use hook
                     hooks_mod.dispatch(self.alloc, self.io, .{
@@ -946,6 +981,105 @@ pub fn extractJsCodeBlock(alloc: Allocator, text: []const u8) ?[]const u8 {
     return null;
 }
 
+fn extractXmlAttr(tag_str: []const u8, attr_name: []const u8) ?[]const u8 {
+    var search_buf: [64]u8 = undefined;
+    const pat = std.fmt.bufPrint(&search_buf, "{s}=\"", .{attr_name}) catch return null;
+    if (std.mem.indexOf(u8, tag_str, pat)) |start_idx| {
+        const val_start = start_idx + pat.len;
+        if (std.mem.indexOfPos(u8, tag_str, val_start, "\"")) |val_end| {
+            return tag_str[val_start..val_end];
+        }
+    }
+    const pat_sq = std.fmt.bufPrint(&search_buf, "{s}='", .{attr_name}) catch return null;
+    if (std.mem.indexOf(u8, tag_str, pat_sq)) |start_sq| {
+        const val_start = start_sq + pat_sq.len;
+        if (std.mem.indexOfPos(u8, tag_str, val_start, "'")) |val_end| {
+            return tag_str[val_start..val_end];
+        }
+    }
+    return null;
+}
+
+/// Chuyển đổi các thẻ XML giả lập (<file_read>, <glob>, <grep>, <bash>, <file_write>) thành mã JS mini.*
+pub fn convertXmlToolTagsToJs(alloc: Allocator, text: []const u8) ?[]const u8 {
+    var js_buf = utils.BufWriter.init(alloc);
+    errdefer js_buf.deinit();
+
+    var has_tags = false;
+    var pos: usize = 0;
+
+    while (pos < text.len) {
+        const tag_start = std.mem.indexOfPos(u8, text, pos, "<") orelse break;
+        pos = tag_start + 1;
+
+        const tag_names = [_][]const u8{ "file_read", "glob", "grep", "bash", "file_write", "file_edit", "http_request", "web_search" };
+        var matched_tag: ?[]const u8 = null;
+        for (tag_names) |tn| {
+            if (std.mem.startsWith(u8, text[tag_start + 1 ..], tn)) {
+                matched_tag = tn;
+                break;
+            }
+        }
+        if (matched_tag == null) continue;
+
+        const tag_name = matched_tag.?;
+        const tag_end = std.mem.indexOfPos(u8, text, tag_start, ">") orelse continue;
+        const tag_str = text[tag_start .. tag_end + 1];
+        pos = tag_end + 1;
+
+        has_tags = true;
+
+        if (std.mem.eql(u8, tag_name, "file_read")) {
+            const file_path = extractXmlAttr(tag_str, "file") orelse extractXmlAttr(tag_str, "path") orelse "";
+            if (file_path.len > 0) {
+                const escaped = json_mod.escape(alloc, file_path) catch continue;
+                defer alloc.free(escaped);
+                js_buf.print("console.log('=== file_read: ' + \"{s}\" + ' ===');\nconsole.log(mini.read(\"{s}\"));\n", .{ escaped, escaped }) catch {};
+            }
+        } else if (std.mem.eql(u8, tag_name, "glob")) {
+            const pattern = extractXmlAttr(tag_str, "pattern") orelse "*";
+            const path = extractXmlAttr(tag_str, "path") orelse ".";
+            const esc_pat = json_mod.escape(alloc, pattern) catch continue;
+            defer alloc.free(esc_pat);
+            const esc_path = json_mod.escape(alloc, path) catch continue;
+            defer alloc.free(esc_path);
+            js_buf.print("console.log('=== glob: ' + \"{s}\" + ' ===');\nconsole.log(JSON.stringify(mini.glob(\"{s}\", \"{s}\")));\n", .{ esc_pat, esc_pat, esc_path }) catch {};
+        } else if (std.mem.eql(u8, tag_name, "grep")) {
+            const pattern = extractXmlAttr(tag_str, "pattern") orelse "";
+            const path = extractXmlAttr(tag_str, "path") orelse ".";
+            const esc_pat = json_mod.escape(alloc, pattern) catch continue;
+            defer alloc.free(esc_pat);
+            const esc_path = json_mod.escape(alloc, path) catch continue;
+            defer alloc.free(esc_path);
+            js_buf.print("console.log('=== grep: ' + \"{s}\" + ' ===');\nconsole.log(JSON.stringify(mini.grep(\"{s}\", \"{s}\")));\n", .{ esc_pat, esc_pat, esc_path }) catch {};
+        } else if (std.mem.eql(u8, tag_name, "bash")) {
+            const cmd = extractXmlAttr(tag_str, "command") orelse extractXmlAttr(tag_str, "cmd") orelse "";
+            if (cmd.len > 0) {
+                const esc_cmd = json_mod.escape(alloc, cmd) catch continue;
+                defer alloc.free(esc_cmd);
+                js_buf.print("console.log('=== bash: ' + \"{s}\" + ' ===');\nconst r = mini.sh(\"{s}\");\nconsole.log(r.stdout);\nif (r.stderr) console.log('stderr: ' + r.stderr);\n", .{ esc_cmd, esc_cmd }) catch {};
+            }
+        } else if (std.mem.eql(u8, tag_name, "file_write")) {
+            const path = extractXmlAttr(tag_str, "path") orelse extractXmlAttr(tag_str, "file") orelse "";
+            const content = extractXmlAttr(tag_str, "content") orelse "";
+            if (path.len > 0) {
+                const esc_path = json_mod.escape(alloc, path) catch continue;
+                defer alloc.free(esc_path);
+                const esc_content = json_mod.escape(alloc, content) catch continue;
+                defer alloc.free(esc_content);
+                js_buf.print("mini.write(\"{s}\", \"{s}\");\nconsole.log('file written: {s}');\n", .{ esc_path, esc_content, esc_path }) catch {};
+            }
+        }
+    }
+
+    if (!has_tags or js_buf.list.items.len == 0) {
+        js_buf.deinit();
+        return null;
+    }
+
+    return js_buf.toOwnedSlice() catch null;
+}
+
 /// Tìm kiếm khối mã JavaScript trong phản hồi của Assistant
 pub fn findJsCodeInResponse(alloc: Allocator, response: *const proto.Response) ?[]const u8 {
     for (response.content.items) |block| {
@@ -956,8 +1090,17 @@ pub fn findJsCodeInResponse(alloc: Allocator, response: *const proto.Response) ?
             else => {},
         }
     }
+    for (response.content.items) |block| {
+        switch (block) {
+            .text => |t| {
+                if (convertXmlToolTagsToJs(alloc, t)) |code| return code;
+            },
+            else => {},
+        }
+    }
     return null;
 }
+
 
 test "agent - extractJsCodeBlock" {
     const alloc = std.testing.allocator;
@@ -977,3 +1120,19 @@ test "agent - extractJsCodeBlock" {
 
     try std.testing.expectEqualStrings("const a = 10;\nconst b = 20;\nconsole.log(a + b);", extracted.?);
 }
+
+test "agent - convertXmlToolTagsToJs" {
+    const alloc = std.testing.allocator;
+    const text =
+        \\<file_read file="/home/mypc/project/rfc_003_summary.md" />
+        \\<glob path="/home/mypc/project" pattern="**/*rfc_003*" />
+    ;
+
+    const js = convertXmlToolTagsToJs(alloc, text);
+    try std.testing.expect(js != null);
+    defer alloc.free(js.?);
+
+    try std.testing.expect(std.mem.indexOf(u8, js.?, "mini.read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js.?, "mini.glob") != null);
+}
+

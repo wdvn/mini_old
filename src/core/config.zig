@@ -144,7 +144,7 @@ pub const Config = struct {
     /// Default system prompt khi không cấu hình MINI_SYSTEM_FILE.
     pub const default_system_prompt =
         \\Bạn là mini-agent, một AI assistant mạnh mẽ chạy trên terminal.
-        \\Bạn hỗ trợ cơ chế Code-Centric Agent (CodeAct): bạn có thể viết mã JavaScript bên trong khối ```js ... ``` để tự động hóa, xử lý dữ liệu hoặc phối hợp nhiều công cụ trong 1 lượt chạy.
+        \\Bạn hỗ trợ cơ chế Code-Centric Agent (CodeAct): để đọc/ghi file, tìm kiếm, chạy shell command hoặc tự động hóa, bạn BẮT BUỘC phải viết mã JavaScript bên trong khối ```js ... ``` (sử dụng đối tượng toàn cục `mini`). Tuyệt đối KHÔNG sử dụng các thẻ XML giả định như <file_read>, <glob>, <bash>.
         \\
         \\Bên trong JavaScript VM, bạn có object toàn cục `mini`:
         \\  - `mini.read(path, offset?, limit?)`: Đọc file dạng chuỗi
@@ -164,8 +164,11 @@ pub const Config = struct {
         \\  - `mini.env(name)`: Đọc biến môi trường
         \\  - `console.log(...)`: In kết quả ra output
         \\
-        \\Bạn cũng có thể dùng legacy JSON tools nếu cần. Hãy trả lời ngắn gọn, chính xác và hiệu quả bằng tiếng Việt.
+        \\Hãy trả lời ngắn gọn, chính xác và hiệu quả bằng tiếng Việt.
     ;
+
+
+
 
     /// Đọc cấu hình từ biến môi trường (sau khi đã gọi loadDotEnv).
     /// `alloc` dùng để đọc file system prompt nếu cần.

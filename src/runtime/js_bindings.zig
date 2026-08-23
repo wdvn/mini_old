@@ -41,6 +41,21 @@ const artifacts_mod = @import("../core/artifacts.zig");
 const utils = @import("../core/utils.zig");
 const json_mod = @import("../core/json.zig");
 const main = @import("../main.zig");
+const registry = @import("../tooling/registry.zig");
+const hooks = @import("../core/hooks.zig");
+const snapshot_mod = @import("../core/snapshot.zig");
+
+// ---------------------------------------------------------------------------
+// Security & auditing guard (ISSUE-CODEACT-001 M2/M3/M4)
+// Mọi binding mini.* nguy hiểm phải đi qua guard này trước khi thực thi.
+// ---------------------------------------------------------------------------
+
+/// Kiểm tra policy (allowlist/blocklist) (ISSUE-CODEACT-001 M2).
+/// Map tên mini.* -> tên tool policy. True = BỊ CHẶN.
+fn guardPolicy(engine: *Engine, tool_name: []const u8) bool {
+    _ = engine;
+    return !registry.isPermitted(tool_name);
+}
 
 fn getEngine(ctx: ?*c.JSContext) ?*Engine {
     const ptr = c.JS_GetContextOpaque(ctx) orelse return null;
@@ -218,6 +233,21 @@ fn jsMiniWrite(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
     const content = jsStringSlice(ctx, argv[1], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid content");
     defer engine.alloc.free(content);
 
+    // M2: policy check — mini.write map sang tool 'file_write'
+    if (guardPolicy(engine, "file_write")) {
+        hooks.dispatch(engine.alloc, engine.io, .{
+            .event = "post-tool-use", .tool_name = "file_write",
+            .input_json = path, .tool_result = "blocked by policy", .is_error = true,
+        });
+        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.write (file_write) is blocked");
+    }
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "pre-tool-use", .tool_name = "file_write", .input_json = path,
+    });
+
+    // M4: snapshot nội dung cũ vào CAS/journal TRƯỚC khi ghi
+    if (snapshot_mod.getTracker()) |t| t.beforeFileWrite(path);
+
     const res = file_tool.writeFile(engine.alloc, engine.io, path, content) catch |e| {
         const obj = c.JS_NewObject(ctx);
         _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, 0));
@@ -226,6 +256,15 @@ fn jsMiniWrite(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
         return obj;
     };
     defer engine.alloc.free(res);
+
+    // M4: flush snapshot sau khi ghi
+    if (snapshot_mod.getTracker()) |t| t.afterFileWrite(0, path);
+
+    // M3: post-hook
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "post-tool-use", .tool_name = "file_write",
+        .input_json = path, .tool_result = res,
+    });
 
     const obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, 1));
@@ -251,6 +290,21 @@ fn jsMiniPatch(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
     const new_str = jsStringSlice(ctx, argv[2], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid newStr");
     defer engine.alloc.free(new_str);
 
+    // M2: policy check — mini.patch map sang tool 'file_edit'
+    if (guardPolicy(engine, "file_edit")) {
+        hooks.dispatch(engine.alloc, engine.io, .{
+            .event = "post-tool-use", .tool_name = "file_edit",
+            .input_json = path, .tool_result = "blocked by policy", .is_error = true,
+        });
+        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.patch (file_edit) is blocked");
+    }
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "pre-tool-use", .tool_name = "file_edit", .input_json = path,
+    });
+
+    // M4: snapshot trước khi sửa
+    if (snapshot_mod.getTracker()) |t| t.beforeFileWrite(path);
+
     const res = file_tool.editFile(engine.alloc, engine.io, path, old_str, new_str) catch |e| {
         const obj = c.JS_NewObject(ctx);
         _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, 0));
@@ -259,6 +313,12 @@ fn jsMiniPatch(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
         return obj;
     };
     defer engine.alloc.free(res);
+
+    if (snapshot_mod.getTracker()) |t| t.afterFileWrite(0, path);
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "post-tool-use", .tool_name = "file_edit",
+        .input_json = path, .tool_result = res,
+    });
 
     const is_ok = std.mem.indexOf(u8, res, "Đã sửa file") != null;
     const obj = c.JS_NewObject(ctx);
@@ -329,6 +389,29 @@ fn jsMiniSh(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JS
     defer engine.alloc.free(cmd_escaped);
     json_w.print("{{\"command\":\"{s}\"}}", .{cmd_escaped}) catch return JS_EXCEPTION;
 
+    // M2: policy check — mini.sh map sang tool 'bash'
+    if (guardPolicy(engine, "bash")) {
+        hooks.dispatch(engine.alloc, engine.io, .{
+            .event = "post-tool-use", .tool_name = "bash",
+            .input_json = command, .tool_result = "blocked by policy", .is_error = true,
+        });
+        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.sh (bash) is blocked");
+    }
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "pre-tool-use", .tool_name = "bash", .input_json = command,
+    });
+
+    // M4: snapshot các path có nguy cơ bị lệnh ghi (sed -i, >, tee, mv, cp, rm...)
+    {
+        var arena = std.heap.ArenaAllocator.init(engine.alloc);
+        defer arena.deinit();
+        if (snapshot_mod.extractWritablePaths(arena.allocator(), command)) |writable| {
+            for (writable) |p| {
+                if (snapshot_mod.getTracker()) |t| t.beforeFileWrite(p);
+            }
+        } else |_| {}
+    }
+
     const out = bash_tool.executeTool(engine.alloc, engine.io, json_w.list.items) catch |e| {
         const obj = c.JS_NewObject(ctx);
         _ = c.JS_SetPropertyStr(ctx, obj, "exitCode", c.JS_NewInt32(ctx, 1));
@@ -341,6 +424,11 @@ fn jsMiniSh(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JS
     defer engine.alloc.free(out);
 
     engine.renewActivity();
+
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "post-tool-use", .tool_name = "bash",
+        .input_json = command, .tool_result = out,
+    });
 
     const obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, obj, "exitCode", c.JS_NewInt32(ctx, 0));
@@ -554,6 +642,18 @@ fn jsMiniHttp(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
         }
     }
 
+    // M2: policy check — mini.http map sang tool 'http_request'
+    if (guardPolicy(engine, "http_request")) {
+        hooks.dispatch(engine.alloc, engine.io, .{
+            .event = "post-tool-use", .tool_name = "http_request",
+            .input_json = url, .tool_result = "blocked by policy", .is_error = true,
+        });
+        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.http (http_request) is blocked");
+    }
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "pre-tool-use", .tool_name = "http_request", .input_json = url,
+    });
+
     var res = http_lib.fetch(engine.alloc, engine.io, .{
         .url = url,
         .method = method,
@@ -567,6 +667,11 @@ fn jsMiniHttp(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
     defer res.deinit(engine.alloc);
 
     engine.renewActivity();
+
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "post-tool-use", .tool_name = "http_request",
+        .input_json = url, .tool_result = res.body,
+    });
 
     const obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, obj, "status", c.JS_NewInt32(ctx, @intCast(res.status)));

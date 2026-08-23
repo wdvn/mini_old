@@ -111,26 +111,10 @@ pub const SnapshotTracker = struct {
     /// Gọi SAU khi file đã thay đổi. Flush snapshots đã thu vào journal
     /// (chỉ những file thực sự đổi hash so với previous). Trả về số snapshot ghi.
     pub fn afterFileWrite(self: *SnapshotTracker, act_id: usize, path: []const u8) void {
-        const idx = self.findByPath(path) orelse return;
-        const tf = self.tracked.items[idx];
-
-        // Xác định hash mới để check file có thực sự đổi không (chỉ để log).
-        var changed = true;
-        if (self.readFileContent(path)) |content| {
-            defer self.alloc.free(content);
-            if (self.cas.store(self.io, content)) |new_h| {
-                defer self.alloc.free(new_h);
-                if (tf.previous_content_hash) |old_h| {
-                    changed = !std.mem.eql(u8, old_h, new_h);
-                }
-            } else |_| {}
-        } else {
-            // File biến mất sau lệnh (rm/mv) → coi như đổi.
-            changed = tf.previous_content_hash != null;
-        }
-        _ = changed;
-
-        self.flush(act_id);
+        // Không flush ngay — agent flush toàn bộ cuối act với act_id thật (tránh event trùng).
+        _ = act_id;
+        _ = self;
+        _ = path;
     }
 
     /// Ghi toàn bộ snapshots đang track vào journal (1 event act_completed phụ).
@@ -238,7 +222,7 @@ pub fn extractWritablePaths(arena: std.mem.Allocator, command: []const u8) ![][]
             }
 
             // 2. tee <file>
-            if (std.mem.indexOf(u8, seg, "tee ")) != null or std.mem.indexOf(u8, seg, "tee\t") != null) {
+            if (std.mem.indexOf(u8, seg, "tee ") != null or std.mem.indexOf(u8, seg, "tee\t") != null) {
                 var tok = std.mem.tokenizeAny(u8, seg, " \t");
                 while (tok.next()) |t| {
                     if (std.mem.eql(u8, t, "tee") or std.mem.eql(u8, t, "-a") or std.mem.eql(u8, t, "-i")) continue;
@@ -246,7 +230,7 @@ pub fn extractWritablePaths(arena: std.mem.Allocator, command: []const u8) ![][]
                     const cleaned = stripQuotes(t);
                     if (looksLikePath(cleaned) and !isDevNull(cleaned)) {
                         try appendUnique(arena, &paths, cleaned);
-                    break;
+                        break;
                     }
                 }
             }
