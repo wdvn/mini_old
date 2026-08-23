@@ -8,6 +8,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const utils = @import("utils.zig");
+const json_mod = @import("json.zig");
 
 // Zig 0.16: std.posix.getenv không còn — extern libc getenv (build link libc),
 // cùng pattern với agent.zig / artifacts.zig.
@@ -58,6 +59,11 @@ pub const ErrorDetail = struct {
     attempt: usize = 1,
     /// Raw body/response từ server, truncate ngắn để journal không phình.
     raw_snippet: ?[]const u8 = null,
+    /// Thông điệp lỗi server trích từ raw_snippet (vd "missing model").
+    /// Giúp phân biệt lỗi thật khi error_name Zig gây hiểu lầm
+    /// (UnknownStopReason nhưng server trả "missing model").
+    /// Null khi không parse được "message" từ raw body.
+    server_error: ?[]const u8 = null,
 };
 
 pub const StateDelta = struct {
@@ -219,6 +225,15 @@ pub const ActJournal = struct {
     /// Ghi event lỗi backend với đầy đủ ErrorDetail để debug trong session.
     /// `desc` mô tả ngắn (hiển thị khi scan journal), chi tiết nằm trong error_detail.
     /// Raw snippet được truncate tại đây để không phình file JSONL.
+    /// Trích "message" từ raw body lỗi dạng {"error":{"message":"..."}},
+    /// trả về slice trỏ vào raw (không owned — raw_snippet sống cùng event).
+    /// Trả null nếu không tìm thấy cấu trúc này.
+    fn extractServerError(raw: ?[]const u8) ?[]const u8 {
+        const r = raw orelse return null;
+        const err_obj = json_mod.findObject(r, "error") orelse return json_mod.findString(r, "message");
+        return json_mod.findString(err_obj, "message");
+    }
+
     pub fn recordError(
         self: *ActJournal,
         io: std.Io,
@@ -232,6 +247,11 @@ pub const ActJournal = struct {
             if (raw.len > max_raw_snippet_len) {
                 detail.raw_snippet = raw[0..max_raw_snippet_len];
             }
+        }
+        // Tự trích thông điệp lỗi từ server nếu caller chưa cung cấp,
+        // để error_name Zig (vd UnknownStopReason) không che giấu lỗi thật.
+        if (detail.server_error == null) {
+            detail.server_error = extractServerError(detail.raw_snippet);
         }
         try self.appendEvent(io, .{
             .act_id = act_id,
@@ -365,6 +385,16 @@ test "recordError ghi đủ ErrorDetail vào journal JSONL" {
         .raw_snippet = long_raw,
     });
 
+    // Lỗi HTTP 400 có error body từ server — server_error phải được tự trích
+    try j.recordError(io, 4, .act_failed, "Act lỗi — rollback & retry", .{
+        .backend = "openai-compat",
+        .model = "deepseek-v4-flash",
+        .error_name = "UnknownStopReason",
+        .http_code = 400,
+        .attempt = 1,
+        .raw_snippet = "{\"error\":{\"message\":\"missing model\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}",
+    });
+
     const content = try readWholeFile(alloc, io, path);
     defer alloc.free(content);
 
@@ -375,10 +405,12 @@ test "recordError ghi đủ ErrorDetail vào journal JSONL" {
     try std.testing.expect(std.mem.indexOf(u8, content, "\"LLMProviderUnavailable\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"http_code\":503") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"attempt\":2") != null);
-    // JSON 1 dòng + có raw snippet đã truncate
-    try std.testing.expect(std.mem.count(u8, content, "\n") == 1);
+    // JSON mỗi event 1 dòng (2 events) + có raw snippet đã truncate
+    try std.testing.expect(std.mem.count(u8, content, "\n") == 2);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"raw_snippet\"") != null);
     try std.testing.expect(content.len < 5000);
+    // server_error tự trích từ raw body: thấy "missing model" thay vì chỉ UnknownStopReason
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"server_error\":\"missing model\"") != null);
 }
 
 test "pruneOldJournals giữ lại N file mới nhất, không xóa file hiện tại" {

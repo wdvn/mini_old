@@ -16,6 +16,13 @@ const MAX_RESPONSE_SIZE = 30 * 1024;
 // Tool entry point
 // ---------------------------------------------------------------------------
 
+/// Kết quả HTTP request có cấu trúc cho caller (JS binding, search tool).
+pub const HttpResponse = struct {
+    status: u16,
+    body: []u8, // heap-allocated bởi caller
+    truncated: usize, // số byte bị cắt (>0 nếu body vượt MAX_RESPONSE_SIZE)
+};
+
 /// Thực thi tool http_request.
 pub fn executeTool(alloc: Allocator, input_json: []const u8) ![]u8 {
     const url = (try json.findStringOwned(alloc, input_json, "url")) orelse
@@ -29,7 +36,8 @@ pub fn executeTool(alloc: Allocator, input_json: []const u8) ![]u8 {
     return httpRequest(alloc, url, method, body, headers_json);
 }
 
-/// Gửi HTTP request và trả về status + headers + body.
+/// Gửi HTTP request, trả về status + body đã tách khỏi phần headers.
+/// Output dạng text cho tool protocol: dòng status, các header, blank line, body.
 pub fn httpRequest(
     alloc: Allocator,
     url: []const u8,

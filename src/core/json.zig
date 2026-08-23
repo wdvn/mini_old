@@ -179,13 +179,83 @@ test "findStringOwned unescape đúng chuỗi JSON" {
 // Building helpers
 // ---------------------------------------------------------------------------
 
-/// Escape một chuỗi Zig để nhúng an toàn vào JSON string.
-/// Caller phải free kết quả.
+/// Escape một chuỗi để nhúng vào JSON string.
 ///
-/// Các ký tự được escape: `"` `\` `\n` `\r` `\t`
+/// Sanitize UTF-8: byte không hợp lệ (sequence cắt cụt, continuation byte
+/// lơ lửng...) được thay bằng U+FFFD (REPLACEMENT CHARACTER) để body gửi
+/// lên backend luôn là JSON/UTF-8 hợp lệ. Không sanitize thì server có thể
+/// từ chối cả request với lỗi gây hiểu lầm (vd "missing model" HTTP 400).
+/// Caller phải free kết quả.
 pub fn escape(alloc: Allocator, s: []const u8) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
+
+    // Đường nhanh: chuỗi đã valid UTF-8 thì chỉ cần escape như cũ.
+    if (std.unicode.utf8ValidateSlice(s)) {
+        try appendEscaped(alloc, &buf, s);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    // Đường sanitize: decode từng codepoint, byte hỏng → U+FFFD.
+    var i: usize = 0;
+    var pending: usize = 0; // số byte ASCII đã scan liên tiếp, chưa flush
+    while (i < s.len) {
+        const b = s[i];
+        if (b < 0x80) {
+            i += 1;
+            pending += 1;
+            continue;
+        }
+        const seq_len = std.unicode.utf8ByteSequenceLength(b) catch {
+            // Byte không phải lead hợp lệ — thay 1 U+FFFD, bỏ qua 1 byte.
+            if (pending > 0) {
+                try appendEscaped(alloc, &buf, s[i - pending .. i]);
+                pending = 0;
+            }
+            try buf.appendSlice(alloc, "\u{FFFD}");
+            i += 1;
+            continue;
+        };
+        // Sequence bị cắt cụt cuối chuỗi (không đủ continuation byte)
+        if (i + seq_len > s.len) {
+            if (pending > 0) {
+                try appendEscaped(alloc, &buf, s[i - pending .. i]);
+                pending = 0;
+            }
+            try buf.appendSlice(alloc, "\u{FFFD}");
+            i = s.len;
+            continue;
+        }
+        if (std.unicode.utf8Decode(s[i .. i + seq_len])) |_| {
+            // Codepoint hợp lệ — giữ nguyên, flush ASCII đứng trước.
+            if (pending > 0) {
+                try appendEscaped(alloc, &buf, s[i - pending .. i]);
+                pending = 0;
+            }
+            try buf.appendSlice(alloc, s[i .. i + seq_len]);
+            i += seq_len;
+        } else |_| {
+            // Sequence hỏng (cắt cụt cuối chuỗi, overlong, surrogate...)
+            // — theo chiến lược maximal subpart (khác Python): tiêu thụ cả
+            // đoạn continuation byte liền kề và thay bằng 1 U+FFFD.
+            if (pending > 0) {
+                try appendEscaped(alloc, &buf, s[i - pending .. i]);
+                pending = 0;
+            }
+            try buf.appendSlice(alloc, "\u{FFFD}");
+            var j = i + 1;
+            while (j < s.len and (s[j] & 0xC0) == 0x80) : (j += 1) {}
+            i = j;
+        }
+    }
+    if (pending > 0) {
+        try appendEscaped(alloc, &buf, s[s.len - pending ..]);
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
+/// Escape chuỗi đã được đảm bảo valid UTF-8 (không sanitize gì thêm).
+fn appendEscaped(alloc: Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
     for (s) |c| {
         switch (c) {
             '"'  => try buf.appendSlice(alloc, "\\\""),
@@ -201,7 +271,6 @@ pub fn escape(alloc: Allocator, s: []const u8) ![]u8 {
             else => try buf.append(alloc, c),
         }
     }
-    return buf.toOwnedSlice(alloc);
 }
 
 /// Unescape một JSON string (phần bên trong dấu ngoặc kép).
@@ -259,4 +328,39 @@ pub fn unescape(alloc: Allocator, s: []const u8) ![]u8 {
         }
     }
     return buf.toOwnedSlice(alloc);
+}
+
+test "escape giữ nguyên chuỗi ASCII/UTF-8 hợp lệ" {
+    const alloc = std.testing.allocator;
+    const got = try escape(alloc, "grep -A 20 \"fail\\|error\"\nline2\ttab");
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("grep -A 20 \\\"fail\\\\|error\\\"\\nline2\\ttab", got);
+
+    // Tiếng Việt valid UTF-8 — phải giữ nguyên từng byte
+    const got2 = try escape(alloc, "đường dẫn /tmp — ok");
+    defer alloc.free(got2);
+    try std.testing.expectEqualStrings("đường dẫn /tmp — ok", got2);
+}
+
+test "escape thay byte UTF-8 invalid bằng U+FFFD" {
+    const alloc = std.testing.allocator;
+
+    // Sequence 3-byte cắt cụt cuối chuỗi (như output tool bị truncate)
+    const trunc = "ok\xe2\x80";
+    const got = try escape(alloc, trunc);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("ok\u{FFFD}", got);
+
+    // Continuation byte lơ lửng giữa chuỗi hợp lệ
+    const dangling = "a\xc3\xa9\xffb";
+    const got2 = try escape(alloc, dangling);
+    defer alloc.free(got2);
+    // \xc3\xa9 = 'é' hợp lệ giữ nguyên; \xff hỏng → U+FFFD
+    try std.testing.expectEqualStrings("aé\u{FFFD}b", got2);
+
+    // Escape vẫn hoạt động sau khi sanitize: quote đứng trước byte hỏng
+    const mixed = "\"quo\"\x80tail";
+    const got3 = try escape(alloc, mixed);
+    defer alloc.free(got3);
+    try std.testing.expectEqualStrings("\\\"quo\\\"\u{FFFD}tail", got3);
 }

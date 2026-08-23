@@ -15,6 +15,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const unicode = @import("unicode.zig");
 const history_mod = @import("history.zig");
+const paste_mod = @import("paste.zig");
 
 /// Input limit (byte). Vượt → hiện lỗi, không nhận thêm.
 pub const MAX_INPUT_BYTES = 64 * 1024;
@@ -56,6 +57,15 @@ pub const LineEditor = struct {
     /// Hiển thị thông báo lỗi input-limit cho redraw kế tiếp.
     limit_msg: bool,
 
+    /// Parser bracketed paste (state machine — xem paste.zig).
+    paste_parser: paste_mod.Parser,
+    /// Đang trong paste mode (giữa START và END marker).
+    pasting: bool,
+    /// Đã push undo cho đợt paste hiện tại (1 undo cho cả đợt).
+    paste_undo_pushed: bool,
+    /// Test-only: bỏ qua ghi stdout trong redraw (không có std.Io hợp lệ).
+    suppress_redraw: bool,
+
     pub fn init(alloc: Allocator) LineEditor {
         return .{
             .alloc = alloc,
@@ -76,6 +86,10 @@ pub const LineEditor = struct {
             .kill_len = 0,
             .kill_head = 0,
             .limit_msg = false,
+            .paste_parser = paste_mod.Parser.init(),
+            .pasting = false,
+            .paste_undo_pushed = false,
+            .suppress_redraw = false,
         };
     }
 
@@ -362,6 +376,7 @@ pub const LineEditor = struct {
     // -----------------------------------------------------------------------
 
     fn redraw(self: *LineEditor, io: std.Io, prompt: []const u8) void {
+        if (self.suppress_redraw) return;
         var out_buf: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&out_buf);
 
@@ -396,6 +411,12 @@ pub const LineEditor = struct {
         raw.lflag.ECHO = false;
         raw.lflag.ICANON = false;
         raw.lflag.ISIG = true;
+        // Tắt(input) CR/NL translation: paste CRLF phải đến nguyên vẹn
+        // (\r\n → 1 space khi sanitize), Enter đến như '\r' (13).
+        raw.iflag.ICRNL = false;
+        raw.iflag.INLCR = false;
+        raw.iflag.IGNCR = false;
+        raw.iflag.IXON = false; // Ctrl+S/Q đến editor, không bị kernel bắt
         raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
         raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
 
@@ -420,14 +441,21 @@ pub const LineEditor = struct {
             var char_buf: [1]u8 = undefined;
             const n = try stdin_file.readStreaming(io, &.{&char_buf});
             if (n == 0) return null;
+            const c = char_buf[0];
 
-            switch (char_buf[0]) {
+            // Đang trong paste mode: mọi byte đi qua paste parser cho tới khi
+            // gặp END marker hoặc idle-timeout (terminal không gửi marker).
+            if (self.pasting) {
+                self.pasteFeed(io, stdin_file, prompt, c);
+                continue;
+            }
+
+            switch (c) {
                 3, 4 => return null, // Ctrl+C / Ctrl+D
                 13, 10 => { // Enter → submit
                     stdout_file.writeStreamingAll(io, "\r\n") catch {};
                     return try self.alloc.dupe(u8, self.buf.items);
-                },
-                12 => { // Ctrl+L redraw
+                },                12 => { // Ctrl+L redraw
                     stdout_file.writeStreamingAll(io, "\x1b[2J\x1b[H") catch {};
                     self.redraw(io, prompt);
                 },
@@ -564,7 +592,7 @@ pub const LineEditor = struct {
                         if ((stdin_file.readStreaming(io, &.{marker[got .. got + 1]}) catch 0) == 0) break;
                     }
                     if (got == 3 and std.mem.eql(u8, &marker, "00~")) {
-                        self.readPastedContent(io, stdin_file, prompt);
+                        self.beginPaste();
                     }
                 },
                 '3' => { // Delete
@@ -664,48 +692,104 @@ pub const LineEditor = struct {
         }
     }
 
-    /// Đọc nội dung bracketed paste cho tới ESC [ 2 0 1 ~.
-    /// Newline → space (single-line composer).
-    fn readPastedContent(self: *LineEditor, io: std.Io, stdin_file: std.Io.File, prompt: []const u8) void {
-        var pending: [6]u8 = undefined;
-        var pending_len: usize = 0;
-        const end_marker = "\x1b[201~";
+    /// Bắt đầu paste mode (đã nhận START marker).
+    fn beginPaste(self: *LineEditor) void {
+        self.pasting = true;
+        self.paste_undo_pushed = false;
+        self.paste_parser.reset();
+        paste_mod.sanitizeReset();
+    }
 
-        while (true) {
-            var char_buf: [1]u8 = undefined;
-            const n = stdin_file.readStreaming(io, &.{&char_buf}) catch 0;
-            if (n == 0) break;
-            const c = char_buf[0];
+    /// Kết thúc paste mode: flush nốt candidate còn hold thành content.
+    fn endPaste(self: *LineEditor, io: std.Io, prompt: []const u8) void {
+        self.pasting = false;
+        self.paste_undo_pushed = false;
+        var tmp: [paste_mod.END_MARKER.len]u8 = undefined;
+        const pre = self.paste_parser.pendingCopy(&tmp);
+        self.insertPastedSanitized(io, prompt, pre);
+        self.paste_parser.reset();
+    }
 
-            if (pending_len > 0) {
-                pending[pending_len] = c;
-                pending_len += 1;
-                if (pending_len == end_marker.len) {
-                    if (std.mem.eql(u8, pending[0..pending_len], end_marker)) {
-                        self.redraw(io, prompt);
-                        return;
-                    }
-                    self.insertPasted(pending[0..pending_len]);
-                    pending_len = 0;
+    /// Feed 1 byte trong paste mode qua state machine (xem paste.zig).
+    /// END marker hoặc idle-timeout sẽ thoát paste mode.
+    fn pasteFeed(self: *LineEditor, io: std.Io, stdin_file: std.Io.File, prompt: []const u8, c: u8) void {
+        // Copy pending TRƯỚC khi feed (feed có thể reset state).
+        var tmp: [paste_mod.END_MARKER.len]u8 = undefined;
+        const pre = self.paste_parser.pendingCopy(&tmp);
+
+        switch (self.paste_parser.feed(c)) {
+            .content => |b| {
+                var one = [1]u8{b};
+                self.insertPastedSanitized(io, prompt, &one);
+                // Content vừa xử lý xong mà stdin im → terminal đã gửi hết
+                // (quên end-marker) → thoát paste mode để Enter không bị nuốt.
+                // Khi paste vẫn đang đổ, poll thấy byte kế ngay → không tốn chờ.
+                if (self.pasteIdleTimedOut(io, stdin_file)) {
+                    self.endPaste(io, prompt);
+                    self.redraw(io, prompt);
                 }
-                continue;
-            }
-
-            if (c == 27) {
-                pending[0] = c;
-                pending_len = 1;
-                continue;
-            }
-
-            self.insertPasted(&.{c});
+            },
+            .marker => |m| {
+                if (m == .end) {
+                    self.endPaste(io, prompt);
+                    self.redraw(io, prompt);
+                }
+                // .start trong khi pasting: marker lồng nhau (hiếm) — bỏ qua.
+            },
+            .none => {
+                // Byte đang hold. Nếu hold kéo dài mà không có byte kế
+                // (terminal gửi marker bị tách / không gửi end-marker) →
+                // idle-timeout thoát paste mode, không kẹt vĩnh viễn.
+                if (self.pasteIdleTimedOut(io, stdin_file)) {
+                    // Không còn byte: flush hold + kết thúc.
+                    self.endPaste(io, prompt);
+                    self.redraw(io, prompt);
+                }
+            },
+            .fail => {
+                // Hold vỡ: flush hold thành content rồi xử lý lại byte hiện tại.
+                self.insertPastedSanitized(io, prompt, pre);
+                switch (self.paste_parser.feed(c)) {
+                    .content => |b| {
+                        var one = [1]u8{b};
+                        self.insertPastedSanitized(io, prompt, &one);
+                    },
+                    .none => {
+                        if (self.pasteIdleTimedOut(io, stdin_file)) {
+                            self.endPaste(io, prompt);
+                            self.redraw(io, prompt);
+                        }
+                    },
+                    else => unreachable,
+                }
+            },
         }
     }
 
-    fn insertPasted(self: *LineEditor, bytes: []const u8) void {
-        for (bytes) |c| {
-            const ch: u8 = if (c == '\n' or c == '\r') ' ' else c;
-            if (ch < 32 and ch != ' ') continue;
-            if (!self.insertBytes(&.{ch})) break;
+    /// Trong paste mode: poll stdin 150ms — hết thời gian mà không có byte
+    /// coi như terminal sẽ không gửi END marker → caller tự thoát paste mode.
+    /// Trả về true nếu idle (không byte nào tới).
+    fn pasteIdleTimedOut(_: *LineEditor, _: std.Io, _: std.Io.File) bool {
+        var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 150) catch return true; // lỗi poll → coi như idle
+        return ready == 0;
+    }
+
+    /// Sanitize (newline→space, bỏ control) rồi insert vào buffer + redraw.
+    /// Push undo 1 lần cho cả đợt paste (không phải per-byte).
+    fn insertPastedSanitized(self: *LineEditor, io: std.Io, prompt: []const u8, bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        if (!self.paste_undo_pushed) {
+            self.pushUndo();
+            self.paste_undo_pushed = true;
+        }
+        // Sanitize vào buffer tạm rồi insert một lệnh.
+        var tmp_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer tmp_list.deinit(self.alloc);
+        for (bytes) |b| _ = paste_mod.sanitizeAppend(&tmp_list, self.alloc, b);
+        if (tmp_list.items.len > 0) {
+            _ = self.insertBytes(tmp_list.items);
+            self.redraw(io, prompt);
         }
     }
 
@@ -745,11 +829,14 @@ test "wordLeft / wordRight ASCII" {
 
     e.pos = e.buf.items.len; // sau "foo"
     try std.testing.expectEqual(@as(usize, 12), e.wordLeft()); // trước "foo"
+    e.pos = 12;
     try std.testing.expectEqual(@as(usize, 6), e.wordLeft()); // trước "world"
+    e.pos = 6;
     try std.testing.expectEqual(@as(usize, 0), e.wordLeft()); // trước "hello"
 
     e.pos = 0;
     try std.testing.expectEqual(@as(usize, 5), e.wordRight()); // sau "hello"
+    e.pos = 5;
     try std.testing.expectEqual(@as(usize, 11), e.wordRight()); // sau "world"
 }
 
@@ -760,8 +847,10 @@ test "word motion qua punct" {
     try e.buf.appendSlice(alloc, "foo.bar baz");
     e.pos = e.buf.items.len;
     try std.testing.expectEqual(@as(usize, 8), e.wordLeft()); // trước "baz"
-    try std.testing.expectEqual(@as(usize, 7), e.wordLeft()); // trước "bar" (punct riêng class)
-    try std.testing.expectEqual(@as(usize, 3), e.wordLeft()); // trước "bar"... "." là 1 cluster
+    e.pos = 8;
+    try std.testing.expectEqual(@as(usize, 4), e.wordLeft()); // trước "bar" ("." là cluster punct riêng)
+    e.pos = 4;
+    try std.testing.expectEqual(@as(usize, 3), e.wordLeft()); // trước "." ("foo" là 1 word)
 }
 
 test "word motion tiếng Việt" {
@@ -772,6 +861,7 @@ test "word motion tiếng Việt" {
     e.pos = e.buf.items.len;
     const w1 = e.wordLeft(); // trước "rồi"
     try std.testing.expectEqualStrings("rồi", e.buf.items[w1..]);
+    e.pos = w1;
     const w2 = e.wordLeft(); // trước "đến"
     try std.testing.expectEqualStrings("đến rồi", e.buf.items[w2..]);
 }
@@ -859,4 +949,128 @@ test "clusterLenBefore với emoji và tiếng Việt" {
     try std.testing.expectEqual(@as(usize, 1), e.pos);
     e.moveLeft(); // qua a
     try std.testing.expectEqual(@as(usize, 0), e.pos);
+}
+
+// ---------------------------------------------------------------------------
+// Paste mode — tái hiện & fix bug kẹt paste (xem paste.zig)
+// ---------------------------------------------------------------------------
+
+/// Mô phỏng feed 1 stream bytes vào editor đang trong paste mode.
+/// Trả về buffer sau khi stream kết thúc (không có timeout — dùng parser trực tiếp).
+fn simulatePaste(alloc: Allocator, input: []const u8) ![]u8 {
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+    e.beginPaste();
+    var tmp: [paste_mod.END_MARKER.len]u8 = undefined;
+    var done = false;
+    for (input) |c| {
+        if (done) break;
+        const pre = e.paste_parser.pendingCopy(&tmp);
+        switch (e.paste_parser.feed(c)) {
+            .content => |b| {
+                var one = [1]u8{b};
+                e.insertPastedSanitized(undefined, "", &one);
+            },
+            .marker => |m| {
+                if (m == .end) {
+                    e.endPaste(undefined, "");
+                    done = true;
+                }
+            },
+            .fail => {
+                e.insertPastedSanitized(undefined, "", pre);
+                switch (e.paste_parser.feed(c)) {
+                    .content => |b| {
+                        var one = [1]u8{b};
+                        e.insertPastedSanitized(undefined, "", &one);
+                    },
+                    .none => {},
+                    else => unreachable,
+                }
+            },
+            .none => {},
+        }
+    }
+    return alloc.dupe(u8, e.buf.items);
+}
+
+test "paste thường: content nằm giữa start/end marker" {
+    const alloc = std.testing.allocator;
+    const out = try simulatePaste(alloc, paste_mod.START_MARKER ++ "hello pasted" ++ paste_mod.END_MARKER);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("hello pasted", out);
+}
+
+test "paste multiline: mỗi newline thành 1 space (CRLF không double)" {
+    const alloc = std.testing.allocator;
+    const out = try simulatePaste(alloc, paste_mod.START_MARKER ++ "line1\r\nline2\nline3" ++ paste_mod.END_MARKER);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("line1 line2 line3", out);
+}
+
+test "paste chứa ANSI escape không nhầm end-marker" {
+    const alloc = std.testing.allocator;
+    // Nội dung có escape sequence gần giống marker + end-marker thật phía sau.
+    const input = paste_mod.START_MARKER ++ "\x1b[31mred\x1b[0m end" ++ paste_mod.END_MARKER;
+    const out = try simulatePaste(alloc, input);
+    defer alloc.free(out);
+    // Escape sequences bị strip control chars, chữ "red end" giữ lại.
+    try std.testing.expectEqualStrings("[31mred[0m end", out);
+}
+
+test "paste chứa prefix gần end-marker vẫn nhận đúng marker thật" {
+    const alloc = std.testing.allocator;
+    const input = paste_mod.START_MARKER ++ "abc\x1b[20" ++ paste_mod.END_MARKER;
+    const out = try simulatePaste(alloc, input);
+    defer alloc.free(out);
+    // "\x1b[20" là prefix chưa hoàn chỉnh → giữ làm content (đúng hành vi: nó
+    // không phải marker), end-marker thật được nhận diện → không kẹt.
+    try std.testing.expectEqualStrings("abc[20", out);
+}
+
+test "paste không có end-marker: flush pending, editor không kẹt" {
+    const alloc = std.testing.allocator;
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+    e.beginPaste();
+    var tmp: [paste_mod.END_MARKER.len]u8 = undefined;
+    // Terminal gửi content + prefix marker rồi im luôn (không end-marker).
+    for (paste_mod.START_MARKER[0..] ++ "dangling\x1b[2") |c| {
+        const pre = e.paste_parser.pendingCopy(&tmp);
+        switch (e.paste_parser.feed(c)) {
+            .content => |b| {
+                var one = [1]u8{b};
+                e.insertPastedSanitized(undefined, "", &one);
+            },
+            .marker => |m| {
+                if (m == .end) e.endPaste(undefined, "");
+            },
+            .fail => {
+                e.insertPastedSanitized(undefined, "", pre);
+                switch (e.paste_parser.feed(c)) {
+                    .content => |b| {
+                        var one = [1]u8{b};
+                        e.insertPastedSanitized(undefined, "", &one);
+                    },
+                    .none => {},
+                    else => unreachable,
+                }
+            },
+            .none => {},
+        }
+    }
+    // Idle timeout path: gọi endPaste như editor sẽ làm.
+    e.endPaste(undefined, "");
+    try std.testing.expect(!e.pasting);
+    // "dangling" + prefix "\x1b[2" (control strip) = "dangling[2".
+    try std.testing.expectEqualStrings("dangling[2", e.buf.items);
+}
+
+test "paste UTF-8 tiếng Việt + emoji giữ nguyên" {
+    const alloc = std.testing.allocator;
+    const out = try simulatePaste(alloc, paste_mod.START_MARKER ++ "xin chào thế giới 👍" ++ paste_mod.END_MARKER);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("xin chào thế giới 👍", out);
 }

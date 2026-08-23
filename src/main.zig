@@ -429,6 +429,8 @@ test {
     _ = @import("acp/server.zig");
     _ = @import("ui/unicode.zig");
     _ = @import("ui/history.zig");
+    _ = @import("ui/editor.zig");
+    _ = @import("ui/paste.zig");
     _ = quickjs_engine;
     _ = js_bindings;
     _ = process_manager;
