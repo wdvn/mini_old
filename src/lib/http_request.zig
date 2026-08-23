@@ -1,11 +1,14 @@
 //! lib/http_request.zig — HTTP client tập trung cho toàn bộ mini-agent.
 //!
 //! Mọi phần cần gửi HTTP request (tools/http.zig, tools/search.zig,
-//! backends, ...) đều gọi qua module này thay vì tự dựng std.http.Client.
+//! backends AI, ...) đều gọi qua module này thay vì tự dựng std.http.Client.
 //!
 //! ## API chính
 //!   - `fetch(alloc, io, .{...})` → `Response { status, headers, body, truncated }`
-//!   - `parseMethod`, `parseHeadersJson`, `formatResponseText` — helpers dùng chung.
+//!   - `postStream(alloc, io, .{...}, on_chunk, userdata)` → status u32 —
+//!     streaming từng chunk cho SSE/NDJSON (thay thế backends/sse.zig cũ).
+//!   - `parseMethod`, `parseHeadersJson`, `parseHeadersKv`, `formatResponseText`
+//!     — helpers dùng chung.
 //!
 //! ## Thiết kế
 //!   - Dùng std.http.Client của Zig std, không dependency ngoài.
@@ -371,6 +374,109 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
         .intern_base = base,
         .intern_headers = headers_out,
     };
+}
+
+// ---------------------------------------------------------------------------
+// postStream — streaming cho SSE / NDJSON (backends AI)
+// ---------------------------------------------------------------------------
+
+/// Callback nhận từng chunk dữ liệu từ HTTP response (streaming).
+/// `chunk` là slice tạm thời — phải copy nếu cần giữ lại.
+/// `userdata` là con trỏ tới context struct của caller.
+pub const StreamChunkFn = *const fn (chunk: []const u8, userdata: *anyopaque) void;
+
+/// Tùy chọn cho streaming POST (tương tự sse.post cũ).
+pub const StreamOptions = struct {
+    /// URL đầy đủ (http:// hoặc https://).
+    url: []const u8,
+    /// Headers dạng "Key: Value".
+    headers: []const []const u8 = &.{},
+    /// Body POST (JSON string).
+    body: []const u8 = "",
+    /// Timeout tổng (giây). Mặc định: 120.
+    timeout_secs: u32 = 120,
+};
+
+/// Parse list headers dạng "Key: Value" → []std.http.Header (đã dupe).
+pub fn parseHeadersKv(alloc: Allocator, headers: []const []const u8) ![]std.http.Header {
+    var list = std.ArrayList(std.http.Header).empty;
+    errdefer list.deinit(alloc);
+    for (headers) |hdr| {
+        if (std.mem.indexOfScalar(u8, hdr, ':')) |idx| {
+            const name = std.mem.trim(u8, hdr[0..idx], " \t");
+            const value = std.mem.trim(u8, hdr[idx + 1 ..], " \t");
+            if (name.len == 0) continue;
+            try list.append(alloc, .{
+                .name = try alloc.dupe(u8, name),
+                .value = try alloc.dupe(u8, value),
+            });
+        }
+    }
+    return list.toOwnedSlice(alloc);
+}
+
+fn freeHeadersKv(alloc: Allocator, headers: []std.http.Header) void {
+    for (headers) |h| {
+        alloc.free(h.name);
+        alloc.free(h.value);
+    }
+    alloc.free(headers);
+}
+
+/// Gửi HTTP POST và stream response qua `on_chunk` callback từng chunk.
+/// Trả về HTTP status code. Dùng cho SSE/NDJSON của các AI backend.
+pub fn postStream(
+    alloc: Allocator,
+    io: std.Io,
+    opts: StreamOptions,
+    on_chunk: StreamChunkFn,
+    userdata: *anyopaque,
+) !u32 {
+    var client = std.http.Client{
+        .allocator = alloc,
+        .io = io,
+    };
+    defer client.deinit();
+
+    const extra_headers = try parseHeadersKv(alloc, opts.headers);
+    defer freeHeadersKv(alloc, extra_headers);
+
+    const uri = try std.Uri.parse(opts.url);
+    var req = try client.request(.POST, uri, .{
+        .extra_headers = extra_headers,
+        .headers = .{
+            .accept_encoding = .omit,
+        },
+        .keep_alive = false,
+    });
+    defer req.deinit();
+
+    // Gửi body
+    if (opts.body.len > 0) {
+        req.transfer_encoding = .{ .content_length = opts.body.len };
+        var req_body = try req.sendBodyUnflushed(&.{});
+        try req_body.writer.writeAll(opts.body);
+        try req_body.end();
+        try req.connection.?.flush();
+    } else {
+        try req.sendBodiless();
+    }
+
+    var redirect_buffer: [4096]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buffer);
+
+    // Đọc streaming từng chunk
+    var transfer_buf: [4096]u8 = undefined;
+    const r = response.reader(&transfer_buf);
+
+    var chunk_buf: [4096]u8 = undefined;
+    while (true) {
+        const n = try r.readSliceShort(&chunk_buf);
+        if (n == 0) break;
+        on_chunk(chunk_buf[0..n], userdata);
+    }
+
+    return @intFromEnum(response.head.status);
 }
 
 // ---------------------------------------------------------------------------
@@ -813,4 +919,55 @@ test "fetch: URL sai scheme/host trả lỗi" {
     // Host không tồn tại → connection error
     const r = fetch(alloc, io, .{ .url = "http://127.0.0.1:1/", .timeout_s = 5 });
     try testing.expectError(error.ConnectionRefused, r);
+}
+
+// -------------------------------------------------------------------------
+// Integration tests: postStream (streaming SSE)
+// -------------------------------------------------------------------------
+
+const StreamAccumCtx = struct {
+    buf: std.ArrayList(u8),
+    chunks: usize,
+
+    fn onChunk(chunk: []const u8, userdata: *anyopaque) void {
+        const self: *StreamAccumCtx = @ptrCast(@alignCast(userdata));
+        self.buf.appendSlice(testing.allocator, chunk) catch {};
+        self.chunks += 1;
+    }
+};
+
+test "postStream: SSE stream nhận đủ chunks + status" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    const response =
+        "HTTP/1.1 200 OK\r\n" ++
+        "content-type: text/event-stream\r\n" ++
+        "content-length: 32\r\n" ++
+        "\r\n" ++
+        "data: a\n\ndata: b\n\ndata: c\n\n";
+
+    var h = try FetchHarness.init(io, response, 1);
+    defer h.deinit();
+    try h.start();
+
+    const u = try h.url(alloc, "/v1/stream");
+    defer alloc.free(u);
+
+    var ctx = StreamAccumCtx{ .buf = .empty, .chunks = 0 };
+    defer ctx.buf.deinit(alloc);
+
+    const status = postStream(alloc, io, .{
+        .url = u,
+        .body = "{\"q\":1}",
+        .headers = &.{"Content-Type: application/json"},
+        .timeout_secs = 10,
+    }, StreamAccumCtx.onChunk, &ctx) catch {
+        h.deinit();
+        return error.TestUnexpectedResult;
+    };
+
+    try testing.expectEqual(@as(u32, 200), status);
+    try testing.expectEqualStrings("data: a\n\ndata: b\n\ndata: c\n\n", ctx.buf.items);
+    try testing.expect(ctx.chunks >= 1);
 }

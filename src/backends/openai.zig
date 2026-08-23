@@ -27,7 +27,8 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayListUnmanaged;
 const proto = @import("../core/protocol.zig");
 const json = @import("../core/json.zig");
-const sse = @import("sse.zig");
+const http_lib = @import("../lib/http_request.zig");
+const main = @import("../main.zig");
 const utils = @import("../core/utils.zig");
 
 // ---------------------------------------------------------------------------
@@ -113,7 +114,7 @@ pub const Client = struct {
             defer ctx.tool_calls.deinit(self.alloc);
 
             const headers = [_][]const u8{ auth_header, "Content-Type: application/json" };
-            const req_http_code = try sse.post(self.alloc, .{
+            const req_http_code = try http_lib.postStream(self.alloc, main.g_io, .{
                 .url = url,
                 .headers = &headers,
                 .body = body,

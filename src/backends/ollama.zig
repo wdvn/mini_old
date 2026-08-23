@@ -26,7 +26,8 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayListUnmanaged;
 const proto = @import("../core/protocol.zig");
 const json = @import("../core/json.zig");
-const sse = @import("sse.zig");
+const http_lib = @import("../lib/http_request.zig");
+const main = @import("../main.zig");
 const utils = @import("../core/utils.zig");
 
 /// Ollama streaming client.
@@ -73,7 +74,7 @@ pub const Client = struct {
         defer ctx.text_accum.deinit(self.alloc);
 
         const headers = [_][]const u8{"Content-Type: application/json"};
-        _ = try sse.post(self.alloc, .{
+        _ = try http_lib.postStream(self.alloc, main.g_io, .{
             .url = url,
             .headers = &headers,
             .body = body,

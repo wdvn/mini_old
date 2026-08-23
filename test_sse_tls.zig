@@ -1,8 +1,9 @@
 //! Scratch test: tái hiện lỗi TlsInitializationFailed/WriteFailed của std.http.Client
-//! qua sse.zig khi gọi OPENAI_COMPAT_URL. Chạy: zig run test_sse_tls.zig
+//! qua lib/http_request.zig (postStream) khi gọi OPENAI_COMPAT_URL. Chạy: zig run test_sse_tls.zig
 
 const std = @import("std");
-const sse = @import("src/backends/sse.zig");
+const main_mod = @import("src/main.zig");
+const sse = @import("src/lib/http_request.zig");
 
 var sink_buffer: [4096]u8 = undefined;
 var total: usize = 0;
@@ -35,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
     defer alloc.free(body);
 
     std.debug.print("POST {s}\n", .{full.items});
-    const code = sse.post(alloc, .{
+    const code = sse.postStream(alloc, main_mod.g_io, .{
         .url = full.items,
         .headers = &.{
             "Content-Type: application/json",
@@ -48,5 +49,3 @@ pub fn main(init: std.process.Init) !void {
     };
     std.debug.print("HTTP {d}, bytes={d}\nfirst: {s}\n", .{ code, total, sink_buffer[0..@min(total, 500)] });
 }
-
-const main_mod = @import("src/main.zig");

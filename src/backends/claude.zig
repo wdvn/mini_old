@@ -20,7 +20,7 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayListUnmanaged;
 const proto = @import("../core/protocol.zig");
 const json = @import("../core/json.zig");
-const sse = @import("sse.zig");
+const http_lib = @import("../lib/http_request.zig");
 const utils = @import("../core/utils.zig");
 const hooks = @import("../core/hooks.zig");
 const main = @import("../main.zig");
@@ -85,7 +85,7 @@ pub const Client = struct {
             api_ver_hdr,
             "Content-Type: application/json",
         };
-        _ = try sse.post(self.alloc, .{
+        _ = try http_lib.postStream(self.alloc, main.g_io, .{
             .url = CLAUDE_API_URL,
             .headers = &headers,
             .body = body,
