@@ -60,33 +60,30 @@ pub fn getSkills() ?[]const SkillInfo {
     return g_skills;
 }
 
-/// Quét thư mục skills và parse metadata.
+const main = @import("../main.zig");
+
+/// Quét thư mục skills và parse metadata (quét ~/.mini/skills/ trước, .agent/skills/ sau; .agent override global).
 /// Trả về số skill nạp được (0 nếu thư mục không tồn tại).
 pub fn loadSkills(alloc: Allocator, io: std.Io, env_map: *const std.process.Environ.Map) usize {
     var arena = std.heap.ArenaAllocator.init(alloc);
-    // Arena chỉ được chuyển giao sang global state khi load thành công;
-    // mọi early-return còn lại phải deinit để không leak.
     var transferred = false;
     defer if (!transferred) arena.deinit();
-
-    const skills_dir = resolveSkillsDir(arena.allocator(), env_map) catch return 0;
-
-    const cwd = std.Io.Dir.cwd();
-    var dir = cwd.openDir(io, skills_dir, .{ .iterate = true }) catch return 0;
-    defer dir.close(io);
 
     var skills: std.ArrayList(SkillInfo) = .empty;
     defer skills.deinit(arena.allocator());
 
-    var it = dir.iterate();
-    while (it.next(io) catch null) |entry| {
-        if (entry.kind != .directory) continue;
-        if (skills.items.len >= MAX_SKILLS) break;
+    // 1. Global skills (~/.mini/skills)
+    if (resolveSkillsDir(arena.allocator(), env_map)) |global_dir| {
+        scanSkillsFromDir(arena.allocator(), io, global_dir, &skills);
+    } else |_| {}
 
-        // Đọc <dir>/<name>/SKILL.md
-        const skill_path = std.fmt.allocPrint(arena.allocator(), "{s}/{s}/SKILL.md", .{ skills_dir, entry.name }) catch continue;
-        const info = parseSkillFile(arena.allocator(), io, skill_path, entry.name) catch continue;
-        skills.append(arena.allocator(), info) catch continue;
+    // 2. Project skills (.agent/skills)
+    if (env_map.get("MINI_AGENT_FOLDER")) |agent_dir| {
+        if (agent_dir.len > 0) {
+            if (std.fmt.allocPrint(arena.allocator(), "{s}/skills", .{agent_dir})) |project_dir| {
+                scanSkillsFromDir(arena.allocator(), io, project_dir, &skills);
+            } else |_| {}
+        }
     }
 
     if (skills.items.len == 0) return 0;
@@ -100,8 +97,37 @@ pub fn loadSkills(alloc: Allocator, io: std.Io, env_map: *const std.process.Envi
     return owned.len;
 }
 
+fn scanSkillsFromDir(arena_alloc: Allocator, io: std.Io, dir_path: []const u8, skills: *std.ArrayList(SkillInfo)) void {
+    const cwd = std.Io.Dir.cwd();
+    var dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+
+        // Đọc <dir>/<name>/SKILL.md
+        const skill_path = std.fmt.allocPrint(arena_alloc, "{s}/{s}/SKILL.md", .{ dir_path, entry.name }) catch continue;
+        const info = parseSkillFile(arena_alloc, io, skill_path, entry.name) catch continue;
+
+        // Check xem skill name này đã tồn tại chưa (Project override Global)
+        var overwritten = false;
+        for (skills.items) |*existing| {
+            if (std.mem.eql(u8, existing.name, info.name)) {
+                existing.* = info;
+                overwritten = true;
+                break;
+            }
+        }
+
+        if (!overwritten and skills.items.len < MAX_SKILLS) {
+            skills.append(arena_alloc, info) catch continue;
+        }
+    }
+}
+
 /// Parse frontmatter của SKILL.md.
-/// Fallback: nếu không có frontmatter hợp lệ, dùng tên thư mục làm name, description rỗng.
+/// Spec agentskills.io: `name` phải trùng tên thư mục cha (`dir_name`).
 fn parseSkillFile(alloc: Allocator, io: std.Io, path: []const u8, dir_name: []const u8) !SkillInfo {
     const cwd = std.Io.Dir.cwd();
     const file = try cwd.openFile(io, path, .{});
@@ -132,6 +158,12 @@ fn parseSkillFile(alloc: Allocator, io: std.Io, path: []const u8, dir_name: []co
                 description = desc;
             }
         }
+    }
+
+    // Spec validation: name trong frontmatter phải khớp tên thư mục
+    if (!std.mem.eql(u8, name, dir_name)) {
+        main.stderrPrint("[skills] Cảnh báo: skill name '{s}' trong {s} không khớp tên thư mục '{s}', dùng tên thư mục.\n", .{ name, path, dir_name });
+        name = dir_name;
     }
 
     return .{

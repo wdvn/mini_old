@@ -87,8 +87,19 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // Nạp biến môi trường từ .env
-    config_mod.loadDotEnv(init.environ_map, init.io);
+    // Init Agent Folder
+    const agent_folder_mod = @import("core/agent_folder.zig");
+    var agent_folder_opt: ?agent_folder_mod.AgentFolder = null;
+    if (agent_folder_mod.resolveOrInitAgentFolder(alloc, init.io, init.environ_map)) |folder| {
+        agent_folder_opt = folder;
+        init.environ_map.put("MINI_AGENT_FOLDER", folder.path) catch {};
+    } else |err| {
+        stderrPrint("[main] Lỗi khi tìm .agent: {any}\n", .{err});
+    }
+    defer if (agent_folder_opt) |*f| f.deinit();
+
+    // Nạp biến môi trường từ .env và config.json
+    config_mod.loadDotEnv(alloc, init.environ_map, init.io);
 
     // Nạp Config
     var cfg = config_mod.Config.load(alloc, init.environ_map, init.io) catch |e| {

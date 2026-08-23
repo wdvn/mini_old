@@ -129,7 +129,7 @@ fn buildRequestBody(
     defer alloc.free(escaped_sys);
 
     try w.print(
-        \\{{"model":"{s}","max_tokens":{d},"stream":true,"system":[{"type":"text","text":"{s}","cache_control":{{"type":"ephemeral"}}}],"messages":[
+        \\{{"model":"{s}","max_tokens":{d},"stream":true,"system":[{{"type":"text","text":"{s}","cache_control":{{"type":"ephemeral"}}}}],"messages":[
     , .{ model, max_tokens, escaped_sys });
 
     for (msgs, 0..) |msg, mi| {

@@ -51,7 +51,7 @@ Nếu tương lai có chuẩn cộng đồng trùng tên, mini sẽ review lại
 .agent/
 ├── AGENTS.md          # Instructions riêng cho mini (RFC-004, open format) — commit
 ├── .gitignore         # Mặc định: ignore output/ — commit
-├── config.toml        # Cấu hình project-level: model, backends, permissions — commit (không chứa secrets)
+├── config.json        # Cấu hình project-level: model, backends, permissions — commit (không chứa secrets)
 ├── skills/            # User-defined skills — commit (chuẩn agentskills.io)
 │   ├── deploy/        #   Mỗi skill = 1 thư mục con, tối thiểu chứa SKILL.md
 │   │   ├── SKILL.md   #     Required: frontmatter YAML (name, description) + instructions
@@ -144,13 +144,13 @@ Lý do tách state khỏi `.agent/`:
 output/
 ```
 
-→ Team commit AGENTS.md, config.toml, skills/, commands/; output runtime không đẩy lên.
+→ Team commit AGENTS.md, config.json, skills/, commands/; output runtime không đẩy lên.
 
 ### 2.3. Discovery & fallback
 
 1. Tìm `.agent/` từ cwd đi lên đến root thư mục (giống cách git tìm `.git/`).
 2. Không tìm thấy → tạo ngầm + seed `.gitignore` mặc định (không tạo AGENTS.md — RFC-004 khuyến khích user tự viết).
-3. Cấu hình merge order: built-in defaults → `~/.config/mini/` (global) → `.agent/config.toml` (project) → flags CLI.
+3. Cấu hình merge order: built-in defaults → `~/.config/mini/` (global) → `.agent/config.json` (project) → flags CLI.
 4. Skills discovery order: `~/.mini/skills/` (global, user cá nhân) → `.agent/skills/` (project, team dùng chung). Trùng `name` → project override global.
 
 ---
@@ -160,7 +160,7 @@ output/
 | Phase | Nội dung | Độ phức tạp |
 |---|---|---|
 | 1 | Discovery `.agent/` + tạo seed `.gitignore` + đọc `.agent/AGENTS.md` vào system prompt | Thấp |
-| 2 | `config.toml` project-level, merge vào Config hiện có | Trung bình |
+| 2 | `config.json` project-level, merge vào Config hiện có | Trung bình |
 | 3 | Skills theo chuẩn agentskills.io: mở rộng `loadSkills()` quét thêm `.agent/skills/*/SKILL.md`, validate spec (name khớp thư mục, giới hạn độ dài) | Trung bình |
 | 4 | Slash commands động từ `.agent/commands/` | Trung bình |
 
@@ -182,5 +182,6 @@ Phase 1-2 không phá vỡ gì; Phase 3-4 thay đổi hành vi tool `skills`, RE
 
 ## 5. Câu hỏi mở
 
-1. `.agent/config.toml` có nên hỗ trợ secrets (API keys) hay bắt buộc env vars? Hiện đề xuất cấm secrets trong config commit.
+1. `.agent/config.json` có nên hỗ trợ secrets (API keys) hay bắt buộc env vars? Hiện đề xuất cấm secrets trong config commit.
+2. **Quyết định định dạng file config**: Sử dụng `config.json` thay vì `config.toml` để sử dụng `std.json` có sẵn trong Zig 0.16.0 standard library, tránh kéo thêm external TOML dependency (tuân thủ quy ước thiết kế trong `AGENTS.md`).
 2. Có nên đặt tên `.mini/` thay vì `.agent/` để tránh nhầm là chuẩn công khai? Câu hỏi đặt ra cho review.

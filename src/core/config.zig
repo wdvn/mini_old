@@ -363,27 +363,60 @@ fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, i
 
     var result = SpResult{ .buf = base_buf, .text = base_text };
 
-    const cwd = std.Io.Dir.cwd();
-    const agents_md_file = cwd.openFile(io, "AGENTS.md", .{}) catch {
-        return appendSkillsBlock(alloc, env_map, io, result);
-    };
-    defer agents_md_file.close(io);
+    var agents_text_accum = std.ArrayList(u8).empty;
+    defer agents_text_accum.deinit(alloc);
 
-    const stat = agents_md_file.stat(io) catch return appendSkillsBlock(alloc, env_map, io, result);
-    if (stat.size == 0 or stat.size > 128 * 1024) return appendSkillsBlock(alloc, env_map, io, result);
+    // 1. Global AGENTS.md (~/.mini/AGENTS.md)
+    if (env_map.get("HOME")) |home| {
+        const global_path = std.fmt.allocPrint(alloc, "{s}/.mini/AGENTS.md", .{home}) catch null;
+        if (global_path) |gp| {
+            defer alloc.free(gp);
+            if (readAgentFile(alloc, io, gp)) |text| {
+                defer alloc.free(text);
+                agents_text_accum.appendSlice(alloc, text) catch {};
+                agents_text_accum.appendSlice(alloc, "\n\n") catch {};
+                main.stderrPrint("[config] Loaded global AGENTS.md ({d} bytes)\n", .{text.len});
+            }
+        }
+    }
 
-    const agents_buf = alloc.alloc(u8, @intCast(stat.size)) catch return appendSkillsBlock(alloc, env_map, io, result);
-    defer alloc.free(agents_buf);
+    // 2. Project AGENTS.md (MINI_AGENT_FOLDER/AGENTS.md)
+    if (env_map.get("MINI_AGENT_FOLDER")) |agent_dir| {
+        const project_path = std.fmt.allocPrint(alloc, "{s}/AGENTS.md", .{agent_dir}) catch null;
+        if (project_path) |pp| {
+            defer alloc.free(pp);
+            if (readAgentFile(alloc, io, pp)) |text| {
+                defer alloc.free(text);
+                agents_text_accum.appendSlice(alloc, text) catch {};
+                agents_text_accum.appendSlice(alloc, "\n\n") catch {};
+                main.stderrPrint("[config] Loaded project AGENTS.md ({d} bytes)\n", .{text.len});
+            }
+        }
+    }
 
-    const n = utils.readAll(io, agents_md_file, agents_buf) catch return appendSkillsBlock(alloc, env_map, io, result);
-    const agents_text = agents_buf[0..n];
+    if (agents_text_accum.items.len > 0) {
+        const combined_text = std.fmt.allocPrint(alloc, "{s}\n\n<RULE[AGENTS.md]>\n{s}</RULE[AGENTS.md]>\n", .{ result.text, agents_text_accum.items }) catch return appendSkillsBlock(alloc, env_map, io, result);
+        if (result.buf) |b| alloc.free(b);
+        result = .{ .buf = combined_text, .text = combined_text };
+    }
 
-    const combined_text = std.fmt.allocPrint(alloc, "{s}\n\n<RULE[AGENTS.md]>\n{s}\n</RULE[AGENTS.md]>\n", .{ result.text, agents_text }) catch return appendSkillsBlock(alloc, env_map, io, result);
-
-    if (result.buf) |b| alloc.free(b);
-    main.stderrPrint("[config] Loaded AGENTS.md ({d} bytes)\n", .{n});
-    result = .{ .buf = combined_text, .text = combined_text };
     return appendSkillsBlock(alloc, env_map, io, result);
+}
+
+fn readAgentFile(alloc: Allocator, io: std.Io, path: []const u8) ?[]u8 {
+    const cwd = std.Io.Dir.cwd();
+    const file = cwd.openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+
+    const stat = file.stat(io) catch return null;
+    if (stat.size == 0 or stat.size > 128 * 1024) return null;
+
+    const buf = alloc.alloc(u8, @intCast(stat.size)) catch return null;
+    const n = utils.readAll(io, file, buf) catch {
+        alloc.free(buf);
+        return null;
+    };
+    return buf[0..n];
 }
 
 /// Inject skills block vào cuối system prompt.
@@ -419,15 +452,42 @@ fn appendSkillsBlock(alloc: Allocator, env_map: *const std.process.Environ.Map, 
 /// Shell env variables luôn có ưu tiên cao hơn (setenv overwrite=0).
 /// Hỗ trợ cú pháp: `KEY=VALUE`, `KEY="VALUE"`, `KEY='VALUE'`,
 ///                 `export KEY=VALUE`, `# comment`, dòng trống.
-pub fn loadDotEnv(env_map: *std.process.Environ.Map, io: std.Io) void {
+pub const JsonConfig = struct {
+    execution_mode: ?[]const u8 = null,
+    openai_compat_url: ?[]const u8 = null,
+    openai_compat_api_key: ?[]const u8 = null,
+    openai_compat_api_header: ?[]const u8 = null,
+    openai_compat_model: ?[]const u8 = null,
+    openai_compat_use_completion_tokens: ?bool = null,
+    anthropic_api_key: ?[]const u8 = null,
+    claude_model: ?[]const u8 = null,
+    ollama_host: ?[]const u8 = null,
+    ollama_model: ?[]const u8 = null,
+    max_tokens: ?u32 = null,
+    memact_enabled: ?bool = null,
+    context_window: ?u32 = null,
+    tool_allowlist: ?[]const u8 = null,
+    tool_blocklist: ?[]const u8 = null,
+    mcp_config: ?[]const u8 = null,
+    hook_command: ?[]const u8 = null,
+    session: ?[]const u8 = null,
+};
+
+/// Tải biến môi trường từ các file .env và config.json theo thứ tự ưu tiên:
+///   1. $MINI_ENV_FILE
+///   2. ./.env
+///   3. .agent/.env
+///   4. ~/.mini/.env
+///   5. .agent/config.json
+///   6. ~/.mini/config.json
+pub fn loadDotEnv(alloc: Allocator, env_map: *std.process.Environ.Map, io: std.Io) void {
     const home = env_map.get("HOME");
 
-    // Danh sách ứng viên
-    var paths: [3][512]u8 = undefined;
-    var path_lens: [3]usize = .{ 0, 0, 0 };
+    // 1. Tải các file .env
+    var paths: [4][512]u8 = undefined;
+    var path_lens: [4]usize = .{ 0, 0, 0, 0 };
     var n: usize = 0;
 
-    // 1. Explicit override
     if (env_map.get("MINI_ENV_FILE")) |explicit| {
         if (explicit.len > 0 and explicit.len < 512) {
             @memcpy(paths[n][0..explicit.len], explicit);
@@ -436,7 +496,6 @@ pub fn loadDotEnv(env_map: *std.process.Environ.Map, io: std.Io) void {
         }
     }
 
-    // 2. CWD/.env
     {
         const name = ".env";
         @memcpy(paths[n][0..name.len], name);
@@ -444,7 +503,14 @@ pub fn loadDotEnv(env_map: *std.process.Environ.Map, io: std.Io) void {
         n += 1;
     }
 
-    // 3. MINI_HOME/.env hoặc ~/.mini/.env
+    if (env_map.get("MINI_AGENT_FOLDER")) |agent_dir| {
+        if (agent_dir.len > 0) {
+            const p = std.fmt.bufPrint(&paths[n], "{s}/.env", .{agent_dir}) catch "";
+            path_lens[n] = p.len;
+            if (p.len > 0) n += 1;
+        }
+    }
+
     if (env_map.get("MINI_HOME")) |mh| {
         if (mh.len > 0) {
             const p = std.fmt.bufPrint(&paths[n], "{s}/.env", .{mh}) catch "";
@@ -460,6 +526,86 @@ pub fn loadDotEnv(env_map: *std.process.Environ.Map, io: std.Io) void {
     for (0..n) |i| {
         tryLoadFile(env_map, io, paths[i][0..path_lens[i]]);
     }
+
+    // 2. Tải các file config.json (project -> global)
+    if (env_map.get("MINI_AGENT_FOLDER")) |agent_dir| {
+        if (agent_dir.len > 0) {
+            var json_path_buf: [512]u8 = undefined;
+            if (std.fmt.bufPrint(&json_path_buf, "{s}/config.json", .{agent_dir})) |jp| {
+                tryLoadJsonConfig(alloc, env_map, io, jp);
+            } else |_| {}
+        }
+    }
+
+    if (env_map.get("MINI_HOME")) |mh| {
+        if (mh.len > 0) {
+            var json_path_buf: [512]u8 = undefined;
+            if (std.fmt.bufPrint(&json_path_buf, "{s}/config.json", .{mh})) |jp| {
+                tryLoadJsonConfig(alloc, env_map, io, jp);
+            } else |_| {}
+        }
+    } else if (home) |h| {
+        var json_path_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&json_path_buf, "{s}/.mini/config.json", .{h})) |jp| {
+            tryLoadJsonConfig(alloc, env_map, io, jp);
+        } else |_| {}
+    }
+}
+
+fn tryLoadJsonConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: std.Io, path: []const u8) void {
+    const cwd = std.Io.Dir.cwd();
+    const file = cwd.openFile(io, path, .{}) catch return;
+    defer file.close(io);
+
+    const stat = file.stat(io) catch return;
+    if (stat.size == 0 or stat.size > 64 * 1024) return;
+
+    const buf = alloc.alloc(u8, @intCast(stat.size)) catch return;
+    defer alloc.free(buf);
+
+    const n = utils.readAll(io, file, buf) catch return;
+    const data = buf[0..n];
+
+    var parsed = std.json.parseFromSlice(JsonConfig, alloc, data, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+
+    const cfg = parsed.value;
+    var count: usize = 0;
+
+    if (cfg.execution_mode) |val| count += setEnvDefault(env_map, "MINI_EXECUTION_MODE", val);
+    if (cfg.openai_compat_url) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_URL", val);
+    if (cfg.openai_compat_api_key) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_API_KEY", val);
+    if (cfg.openai_compat_api_header) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_API_HEADER", val);
+    if (cfg.openai_compat_model) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_MODEL", val);
+    if (cfg.openai_compat_use_completion_tokens) |val| count += setEnvDefault(env_map, "MINI_USE_COMPLETION_TOKENS", if (val) "1" else "0");
+    if (cfg.anthropic_api_key) |val| count += setEnvDefault(env_map, "ANTHROPIC_API_KEY", val);
+    if (cfg.claude_model) |val| count += setEnvDefault(env_map, "CLAUDE_MODEL", val);
+    if (cfg.ollama_host) |val| count += setEnvDefault(env_map, "OLLAMA_HOST", val);
+    if (cfg.ollama_model) |val| count += setEnvDefault(env_map, "OLLAMA_MODEL", val);
+    if (cfg.max_tokens) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_MAX_TOKENS", s) else |_| {}
+    }
+    if (cfg.memact_enabled) |val| count += setEnvDefault(env_map, "MINI_MEMACT_ENABLED", if (val) "1" else "0");
+    if (cfg.context_window) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_CONTEXT_WINDOW", s) else |_| {}
+    }
+    if (cfg.tool_allowlist) |val| count += setEnvDefault(env_map, "MINI_TOOL_ALLOWLIST", val);
+    if (cfg.tool_blocklist) |val| count += setEnvDefault(env_map, "MINI_TOOL_BLOCKLIST", val);
+    if (cfg.mcp_config) |val| count += setEnvDefault(env_map, "MINI_MCP_CONFIG", val);
+    if (cfg.hook_command) |val| count += setEnvDefault(env_map, "MINI_HOOK_COMMAND", val);
+    if (cfg.session) |val| count += setEnvDefault(env_map, "MINI_SESSION", val);
+
+    if (count > 0) {
+        main.stderrPrint("[config] Loaded {d} settings from {s}\n", .{ count, path });
+    }
+}
+
+fn setEnvDefault(env_map: *std.process.Environ.Map, key: []const u8, val: []const u8) usize {
+    if (env_map.get(key) != null) return 0;
+    env_map.put(key, val) catch return 0;
+    return 1;
 }
 
 fn tryLoadFile(env_map: *std.process.Environ.Map, io: std.Io, path: []const u8) void {
@@ -509,4 +655,24 @@ fn tryLoadFile(env_map: *std.process.Environ.Map, io: std.Io, path: []const u8) 
     if (loaded > 0) {
         main.stderrPrint("[config] Loaded {d} vars from {s}\n", .{ loaded, path });
     }
+}
+
+test "JsonConfig parsing" {
+    const alloc = std.testing.allocator;
+    const json_str =
+        \\{
+        \\  "execution_mode": "codeact",
+        \\  "openai_compat_model": "gpt-4o",
+        \\  "max_tokens": 4096,
+        \\  "memact_enabled": true
+        \\}
+    ;
+
+    var parsed = try std.json.parseFromSlice(JsonConfig, alloc, json_str, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("codeact", parsed.value.execution_mode.?);
+    try std.testing.expectEqualStrings("gpt-4o", parsed.value.openai_compat_model.?);
+    try std.testing.expectEqual(4096, parsed.value.max_tokens.?);
+    try std.testing.expectEqual(true, parsed.value.memact_enabled.?);
 }

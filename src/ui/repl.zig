@@ -135,8 +135,105 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
         return true;
     }
 
+    if (tryExecuteCustomSlashCommand(alloc, io, agent, input) catch false) {
+        return true;
+    }
+
     main.stdoutPrint("Lệnh không hợp lệ: {s}. Gõ /help để xem danh sách.\n", .{input});
     return true;
+}
+
+const utils = @import("../core/utils.zig");
+
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
+    if (getenv(name)) |ptr| {
+        return std.mem.span(ptr);
+    }
+    return null;
+}
+
+fn tryExecuteCustomSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, input: []const u8) !bool {
+    if (!std.mem.startsWith(u8, input, "/")) return false;
+
+    const cmd_line = input[1..];
+    const space_idx = std.mem.indexOfScalar(u8, cmd_line, ' ') orelse cmd_line.len;
+    const cmd_name = cmd_line[0..space_idx];
+    if (cmd_name.len == 0) return false;
+
+    const args_str = if (space_idx < cmd_line.len) std.mem.trim(u8, cmd_line[space_idx..], " \t") else "";
+
+    const agent_dir = getEnvVar("MINI_AGENT_FOLDER") orelse ".agent";
+    const cmd_path = std.fmt.allocPrint(alloc, "{s}/commands/{s}.md", .{ agent_dir, cmd_name }) catch return false;
+    defer alloc.free(cmd_path);
+
+    const cwd = std.Io.Dir.cwd();
+    const file = cwd.openFile(io, cmd_path, .{}) catch return false;
+    defer file.close(io);
+
+    const stat = file.stat(io) catch return false;
+    if (stat.size == 0 or stat.size > 128 * 1024) return false;
+
+    const template_buf = alloc.alloc(u8, @intCast(stat.size)) catch return false;
+    defer alloc.free(template_buf);
+
+    const n = utils.readAll(io, file, template_buf) catch return false;
+    const template = template_buf[0..n];
+
+    const expanded = try expandCommandTemplate(alloc, template, args_str);
+    defer alloc.free(expanded);
+
+    main.stdoutPrint("\x1b[90m[command /{s}]\x1b[0m\n", .{cmd_name});
+    try agent.processInput(expanded, printText, printThinkText);
+    return true;
+}
+
+fn expandCommandTemplate(alloc: Allocator, template: []const u8, args_str: []const u8) ![]u8 {
+    var result = std.ArrayList(u8).empty;
+    errdefer result.deinit(alloc);
+
+    var positional: [10][]const u8 = undefined;
+    var arg_count: usize = 0;
+    var it = std.mem.tokenizeAny(u8, args_str, " \t");
+    while (it.next()) |arg| {
+        if (arg_count < 9) {
+            arg_count += 1;
+            positional[arg_count] = arg;
+        }
+    }
+
+    var i: usize = 0;
+    while (i < template.len) {
+        if (template[i] == '$') {
+            if (std.mem.startsWith(u8, template[i..], "$ARGUMENTS")) {
+                try result.appendSlice(alloc, args_str);
+                i += "$ARGUMENTS".len;
+                continue;
+            } else if (i + 1 < template.len and template[i + 1] >= '1' and template[i + 1] <= '9') {
+                const idx = template[i + 1] - '0';
+                if (idx <= arg_count) {
+                    try result.appendSlice(alloc, positional[idx]);
+                }
+                i += 2;
+                continue;
+            }
+        }
+        try result.append(alloc, template[i]);
+        i += 1;
+    }
+
+    return result.toOwnedSlice(alloc);
+}
+
+test "expandCommandTemplate positional and arguments substitution" {
+    const alloc = std.testing.allocator;
+    const template = "Commit: $ARGUMENTS (task=$1, file=$2)";
+    const args_str = "fix-bug main.zig";
+
+    const expanded = try expandCommandTemplate(alloc, template, args_str);
+    defer alloc.free(expanded);
+
+    try std.testing.expectEqualStrings("Commit: fix-bug main.zig (task=fix-bug, file=main.zig)", expanded);
 }
 
 // ---------------------------------------------------------------------------
