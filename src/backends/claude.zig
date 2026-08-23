@@ -83,6 +83,7 @@ pub const Client = struct {
         const headers = [_][]const u8{
             auth_hdr,
             api_ver_hdr,
+            "anthropic-beta: prompt-caching-2024-07-31",
             "Content-Type: application/json",
         };
         _ = try http_lib.postStream(self.alloc, main.g_io, .{
@@ -123,12 +124,12 @@ fn buildRequestBody(
     errdefer buf.deinit();
     const w = &buf;
 
-    // System prompt
+    // System prompt (với cache_control cho Anthropic Prompt Caching)
     const escaped_sys = try json.escape(alloc, system_prompt);
     defer alloc.free(escaped_sys);
 
     try w.print(
-        \\ {{"model":"{s}","max_tokens":{d},"stream":true,"system":"{s}","messages":[
+        \\{{"model":"{s}","max_tokens":{d},"stream":true,"system":[{"type":"text","text":"{s}","cache_control":{{"type":"ephemeral"}}}],"messages":[
     , .{ model, max_tokens, escaped_sys });
 
     for (msgs, 0..) |msg, mi| {
@@ -207,9 +208,15 @@ fn buildRequestBody(
         try w.writeAll(",\"tools\":[");
         for (tools, 0..) |td, ti| {
             if (ti > 0) try w.writeByte(',');
-            try w.print(
-                \\{{"name":"{s}","description":"{s}","input_schema":{s}}}
-            , .{ td.name, td.description, td.input_schema_json });
+            if (ti == tools.len - 1) {
+                try w.print(
+                    \\{{"name":"{s}","description":"{s}","input_schema":{s},"cache_control":{{"type":"ephemeral"}}}}
+                , .{ td.name, td.description, td.input_schema_json });
+            } else {
+                try w.print(
+                    \\{{"name":"{s}","description":"{s}","input_schema":{s}}}
+                , .{ td.name, td.description, td.input_schema_json });
+            }
         }
         try w.writeByte(']');
         try w.writeAll(",\"tool_choice\":{\"type\":\"auto\"}");
@@ -386,3 +393,28 @@ const StreamCtx = struct {
         return .unknown;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Unit Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "claude buildRequestBody contains cache_control" {
+    const alloc = testing.allocator;
+    const msgs = [_]proto.Message{};
+    const tools = [_]proto.ToolDefinition{
+        .{ .name = "tool1", .description = "desc1", .input_schema_json = "{}" },
+        .{ .name = "tool2", .description = "desc2", .input_schema_json = "{}" },
+    };
+
+    const body = try buildRequestBody(alloc, "claude-3-5-sonnet", 1024, "System prompt test", &msgs, &tools);
+    defer alloc.free(body);
+
+    // Kiểm tra có cache_control trong system prompt
+    try testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
+    // Kiểm tra system prompt formatted như array block
+    try testing.expect(std.mem.indexOf(u8, body, "\"system\":[{\"type\":\"text\",\"text\":\"System prompt test\",\"cache_control\":{\"type\":\"ephemeral\"}}]") != null);
+    // Kiểm tra tool2 (tool cuối) có cache_control
+    try testing.expect(std.mem.indexOf(u8, body, "\"name\":\"tool2\",\"description\":\"desc2\",\"input_schema\":{},\"cache_control\":{\"type\":\"ephemeral\"}") != null);
+}

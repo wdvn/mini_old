@@ -179,19 +179,35 @@ fn buildRequestBody(
 
     if (use_completion_tokens) {
         try w.print(
-            \\{{"model":"{s}","max_completion_tokens":{d},{s}"stream":true,"messages":[
+            \\{{"model":"{s}","max_completion_tokens":{d},{s}"stream":true,"stream_options":{{"include_usage":true}}
         , .{ model, max_tokens, reasoning_effort_str });
     } else {
         try w.print(
-            \\{{"model":"{s}","max_tokens":{d},{s}"stream":true,"messages":[
+            \\{{"model":"{s}","max_tokens":{d},{s}"stream":true,"stream_options":{{"include_usage":true}}
         , .{ model, max_tokens, reasoning_effort_str });
     }
+
+    // Tool definitions (đặt trước messages để đảm bảo JSON prefix là tĩnh 100% giữa các lượt)
+    if (tools.len > 0) {
+        try w.writeAll(",\"tools\":[");
+        for (tools, 0..) |td, ti| {
+            if (ti > 0) try w.writeByte(',');
+            const escaped_desc = try json.escape(alloc, td.description);
+            defer alloc.free(escaped_desc);
+            try w.print(
+                \\{{"type":"function","function":{{"name":"{s}","description":"{s}","parameters":{s}}}}}
+            , .{ td.name, escaped_desc, td.input_schema_json });
+        }
+        try w.writeAll("],\"tool_choice\":\"auto\"");
+    }
+
+    try w.writeAll(",\"messages\":[");
 
     // System message
     if (system_prompt.len > 0) {
         const escaped_sys = try json.escape(alloc, system_prompt);
         defer alloc.free(escaped_sys);
-        try w.print("{{\t\"role\":\"system\",\"content\":\"{s}\"}}", .{escaped_sys});
+        try w.print("{{\"role\":\"system\",\"content\":\"{s}\"}}", .{escaped_sys});
         if (msgs.len > 0) try w.writeByte(',');
     }
 
@@ -264,8 +280,6 @@ fn buildRequestBody(
                     const tu = block.tool_use;
                     if (!first_tc) try w.writeByte(',');
                     first_tc = false;
-                    // Escape arguments since it's a raw JSON string that must be passed verbatim, WAIT! The arguments JSON is an unescaped raw JSON string in our system. But it must be put inside a JSON string value!
-                    // So we must escape it like we escape strings!
                     const escaped_args = try json.escape(alloc, tu.input_json);
                     defer alloc.free(escaped_args);
                     try w.print(
@@ -280,21 +294,6 @@ fn buildRequestBody(
     }
 
     try w.writeByte(']');
-
-    // Tool definitions
-    if (tools.len > 0) {
-        try w.writeAll(",\"tools\":[");
-        for (tools, 0..) |td, ti| {
-            if (ti > 0) try w.writeByte(',');
-            const escaped_desc = try json.escape(alloc, td.description);
-            defer alloc.free(escaped_desc);
-            try w.print(
-                \\{{"type":"function","function":{{"name":"{s}","description":"{s}","parameters":{s}}}}}
-            , .{ td.name, escaped_desc, td.input_schema_json });
-        }
-        try w.writeAll("],\"tool_choice\":\"auto\"");
-    }
-
     try w.writeByte('}');
     return buf.toOwnedSlice();
 }
@@ -512,3 +511,31 @@ const StreamCtx = struct {
         if (self.text_accum_init) self.text_accum.deinit(self.alloc);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Unit Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "openai buildRequestBody includes stream_options, static tools prefix and clean system message" {
+    const alloc = testing.allocator;
+    const msgs = [_]proto.Message{};
+    const tools = [_]proto.ToolDefinition{
+        .{ .name = "test_tool", .description = "desc", .input_schema_json = "{}" },
+    };
+
+    const body = try buildRequestBody(alloc, "gpt-4o", 1024, false, false, "System prompt test", &msgs, &tools);
+    defer alloc.free(body);
+
+    // Kiểm tra có stream_options include_usage
+    try testing.expect(std.mem.indexOf(u8, body, "\"stream_options\":{\"include_usage\":true}") != null);
+    // Kiểm tra System message được format sạch không có tab
+    try testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"system\",\"content\":\"System prompt test\"}") != null);
+
+    // Kiểm tra "tools" xuất hiện TRƯỚC "messages" để giữ prefix tĩnh 100%
+    const tools_pos = std.mem.indexOf(u8, body, "\"tools\":[");
+    const msgs_pos = std.mem.indexOf(u8, body, "\"messages\":[");
+    try testing.expect(tools_pos != null and msgs_pos != null);
+    try testing.expect(tools_pos.? < msgs_pos.?);
+}

@@ -106,7 +106,21 @@ fn buildRequestBody(
     errdefer buf.deinit();
     const w = &buf;
 
-    try w.print("{{\"model\":\"{s}\",\"stream\":true,\"messages\":[", .{model});
+    try w.print("{{\"model\":\"{s}\",\"stream\":true", .{model});
+
+    // Tools (Ollama 0.3.0+) đặt trước messages để đảm bảo JSON prefix là tĩnh 100%
+    if (tools.len > 0) {
+        try w.writeAll(",\"tools\":[");
+        for (tools, 0..) |td, ti| {
+            if (ti > 0) try w.writeByte(',');
+            try w.print(
+                \\{{"type":"function","function":{{"name":"{s}","description":"{s}","parameters":{s}}}}}
+            , .{ td.name, td.description, td.input_schema_json });
+        }
+        try w.writeByte(']');
+    }
+
+    try w.writeAll(",\"messages\":[");
 
     // System
     if (system_prompt.len > 0) {
@@ -137,19 +151,6 @@ fn buildRequestBody(
         if (mi + 1 < msgs.len) try w.writeByte(',');
     }
     try w.writeByte(']');
-
-    // Tools (Ollama 0.3.0+)
-    if (tools.len > 0) {
-        try w.writeAll(",\"tools\":[");
-        for (tools, 0..) |td, ti| {
-            if (ti > 0) try w.writeByte(',');
-            try w.print(
-                \\{{"type":"function","function":{{"name":"{s}","description":"{s}","parameters":{s}}}}}
-            , .{ td.name, td.description, td.input_schema_json });
-        }
-        try w.writeByte(']');
-    }
-
     try w.writeByte('}');
     return buf.toOwnedSlice();
 }
