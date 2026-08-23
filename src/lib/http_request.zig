@@ -476,15 +476,15 @@ pub fn postStream(
     defer req.deinit();
 
     // Gửi body
+    // POST luôn phải có body (sendBodiless assert !method.requestHasBody()
+    // → panic với POST/PUT). Gửi content_length = 0 khi body rỗng.
+    req.transfer_encoding = .{ .content_length = opts.body.len };
+    var req_body = try req.sendBodyUnflushed(&.{});
     if (opts.body.len > 0) {
-        req.transfer_encoding = .{ .content_length = opts.body.len };
-        var req_body = try req.sendBodyUnflushed(&.{});
         try req_body.writer.writeAll(opts.body);
-        try req_body.end();
-        try req.connection.?.flush();
-    } else {
-        try req.sendBodiless();
     }
+    try req_body.end();
+    try req.connection.?.flush();
 
     var redirect_buffer: [4096]u8 = undefined;
     var response = try req.receiveHead(&redirect_buffer);
