@@ -234,7 +234,28 @@ pub fn fetch(alloc: Allocator, io: std.Io, opts: Options) !Response {
     };
     defer client.deinit();
 
+    // Pre-warm TLS state đúng cách std làm cho https trực tiếp: rescan CA
+    // bundle + set `now`. Không có bước này, request http bị redirect 301 →
+    // https sẽ panic "attempt to use null value" trong Tls.create (unwrap
+    // `client.now.?` khi connect).
+    initTlsState(&client, io);
+
     return fetchWithClient(alloc, &client, opts);
+}
+
+/// Khởi tạo `now` + `ca_bundle` cho client (mirror logic tls: block trong
+/// std.http.Client.connect — std chỉ chạy nhánh này khi URL gốc là https).
+fn initTlsState(client: *std.http.Client, io: std.Io) void {
+    if (std.http.Client.disable_tls) return;
+    client.now = std.Io.Clock.real.now(io);
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(client.allocator);
+    bundle.rescan(client.allocator, io, client.now.?) catch {
+        // Load CA thất bại → bỏ trống, TLS sẽ trả CertificateBundleLoadFailure
+        // thay vì crash; các connection http vẫn hoạt động bình thường.
+        return;
+    };
+    std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
 }
 
 /// Như `fetch` nhưng dùng client có sẵn (reuse connection pool, caller quản deinit).
@@ -437,6 +458,9 @@ pub fn postStream(
         .io = io,
     };
     defer client.deinit();
+
+    // Xem fetch(): redirect http → https cần TLS state được pre-warm.
+    initTlsState(&client, io);
 
     const extra_headers = try parseHeadersKv(alloc, opts.headers);
     defer freeHeadersKv(alloc, extra_headers);

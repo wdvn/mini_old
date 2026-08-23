@@ -20,7 +20,7 @@ src/
   acp/                — ACP server
 docs/                 — proposals, technical docs (tiếng Việt)
 scripts/build_release.sh
-test*.zig             — standalone test scratch files (không thuộc build chính)
+testcases/            — tất cả các file test (standalone, integration, benchmarks, ...)
 ```
 
 ## Build & Run
@@ -37,7 +37,7 @@ test*.zig             — standalone test scratch files (không thuộc build ch
 - Comment tiếng Việt, giữ style hiện có trong file đang sửa.
 - Mỗi module `.zig` có doc-comment `//!` mô tả trách nhiệm ở đầu file.
 - Không thêm dependency ngoài nếu chưa được thảo luận trong proposal — nếu cần, mở proposal trước.
-- File `test*.zig` ở root là scratch experiments, không xóa, không đưa vào build.
+- Tất cả các file test (scratch experiments, standalone test, benchmarks...) đều được đặt trong thư mục `testcases/` và phải có tên dạng `test_*.zig` (không để file test ở thư mục root).
 - Proposals/design docs đặt ở `docs/`, format: `rfc_NNN_<tên>_proposal.md` (RFC đánh số tăng dần, snake_case; ví dụ `rfc_005_agent_folder_proposal.md`). Doc tham khảo/thuần kiến thức (không phải proposal) giữ tên snake_case thường.
 
 ## Lưu ý kiến trúc
@@ -56,4 +56,4 @@ test*.zig             — standalone test scratch files (không thuộc build ch
 ## PR / Commit
 
 - Commit message tiếng Anh hoặc tiếng Việt, format: `module: mô tả ngắn` (ví dụ `editor: add word motion keybindings`).
-- Không commit file scratch test ngoài `test*.zig` đã có, không commit `zig-cache/`, `zig-out/`.
+- Không commit file scratch test ngoài các file test trong `testcases/` đã có, không commit `zig-cache/`, `zig-out/`.
