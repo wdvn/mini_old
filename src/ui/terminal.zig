@@ -122,12 +122,38 @@ pub fn cursorDown(io: std.Io, n: usize) void {
 }
 
 extern fn isatty(fd: c_int) c_int;
+extern fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
+
+const CWinSize = extern struct {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+};
 
 /// Kiểm tra stdout có phải là TTY không.
 pub fn isStdoutTty() bool {
     if (comptime builtin.is_test) return false;
     if (builtin.os.tag == .windows) return true;
     return isatty(1) != 0;
+}
+
+pub const WinSize = struct {
+    rows: u16,
+    cols: u16,
+};
+
+/// Lấy kích thước terminal hiện tại (rows, cols). Fallback 24x80 nếu không lấy được.
+pub fn getTerminalSize() WinSize {
+    if (comptime builtin.is_test) return .{ .rows = 24, .cols = 80 };
+    if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
+        const TIOCGWINSZ: c_ulong = if (builtin.os.tag == .linux) 0x5413 else 0x40087468;
+        var ws: CWinSize = undefined;
+        if (ioctl(1, TIOCGWINSZ, &ws) == 0 and ws.ws_col > 0) {
+            return .{ .rows = ws.ws_row, .cols = ws.ws_col };
+        }
+    }
+    return .{ .rows = 24, .cols = 80 };
 }
 
 test "terminal constants" {

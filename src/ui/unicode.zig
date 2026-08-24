@@ -254,6 +254,39 @@ pub fn displayWidth(s: []const u8) usize {
     return w;
 }
 
+/// Tính chiều rộng hiển thị thực tế trên terminal, tự động bỏ qua ANSI escape sequences (màu sắc, cursor control...).
+pub fn visibleWidth(s: []const u8) usize {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == 0x1b) {
+            // Bỏ qua ANSI sequence: \x1b[...]
+            i += 1;
+            if (i < s.len and (s[i] == '[' or s[i] == '(' or s[i] == ')')) {
+                i += 1;
+                while (i < s.len) : (i += 1) {
+                    const c = s[i];
+                    if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or c == '~') {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        const cluster_len = clusterLenAt(s, i);
+        const cluster = s[i .. i + cluster_len];
+        const d = decodeAt(cluster);
+        if (containsVS16(cluster[d.len..])) {
+            w += 2;
+        } else {
+            w += clusterWidth(d.cp);
+        }
+        i += cluster_len;
+    }
+    return w;
+}
+
 /// Kiểm tra slice chứa U+FE0F (VS16, mã hoá UTF-8: EF B8 8F).
 fn containsVS16(s: []const u8) bool {
     return std.mem.indexOf(u8, s, "\xEF\xB8\x8F") != null;
@@ -347,3 +380,9 @@ test "grapheme count Vietnamese" {
     while (it1.next() != null) n += 1;
     try std.testing.expectEqual(@as(usize, 3), n);
 }
+
+test "visibleWidth strips ANSI escapes" {
+    try std.testing.expectEqual(@as(usize, 6), visibleWidth("\x1b[1;34mYou\x1b[0m > "));
+    try std.testing.expectEqual(@as(usize, 5), visibleWidth("\x1b[31mhello\x1b[0m"));
+}
+
