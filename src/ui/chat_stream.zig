@@ -111,7 +111,7 @@ pub const TurnRenderer = struct {
         if (!self.has_printed_response_header) {
             self.has_printed_response_header = true;
             var buf: [128]u8 = undefined;
-            const header = std.fmt.bufPrint(&buf, "\n \x1b[1;32m{s} mini-agent\x1b[0m\n\n", .{term.GLYPH_BOT}) catch "\n 🤖 mini-agent\n\n";
+            const header = std.fmt.bufPrint(&buf, "\n \x1b[1;32m{s} mini-agent\x1b[0m\n\n", .{term.GLYPH_BOT}) catch "\n 💩 mini-agent\n\n";
             term.writeStdout(header);
         }
 

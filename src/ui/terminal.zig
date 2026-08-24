@@ -68,7 +68,7 @@ pub const GLYPH_CHECK = "✓";
 pub const GLYPH_CROSS = "✗";
 pub const GLYPH_THINK = "💭";
 pub const GLYPH_STATS = "📊";
-pub const GLYPH_BOT = "🤖";
+pub const GLYPH_BOT = "💩";
 pub const GLYPH_BULLET = "•";
 
 // ---------------------------------------------------------------------------
