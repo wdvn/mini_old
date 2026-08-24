@@ -247,7 +247,7 @@ pub const TurnRenderer = struct {
         }
 
         var header_buf: [512]u8 = undefined;
-        const line = std.fmt.bufPrint(&header_buf, "\n \x1b[1;33m{s}\x1b[0m \x1b[1;37m{s}\x1b[0m {s}\n", .{
+        const line = std.fmt.bufPrint(&header_buf, " \x1b[1;33m{s}\x1b[0m \x1b[1;37m{s}\x1b[0m {s}\n", .{
             term.GLYPH_ACTION, name, detail,
         }) catch return;
 
