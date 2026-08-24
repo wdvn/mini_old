@@ -100,10 +100,11 @@ pub const TurnRenderer = struct {
         var s = spinner_mod.Spinner.start();
         while (self.waiting_active.load(.acquire)) {
             const frame = s.nextFrame();
-            const sec = s.elapsedSeconds();
+            var dur_buf: [32]u8 = undefined;
+            const dur_str = utils.formatDuration(&dur_buf, s.elapsedMs());
             var buf: [128]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, "\r\x1b[2K \x1b[36m{s}\x1b[0m \x1b[90mThinking ({d:.1}s)...\x1b[0m", .{
-                frame, sec,
+            const line = std.fmt.bufPrint(&buf, "\r\x1b[2K \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})...\x1b[0m", .{
+                frame, dur_str,
             }) catch break;
             term.writeStdout(line);
             std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(80), .awake) catch {};
@@ -131,7 +132,7 @@ pub const TurnRenderer = struct {
         self.think_snippet_len = 0;
         self.think_last_update_ms = 0;
 
-        term.writeStdout("\n \x1b[90m💭 Thinking...\x1b[0m");
+        term.writeStdout(" \x1b[90m💭 Thinking...\x1b[0m");
     }
 
     /// Stream một đoạn text trong khối Thinking (thu gọn trên 1 dòng duy nhất, cập nhật thời gian và snippet).
@@ -169,18 +170,19 @@ pub const TurnRenderer = struct {
         if (now - self.think_last_update_ms >= 40) {
             self.think_last_update_ms = now;
             const diff = if (now >= self.think_start_ms) now - self.think_start_ms else 0;
-            const sec = @as(f64, @floatFromInt(diff)) / 1000.0;
+            var dur_buf: [32]u8 = undefined;
+            const dur_str = utils.formatDuration(&dur_buf, @intCast(diff));
             const frame = self.spinner.nextFrame();
 
             const snippet = std.mem.trim(u8, self.think_snippet_buf[0..self.think_snippet_len], " ");
             var out_buf: [256]u8 = undefined;
             const line = if (snippet.len > 0)
-                std.fmt.bufPrint(&out_buf, "\r\x1b[2K \x1b[36m{s}\x1b[0m \x1b[90mThinking ({d:.1}s)...\x1b[0m \x1b[2;90m{s}\x1b[0m", .{
-                    frame, sec, snippet,
+                std.fmt.bufPrint(&out_buf, "\r\x1b[2K \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})...\x1b[0m \x1b[2;90m{s}\x1b[0m", .{
+                    frame, dur_str, snippet,
                 }) catch ""
             else
-                std.fmt.bufPrint(&out_buf, "\r\x1b[2K \x1b[36m{s}\x1b[0m \x1b[90mThinking ({d:.1}s)...\x1b[0m", .{
-                    frame, sec,
+                std.fmt.bufPrint(&out_buf, "\r\x1b[2K \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})...\x1b[0m", .{
+                    frame, dur_str,
                 }) catch "";
 
             if (line.len > 0) term.writeStdout(line);
@@ -193,10 +195,11 @@ pub const TurnRenderer = struct {
         self.is_thinking = false;
         const now = utils.milliTimestamp();
         const diff = if (now >= self.think_start_ms) now - self.think_start_ms else 0;
-        const sec = @as(f64, @floatFromInt(diff)) / 1000.0;
+        var dur_buf: [32]u8 = undefined;
+        const dur_str = utils.formatDuration(&dur_buf, @intCast(diff));
 
         var buf: [128]u8 = undefined;
-        const footer = std.fmt.bufPrint(&buf, "\r\x1b[2K \x1b[90m💭 Thought for {d:.1}s\x1b[0m\n", .{sec}) catch "\r\x1b[2K \x1b[90m💭 Thought\x1b[0m\n";
+        const footer = std.fmt.bufPrint(&buf, "\r\x1b[2K \x1b[90m💭 Thought for {s}\x1b[0m\n", .{dur_str}) catch "\r\x1b[2K \x1b[90m💭 Thought\x1b[0m\n";
         term.writeStdout(footer);
     }
 

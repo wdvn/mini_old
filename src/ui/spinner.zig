@@ -46,11 +46,12 @@ pub const Spinner = struct {
         _ = io;
         if (!term.isStdoutTty()) return;
         const frame = self.nextFrame();
-        const sec = self.elapsedSeconds();
+        var dur_buf: [32]u8 = undefined;
+        const dur_str = utils.formatDuration(&dur_buf, self.elapsedMs());
 
         var buf: [256]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "\r\x1b[2K\x1b[36m{s}\x1b[0m \x1b[90m{s} ({d:.1}s)...\x1b[0m", .{
-            frame, msg, sec,
+        const line = std.fmt.bufPrint(&buf, "\r\x1b[2K\x1b[36m{s}\x1b[0m \x1b[90m{s} ({s})...\x1b[0m", .{
+            frame, msg, dur_str,
         }) catch return;
 
         term.writeStdout(line);

@@ -50,9 +50,9 @@ pub const StreamHighlighter = struct {
                     const display_lang = if (lang.len > 0) lang else "code";
 
                     var header_buf: [256]u8 = undefined;
-                    const header = std.fmt.bufPrint(&header_buf, "\n  \x1b[90m{s}── \x1b[1;33m{s}\x1b[0m\x1b[90m ───────────────────────────────────────────────\x1b[0m\n", .{
+                    const header = std.fmt.bufPrint(&header_buf, "  \x1b[90m{s}── \x1b[1;33m{s}\x1b[0m\x1b[90m ───────────────────────────────────────────────\x1b[0m\n", .{
                         term.BOX_TOP_LEFT, display_lang,
-                    }) catch "\n  ╭── code ───────────────────────────────────────────────\n";
+                    }) catch "  ╭── code ───────────────────────────────────────────────\n";
                     term.writeStdout(header);
                     self.code_lang_len = 0;
                 } else {
@@ -226,9 +226,10 @@ pub const StreamHighlighter = struct {
         _ = io;
         if (self.in_code_block or self.in_code_header or self.in_closing_fence) {
             var footer_buf: [128]u8 = undefined;
-            const footer = std.fmt.bufPrint(&footer_buf, "\n  \x1b[90m{s}─────────────────────────────────────────────────────────────\x1b[0m\n", .{
-                term.BOX_BOT_LEFT,
-            }) catch "\n  ╰─────────────────────────────────────────────────────────────\n";
+            const prefix = if (self.at_line_start) "" else "\n";
+            const footer = std.fmt.bufPrint(&footer_buf, "{s}  \x1b[90m{s}─────────────────────────────────────────────────────────────\x1b[0m\n", .{
+                prefix, term.BOX_BOT_LEFT,
+            }) catch "  ╰─────────────────────────────────────────────────────────────\n";
             term.writeStdout(footer);
             self.in_code_block = false;
             self.in_code_header = false;
