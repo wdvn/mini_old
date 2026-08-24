@@ -208,9 +208,10 @@ pub const TurnRenderer = struct {
         }
 
         if (!self.has_printed_response_header) {
+            if (std.mem.trim(u8, text, " \r\n\t").len == 0) return;
             self.has_printed_response_header = true;
             var buf: [128]u8 = undefined;
-            const header = std.fmt.bufPrint(&buf, "\n \x1b[1;32m{s} mini-agent\x1b[0m\n\n", .{term.GLYPH_BOT}) catch "\n 💩 mini-agent\n\n";
+            const header = std.fmt.bufPrint(&buf, "\n \x1b[1;32m{s} mini-agent\x1b[0m\n", .{term.GLYPH_BOT}) catch "\n 💩 mini-agent\n";
             term.writeStdout(header);
         }
 
@@ -246,7 +247,7 @@ pub const TurnRenderer = struct {
         }
 
         var header_buf: [512]u8 = undefined;
-        const line = std.fmt.bufPrint(&header_buf, " \x1b[1;33m{s}\x1b[0m \x1b[1;37m{s}\x1b[0m {s}\n", .{
+        const line = std.fmt.bufPrint(&header_buf, "\n \x1b[1;33m{s}\x1b[0m \x1b[1;37m{s}\x1b[0m {s}\n", .{
             term.GLYPH_ACTION, name, detail,
         }) catch return;
 
@@ -265,13 +266,13 @@ pub const TurnRenderer = struct {
 
         var status_buf: [256]u8 = undefined;
         if (is_error) {
-            const status_line = std.fmt.bufPrint(&status_buf, "    \x1b[31m{s} Lỗi sau {d}ms:\x1b[0m {s}\n\n", .{
+            const status_line = std.fmt.bufPrint(&status_buf, "    \x1b[31m{s} Lỗi sau {d}ms:\x1b[0m {s}\n", .{
                 term.GLYPH_CROSS, duration_ms, if (result.len > 120) result[0..120] else result,
             }) catch return;
             term.writeStdout(status_line);
         } else {
             _ = name;
-            const status_line = std.fmt.bufPrint(&status_buf, "    \x1b[32m{s} Hoàn thành ({d}ms)\x1b[0m\n\n", .{
+            const status_line = std.fmt.bufPrint(&status_buf, "    \x1b[32m{s} Hoàn thành ({d}ms)\x1b[0m\n", .{
                 term.GLYPH_CHECK, duration_ms,
             }) catch return;
             term.writeStdout(status_line);
