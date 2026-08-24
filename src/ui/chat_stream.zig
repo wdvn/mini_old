@@ -7,6 +7,7 @@
 //! - Markdown & Code Highlighting khi stream
 //! - Telemetry Status Footer
 
+const builtin = @import("builtin");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const term = @import("terminal.zig");
@@ -43,6 +44,9 @@ pub const TurnRenderer = struct {
     think_tag_buf: [16]u8 = undefined,
     think_tag_len: usize = 0,
 
+    waiting_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    waiting_thread: ?std.Thread = null,
+
     pub fn init(alloc: Allocator, io: std.Io) TurnRenderer {
         return .{
             .alloc = alloc,
@@ -57,7 +61,13 @@ pub const TurnRenderer = struct {
             .has_printed_response_header = false,
             .in_think_tag = false,
             .think_tag_len = 0,
+            .waiting_active = std.atomic.Value(bool).init(false),
+            .waiting_thread = null,
         };
+    }
+
+    pub fn deinit(self: *TurnRenderer) void {
+        self.stopWaiting();
     }
 
     /// Bắt đầu một Turn mới từ input của User.
@@ -71,6 +81,46 @@ pub const TurnRenderer = struct {
         self.in_think_tag = false;
         self.think_tag_len = 0;
         self.highlighter = markdown_mod.StreamHighlighter.init();
+
+        // Bật ngay live spinner trong khi chờ backend phản hồi TTFT
+        self.startWaiting();
+    }
+
+    /// Bắt đầu spinner chờ phản hồi đầu tiên từ AI backend (TTFT).
+    pub fn startWaiting(self: *TurnRenderer) void {
+        if (self.waiting_active.load(.acquire)) return;
+        if (comptime builtin.is_test) return;
+        if (!term.isStdoutTty()) return;
+
+        self.waiting_active.store(true, .release);
+        self.waiting_thread = std.Thread.spawn(.{}, waitingLoop, .{self}) catch null;
+    }
+
+    fn waitingLoop(self: *TurnRenderer) void {
+        var s = spinner_mod.Spinner.start();
+        while (self.waiting_active.load(.acquire)) {
+            const frame = s.nextFrame();
+            const sec = s.elapsedSeconds();
+            var buf: [128]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, "\r\x1b[2K \x1b[36m{s}\x1b[0m \x1b[90mThinking ({d:.1}s)...\x1b[0m", .{
+                frame, sec,
+            }) catch break;
+            term.writeStdout(line);
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(80), .awake) catch {};
+        }
+    }
+
+    /// Dừng spinner chờ phản hồi và dọn dẹp dòng hiển thị.
+    pub fn stopWaiting(self: *TurnRenderer) void {
+        if (!self.waiting_active.load(.acquire)) return;
+        self.waiting_active.store(false, .release);
+        if (self.waiting_thread) |th| {
+            th.join();
+            self.waiting_thread = null;
+        }
+        if (term.isStdoutTty()) {
+            term.writeStdout("\r\x1b[2K");
+        }
     }
 
     /// Bắt đầu khối Reasoning / Thinking.
@@ -86,6 +136,7 @@ pub const TurnRenderer = struct {
 
     /// Stream một đoạn text trong khối Thinking (thu gọn trên 1 dòng duy nhất, cập nhật thời gian và snippet).
     pub fn streamThinking(self: *TurnRenderer, text: []const u8) void {
+        self.stopWaiting();
         if (!self.is_thinking) {
             self.startThinking();
         }
@@ -151,6 +202,7 @@ pub const TurnRenderer = struct {
 
     /// Stream câu trả lời của AI ra stdout với Markdown & Code highlighting.
     pub fn streamResponse(self: *TurnRenderer, text: []const u8) void {
+        self.stopWaiting();
         if (self.is_thinking) {
             self.endThinking();
         }
@@ -167,6 +219,7 @@ pub const TurnRenderer = struct {
 
     /// Bắt đầu thực thi một Tool Action.
     pub fn startTool(self: *TurnRenderer, name: []const u8, input_json: []const u8) void {
+        self.stopWaiting();
         if (self.is_thinking) {
             self.endThinking();
         }
@@ -292,6 +345,7 @@ pub const TurnRenderer = struct {
 
     /// Hoàn thành toàn bộ Turn và in Telemetry Status Footer.
     pub fn finishTurn(self: *TurnRenderer, stats: TurnStats) void {
+        self.stopWaiting();
         if (self.is_thinking) {
             self.endThinking();
         }

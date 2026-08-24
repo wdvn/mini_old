@@ -222,6 +222,7 @@ pub fn main(init: std.process.Init) !void {
         defer alloc.free(expanded);
 
         var renderer = ui_repl.chat_stream.TurnRenderer.init(alloc, init.io);
+        defer renderer.deinit();
         ui_repl.current_renderer = &renderer;
         defer ui_repl.current_renderer = null;
 

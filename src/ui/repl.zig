@@ -49,6 +49,7 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
 
         // Khởi tạo TurnRenderer cho lượt chat này
         var renderer = chat_stream.TurnRenderer.init(alloc, io);
+        defer renderer.deinit();
         current_renderer = &renderer;
         defer current_renderer = null;
 
