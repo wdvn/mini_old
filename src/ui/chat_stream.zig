@@ -79,9 +79,9 @@ pub const TurnRenderer = struct {
         }
 
         var bot_buf: [128]u8 = undefined;
-        const bot_line = std.fmt.bufPrint(&bot_buf, "\x1b[90m{s}────────────────────────────────────────────────────────────────────\x1b[0m\n\n", .{
+        const bot_line = std.fmt.bufPrint(&bot_buf, "\x1b[90m{s}────────────────────────────────────────────────────────────────────\x1b[0m\n", .{
             term.BOX_BOT_LEFT,
-        }) catch "╰────────────────────────────────────────────────────────────────────\n\n";
+        }) catch "╰────────────────────────────────────────────────────────────────────\n";
         term.writeStdout(bot_line);
     }
 
@@ -92,9 +92,9 @@ pub const TurnRenderer = struct {
         self.think_start_ms = utils.milliTimestamp();
 
         var buf: [128]u8 = undefined;
-        const header = std.fmt.bufPrint(&buf, " \x1b[90m{s} \x1b[1;90mThinking...\x1b[0m\n", .{
+        const header = std.fmt.bufPrint(&buf, "\n \x1b[90m{s} \x1b[1;90mThinking...\x1b[0m\n", .{
             term.GLYPH_THINK,
-        }) catch " 💭 Thinking...\n";
+        }) catch "\n 💭 Thinking...\n";
         term.writeStdout(header);
     }
 
@@ -117,7 +117,7 @@ pub const TurnRenderer = struct {
         const sec = @as(f64, @floatFromInt(diff)) / 1000.0;
 
         var buf: [128]u8 = undefined;
-        const footer = std.fmt.bufPrint(&buf, "\n \x1b[90m└─ Thought for {d:.1}s\x1b[0m\n\n", .{sec}) catch "\n └─ Thought\n\n";
+        const footer = std.fmt.bufPrint(&buf, "\n \x1b[90m└─ Thought for {d:.1}s\x1b[0m\n", .{sec}) catch "\n └─ Thought\n";
         term.writeStdout(footer);
     }
 
@@ -130,7 +130,7 @@ pub const TurnRenderer = struct {
         if (!self.has_printed_response_header) {
             self.has_printed_response_header = true;
             var buf: [128]u8 = undefined;
-            const header = std.fmt.bufPrint(&buf, " \x1b[1;32m{s} mini-agent\x1b[0m\n", .{term.GLYPH_BOT}) catch " 🤖 mini-agent\n";
+            const header = std.fmt.bufPrint(&buf, "\n \x1b[1;32m{s} mini-agent\x1b[0m\n\n", .{term.GLYPH_BOT}) catch "\n 🤖 mini-agent\n\n";
             term.writeStdout(header);
         }
 

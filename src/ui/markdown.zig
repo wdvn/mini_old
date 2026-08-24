@@ -13,19 +13,17 @@ pub const State = enum {
     normal,
     inline_code,
     bold,
-    code_block,
 };
 
 pub const StreamHighlighter = struct {
     state: State = .normal,
     in_code_block: bool = false,
+    in_code_header: bool = false,
+    in_closing_fence: bool = false,
+    fence_backtick_count: usize = 0,
     at_line_start: bool = true,
     code_lang_buf: [32]u8 = undefined,
     code_lang_len: usize = 0,
-    line_buf: [1024]u8 = undefined,
-    line_len: usize = 0,
-    carry_buf: [16]u8 = undefined,
-    carry_len: usize = 0,
 
     pub fn init() StreamHighlighter {
         return .{};
@@ -39,38 +37,89 @@ pub const StreamHighlighter = struct {
         while (i < chunk.len) {
             const c = chunk[i];
 
-            if (self.in_code_block) {
-                // Kiểm tra xem có đóng code block ``` không
-                if (self.at_line_start and i + 2 < chunk.len and chunk[i] == '`' and chunk[i + 1] == '`' and chunk[i + 2] == '`') {
-                    self.in_code_block = false;
-                    self.state = .normal;
-                    i += 3;
-                    // Bỏ qua phần còn lại của dòng đóng ```
-                    while (i < chunk.len and chunk[i] != '\n') : (i += 1) {}
-                    if (i < chunk.len and chunk[i] == '\n') i += 1;
+            // 1. Đang đọc dòng mở code block (ví dụ: ```js\n)
+            if (self.in_code_header) {
+                if (c == '\n') {
+                    self.in_code_header = false;
+                    self.in_code_block = true;
                     self.at_line_start = true;
+                    self.fence_backtick_count = 0;
+
+                    const raw_lang = if (self.code_lang_len > 0) self.code_lang_buf[0..self.code_lang_len] else "code";
+                    const lang = std.mem.trim(u8, raw_lang, " \t\r");
+                    const display_lang = if (lang.len > 0) lang else "code";
+
+                    var header_buf: [256]u8 = undefined;
+                    const header = std.fmt.bufPrint(&header_buf, "\n  \x1b[90m{s}── \x1b[1;33m{s}\x1b[0m\x1b[90m ───────────────────────────────────────────────\x1b[0m\n", .{
+                        term.BOX_TOP_LEFT, display_lang,
+                    }) catch "\n  ╭── code ───────────────────────────────────────────────\n";
+                    term.writeStdout(header);
+                    self.code_lang_len = 0;
+                } else {
+                    if (self.code_lang_len < self.code_lang_buf.len and c != '\r') {
+                        self.code_lang_buf[self.code_lang_len] = c;
+                        self.code_lang_len += 1;
+                    }
+                }
+                i += 1;
+                continue;
+            }
+
+            // 2. Đang đọc dòng đóng code block (bỏ qua các ký tự còn lại của dòng ``` cho tới \n)
+            if (self.in_closing_fence) {
+                if (c == '\n') {
+                    self.in_closing_fence = false;
+                    self.in_code_block = false;
+                    self.at_line_start = true;
+                    self.fence_backtick_count = 0;
 
                     var footer_buf: [128]u8 = undefined;
                     const footer = std.fmt.bufPrint(&footer_buf, "  \x1b[90m{s}─────────────────────────────────────────────────────────────\x1b[0m\n", .{
                         term.BOX_BOT_LEFT,
                     }) catch "  ╰─────────────────────────────────────────────────────────────\n";
                     term.writeStdout(footer);
-                    continue;
                 }
+                i += 1;
+                continue;
+            }
 
+            // 3. Đang trong Code Block
+            if (self.in_code_block) {
                 if (self.at_line_start) {
-                    var border_buf: [32]u8 = undefined;
-                    const border = std.fmt.bufPrint(&border_buf, "  \x1b[90m{s}\x1b[0m ", .{term.BOX_VERT}) catch "  │ ";
-                    term.writeStdout(border);
-                    self.at_line_start = false;
+                    if (c == '`') {
+                        self.fence_backtick_count += 1;
+                        if (self.fence_backtick_count == 3) {
+                            self.in_closing_fence = true;
+                            self.fence_backtick_count = 0;
+                        }
+                        i += 1;
+                        continue;
+                    }
+
+                    if (self.fence_backtick_count > 0) {
+                        var border_buf: [32]u8 = undefined;
+                        const border = std.fmt.bufPrint(&border_buf, "  \x1b[90m{s}\x1b[0m ", .{term.BOX_VERT}) catch "  │ ";
+                        term.writeStdout(border);
+                        var k: usize = 0;
+                        while (k < self.fence_backtick_count) : (k += 1) {
+                            term.writeStdout("`");
+                        }
+                        self.fence_backtick_count = 0;
+                        self.at_line_start = false;
+                    } else {
+                        var border_buf: [32]u8 = undefined;
+                        const border = std.fmt.bufPrint(&border_buf, "  \x1b[90m{s}\x1b[0m ", .{term.BOX_VERT}) catch "  │ ";
+                        term.writeStdout(border);
+                        self.at_line_start = false;
+                    }
                 }
 
                 if (c == '\n') {
                     term.writeStdout("\n");
                     self.at_line_start = true;
+                    self.fence_backtick_count = 0;
                     i += 1;
                 } else {
-                    // Highlight từ khóa và chuỗi ký tự cơ bản trong code block
                     const remaining = chunk[i..];
                     if (scanAndPrintCodeToken(remaining)) |consumed| {
                         i += consumed;
@@ -82,31 +131,48 @@ pub const StreamHighlighter = struct {
                 continue;
             }
 
-            // Kiểm tra mở code block ```
-            if (self.at_line_start and i + 2 < chunk.len and chunk[i] == '`' and chunk[i + 1] == '`' and chunk[i + 2] == '`') {
-                self.in_code_block = true;
-                self.state = .code_block;
-                i += 3;
+            // 4. Ngoài Code Block (Văn bản thông thường)
+            if (self.at_line_start) {
+                if (c == '`') {
+                    self.fence_backtick_count += 1;
+                    if (self.fence_backtick_count == 3) {
+                        self.in_code_header = true;
+                        self.code_lang_len = 0;
+                        self.fence_backtick_count = 0;
+                    }
+                    i += 1;
+                    continue;
+                }
 
-                // Đọc language tag (ví dụ: ```zig)
-                self.code_lang_len = 0;
-                while (i < chunk.len and chunk[i] != '\n' and chunk[i] != ' ' and chunk[i] != '\r') : (i += 1) {
-                    if (self.code_lang_len < self.code_lang_buf.len) {
-                        self.code_lang_buf[self.code_lang_len] = chunk[i];
-                        self.code_lang_len += 1;
+                if (self.fence_backtick_count > 0) {
+                    var k: usize = 0;
+                    while (k < self.fence_backtick_count) : (k += 1) {
+                        if (self.state == .inline_code) {
+                            term.writeStdout("\x1b[0m");
+                            self.state = .normal;
+                        } else {
+                            term.writeStdout("\x1b[48;5;236m\x1b[33m");
+                            self.state = .inline_code;
+                        }
+                    }
+                    self.fence_backtick_count = 0;
+                }
+
+                // Xử lý Headers (#, ##, ###) ở đầu dòng
+                if (c == '#') {
+                    var h_count: usize = 0;
+                    var h_idx = i;
+                    while (h_idx < chunk.len and chunk[h_idx] == '#') : (h_idx += 1) {
+                        h_count += 1;
+                    }
+                    if (h_idx < chunk.len and chunk[h_idx] == ' ') {
+                        term.writeStdout("\x1b[1;36m");
+                        term.writeStdout(chunk[i .. h_idx + 1]);
+                        i = h_idx + 1;
+                        self.at_line_start = false;
+                        continue;
                     }
                 }
-                while (i < chunk.len and chunk[i] != '\n') : (i += 1) {}
-                if (i < chunk.len and chunk[i] == '\n') i += 1;
-
-                const lang = if (self.code_lang_len > 0) self.code_lang_buf[0..self.code_lang_len] else "code";
-                var header_buf: [256]u8 = undefined;
-                const header = std.fmt.bufPrint(&header_buf, "\n  \x1b[90m{s}── \x1b[1;33m{s}\x1b[0m\x1b[90m ───────────────────────────────────────────────\x1b[0m\n", .{
-                    term.BOX_TOP_LEFT, lang,
-                }) catch "\n  ╭── code ───────────────────────────────────────────────\n";
-                term.writeStdout(header);
-                self.at_line_start = true;
-                continue;
             }
 
             // Xử lý Inline Code `...`
@@ -119,6 +185,7 @@ pub const StreamHighlighter = struct {
                     self.state = .inline_code;
                 }
                 i += 1;
+                self.at_line_start = false;
                 continue;
             }
 
@@ -132,31 +199,17 @@ pub const StreamHighlighter = struct {
                     self.state = .bold;
                 }
                 i += 2;
+                self.at_line_start = false;
                 continue;
             }
 
-            // Xử lý Headers (#, ##, ###) ở đầu dòng
-            if (self.at_line_start and c == '#') {
-                var h_count: usize = 0;
-                var h_idx = i;
-                while (h_idx < chunk.len and chunk[h_idx] == '#') : (h_idx += 1) {
-                    h_count += 1;
-                }
-                if (h_idx < chunk.len and chunk[h_idx] == ' ') {
-                    term.writeStdout("\x1b[1;36m");
-                    term.writeStdout(chunk[i .. h_idx + 1]);
-                    i = h_idx + 1;
-                    self.at_line_start = false;
-                    continue;
-                }
-            }
-
             if (c == '\n') {
-                if (self.state != .normal and self.state != .code_block) {
+                if (self.state != .normal) {
                     term.writeStdout("\x1b[0m");
                     self.state = .normal;
                 }
                 self.at_line_start = true;
+                self.fence_backtick_count = 0;
                 term.writeStdout("\n");
                 i += 1;
                 continue;
@@ -171,17 +224,20 @@ pub const StreamHighlighter = struct {
     /// Hoàn tất stream, dọn dẹp state và reset màu.
     pub fn flush(self: *StreamHighlighter, io: std.Io) void {
         _ = io;
-        if (self.in_code_block) {
+        if (self.in_code_block or self.in_code_header or self.in_closing_fence) {
             var footer_buf: [128]u8 = undefined;
             const footer = std.fmt.bufPrint(&footer_buf, "\n  \x1b[90m{s}─────────────────────────────────────────────────────────────\x1b[0m\n", .{
                 term.BOX_BOT_LEFT,
             }) catch "\n  ╰─────────────────────────────────────────────────────────────\n";
             term.writeStdout(footer);
             self.in_code_block = false;
+            self.in_code_header = false;
+            self.in_closing_fence = false;
         }
         term.writeStdout("\x1b[0m");
         self.state = .normal;
         self.at_line_start = true;
+        self.fence_backtick_count = 0;
     }
 };
 
@@ -242,4 +298,18 @@ fn scanAndPrintCodeToken(text: []const u8) ?usize {
 test "StreamHighlighter handles basic markdown" {
     const hl = StreamHighlighter.init();
     try std.testing.expectEqual(State.normal, hl.state);
+}
+
+test "StreamHighlighter handles chunked code fences" {
+    var hl = StreamHighlighter.init();
+    hl.processChunk(undefined, "```");
+    try std.testing.expect(hl.in_code_header);
+    hl.processChunk(undefined, "js\n");
+    try std.testing.expect(hl.in_code_block);
+    hl.processChunk(undefined, "console.log('hi');\n");
+    try std.testing.expect(hl.in_code_block);
+    hl.processChunk(undefined, "```\n");
+    try std.testing.expect(!hl.in_code_block);
+    hl.processChunk(undefined, "Xin chào!");
+    try std.testing.expect(!hl.in_code_block);
 }

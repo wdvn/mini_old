@@ -243,16 +243,14 @@ pub const AgentLoop = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !StepResult {
-        if (act_id > 1) {
-            main.stderrPrint("\x1b[90m[agent] --- Vòng lặp {d} ---\x1b[0m\n", .{act_id});
-        } else {
-            main.stderrPrint("\n\x1b[90m[agent] --- Bắt đầu quy trình ---\x1b[0m\n", .{});
+        if (main.ui_repl.current_renderer == null) {
+            if (act_id > 1) {
+                main.stderrPrint("\x1b[90m[agent] --- Vòng lặp {d} ---\x1b[0m\n", .{act_id});
+            } else {
+                main.stderrPrint("\n\x1b[90m[agent] --- Bắt đầu quy trình ---\x1b[0m\n", .{});
+            }
+            main.stderrPrint("\x1b[36m[agent]\x1b[0m \x1b[93mĐang suy nghĩ / Phân tích yêu cầu... \x1b[0m\n", .{});
         }
-
-        main.stderrPrint("\x1b[36m[agent]\x1b[0m \x1b[93mĐang suy nghĩ / Phân tích yêu cầu... \x1b[0m\n", .{});
-
-        // Gửi lên AI backend (streaming) — không tự ý nén ngữ cảnh trước khi model thực sự báo quá tải
-
 
         // Gửi lên AI backend (streaming)
         var response = try self.sendToBackend(
@@ -268,7 +266,9 @@ pub const AgentLoop = struct {
         defer response.deinit();
 
         // Xuống dòng sau khi stream xong
-        try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
+        if (main.ui_repl.current_renderer == null) {
+            try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
+        }
 
         // Thêm response vào history (nếu có nội dung)
         _ = try self.history.addAssistantResponse(&response);
