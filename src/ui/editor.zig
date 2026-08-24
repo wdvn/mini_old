@@ -3,7 +3,7 @@
 //! Đáp ứng các issue editor:
 //!   - Buffer động `ArrayListUnmanaged(u8)` (input limit 64KB, reject thay vì truncate)
 //!   - UTF-8 aware qua `unicode.zig`: cursor move theo grapheme cluster,
-//!     redraw theo displayWidth (gõ tiếng Việt / emoji không lệch cursor)
+//!     redraw theo displayWidth và multiline wrapping (gõ tiếng Việt / emoji / paste dài không lặp prompt)
 //!   - Word motion: Alt+B/F di chuyển theo từ, Alt+D / Alt+Backspace xóa từ
 //!   - Undo/Redo: Ctrl+Z / Ctrl+Y (ring 16 snapshot, cap 4KB/snapshot)
 //!   - Kill ring: Ctrl+W cut từ trái, Ctrl+K cut tới cuối dòng, Ctrl+Y yank (ring 5)
@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 const unicode = @import("unicode.zig");
 const history_mod = @import("history.zig");
 const paste_mod = @import("paste.zig");
+const term = @import("terminal.zig");
 
 /// Input limit (byte). Vượt → hiện lỗi, không nhận thêm.
 pub const MAX_INPUT_BYTES = 64 * 1024;
@@ -38,6 +39,10 @@ pub const LineEditor = struct {
     buf: std.ArrayListUnmanaged(u8),
     /// Vị trí cursor (byte offset, luôn đứng ở biên grapheme).
     pos: usize,
+
+    // --- Multiline / Wrapping redraw tracking ---
+    rendered_rows: usize,
+    cursor_row: usize,
 
     // --- Undo/Redo ---
     undo_stack: [UNDO_DEPTH][]u8,
@@ -63,6 +68,8 @@ pub const LineEditor = struct {
     pasting: bool,
     /// Đã push undo cho đợt paste hiện tại (1 undo cho cả đợt).
     paste_undo_pushed: bool,
+    /// Buffer tích luỹ nội dung paste trước khi flush vào buffer chính.
+    paste_buf: std.ArrayListUnmanaged(u8),
     /// Test-only: bỏ qua ghi stdout trong redraw (không có std.Io hợp lệ).
     suppress_redraw: bool,
 
@@ -74,6 +81,8 @@ pub const LineEditor = struct {
             .draft = .empty,
             .buf = .empty,
             .pos = 0,
+            .rendered_rows = 0,
+            .cursor_row = 0,
             .undo_stack = undefined,
             .undo_pos_stack = undefined,
             .undo_len = 0,
@@ -89,6 +98,7 @@ pub const LineEditor = struct {
             .paste_parser = paste_mod.Parser.init(),
             .pasting = false,
             .paste_undo_pushed = false,
+            .paste_buf = .empty,
             .suppress_redraw = false,
         };
     }
@@ -97,6 +107,7 @@ pub const LineEditor = struct {
         self.prompt_history.deinit();
         self.draft.deinit(self.alloc);
         self.buf.deinit(self.alloc);
+        self.paste_buf.deinit(self.alloc);
         for (self.undo_stack[0..self.undo_len]) |s| self.alloc.free(s);
         for (self.redo_stack[0..self.redo_len]) |s| self.alloc.free(s);
         for (self.kill_ring[0..self.kill_len]) |s| self.alloc.free(s);
@@ -372,26 +383,53 @@ pub const LineEditor = struct {
     }
 
     // -----------------------------------------------------------------------
-    // Render
+    // Render (Multiline Wrapping Aware)
     // -----------------------------------------------------------------------
 
     fn redraw(self: *LineEditor, io: std.Io, prompt: []const u8) void {
         if (self.suppress_redraw) return;
-        var out_buf: [4096]u8 = undefined;
+        var out_buf: [8192]u8 = undefined;
         var w = std.Io.Writer.fixed(&out_buf);
 
-        w.writeAll("\x1b[2K\r") catch return;
-        if (self.limit_msg) {
-            w.writeAll("\x1b[33m[input limit 64KB — từ chối]\x1b[0m\r\n\x1b[2K\r") catch return;
+        // 1. Lùi cursor về dòng đầu tiên của prompt nếu lần render trước bị wrap xuống các dòng dưới
+        if (self.cursor_row > 0) {
+            w.print("\x1b[{d}A", .{self.cursor_row}) catch return;
         }
+        // 2. Về đầu dòng và xóa toàn bộ vùng hiển thị từ cursor xuống dưới màn hình
+        w.writeAll("\r\x1b[J") catch return;
+
+        if (self.limit_msg) {
+            w.writeAll("\x1b[33m[input limit 64KB — từ chối]\x1b[0m\r\n\x1b[J") catch return;
+        }
+
+        // 3. In prompt và buffer
         w.writeAll(prompt) catch return;
         w.writeAll(self.buf.items) catch return;
 
-        // Di chuyển cursor về đúng vị trí theo displayWidth.
-        const after_width = unicode.displayWidth(self.buf.items[self.pos..]);
-        if (after_width > 0) {
-            w.print("\x1b[{d}D", .{after_width}) catch return;
+        // 4. Tính toán độ rộng terminal và vị trí cursor thực tế
+        const term_size = term.getTerminalSize();
+        const cols: usize = if (term_size.cols > 0) term_size.cols else 80;
+
+        const prompt_w = unicode.visibleWidth(prompt);
+        const buf_w = unicode.displayWidth(self.buf.items);
+        const total_w = prompt_w + buf_w;
+        const total_rows = total_w / cols;
+
+        const cursor_offset = prompt_w + unicode.displayWidth(self.buf.items[0..self.pos]);
+        const new_cursor_row = cursor_offset / cols;
+        const new_cursor_col = cursor_offset % cols;
+
+        // 5. Di chuyển con trỏ terminal về đúng vị trí (new_cursor_row, new_cursor_col)
+        if (total_rows > new_cursor_row) {
+            w.print("\x1b[{d}A", .{total_rows - new_cursor_row}) catch return;
         }
+        w.writeAll("\r") catch return;
+        if (new_cursor_col > 0) {
+            w.print("\x1b[{d}C", .{new_cursor_col}) catch return;
+        }
+
+        self.rendered_rows = total_rows;
+        self.cursor_row = new_cursor_row;
 
         const stdout_file = std.Io.File.stdout();
         stdout_file.writeStreamingAll(io, out_buf[0..w.end]) catch {};
@@ -431,6 +469,8 @@ pub const LineEditor = struct {
 
         self.buf.clearRetainingCapacity();
         self.pos = 0;
+        self.rendered_rows = 0;
+        self.cursor_row = 0;
         self.limit_msg = false;
         self.history_index = self.prompt_history.entries.items.len;
         self.draft.clearRetainingCapacity();
@@ -438,154 +478,233 @@ pub const LineEditor = struct {
         self.redraw(io, prompt);
 
         while (true) {
-            var char_buf: [1]u8 = undefined;
-            const n = try stdin_file.readStreaming(io, &.{&char_buf});
+            var read_buf: [1024]u8 = undefined;
+            const n = try stdin_file.readStreaming(io, &.{&read_buf});
             if (n == 0) return null;
-            const c = char_buf[0];
 
-            // Đang trong paste mode: mọi byte đi qua paste parser cho tới khi
-            // gặp END marker hoặc idle-timeout (terminal không gửi marker).
+            // Đang trong paste mode: đưa toàn bộ chunk vào paste parser
             if (self.pasting) {
-                self.pasteFeed(io, stdin_file, prompt, c);
+                self.pasteFeed(io, prompt, read_buf[0..n]);
+                if (self.pasting and self.pasteIdleTimedOut(io, stdin_file)) {
+                    self.endPaste(io, prompt);
+                }
                 continue;
             }
 
-            switch (c) {
-                3, 4 => return null, // Ctrl+C / Ctrl+D
-                13, 10 => { // Enter → submit
-                    stdout_file.writeStreamingAll(io, "\r\n") catch {};
-                    return try self.alloc.dupe(u8, self.buf.items);
-                },                12 => { // Ctrl+L redraw
-                    stdout_file.writeStreamingAll(io, "\x1b[2J\x1b[H") catch {};
-                    self.redraw(io, prompt);
-                },
-                127, 8 => { // Backspace (grapheme)
-                    if (self.pos > 0) {
-                        self.pushUndo();
-                        const start = self.pos - self.clusterLenBefore(self.pos);
-                        if (self.deleteRange(start, self.pos)) |rem| self.alloc.free(rem);
-                        self.redraw(io, prompt);
-                    }
-                },
-                1 => { // Ctrl+A
-                    self.pos = 0;
-                    self.redraw(io, prompt);
-                },
-                5 => { // Ctrl+E
-                    self.pos = self.buf.items.len;
-                    self.redraw(io, prompt);
-                },
-                21 => { // Ctrl+U — xóa tới đầu dòng
-                    if (self.pos > 0) {
-                        self.pushUndo();
-                        if (self.deleteRange(0, self.pos)) |rem| self.alloc.free(rem);
-                        self.redraw(io, prompt);
-                    }
-                },
-                23 => { // Ctrl+W — kill word trái
-                    const start = self.wordLeft();
-                    if (start < self.pos) {
-                        self.pushUndo();
-                        if (self.deleteRange(start, self.pos)) |rem| {
-                            self.killPush(rem);
-                            self.alloc.free(rem);
+            var i: usize = 0;
+            while (i < n) {
+                const c = read_buf[i];
+                switch (c) {
+                    3, 4 => return null, // Ctrl+C / Ctrl+D
+                    13, 10 => { // Enter → submit
+                        if (self.rendered_rows > self.cursor_row) {
+                            var move_down_buf: [32]u8 = undefined;
+                            const seq = std.fmt.bufPrint(&move_down_buf, "\x1b[{d}B", .{self.rendered_rows - self.cursor_row}) catch "";
+                            stdout_file.writeStreamingAll(io, seq) catch {};
                         }
+                        stdout_file.writeStreamingAll(io, "\r\n") catch {};
+                        return try self.alloc.dupe(u8, self.buf.items);
+                    },
+                    12 => { // Ctrl+L redraw
+                        stdout_file.writeStreamingAll(io, "\x1b[2J\x1b[H") catch {};
+                        self.cursor_row = 0;
+                        self.rendered_rows = 0;
                         self.redraw(io, prompt);
-                    }
-                },
-                11 => { // Ctrl+K — kill tới cuối dòng
-                    if (self.pos < self.buf.items.len) {
-                        self.pushUndo();
-                        if (self.deleteRange(self.pos, self.buf.items.len)) |rem| {
-                            self.killPush(rem);
-                            self.alloc.free(rem);
-                        }
-                        self.redraw(io, prompt);
-                    }
-                },
-                25 => { // Ctrl+Y — yank kill ring
-                    if (self.killTop()) |text| {
-                        self.pushUndo();
-                        if (self.insertBytes(text)) {
+                        i += 1;
+                    },
+                    127, 8 => { // Backspace (grapheme)
+                        if (self.pos > 0) {
+                            self.pushUndo();
+                            const start = self.pos - self.clusterLenBefore(self.pos);
+                            if (self.deleteRange(start, self.pos)) |rem| self.alloc.free(rem);
                             self.redraw(io, prompt);
                         }
-                    }
-                },
-                26 => { // Ctrl+Z — undo
-                    if (self.applyUndo()) self.redraw(io, prompt);
-                },
-                19 => { // Ctrl+S thường bị terminal bắt — không dùng. Ctrl+Y đã là redo chuẩn readline? Không: Ctrl+_ (31) là readline undo. Thêm:
-                    self.redraw(io, prompt);
-                },
-                31 => { // Ctrl+_ — redo (alias Ctrl+Y)
-                    if (self.applyRedo()) self.redraw(io, prompt);
-                },
-                27 => { // ESC — escape sequence
-                    self.handleEscape(io, stdin_file, prompt);
-                },
-                else => {
-                    if (char_buf[0] >= 32) {
-                        // UTF-8 continuation bytes có thể đến sau — đọc nốt multibyte.
-                        const seq_len = unicode.utf8Len(char_buf[0]);
-                        var bytes: [4]u8 = undefined;
-                        bytes[0] = char_buf[0];
-                        var got: usize = 1;
-                        while (got < seq_len) : (got += 1) {
-                            var b: [1]u8 = undefined;
-                            const rn = stdin_file.readStreaming(io, &.{&b}) catch 0;
-                            if (rn == 0) break;
-                            bytes[got] = b[0];
-                        }
-                        self.pushUndo();
-                        if (self.insertBytes(bytes[0..got])) {
+                        i += 1;
+                    },
+                    1 => { // Ctrl+A
+                        self.pos = 0;
+                        self.redraw(io, prompt);
+                        i += 1;
+                    },
+                    5 => { // Ctrl+E
+                        self.pos = self.buf.items.len;
+                        self.redraw(io, prompt);
+                        i += 1;
+                    },
+                    21 => { // Ctrl+U — xóa tới đầu dòng
+                        if (self.pos > 0) {
+                            self.pushUndo();
+                            if (self.deleteRange(0, self.pos)) |rem| self.alloc.free(rem);
                             self.redraw(io, prompt);
+                        }
+                        i += 1;
+                    },
+                    23 => { // Ctrl+W — kill word trái
+                        const start = self.wordLeft();
+                        if (start < self.pos) {
+                            self.pushUndo();
+                            if (self.deleteRange(start, self.pos)) |rem| {
+                                self.killPush(rem);
+                                self.alloc.free(rem);
+                            }
+                            self.redraw(io, prompt);
+                        }
+                        i += 1;
+                    },
+                    11 => { // Ctrl+K — kill tới cuối dòng
+                        if (self.pos < self.buf.items.len) {
+                            self.pushUndo();
+                            if (self.deleteRange(self.pos, self.buf.items.len)) |rem| {
+                                self.killPush(rem);
+                                self.alloc.free(rem);
+                            }
+                            self.redraw(io, prompt);
+                        }
+                        i += 1;
+                    },
+                    25 => { // Ctrl+Y — yank kill ring
+                        if (self.killTop()) |text| {
+                            self.pushUndo();
+                            if (self.insertBytes(text)) {
+                                self.redraw(io, prompt);
+                            }
+                        }
+                        i += 1;
+                    },
+                    26 => { // Ctrl+Z — undo
+                        if (self.applyUndo()) self.redraw(io, prompt);
+                        i += 1;
+                    },
+                    19 => {
+                        self.redraw(io, prompt);
+                        i += 1;
+                    },
+                    31 => { // Ctrl+_ — redo (alias Ctrl+Y)
+                        if (self.applyRedo()) self.redraw(io, prompt);
+                        i += 1;
+                    },
+                    27 => { // ESC — escape sequence
+                        const consumed = self.handleEscapeSlice(io, stdin_file, prompt, read_buf[i..n]);
+                        i += consumed;
+                    },
+                    else => {
+                        if (c >= 32) {
+                            var end = i + 1;
+                            while (end < n and read_buf[end] >= 32 and read_buf[end] != 127) : (end += 1) {}
+
+                            if (end - i == 1) {
+                                const seq_len = unicode.utf8Len(c);
+                                var bytes: [4]u8 = undefined;
+                                bytes[0] = c;
+                                var got: usize = 1;
+                                while (got < seq_len) : (got += 1) {
+                                    var b: [1]u8 = undefined;
+                                    const rn = stdin_file.readStreaming(io, &.{&b}) catch 0;
+                                    if (rn == 0) break;
+                                    bytes[got] = b[0];
+                                }
+                                self.pushUndo();
+                                if (self.insertBytes(bytes[0..got])) {
+                                    self.redraw(io, prompt);
+                                } else {
+                                    if (self.popUndo()) |entry| self.alloc.free(entry.snap);
+                                    self.redraw(io, prompt);
+                                }
+                                i += 1;
+                            } else {
+                                // Batch insert cho text nhanh / dán ngoài paste mode
+                                self.pushUndo();
+                                if (self.insertBytes(read_buf[i..end])) {
+                                    self.redraw(io, prompt);
+                                } else {
+                                    if (self.popUndo()) |entry| self.alloc.free(entry.snap);
+                                    self.redraw(io, prompt);
+                                }
+                                i = end;
+                            }
                         } else {
-                            // insert bị reject (limit) — hoàn tác undo snapshot vừa push.
-                            if (self.popUndo()) |entry| self.alloc.free(entry.snap);
-                            self.redraw(io, prompt);
+                            i += 1;
                         }
-                    }
-                },
+                    },
+                }
             }
         }
     }
 
     /// Xử lý escape sequence: mũi tên, Alt+key, Home/End, Delete, bracketed paste.
-    fn handleEscape(self: *LineEditor, io: std.Io, stdin_file: std.Io.File, prompt: []const u8) void {
-        var seq: [2]u8 = undefined;
-        if ((stdin_file.readStreaming(io, &.{seq[0..1]}) catch 0) == 0) return;
-        if ((stdin_file.readStreaming(io, &.{seq[1..2]}) catch 0) == 0) return;
+    fn handleEscapeSlice(self: *LineEditor, io: std.Io, stdin_file: std.Io.File, prompt: []const u8, slice: []const u8) usize {
+        var seq_buf: [8]u8 = undefined;
+        var seq_len: usize = 0;
 
-        if (seq[0] == '[') {
-            switch (seq[1]) {
+        const copy_len = @min(slice.len, seq_buf.len);
+        @memcpy(seq_buf[0..copy_len], slice[0..copy_len]);
+        seq_len = copy_len;
+
+        if (seq_len < 3) {
+            while (seq_len < 3) {
+                var b: [1]u8 = undefined;
+                if ((stdin_file.readStreaming(io, &.{&b}) catch 0) == 0) break;
+                seq_buf[seq_len] = b[0];
+                seq_len += 1;
+            }
+        }
+
+        if (seq_len >= 3 and seq_buf[0] == 0x1b and seq_buf[1] == '[') {
+            switch (seq_buf[2]) {
                 'A' => { // ↑ history
                     self.loadHistoryEntry(-1);
                     self.redraw(io, prompt);
+                    return @min(3, slice.len);
                 },
                 'B' => { // ↓ history
                     self.loadHistoryEntry(1);
                     self.redraw(io, prompt);
+                    return @min(3, slice.len);
                 },
                 'C' => { // →
                     self.moveRight();
                     self.redraw(io, prompt);
+                    return @min(3, slice.len);
                 },
                 'D' => { // ←
                     self.moveLeft();
                     self.redraw(io, prompt);
+                    return @min(3, slice.len);
                 },
                 'H' => { // Home
                     self.pos = 0;
                     self.redraw(io, prompt);
+                    return @min(3, slice.len);
                 },
                 'F' => { // End
                     self.pos = self.buf.items.len;
                     self.redraw(io, prompt);
+                    return @min(3, slice.len);
                 },
-                '1' => { // ESC [ 1 ~ hoặc ESC [ 1 ; 3 C (Alt+→) — đọc tới '~' hoặc chữ
+                '1' => { // ESC [ 1 ~ hoặc ESC [ 1 ; 3 C (Alt+→)
+                    if (seq_len >= 4 and seq_buf[3] == '~') {
+                        self.pos = 0;
+                        self.redraw(io, prompt);
+                        return @min(4, slice.len);
+                    }
+                    if (seq_len >= 6 and seq_buf[3] == ';' and seq_buf[4] == '3') {
+                        if (seq_buf[5] == 'C') {
+                            self.pos = self.wordRight();
+                            self.redraw(io, prompt);
+                        } else if (seq_buf[5] == 'D') {
+                            self.pos = self.wordLeft();
+                            self.redraw(io, prompt);
+                        }
+                        return @min(6, slice.len);
+                    }
                     self.consumeTildeOrModifier(io, stdin_file, prompt);
+                    return @min(3, slice.len);
                 },
                 '2' => { // Bracketed paste bắt đầu: ESC [ 2 0 0 ~
+                    if (seq_len >= 6 and std.mem.eql(u8, seq_buf[0..6], "\x1b[200~")) {
+                        self.beginPaste();
+                        return @min(6, slice.len);
+                    }
                     var marker: [3]u8 = undefined;
                     var got: usize = 0;
                     while (got < 3) : (got += 1) {
@@ -594,8 +713,18 @@ pub const LineEditor = struct {
                     if (got == 3 and std.mem.eql(u8, &marker, "00~")) {
                         self.beginPaste();
                     }
+                    return @min(3, slice.len);
                 },
                 '3' => { // Delete
+                    if (seq_len >= 4 and seq_buf[3] == '~') {
+                        if (self.pos < self.buf.items.len) {
+                            self.pushUndo();
+                            const end = self.pos + self.clusterLenAt(self.pos);
+                            if (self.deleteRange(self.pos, end)) |rem| self.alloc.free(rem);
+                            self.redraw(io, prompt);
+                        }
+                        return @min(4, slice.len);
+                    }
                     var tilde: [1]u8 = undefined;
                     _ = stdin_file.readStreaming(io, &.{&tilde}) catch 0;
                     if (tilde[0] == '~' and self.pos < self.buf.items.len) {
@@ -604,41 +733,46 @@ pub const LineEditor = struct {
                         if (self.deleteRange(self.pos, end)) |rem| self.alloc.free(rem);
                         self.redraw(io, prompt);
                     }
+                    return @min(3, slice.len);
                 },
                 else => {},
             }
-        } else if (seq[0] == 'O') {
-            switch (seq[1]) {
+        } else if (seq_len >= 3 and seq_buf[0] == 0x1b and seq_buf[1] == 'O') {
+            switch (seq_buf[2]) {
                 'H' => {
                     self.pos = 0;
                     self.redraw(io, prompt);
+                    return @min(3, slice.len);
                 },
                 'F' => {
                     self.pos = self.buf.items.len;
                     self.redraw(io, prompt);
+                    return @min(3, slice.len);
                 },
                 else => {},
             }
-        } else {
-            // Alt+<key>: ESC theo sau bởi key thường.
-            switch (seq[1]) {
-                'b', 'B' => { // Alt+B — word left
+        } else if (seq_len >= 2 and seq_buf[0] == 0x1b) {
+            switch (seq_buf[1]) {
+                'b', 'B' => {
                     self.pos = self.wordLeft();
                     self.redraw(io, prompt);
+                    return @min(2, slice.len);
                 },
-                'f', 'F' => { // Alt+F — word right
+                'f', 'F' => {
                     self.pos = self.wordRight();
                     self.redraw(io, prompt);
+                    return @min(2, slice.len);
                 },
-                'd', 'D' => { // Alt+D — delete word phải
+                'd', 'D' => {
                     const end = self.wordRight();
                     if (end > self.pos) {
                         self.pushUndo();
                         if (self.deleteRange(self.pos, end)) |rem| self.alloc.free(rem);
                         self.redraw(io, prompt);
                     }
+                    return @min(2, slice.len);
                 },
-                127, 8 => { // Alt+Backspace — delete word trái
+                127, 8 => {
                     const start = self.wordLeft();
                     if (start < self.pos) {
                         self.pushUndo();
@@ -648,10 +782,13 @@ pub const LineEditor = struct {
                         }
                         self.redraw(io, prompt);
                     }
+                    return @min(2, slice.len);
                 },
                 else => {},
             }
         }
+
+        return @max(1, @min(seq_len, slice.len));
     }
 
     /// ESC [ 1 ... — đọc nốt tới '~' (Home variant) hoặc ';<mod><key>' (modifier combo).
@@ -674,13 +811,12 @@ pub const LineEditor = struct {
                 while (k < 2) : (k += 1) {
                     if ((stdin_file.readStreaming(io, &.{modkey[k .. k + 1]}) catch 0) == 0) return;
                 }
-                // modkey[0] = modifier digit, modkey[1] = key
                 switch (modkey[1]) {
-                    'C' => { // Alt+→ word right
+                    'C' => {
                         self.pos = self.wordRight();
                         self.redraw(io, prompt);
                     },
-                    'D' => { // Alt+← word left
+                    'D' => {
                         self.pos = self.wordLeft();
                         self.redraw(io, prompt);
                     },
@@ -696,94 +832,72 @@ pub const LineEditor = struct {
     fn beginPaste(self: *LineEditor) void {
         self.pasting = true;
         self.paste_undo_pushed = false;
+        self.paste_buf.clearRetainingCapacity();
         self.paste_parser.reset();
         paste_mod.sanitizeReset();
     }
 
-    /// Kết thúc paste mode: flush nốt candidate còn hold thành content.
+    /// Kết thúc paste mode: flush nốt candidate còn hold thành content và chèn vào buffer.
     fn endPaste(self: *LineEditor, io: std.Io, prompt: []const u8) void {
+        if (!self.pasting) return;
         self.pasting = false;
         self.paste_undo_pushed = false;
         var tmp: [paste_mod.END_MARKER.len]u8 = undefined;
         const pre = self.paste_parser.pendingCopy(&tmp);
-        self.insertPastedSanitized(io, prompt, pre);
+        for (pre) |b| _ = paste_mod.sanitizeAppend(&self.paste_buf, self.alloc, b);
         self.paste_parser.reset();
+
+        if (self.paste_buf.items.len > 0) {
+            self.pushUndo();
+            _ = self.insertBytes(self.paste_buf.items);
+            self.paste_buf.clearRetainingCapacity();
+        }
+        self.redraw(io, prompt);
     }
 
-    /// Feed 1 byte trong paste mode qua state machine (xem paste.zig).
-    /// END marker hoặc idle-timeout sẽ thoát paste mode.
-    fn pasteFeed(self: *LineEditor, io: std.Io, stdin_file: std.Io.File, prompt: []const u8, c: u8) void {
-        // Copy pending TRƯỚC khi feed (feed có thể reset state).
+    /// Feed các bytes trong paste mode qua state machine (xem paste.zig).
+    fn pasteFeed(self: *LineEditor, io: std.Io, prompt: []const u8, bytes: []const u8) void {
         var tmp: [paste_mod.END_MARKER.len]u8 = undefined;
-        const pre = self.paste_parser.pendingCopy(&tmp);
-
-        switch (self.paste_parser.feed(c)) {
-            .content => |b| {
-                var one = [1]u8{b};
-                self.insertPastedSanitized(io, prompt, &one);
-                // Content vừa xử lý xong mà stdin im → terminal đã gửi hết
-                // (quên end-marker) → thoát paste mode để Enter không bị nuốt.
-                // Khi paste vẫn đang đổ, poll thấy byte kế ngay → không tốn chờ.
-                if (self.pasteIdleTimedOut(io, stdin_file)) {
-                    self.endPaste(io, prompt);
-                    self.redraw(io, prompt);
-                }
-            },
-            .marker => |m| {
-                if (m == .end) {
-                    self.endPaste(io, prompt);
-                    self.redraw(io, prompt);
-                }
-                // .start trong khi pasting: marker lồng nhau (hiếm) — bỏ qua.
-            },
-            .none => {
-                // Byte đang hold. Nếu hold kéo dài mà không có byte kế
-                // (terminal gửi marker bị tách / không gửi end-marker) →
-                // idle-timeout thoát paste mode, không kẹt vĩnh viễn.
-                if (self.pasteIdleTimedOut(io, stdin_file)) {
-                    // Không còn byte: flush hold + kết thúc.
-                    self.endPaste(io, prompt);
-                    self.redraw(io, prompt);
-                }
-            },
-            .fail => {
-                // Hold vỡ: flush hold thành content rồi xử lý lại byte hiện tại.
-                self.insertPastedSanitized(io, prompt, pre);
-                switch (self.paste_parser.feed(c)) {
-                    .content => |b| {
-                        var one = [1]u8{b};
-                        self.insertPastedSanitized(io, prompt, &one);
-                    },
-                    .none => {
-                        if (self.pasteIdleTimedOut(io, stdin_file)) {
-                            self.endPaste(io, prompt);
-                            self.redraw(io, prompt);
-                        }
-                    },
-                    else => unreachable,
-                }
-            },
+        for (bytes) |c| {
+            const pre = self.paste_parser.pendingCopy(&tmp);
+            switch (self.paste_parser.feed(c)) {
+                .content => |b| {
+                    _ = paste_mod.sanitizeAppend(&self.paste_buf, self.alloc, b);
+                },
+                .marker => |m| {
+                    if (m == .end) {
+                        self.endPaste(io, prompt);
+                        return;
+                    }
+                },
+                .none => {},
+                .fail => {
+                    for (pre) |b| _ = paste_mod.sanitizeAppend(&self.paste_buf, self.alloc, b);
+                    switch (self.paste_parser.feed(c)) {
+                        .content => |b| _ = paste_mod.sanitizeAppend(&self.paste_buf, self.alloc, b),
+                        .none => {},
+                        else => {},
+                    }
+                },
+            }
         }
     }
 
-    /// Trong paste mode: poll stdin 150ms — hết thời gian mà không có byte
+    /// Trong paste mode: poll stdin 25ms — hết thời gian mà không có byte
     /// coi như terminal sẽ không gửi END marker → caller tự thoát paste mode.
-    /// Trả về true nếu idle (không byte nào tới).
     fn pasteIdleTimedOut(_: *LineEditor, _: std.Io, _: std.Io.File) bool {
         var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
-        const ready = std.posix.poll(&fds, 150) catch return true; // lỗi poll → coi như idle
+        const ready = std.posix.poll(&fds, 25) catch return true;
         return ready == 0;
     }
 
     /// Sanitize (newline→space, bỏ control) rồi insert vào buffer + redraw.
-    /// Push undo 1 lần cho cả đợt paste (không phải per-byte).
     fn insertPastedSanitized(self: *LineEditor, io: std.Io, prompt: []const u8, bytes: []const u8) void {
         if (bytes.len == 0) return;
         if (!self.paste_undo_pushed) {
             self.pushUndo();
             self.paste_undo_pushed = true;
         }
-        // Sanitize vào buffer tạm rồi insert một lệnh.
         var tmp_list: std.ArrayListUnmanaged(u8) = .empty;
         defer tmp_list.deinit(self.alloc);
         for (bytes) |b| _ = paste_mod.sanitizeAppend(&tmp_list, self.alloc, b);
@@ -962,70 +1076,38 @@ fn simulatePaste(alloc: Allocator, input: []const u8) ![]u8 {
     defer e.deinit();
     e.suppress_redraw = true;
     e.beginPaste();
-    var tmp: [paste_mod.END_MARKER.len]u8 = undefined;
-    var done = false;
-    for (input) |c| {
-        if (done) break;
-        const pre = e.paste_parser.pendingCopy(&tmp);
-        switch (e.paste_parser.feed(c)) {
-            .content => |b| {
-                var one = [1]u8{b};
-                e.insertPastedSanitized(undefined, "", &one);
-            },
-            .marker => |m| {
-                if (m == .end) {
-                    e.endPaste(undefined, "");
-                    done = true;
-                }
-            },
-            .fail => {
-                e.insertPastedSanitized(undefined, "", pre);
-                switch (e.paste_parser.feed(c)) {
-                    .content => |b| {
-                        var one = [1]u8{b};
-                        e.insertPastedSanitized(undefined, "", &one);
-                    },
-                    .none => {},
-                    else => unreachable,
-                }
-            },
-            .none => {},
-        }
-    }
+    e.pasteFeed(undefined, "", input);
+    if (e.pasting) e.endPaste(undefined, "");
     return alloc.dupe(u8, e.buf.items);
 }
 
 test "paste thường: content nằm giữa start/end marker" {
     const alloc = std.testing.allocator;
-    const out = try simulatePaste(alloc, paste_mod.START_MARKER ++ "hello pasted" ++ paste_mod.END_MARKER);
+    const out = try simulatePaste(alloc, "hello pasted" ++ paste_mod.END_MARKER);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("hello pasted", out);
 }
 
 test "paste multiline: mỗi newline thành 1 space (CRLF không double)" {
     const alloc = std.testing.allocator;
-    const out = try simulatePaste(alloc, paste_mod.START_MARKER ++ "line1\r\nline2\nline3" ++ paste_mod.END_MARKER);
+    const out = try simulatePaste(alloc, "line1\r\nline2\nline3" ++ paste_mod.END_MARKER);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("line1 line2 line3", out);
 }
 
 test "paste chứa ANSI escape không nhầm end-marker" {
     const alloc = std.testing.allocator;
-    // Nội dung có escape sequence gần giống marker + end-marker thật phía sau.
-    const input = paste_mod.START_MARKER ++ "\x1b[31mred\x1b[0m end" ++ paste_mod.END_MARKER;
+    const input = "\x1b[31mred\x1b[0m end" ++ paste_mod.END_MARKER;
     const out = try simulatePaste(alloc, input);
     defer alloc.free(out);
-    // Escape sequences bị strip control chars, chữ "red end" giữ lại.
     try std.testing.expectEqualStrings("[31mred[0m end", out);
 }
 
 test "paste chứa prefix gần end-marker vẫn nhận đúng marker thật" {
     const alloc = std.testing.allocator;
-    const input = paste_mod.START_MARKER ++ "abc\x1b[20" ++ paste_mod.END_MARKER;
+    const input = "abc\x1b[20" ++ paste_mod.END_MARKER;
     const out = try simulatePaste(alloc, input);
     defer alloc.free(out);
-    // "\x1b[20" là prefix chưa hoàn chỉnh → giữ làm content (đúng hành vi: nó
-    // không phải marker), end-marker thật được nhận diện → không kẹt.
     try std.testing.expectEqualStrings("abc[20", out);
 }
 
@@ -1035,42 +1117,28 @@ test "paste không có end-marker: flush pending, editor không kẹt" {
     defer e.deinit();
     e.suppress_redraw = true;
     e.beginPaste();
-    var tmp: [paste_mod.END_MARKER.len]u8 = undefined;
-    // Terminal gửi content + prefix marker rồi im luôn (không end-marker).
-    for (paste_mod.START_MARKER[0..] ++ "dangling\x1b[2") |c| {
-        const pre = e.paste_parser.pendingCopy(&tmp);
-        switch (e.paste_parser.feed(c)) {
-            .content => |b| {
-                var one = [1]u8{b};
-                e.insertPastedSanitized(undefined, "", &one);
-            },
-            .marker => |m| {
-                if (m == .end) e.endPaste(undefined, "");
-            },
-            .fail => {
-                e.insertPastedSanitized(undefined, "", pre);
-                switch (e.paste_parser.feed(c)) {
-                    .content => |b| {
-                        var one = [1]u8{b};
-                        e.insertPastedSanitized(undefined, "", &one);
-                    },
-                    .none => {},
-                    else => unreachable,
-                }
-            },
-            .none => {},
-        }
-    }
+    e.pasteFeed(undefined, "", "dangling\x1b[2");
     // Idle timeout path: gọi endPaste như editor sẽ làm.
     e.endPaste(undefined, "");
     try std.testing.expect(!e.pasting);
-    // "dangling" + prefix "\x1b[2" (control strip) = "dangling[2".
     try std.testing.expectEqualStrings("dangling[2", e.buf.items);
 }
 
 test "paste UTF-8 tiếng Việt + emoji giữ nguyên" {
     const alloc = std.testing.allocator;
-    const out = try simulatePaste(alloc, paste_mod.START_MARKER ++ "xin chào thế giới 👍" ++ paste_mod.END_MARKER);
+    const out = try simulatePaste(alloc, "xin chào thế giới 👍" ++ paste_mod.END_MARKER);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("xin chào thế giới 👍", out);
+}
+
+test "paste đoạn dài không bị lặp redraw hay tràn dòng" {
+    const alloc = std.testing.allocator;
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+    e.beginPaste();
+    const long_text = "// contextTools returns tools that let the producer inspect and compact its // current session. " ** 10;
+    e.pasteFeed(undefined, "", long_text ++ paste_mod.END_MARKER);
+    try std.testing.expect(!e.pasting);
+    try std.testing.expect(e.buf.items.len > 500);
 }

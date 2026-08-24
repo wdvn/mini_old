@@ -243,16 +243,14 @@ pub const AgentLoop = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !StepResult {
-        if (act_id > 1) {
-            main.stderrPrint("\x1b[90m[agent] --- Vòng lặp {d} ---\x1b[0m\n", .{act_id});
-        } else {
-            main.stderrPrint("\n\x1b[90m[agent] --- Bắt đầu quy trình ---\x1b[0m\n", .{});
+        if (main.ui_repl.current_renderer == null) {
+            if (act_id > 1) {
+                main.stderrPrint("\x1b[90m[agent] --- Vòng lặp {d} ---\x1b[0m\n", .{act_id});
+            } else {
+                main.stderrPrint("\n\x1b[90m[agent] --- Bắt đầu quy trình ---\x1b[0m\n", .{});
+            }
+            main.stderrPrint("\x1b[36m[agent]\x1b[0m \x1b[93mĐang suy nghĩ / Phân tích yêu cầu... \x1b[0m\n", .{});
         }
-
-        main.stderrPrint("\x1b[36m[agent]\x1b[0m \x1b[93mĐang suy nghĩ / Phân tích yêu cầu... \x1b[0m\n", .{});
-
-        // Gửi lên AI backend (streaming) — không tự ý nén ngữ cảnh trước khi model thực sự báo quá tải
-
 
         // Gửi lên AI backend (streaming)
         var response = try self.sendToBackend(
@@ -268,7 +266,9 @@ pub const AgentLoop = struct {
         defer response.deinit();
 
         // Xuống dòng sau khi stream xong
-        try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
+        if (main.ui_repl.current_renderer == null) {
+            try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
+        }
 
         // Thêm response vào history (nếu có nội dung)
         _ = try self.history.addAssistantResponse(&response);
@@ -278,10 +278,21 @@ pub const AgentLoop = struct {
             if (findJsCodeInResponse(self.alloc, &response)) |js_code| {
                 defer self.alloc.free(js_code);
 
-                main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting QuickJS-ng script...\x1b[0m ", .{});
+                const start_codeact_ms = utils.milliTimestamp();
+                if (main.ui_repl.current_renderer) |r| {
+                    r.startTool("codeact", "{}");
+                } else {
+                    main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting QuickJS-ng script...\x1b[0m ", .{});
+                }
 
                 var res = self.engine.eval(js_code, "agent_codeact.js") catch |e| {
-                    main.stderrPrint("\x1b[31m[engine error: {s}]\x1b[0m\n", .{@errorName(e)});
+                    const end_err_ms = utils.milliTimestamp();
+                    const dur_ms = if (end_err_ms >= start_codeact_ms) @as(u64, @intCast(end_err_ms - start_codeact_ms)) else 0;
+                    if (main.ui_repl.current_renderer) |r| {
+                        r.finishTool("codeact", @errorName(e), true, dur_ms, null, null);
+                    } else {
+                        main.stderrPrint("\x1b[31m[engine error: {s}]\x1b[0m\n", .{@errorName(e)});
+                    }
                     const err_msg = try std.fmt.allocPrint(self.alloc, "[CodeAct System Error]: {s}", .{@errorName(e)});
                     defer self.alloc.free(err_msg);
                     try self.history.addUser(err_msg);
@@ -289,8 +300,15 @@ pub const AgentLoop = struct {
                 };
                 defer res.deinit();
 
+                const end_codeact_ms = utils.milliTimestamp();
+                const dur_ms = if (end_codeact_ms >= start_codeact_ms) @as(u64, @intCast(end_codeact_ms - start_codeact_ms)) else 0;
+
                 if (!res.is_error) {
-                    main.stderrPrint("\x1b[32m[ok]\x1b[0m\n", .{});
+                    if (main.ui_repl.current_renderer) |r| {
+                        r.finishTool("codeact", if (res.return_value_json) |ret| ret else res.stdout, false, dur_ms, null, null);
+                    } else {
+                        main.stderrPrint("\x1b[32m[ok]\x1b[0m\n", .{});
+                    }
                     self.js_retry_count = 0;
 
                     var out_buf = utils.BufWriter.init(self.alloc);
@@ -310,7 +328,11 @@ pub const AgentLoop = struct {
                     try self.history.addUser(out_buf.list.items);
                     return .continue_loop;
                 } else {
-                    main.stderrPrint("\x1b[31m[error]\x1b[0m\n", .{});
+                    if (main.ui_repl.current_renderer) |r| {
+                        r.finishTool("codeact", if (res.error_message) |m| m else "JS Error", true, dur_ms, null, null);
+                    } else {
+                        main.stderrPrint("\x1b[31m[error]\x1b[0m\n", .{});
+                    }
                     self.js_retry_count += 1;
 
                     var err_buf = utils.BufWriter.init(self.alloc);
@@ -340,7 +362,9 @@ pub const AgentLoop = struct {
 
         switch (response.stop_reason) {
             .end_turn, .stop_sequence => {
-                main.stderrPrint("\n\x1b[92m[agent] ✓ Hoàn thành sau {d} vòng lặp.\x1b[0m\n", .{act_id});
+                if (main.ui_repl.current_renderer == null) {
+                    main.stderrPrint("\n\x1b[92m[agent] ✓ Hoàn thành sau {d} vòng lặp.\x1b[0m\n", .{act_id});
+                }
                 return .exit_loop;
             },
             .max_tokens => {
@@ -838,34 +862,37 @@ pub const AgentLoop = struct {
         for (response.content.items) |block| {
             switch (block) {
                 .tool_use => |tu| {
-                    // Hiển thị tên tool và tham số chính (verbose)
-                    if (std.mem.eql(u8, tu.name, "bash")) {
-                        if (json_mod.findString(tu.input_json, "command")) |cmd| {
-                            var cmd_buf: [100]u8 = undefined;
-                            const display_cmd = if (cmd.len > 97) std.fmt.bufPrint(&cmd_buf, "{s}...", .{cmd[0..97]}) catch cmd else cmd;
-                            main.stderrPrint("\x1b[90m[bash]\x1b[0m \x1b[35m{s}\x1b[0m ", .{display_cmd});
-                        } else {
-                            main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
-                        }
-                    } else if (std.mem.eql(u8, tu.name, "file_read") or std.mem.eql(u8, tu.name, "file_write") or std.mem.eql(u8, tu.name, "file_edit")) {
-                        if (json_mod.findString(tu.input_json, "path")) |path| {
-                            main.stderrPrint("\x1b[90m[{s}]\x1b[0m \x1b[34m{s}\x1b[0m ", .{tu.name, path});
-                        } else {
-                            main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
-                        }
-                    } else if (std.mem.eql(u8, tu.name, "web_search")) {
-                        if (json_mod.findString(tu.input_json, "query")) |query| {
-                            main.stderrPrint("\x1b[90m[search]\x1b[0m \x1b[32m{s}\x1b[0m ", .{query});
-                        } else {
-                            main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
-                        }
-                    } else if (std.mem.eql(u8, tu.name, "codeact")) {
-                        main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting QuickJS-ng script...\x1b[0m ", .{});
+                    const start_tool_ms = utils.milliTimestamp();
+                    if (main.ui_repl.current_renderer) |r| {
+                        r.startTool(tu.name, tu.input_json);
                     } else {
-
-                        main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
+                        // Hiển thị tên tool và tham số chính (fallback log)
+                        if (std.mem.eql(u8, tu.name, "bash")) {
+                            if (json_mod.findString(tu.input_json, "command")) |cmd| {
+                                var cmd_buf: [100]u8 = undefined;
+                                const display_cmd = if (cmd.len > 97) std.fmt.bufPrint(&cmd_buf, "{s}...", .{cmd[0..97]}) catch cmd else cmd;
+                                main.stderrPrint("\x1b[90m[bash]\x1b[0m \x1b[35m{s}\x1b[0m ", .{display_cmd});
+                            } else {
+                                main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
+                            }
+                        } else if (std.mem.eql(u8, tu.name, "file_read") or std.mem.eql(u8, tu.name, "file_write") or std.mem.eql(u8, tu.name, "file_edit")) {
+                            if (json_mod.findString(tu.input_json, "path")) |path| {
+                                main.stderrPrint("\x1b[90m[{s}]\x1b[0m \x1b[34m{s}\x1b[0m ", .{tu.name, path});
+                            } else {
+                                main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
+                            }
+                        } else if (std.mem.eql(u8, tu.name, "web_search")) {
+                            if (json_mod.findString(tu.input_json, "query")) |query| {
+                                main.stderrPrint("\x1b[90m[search]\x1b[0m \x1b[32m{s}\x1b[0m ", .{query});
+                            } else {
+                                main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
+                            }
+                        } else if (std.mem.eql(u8, tu.name, "codeact")) {
+                            main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting QuickJS-ng script...\x1b[0m ", .{});
+                        } else {
+                            main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
+                        }
                     }
-
 
                     // Phát pre-tool-use hook
                     hooks_mod.dispatch(self.alloc, self.io, .{
@@ -898,7 +925,7 @@ pub const AgentLoop = struct {
                                 file_snaps.append(self.alloc, .{
                                     .path = p,
                                     .previous_content_hash = prev_hash,
-                                }) catch {};
+                                    }) catch {};
                             } else |_| {
                                 if (prev_hash) |h| self.alloc.free(h);
                             }
@@ -933,10 +960,23 @@ pub const AgentLoop = struct {
                         .is_error = is_err,
                     });
 
-                    if (is_err) {
-                        main.stderrPrint("\x1b[31m[lỗi]\x1b[0m\n", .{});
+                    const end_tool_ms = utils.milliTimestamp();
+                    const dur_ms = if (end_tool_ms >= start_tool_ms) @as(u64, @intCast(end_tool_ms - start_tool_ms)) else 0;
+
+                    if (main.ui_repl.current_renderer) |r| {
+                        var patch_path: ?[]const u8 = null;
+                        var patch_diff: ?[]const u8 = null;
+                        if (std.mem.eql(u8, tu.name, "file_edit") or std.mem.eql(u8, tu.name, "file_write")) {
+                            patch_path = json_mod.findString(tu.input_json, "path");
+                            patch_diff = json_mod.findString(tu.input_json, "patch") orelse json_mod.findString(tu.input_json, "content");
+                        }
+                        r.finishTool(tu.name, result, is_err, dur_ms, patch_path, patch_diff);
                     } else {
-                        main.stderrPrint("\x1b[32m[ok]\x1b[0m\n", .{});
+                        if (is_err) {
+                            main.stderrPrint("\x1b[31m[lỗi]\x1b[0m\n", .{});
+                        } else {
+                            main.stderrPrint("\x1b[32m[ok]\x1b[0m\n", .{});
+                        }
                     }
                 },
                 else => {},

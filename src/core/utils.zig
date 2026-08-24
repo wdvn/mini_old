@@ -105,4 +105,48 @@ pub fn milliTimestamp() i64 {
     return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1000000);
 }
 
+/// Format duration (ms) thành định dạng dễ đọc cho con người (ms, s, m s, h m s).
+pub fn formatDuration(buf: []u8, duration_ms: u64) []const u8 {
+    if (duration_ms < 1000) {
+        return std.fmt.bufPrint(buf, "{d}ms", .{duration_ms}) catch "0ms";
+    }
+    if (duration_ms < 60_000) {
+        const sec = @as(f64, @floatFromInt(duration_ms)) / 1000.0;
+        return std.fmt.bufPrint(buf, "{d:.1}s", .{sec}) catch "0s";
+    }
+    const total_sec = duration_ms / 1000;
+    if (total_sec < 3600) {
+        const m = total_sec / 60;
+        const s = total_sec % 60;
+        if (s == 0) {
+            return std.fmt.bufPrint(buf, "{d}m", .{m}) catch "0m";
+        }
+        return std.fmt.bufPrint(buf, "{d}m {d}s", .{ m, s }) catch "0m";
+    }
+    const h = total_sec / 3600;
+    const rem_sec = total_sec % 3600;
+    const m = rem_sec / 60;
+    const s = rem_sec % 60;
+    if (m == 0 and s == 0) {
+        return std.fmt.bufPrint(buf, "{d}h", .{h}) catch "0h";
+    }
+    if (s == 0) {
+        return std.fmt.bufPrint(buf, "{d}h {d}m", .{ h, m }) catch "0h";
+    }
+    return std.fmt.bufPrint(buf, "{d}h {d}m {d}s", .{ h, m, s }) catch "0h";
+}
+
+test "formatDuration formats ms, s, m, h" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("12ms", formatDuration(&buf, 12));
+    try std.testing.expectEqualStrings("999ms", formatDuration(&buf, 999));
+    try std.testing.expectEqualStrings("1.0s", formatDuration(&buf, 1000));
+    try std.testing.expectEqualStrings("25.9s", formatDuration(&buf, 25934));
+    try std.testing.expectEqualStrings("1m", formatDuration(&buf, 60000));
+    try std.testing.expectEqualStrings("2m 15s", formatDuration(&buf, 135000));
+    try std.testing.expectEqualStrings("1h", formatDuration(&buf, 3600000));
+    try std.testing.expectEqualStrings("1h 5m 12s", formatDuration(&buf, 3912000));
+}
+
+
 
