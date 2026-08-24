@@ -34,6 +34,9 @@ pub const TurnRenderer = struct {
     highlighter: markdown_mod.StreamHighlighter,
     is_thinking: bool = false,
     think_start_ms: i64 = 0,
+    think_snippet_buf: [80]u8 = undefined,
+    think_snippet_len: usize = 0,
+    think_last_update_ms: i64 = 0,
     turn_start_ms: i64 = 0,
     has_printed_response_header: bool = false,
     in_think_tag: bool = false,
@@ -48,6 +51,8 @@ pub const TurnRenderer = struct {
             .highlighter = markdown_mod.StreamHighlighter.init(),
             .is_thinking = false,
             .think_start_ms = 0,
+            .think_snippet_len = 0,
+            .think_last_update_ms = 0,
             .turn_start_ms = 0,
             .has_printed_response_header = false,
             .in_think_tag = false,
@@ -60,6 +65,8 @@ pub const TurnRenderer = struct {
         _ = prompt;
         self.turn_start_ms = utils.milliTimestamp();
         self.is_thinking = false;
+        self.think_snippet_len = 0;
+        self.think_last_update_ms = 0;
         self.has_printed_response_header = false;
         self.in_think_tag = false;
         self.think_tag_len = 0;
@@ -71,25 +78,65 @@ pub const TurnRenderer = struct {
         if (self.is_thinking) return;
         self.is_thinking = true;
         self.think_start_ms = utils.milliTimestamp();
+        self.think_snippet_len = 0;
+        self.think_last_update_ms = 0;
 
-        var buf: [128]u8 = undefined;
-        const header = std.fmt.bufPrint(&buf, "\n \x1b[90m{s} \x1b[1;90mThinking...\x1b[0m\n", .{
-            term.GLYPH_THINK,
-        }) catch "\n 💭 Thinking...\n";
-        term.writeStdout(header);
+        term.writeStdout("\n \x1b[90m💭 Thinking...\x1b[0m");
     }
 
-    /// Stream một đoạn text trong khối Thinking.
+    /// Stream một đoạn text trong khối Thinking (thu gọn trên 1 dòng duy nhất, cập nhật thời gian và snippet).
     pub fn streamThinking(self: *TurnRenderer, text: []const u8) void {
         if (!self.is_thinking) {
             self.startThinking();
         }
-        term.writeStdout("\x1b[90m");
-        term.writeStdout(text);
-        term.writeStdout("\x1b[0m");
+
+        // Tích luỹ snippet gần nhất (loại bỏ newlines, chỉ giữ các ký tự hiển thị được)
+        for (text) |c| {
+            if (c == '\n' or c == '\r' or c == '\t') {
+                if (self.think_snippet_len > 0 and self.think_snippet_buf[self.think_snippet_len - 1] != ' ') {
+                    if (self.think_snippet_len < self.think_snippet_buf.len) {
+                        self.think_snippet_buf[self.think_snippet_len] = ' ';
+                        self.think_snippet_len += 1;
+                    }
+                }
+            } else if (c >= 32) {
+                if (self.think_snippet_len < self.think_snippet_buf.len) {
+                    self.think_snippet_buf[self.think_snippet_len] = c;
+                    self.think_snippet_len += 1;
+                } else {
+                    const shift = 20;
+                    std.mem.copyForwards(u8, self.think_snippet_buf[0 .. self.think_snippet_buf.len - shift], self.think_snippet_buf[shift..]);
+                    self.think_snippet_len = self.think_snippet_buf.len - shift;
+                    self.think_snippet_buf[self.think_snippet_len] = c;
+                    self.think_snippet_len += 1;
+                }
+            }
+        }
+
+        const now = utils.milliTimestamp();
+        // Rate-limit redraw mỗi 40ms để terminal chạy mượt mà
+        if (now - self.think_last_update_ms >= 40) {
+            self.think_last_update_ms = now;
+            const diff = if (now >= self.think_start_ms) now - self.think_start_ms else 0;
+            const sec = @as(f64, @floatFromInt(diff)) / 1000.0;
+            const frame = self.spinner.nextFrame();
+
+            const snippet = std.mem.trim(u8, self.think_snippet_buf[0..self.think_snippet_len], " ");
+            var out_buf: [256]u8 = undefined;
+            const line = if (snippet.len > 0)
+                std.fmt.bufPrint(&out_buf, "\r\x1b[2K \x1b[36m{s}\x1b[0m \x1b[90mThinking ({d:.1}s)...\x1b[0m \x1b[2;90m{s}\x1b[0m", .{
+                    frame, sec, snippet,
+                }) catch ""
+            else
+                std.fmt.bufPrint(&out_buf, "\r\x1b[2K \x1b[36m{s}\x1b[0m \x1b[90mThinking ({d:.1}s)...\x1b[0m", .{
+                    frame, sec,
+                }) catch "";
+
+            if (line.len > 0) term.writeStdout(line);
+        }
     }
 
-    /// Kết thúc khối Thinking.
+    /// Kết thúc khối Thinking: thu gọn lại thành 1 dòng tóm tắt duy nhất.
     pub fn endThinking(self: *TurnRenderer) void {
         if (!self.is_thinking) return;
         self.is_thinking = false;
@@ -98,7 +145,7 @@ pub const TurnRenderer = struct {
         const sec = @as(f64, @floatFromInt(diff)) / 1000.0;
 
         var buf: [128]u8 = undefined;
-        const footer = std.fmt.bufPrint(&buf, "\n \x1b[90m└─ Thought for {d:.1}s\x1b[0m\n", .{sec}) catch "\n └─ Thought\n";
+        const footer = std.fmt.bufPrint(&buf, "\r\x1b[2K \x1b[90m💭 Thought for {d:.1}s\x1b[0m\n", .{sec}) catch "\r\x1b[2K \x1b[90m💭 Thought\x1b[0m\n";
         term.writeStdout(footer);
     }
 
