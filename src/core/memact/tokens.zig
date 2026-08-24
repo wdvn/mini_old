@@ -87,6 +87,15 @@ pub const TokenEstimator = struct {
         }
         return total;
     }
+
+    /// Ước lượng cho một mảng Messages.
+    pub fn estimateMessages(self: *TokenEstimator, msgs: []const proto.Message) u32 {
+        var total: u32 = 0;
+        for (msgs) |*msg| {
+            total += self.estimateMessage(msg);
+        }
+        return total;
+    }
 };
 
 test "token estimator heuristic" {

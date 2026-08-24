@@ -1,4 +1,4 @@
-//! repl.zig — Interactive Terminal REPL & UI Presentation Layer cho mini-agent.
+//! repl.zig — Interactive Terminal REPL & UI Presentation Layer cho mini-agent (RFC-007).
 //!
 //! Tách biệt hoàn toàn phần giao diện người dùng, xử lý lệnh Slash (/help, /model, /artifact, /clear),
 //! và streaming markdown / thinking text ra khỏi composition root.
@@ -9,8 +9,12 @@ const agent_mod = @import("../core/agent.zig");
 const artifacts_mod = @import("../core/artifacts.zig");
 const editor_mod = @import("editor.zig");
 const main = @import("../main.zig");
+pub const chat_stream = @import("chat_stream.zig");
 
 pub const PROMPT_PREFIX = "\x1b[1;34mYou\x1b[0m > ";
+
+/// Renderer toàn cục của turn hiện tại (nếu đang xử lý).
+pub var current_renderer: ?*chat_stream.TurnRenderer = null;
 
 /// Chạy vòng lặp tương tác REPL.
 pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, version: []const u8) !void {
@@ -43,10 +47,31 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
         const expanded_input = try artifacts_mod.expandArtifactReferences(alloc, io, input);
         defer alloc.free(expanded_input);
 
+        // Khởi tạo TurnRenderer cho lượt chat này
+        var renderer = chat_stream.TurnRenderer.init(alloc, io);
+        current_renderer = &renderer;
+        defer current_renderer = null;
+
+        renderer.startTurn(expanded_input);
+        const start_ms = utils.milliTimestamp();
+
         // Gửi đến agent
         agent.processInput(expanded_input, printText, printThinkText) catch |e| {
             main.stdoutPrint("\x1b[31m[lỗi]\x1b[0m {s}\n", .{@errorName(e)});
         };
+
+        const end_ms = utils.milliTimestamp();
+        const duration = if (end_ms >= start_ms) @as(u64, @intCast(end_ms - start_ms)) else 0;
+        const ctx_tokens = agent.token_estimator.estimateMessages(agent.history.messages());
+
+        renderer.finishTurn(.{
+            .prompt_tokens = agent.token_estimator.estimate(expanded_input),
+            .completion_tokens = 0,
+            .context_tokens = ctx_tokens,
+            .max_context_tokens = 128 * 1024,
+            .duration_ms = duration,
+            .acts_count = 1,
+        });
     }
 
     try stdout.writeStreamingAll(io, "\nTạm biệt!\n");
@@ -184,7 +209,29 @@ fn tryExecuteCustomSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.
     defer alloc.free(expanded);
 
     main.stdoutPrint("\x1b[90m[command /{s}]\x1b[0m\n", .{cmd_name});
+
+    var renderer = chat_stream.TurnRenderer.init(alloc, io);
+    current_renderer = &renderer;
+    defer current_renderer = null;
+
+    renderer.startTurn(expanded);
+    const start_ms = utils.milliTimestamp();
+
     try agent.processInput(expanded, printText, printThinkText);
+
+    const end_ms = utils.milliTimestamp();
+    const duration = if (end_ms >= start_ms) @as(u64, @intCast(end_ms - start_ms)) else 0;
+    const ctx_tokens = agent.token_estimator.estimateMessages(agent.history.messages());
+
+    renderer.finishTurn(.{
+        .prompt_tokens = agent.token_estimator.estimate(expanded),
+        .completion_tokens = 0,
+        .context_tokens = ctx_tokens,
+        .max_context_tokens = 128 * 1024,
+        .duration_ms = duration,
+        .acts_count = 1,
+    });
+
     return true;
 }
 
@@ -237,100 +284,42 @@ test "expandCommandTemplate positional and arguments substitution" {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming callback handlers
+// Streaming callback handlers (TurnRenderer-aware)
 // ---------------------------------------------------------------------------
 
-var is_thinking = false;
-
 pub fn printThinkText(text: []const u8) void {
-    const io = main.getIo();
-    if (!is_thinking) {
-        std.Io.File.stderr().writeStreamingAll(io, "\x1b[90m\n[Suy nghĩ]\n") catch {};
-        is_thinking = true;
+    if (current_renderer) |r| {
+        r.streamThinking(text);
+    } else {
+        const io = main.getIo();
+        std.Io.File.stderr().writeStreamingAll(io, "\x1b[90m") catch {};
+        std.Io.File.stderr().writeStreamingAll(io, text) catch {};
+        std.Io.File.stderr().writeStreamingAll(io, "\x1b[0m") catch {};
     }
-    std.Io.File.stderr().writeStreamingAll(io, text) catch {};
 }
 
 pub fn printRawText(text: []const u8) void {
-    const io = main.getIo();
-    if (is_thinking) {
-        std.Io.File.stderr().writeStreamingAll(io, "\x1b[0m\n\n") catch {};
-        is_thinking = false;
+    if (current_renderer) |r| {
+        r.streamResponse(text);
+    } else {
+        const io = main.getIo();
+        std.Io.File.stdout().writeStreamingAll(io, text) catch {};
     }
-    std.Io.File.stdout().writeStreamingAll(io, text) catch {};
 }
 
-var think_tag_buf: [16]u8 = undefined;
-var think_tag_len: usize = 0;
-var in_think_tag: bool = false;
-
 pub fn printText(text: []const u8) void {
-    var start: usize = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        const c = text[i];
-        if (in_think_tag) {
-            const expected = "</think>";
-            if (c == '<' or think_tag_len > 0) {
-                if (i > start) {
-                    printThinkText(text[start..i]);
-                }
-                think_tag_buf[think_tag_len] = c;
-                think_tag_len += 1;
-                i += 1;
-                start = i;
-
-                if (think_tag_buf[think_tag_len - 1] == expected[think_tag_len - 1]) {
-                    if (think_tag_len == expected.len) {
-                        in_think_tag = false;
-                        think_tag_len = 0;
-                        resetThinkState();
-                    }
-                } else {
-                    printThinkText(think_tag_buf[0..think_tag_len]);
-                    think_tag_len = 0;
-                }
-            } else {
-                i += 1;
-            }
-        } else {
-            const expected = "<think>";
-            if (c == '<' or think_tag_len > 0) {
-                if (i > start) {
-                    printRawText(text[start..i]);
-                }
-                think_tag_buf[think_tag_len] = c;
-                think_tag_len += 1;
-                i += 1;
-                start = i;
-
-                if (think_tag_buf[think_tag_len - 1] == expected[think_tag_len - 1]) {
-                    if (think_tag_len == expected.len) {
-                        in_think_tag = true;
-                        think_tag_len = 0;
-                    }
-                } else {
-                    printRawText(think_tag_buf[0..think_tag_len]);
-                    think_tag_len = 0;
-                }
-            } else {
-                i += 1;
-            }
-        }
-    }
-    if (start < text.len) {
-        if (in_think_tag) {
-            printThinkText(text[start..]);
-        } else {
-            printRawText(text[start..]);
-        }
+    if (current_renderer) |r| {
+        r.processTextChunk(text);
+    } else {
+        const io = main.getIo();
+        std.Io.File.stdout().writeStreamingAll(io, text) catch {};
     }
 }
 
 pub fn resetThinkState() void {
-    const io = main.getIo();
-    if (is_thinking) {
-        std.Io.File.stderr().writeStreamingAll(io, "\x1b[0m\n") catch {};
-        is_thinking = false;
+    if (current_renderer) |r| {
+        if (r.is_thinking) {
+            r.endThinking();
+        }
     }
 }

@@ -20,6 +20,11 @@ pub const hooks_mod = @import("core/hooks.zig");
 pub const artifacts_mod = @import("core/artifacts.zig");
 pub const acp_mod = @import("acp/server.zig");
 pub const ui_repl = @import("ui/repl.zig");
+pub const ui_terminal = @import("ui/terminal.zig");
+pub const ui_spinner = @import("ui/spinner.zig");
+pub const ui_diff = @import("ui/diff_renderer.zig");
+pub const ui_markdown = @import("ui/markdown.zig");
+pub const ui_chat_stream = @import("ui/chat_stream.zig");
 pub const resetThinkState = ui_repl.resetThinkState;
 pub const quickjs_engine = @import("runtime/quickjs_engine.zig");
 pub const js_bindings = @import("runtime/js_bindings.zig");
@@ -215,7 +220,28 @@ pub fn main(init: std.process.Init) !void {
     if (args.prompt) |prompt| {
         const expanded = try artifacts_mod.expandArtifactReferences(alloc, init.io, prompt);
         defer alloc.free(expanded);
+
+        var renderer = ui_repl.chat_stream.TurnRenderer.init(alloc, init.io);
+        ui_repl.current_renderer = &renderer;
+        defer ui_repl.current_renderer = null;
+
+        renderer.startTurn(expanded);
+        const start_ms = utils.milliTimestamp();
+
         try agent.processInput(expanded, ui_repl.printText, ui_repl.printThinkText);
+
+        const end_ms = utils.milliTimestamp();
+        const duration = if (end_ms >= start_ms) @as(u64, @intCast(end_ms - start_ms)) else 0;
+        const ctx_tokens = agent.token_estimator.estimateMessages(agent.history.messages());
+
+        renderer.finishTurn(.{
+            .prompt_tokens = agent.token_estimator.estimate(expanded),
+            .completion_tokens = 0,
+            .context_tokens = ctx_tokens,
+            .max_context_tokens = 128 * 1024,
+            .duration_ms = duration,
+            .acts_count = 1,
+        });
         return;
     }
 
@@ -234,7 +260,28 @@ pub fn main(init: std.process.Init) !void {
         const file_prompt = std.mem.trim(u8, file_buf[0..n], " \t\r\n");
         const expanded = try artifacts_mod.expandArtifactReferences(alloc, init.io, file_prompt);
         defer alloc.free(expanded);
+
+        var renderer = ui_repl.chat_stream.TurnRenderer.init(alloc, init.io);
+        ui_repl.current_renderer = &renderer;
+        defer ui_repl.current_renderer = null;
+
+        renderer.startTurn(expanded);
+        const start_ms = utils.milliTimestamp();
+
         try agent.processInput(expanded, ui_repl.printText, ui_repl.printThinkText);
+
+        const end_ms = utils.milliTimestamp();
+        const duration = if (end_ms >= start_ms) @as(u64, @intCast(end_ms - start_ms)) else 0;
+        const ctx_tokens = agent.token_estimator.estimateMessages(agent.history.messages());
+
+        renderer.finishTurn(.{
+            .prompt_tokens = agent.token_estimator.estimate(expanded),
+            .completion_tokens = 0,
+            .context_tokens = ctx_tokens,
+            .max_context_tokens = 128 * 1024,
+            .duration_ms = duration,
+            .acts_count = 1,
+        });
         return;
     }
 
@@ -434,6 +481,7 @@ test {
     _ = @import("core/json.zig");
     _ = @import("core/config.zig");
     _ = @import("core/memact/tokens.zig");
+    _ = @import("core/memact/store.zig");
     _ = @import("tooling/registry.zig");
     _ = @import("lib/http_request.zig");
     _ = @import("tools/bash.zig");
@@ -442,6 +490,11 @@ test {
     _ = @import("ui/history.zig");
     _ = @import("ui/editor.zig");
     _ = @import("ui/paste.zig");
+    _ = @import("ui/terminal.zig");
+    _ = @import("ui/spinner.zig");
+    _ = @import("ui/diff_renderer.zig");
+    _ = @import("ui/markdown.zig");
+    _ = @import("ui/chat_stream.zig");
     _ = quickjs_engine;
     _ = js_bindings;
     _ = process_manager;
