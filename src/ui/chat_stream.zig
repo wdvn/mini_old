@@ -264,16 +264,19 @@ pub const TurnRenderer = struct {
             }
         }
 
+        var dur_buf: [32]u8 = undefined;
+        const dur_str = utils.formatDuration(&dur_buf, duration_ms);
+
         var status_buf: [256]u8 = undefined;
         if (is_error) {
-            const status_line = std.fmt.bufPrint(&status_buf, "    \x1b[31m{s} Lỗi sau {d}ms:\x1b[0m {s}\n", .{
-                term.GLYPH_CROSS, duration_ms, if (result.len > 120) result[0..120] else result,
+            const status_line = std.fmt.bufPrint(&status_buf, "    \x1b[31m{s} Lỗi sau {s}:\x1b[0m {s}\n", .{
+                term.GLYPH_CROSS, dur_str, if (result.len > 120) result[0..120] else result,
             }) catch return;
             term.writeStdout(status_line);
         } else {
             _ = name;
-            const status_line = std.fmt.bufPrint(&status_buf, "    \x1b[32m{s} Hoàn thành ({d}ms)\x1b[0m\n", .{
-                term.GLYPH_CHECK, duration_ms,
+            const status_line = std.fmt.bufPrint(&status_buf, "    \x1b[32m{s} Hoàn thành ({s})\x1b[0m\n", .{
+                term.GLYPH_CHECK, dur_str,
             }) catch return;
             term.writeStdout(status_line);
         }
@@ -355,13 +358,15 @@ pub const TurnRenderer = struct {
         term.writeStdout("\n");
 
         const total_tokens = stats.prompt_tokens + stats.completion_tokens;
-        const elapsed_sec = if (stats.duration_ms > 0)
-            @as(f64, @floatFromInt(stats.duration_ms)) / 1000.0
+        const total_ms = if (stats.duration_ms > 0)
+            stats.duration_ms
         else blk: {
             const now = utils.milliTimestamp();
             const diff = if (now >= self.turn_start_ms) now - self.turn_start_ms else 0;
-            break :blk @as(f64, @floatFromInt(diff)) / 1000.0;
+            break :blk @as(u64, @intCast(diff));
         };
+        var dur_buf: [32]u8 = undefined;
+        const dur_str = utils.formatDuration(&dur_buf, total_ms);
 
         const ctx_pct = if (stats.max_context_tokens > 0)
             (@as(f64, @floatFromInt(stats.context_tokens)) / @as(f64, @floatFromInt(stats.max_context_tokens))) * 100.0
@@ -371,14 +376,14 @@ pub const TurnRenderer = struct {
         var footer_buf: [512]u8 = undefined;
         const footer = std.fmt.bufPrint(&footer_buf,
             " \x1b[90m────────────────────────────────────────────────────────────────────\x1b[0m\n" ++
-            " \x1b[90m{s} {d} tokens ({d} prompt / {d} completion) {s} {d:.1}s {s} Context: {d}/{d} ({d:.0}%) {s} {d} act(s)\x1b[0m\n\n",
+            " \x1b[90m{s} {d} tokens ({d} prompt / {d} completion) {s} {s} {s} Context: {d}/{d} ({d:.0}%) {s} {d} act(s)\x1b[0m\n\n",
             .{
                 term.GLYPH_STATS,
                 total_tokens,
                 stats.prompt_tokens,
                 stats.completion_tokens,
                 term.GLYPH_BULLET,
-                elapsed_sec,
+                dur_str,
                 term.GLYPH_BULLET,
                 stats.context_tokens,
                 stats.max_context_tokens,
