@@ -28,6 +28,13 @@ pub const TurnStats = struct {
     files_modified: usize = 0,
 };
 
+pub const LastBlock = enum {
+    none,
+    thinking,
+    text,
+    tool,
+};
+
 pub const TurnRenderer = struct {
     alloc: Allocator,
     io: std.Io,
@@ -43,7 +50,7 @@ pub const TurnRenderer = struct {
     in_think_tag: bool = false,
     think_tag_buf: [16]u8 = undefined,
     think_tag_len: usize = 0,
-
+    last_block: LastBlock = .none,
     waiting_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     waiting_thread: ?std.Thread = null,
 
@@ -61,6 +68,7 @@ pub const TurnRenderer = struct {
             .has_printed_response_header = false,
             .in_think_tag = false,
             .think_tag_len = 0,
+            .last_block = .none,
             .waiting_active = std.atomic.Value(bool).init(false),
             .waiting_thread = null,
         };
@@ -80,6 +88,7 @@ pub const TurnRenderer = struct {
         self.has_printed_response_header = false;
         self.in_think_tag = false;
         self.think_tag_len = 0;
+        self.last_block = .none;
         self.highlighter = markdown_mod.StreamHighlighter.init();
 
         // Bật ngay live spinner trong khi chờ backend phản hồi TTFT
@@ -132,7 +141,11 @@ pub const TurnRenderer = struct {
         self.think_snippet_len = 0;
         self.think_last_update_ms = 0;
 
+        if (self.last_block == .tool) {
+            term.writeStdout("\n");
+        }
         term.writeStdout(" \x1b[90m💭 Thinking...\x1b[0m");
+        self.last_block = .thinking;
     }
 
     /// Stream một đoạn text trong khối Thinking (thu gọn trên 1 dòng duy nhất, cập nhật thời gian và snippet).
@@ -201,6 +214,7 @@ pub const TurnRenderer = struct {
         var buf: [128]u8 = undefined;
         const footer = std.fmt.bufPrint(&buf, "\r\x1b[2K \x1b[90m💭 Thought for {s}\x1b[0m\n", .{dur_str}) catch "\r\x1b[2K \x1b[90m💭 Thought\x1b[0m\n";
         term.writeStdout(footer);
+        self.last_block = .thinking;
     }
 
     /// Stream câu trả lời của AI ra stdout với Markdown & Code highlighting.
@@ -210,14 +224,20 @@ pub const TurnRenderer = struct {
             self.endThinking();
         }
 
+        const trimmed = std.mem.trim(u8, text, " \r\n\t");
+        if (trimmed.len == 0 and !self.has_printed_response_header) return;
+
         if (!self.has_printed_response_header) {
-            if (std.mem.trim(u8, text, " \r\n\t").len == 0) return;
             self.has_printed_response_header = true;
             var buf: [128]u8 = undefined;
             const header = std.fmt.bufPrint(&buf, "\n \x1b[1;32m{s} mini-agent\x1b[0m\n", .{term.GLYPH_BOT}) catch "\n 💩 mini-agent\n";
             term.writeStdout(header);
+        } else if (self.last_block == .tool) {
+            // Sau khi kết thúc tool, bắt đầu đoạn text mới thì thêm 1 dòng trống
+            term.writeStdout("\n");
         }
 
+        self.last_block = .text;
         self.highlighter.processChunk(self.io, text);
     }
 
@@ -228,6 +248,15 @@ pub const TurnRenderer = struct {
             self.endThinking();
         }
         self.highlighter.flush(self.io);
+
+        // Nếu trước đó là văn bản text giải thích, xuống dòng để không bị dính liền vào text
+        if (self.last_block == .text) {
+            term.writeStdout("\n\n");
+        } else if (self.last_block == .none) {
+            term.writeStdout("\n");
+        }
+
+        self.last_block = .tool;
 
         var detail_buf: [256]u8 = undefined;
         var detail: []const u8 = "";
@@ -283,6 +312,7 @@ pub const TurnRenderer = struct {
             }) catch return;
             term.writeStdout(status_line);
         }
+        self.last_block = .tool;
     }
 
     /// Xử lý callback text chung (tự động phân biệt <think>...</think> và response text).
