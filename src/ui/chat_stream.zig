@@ -57,32 +57,13 @@ pub const TurnRenderer = struct {
 
     /// Bắt đầu một Turn mới từ input của User.
     pub fn startTurn(self: *TurnRenderer, prompt: []const u8) void {
+        _ = prompt;
         self.turn_start_ms = utils.milliTimestamp();
         self.is_thinking = false;
         self.has_printed_response_header = false;
         self.in_think_tag = false;
         self.think_tag_len = 0;
         self.highlighter = markdown_mod.StreamHighlighter.init();
-
-        // In khung User Prompt
-        var top_buf: [128]u8 = undefined;
-        const top_line = std.fmt.bufPrint(&top_buf, "\n\x1b[90m{s}─ \x1b[1;34m{s} You\x1b[0m\x1b[90m ─────────────────────────────────────────────────────────────\x1b[0m\n", .{
-            term.BOX_TOP_LEFT, term.GLYPH_PROMPT,
-        }) catch "\n╭─ ❯ You ─────────────────────────────────────────────────────────────\n";
-        term.writeStdout(top_line);
-
-        var it = std.mem.splitScalar(u8, prompt, '\n');
-        while (it.next()) |line| {
-            var line_buf: [2048]u8 = undefined;
-            const formatted = std.fmt.bufPrint(&line_buf, "\x1b[90m{s}\x1b[0m  {s}\n", .{ term.BOX_VERT, line }) catch continue;
-            term.writeStdout(formatted);
-        }
-
-        var bot_buf: [128]u8 = undefined;
-        const bot_line = std.fmt.bufPrint(&bot_buf, "\x1b[90m{s}────────────────────────────────────────────────────────────────────\x1b[0m\n", .{
-            term.BOX_BOT_LEFT,
-        }) catch "╰────────────────────────────────────────────────────────────────────\n";
-        term.writeStdout(bot_line);
     }
 
     /// Bắt đầu khối Reasoning / Thinking.
