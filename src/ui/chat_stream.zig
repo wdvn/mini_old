@@ -28,13 +28,6 @@ pub const TurnStats = struct {
     files_modified: usize = 0,
 };
 
-pub const LastBlock = enum {
-    none,
-    thinking,
-    text,
-    tool,
-};
-
 pub const TurnRenderer = struct {
     alloc: Allocator,
     io: std.Io,
@@ -50,7 +43,7 @@ pub const TurnRenderer = struct {
     in_think_tag: bool = false,
     think_tag_buf: [16]u8 = undefined,
     think_tag_len: usize = 0,
-    last_block: LastBlock = .none,
+    consecutive_newlines: usize = 1,
     waiting_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     waiting_thread: ?std.Thread = null,
 
@@ -68,7 +61,7 @@ pub const TurnRenderer = struct {
             .has_printed_response_header = false,
             .in_think_tag = false,
             .think_tag_len = 0,
-            .last_block = .none,
+            .consecutive_newlines = 1,
             .waiting_active = std.atomic.Value(bool).init(false),
             .waiting_thread = null,
         };
@@ -76,6 +69,35 @@ pub const TurnRenderer = struct {
 
     pub fn deinit(self: *TurnRenderer) void {
         self.stopWaiting();
+    }
+
+    /// Ghi chuỗi ra terminal và cập nhật trạng thái dòng / newlines liên tiếp.
+    pub fn write(self: *TurnRenderer, bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        term.writeStdout(bytes);
+        for (bytes) |c| {
+            if (c == '\n') {
+                self.consecutive_newlines += 1;
+            } else if (c != '\r') {
+                self.consecutive_newlines = 0;
+            }
+        }
+    }
+
+    /// Đảm bảo con trỏ đang ở đầu một dòng mới (ít nhất 1 ký tự \n).
+    pub fn ensureNewline(self: *TurnRenderer) void {
+        if (self.consecutive_newlines == 0) {
+            self.write("\n");
+        }
+    }
+
+    /// Đảm bảo có đúng 1 dòng trống phân cách đoạn (ít nhất 2 ký tự \n).
+    pub fn ensureBlankLine(self: *TurnRenderer) void {
+        if (self.consecutive_newlines == 0) {
+            self.write("\n\n");
+        } else if (self.consecutive_newlines == 1) {
+            self.write("\n");
+        }
     }
 
     /// Bắt đầu một Turn mới từ input của User.
@@ -88,7 +110,7 @@ pub const TurnRenderer = struct {
         self.has_printed_response_header = false;
         self.in_think_tag = false;
         self.think_tag_len = 0;
-        self.last_block = .none;
+        self.consecutive_newlines = 1;
         self.highlighter = markdown_mod.StreamHighlighter.init();
 
         // Bật ngay live spinner trong khi chờ backend phản hồi TTFT
@@ -141,11 +163,8 @@ pub const TurnRenderer = struct {
         self.think_snippet_len = 0;
         self.think_last_update_ms = 0;
 
-        if (self.last_block == .tool) {
-            term.writeStdout("\n");
-        }
-        term.writeStdout(" \x1b[90m💭 Thinking...\x1b[0m");
-        self.last_block = .thinking;
+        self.ensureNewline();
+        self.write(" \x1b[90m💭 Thinking...\x1b[0m");
     }
 
     /// Stream một đoạn text trong khối Thinking (thu gọn trên 1 dòng duy nhất, cập nhật thời gian và snippet).
@@ -213,8 +232,7 @@ pub const TurnRenderer = struct {
 
         var buf: [128]u8 = undefined;
         const footer = std.fmt.bufPrint(&buf, "\r\x1b[2K \x1b[90m💭 Thought for {s}\x1b[0m\n", .{dur_str}) catch "\r\x1b[2K \x1b[90m💭 Thought\x1b[0m\n";
-        term.writeStdout(footer);
-        self.last_block = .thinking;
+        self.write(footer);
     }
 
     /// Stream câu trả lời của AI ra stdout với Markdown & Code highlighting.
@@ -229,16 +247,20 @@ pub const TurnRenderer = struct {
 
         if (!self.has_printed_response_header) {
             self.has_printed_response_header = true;
+            self.ensureBlankLine();
             var buf: [128]u8 = undefined;
-            const header = std.fmt.bufPrint(&buf, "\n \x1b[1;32m{s} mini-agent\x1b[0m\n", .{term.GLYPH_BOT}) catch "\n 💩 mini-agent\n";
-            term.writeStdout(header);
-        } else if (self.last_block == .tool) {
-            // Sau khi kết thúc tool, bắt đầu đoạn text mới thì thêm 1 dòng trống
-            term.writeStdout("\n");
+            const header = std.fmt.bufPrint(&buf, " \x1b[1;32m{s} mini-agent\x1b[0m\n", .{term.GLYPH_BOT}) catch " 💩 mini-agent\n";
+            self.write(header);
         }
 
-        self.last_block = .text;
         self.highlighter.processChunk(self.io, text);
+        for (text) |c| {
+            if (c == '\n') {
+                self.consecutive_newlines += 1;
+            } else if (c != '\r') {
+                self.consecutive_newlines = 0;
+            }
+        }
     }
 
     /// Bắt đầu thực thi một Tool Action.
@@ -249,14 +271,12 @@ pub const TurnRenderer = struct {
         }
         self.highlighter.flush(self.io);
 
-        // Nếu trước đó là văn bản text giải thích, xuống dòng để không bị dính liền vào text
-        if (self.last_block == .text) {
-            term.writeStdout("\n\n");
-        } else if (self.last_block == .none) {
-            term.writeStdout("\n");
+        // Nếu văn bản trước đó chưa kết thúc bằng newline, tách 1 dòng trống
+        if (self.consecutive_newlines == 0) {
+            self.ensureBlankLine();
+        } else {
+            self.ensureNewline();
         }
-
-        self.last_block = .tool;
 
         var detail_buf: [256]u8 = undefined;
         var detail: []const u8 = "";
@@ -283,7 +303,7 @@ pub const TurnRenderer = struct {
             term.GLYPH_ACTION, name, detail,
         }) catch return;
 
-        term.writeStdout(line);
+        self.write(line);
     }
 
     /// Hoàn thành một Tool Action.
@@ -304,15 +324,14 @@ pub const TurnRenderer = struct {
             const status_line = std.fmt.bufPrint(&status_buf, "    \x1b[31m{s} Lỗi sau {s}:\x1b[0m {s}\n", .{
                 term.GLYPH_CROSS, dur_str, if (result.len > 120) result[0..120] else result,
             }) catch return;
-            term.writeStdout(status_line);
+            self.write(status_line);
         } else {
             _ = name;
             const status_line = std.fmt.bufPrint(&status_buf, "    \x1b[32m{s} Hoàn thành ({s})\x1b[0m\n", .{
                 term.GLYPH_CHECK, dur_str,
             }) catch return;
-            term.writeStdout(status_line);
+            self.write(status_line);
         }
-        self.last_block = .tool;
     }
 
     /// Xử lý callback text chung (tự động phân biệt <think>...</think> và response text).
