@@ -35,6 +35,7 @@ mini-agent là một AI agent dòng lệnh viết bằng Zig: nó nhận prompt,
 ```bash
 git clone <repo-url> && cd mini
 zig build
+./scripts/setup_home_mini.sh    # Khởi tạo thư mục ~/.mini và sync skills/config
 ./zig-out/bin/mini --version
 ```
 

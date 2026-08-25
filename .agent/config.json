@@ -1,0 +1,5 @@
+{
+  "execution_mode": "auto",
+  "memact_enabled": true,
+  "max_tokens": 8192
+}

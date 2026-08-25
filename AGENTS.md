@@ -20,6 +20,7 @@ src/
   acp/                — ACP server
 docs/                 — proposals, technical docs (tiếng Việt)
 scripts/build_release.sh
+scripts/setup_home_mini.sh — Khởi tạo & sync skills/config cho ~/.mini
 testcases/            — tất cả các file test (standalone, integration, benchmarks, ...)
 ```
 
@@ -29,6 +30,7 @@ testcases/            — tất cả các file test (standalone, integration, be
 - `zig build run` → build + chạy interactive REPL.
 - `zig build run -- -e "..."` → single-shot mode.
 - `zig build test` → unit tests (root `src/main.zig`, link QuickJS).
+- Setup môi trường user: `scripts/setup_home_mini.sh` (tạo/sync `~/.mini/`).
 - Release: `scripts/build_release.sh`.
 - Cross-compile: `zig build -Dtarget=x86_64-linux-gnu` (hoặc `aarch64-linux-gnu`).
 

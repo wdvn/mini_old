@@ -127,6 +127,8 @@ pub const TurnRenderer = struct {
         self.waiting_thread = std.Thread.spawn(.{}, waitingLoop, .{self}) catch null;
     }
 
+    extern "c" fn usleep(usec: c_uint) c_int;
+
     fn waitingLoop(self: *TurnRenderer) void {
         var s = spinner_mod.Spinner.start();
         while (self.waiting_active.load(.acquire)) {
@@ -138,7 +140,7 @@ pub const TurnRenderer = struct {
                 frame, dur_str,
             }) catch break;
             term.writeStdout(line);
-            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(80), .awake) catch {};
+            _ = usleep(80 * 1000);
         }
     }
 

@@ -134,8 +134,13 @@ pub const AgentLoop = struct {
     last_backend_http_code: u32 = 0,
     /// Raw body lỗi backend gần nhất (bản dupe, agent sở hữu — đưa vào journal).
     last_backend_raw_error: ?[]u8 = null,
+    /// Số act đã chạy trong turn gần nhất.
+    last_turn_acts: usize = 0,
+    /// Số token completion đã nhận trong turn gần nhất.
+    last_turn_completion_tokens: usize = 0,
 
     pub const Error = error{
+        LLMAuthenticationError,
         LLMRateLimitExceeded,
         LLMProviderUnavailable,
         LLMMalformedJsonOutput,
@@ -273,6 +278,16 @@ pub const AgentLoop = struct {
         // Thêm response vào history (nếu có nội dung)
         _ = try self.history.addAssistantResponse(&response);
 
+        // Tích luỹ token completion
+        for (response.content.items) |block| {
+            switch (block) {
+                .text => |t| self.last_turn_completion_tokens += self.token_estimator.estimate(t),
+                .thinking => |th| self.last_turn_completion_tokens += self.token_estimator.estimate(th.thinking),
+                .tool_use => |tu| self.last_turn_completion_tokens += self.token_estimator.estimate(tu.name) + self.token_estimator.estimate(tu.input_json),
+                else => {},
+            }
+        }
+
         // 1. CodeAct: Kiểm tra có khối mã JavaScript trong response không
         if (self.config.execution_mode != .tools) {
             if (findJsCodeInResponse(self.alloc, &response)) |js_code| {
@@ -393,6 +408,7 @@ pub const AgentLoop = struct {
                 if (response.http_code >= 400) {
                     self.setLastErrorContext(response.http_code, response.raw_debug_info);
                 }
+                if (response.http_code == 401 or response.http_code == 403) return error.LLMAuthenticationError;
                 if (response.http_code == 429) return error.LLMRateLimitExceeded;
                 if (response.http_code >= 500 and response.http_code < 600) return error.LLMProviderUnavailable;
 
@@ -470,6 +486,10 @@ pub const AgentLoop = struct {
         // Thêm user message vào history
         try self.history.addUser(user_text);
 
+        // Reset turn metrics
+        self.last_turn_acts = 0;
+        self.last_turn_completion_tokens = 0;
+
         // Reset bộ đếm retry sửa lỗi role cho turn mới
         self.role_fix_attempts = 0;
         // Reset bộ đếm continue-max_tokens cho turn mới
@@ -511,6 +531,7 @@ pub const AgentLoop = struct {
 
         // Không giới hạn số act — model tự quyết định khi nào dừng (exit_loop).
         while (true) : (act_id += 1) {
+            self.last_turn_acts = act_id;
             var try_count: usize = 0;
 
             while (try_count <= max_retries) : (try_count += 1) {
@@ -520,6 +541,18 @@ pub const AgentLoop = struct {
 
                 const result = self.executeStep(act_id, tool_defs, text_cb, think_cb) catch |e| {
                     switch (e) {
+                        error.LLMAuthenticationError => {
+                            main.stderrPrint("\n\x1b[31m[agent] ⛔ Lỗi xác thực/quyền truy cập backend (HTTP {d})! Vui lòng kiểm tra API key hoặc tài khoản.\x1b[0m\n", .{self.last_backend_http_code});
+                            if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Lỗi xác thực/quyền backend — abort", .{
+                                .backend = self.backend.name(),
+                                .model = self.backend.model(),
+                                .error_name = @errorName(e),
+                                .http_code = self.last_backend_http_code,
+                                .attempt = 1,
+                                .raw_snippet = self.last_backend_raw_error,
+                            }) catch {};
+                            return e;
+                        },
                         error.LLMRateLimitExceeded, error.LLMProviderUnavailable => {
                             // Journal: đủ ngữ cảnh debug — backend, model, error name,
                             // HTTP code (classify từ response), lần thử, raw body server.
@@ -618,16 +651,22 @@ pub const AgentLoop = struct {
                 };
 
                 // Flush toàn bộ snapshot mini.write/patch/sh đã track trong act này (M4)
+                var recorded_delta = false;
                 if (self.snapshot_tracker) |*t| {
-                    t.flush(act_id);
+                    if (t.tracked.items.len > 0) {
+                        t.flush(act_id);
+                        recorded_delta = true;
+                    }
                     t.reset();
                 }
 
-                if (self.journal) |*j| {
-                    j.recordActComplete(self.io, act_id, .{
-                        .act_id = act_id,
-                        .file_snapshots = &.{}, 
-                    }) catch {};
+                if (!recorded_delta) {
+                    if (self.journal) |*j| {
+                        j.recordActComplete(self.io, act_id, .{
+                            .act_id = act_id,
+                            .file_snapshots = &.{}, 
+                        }) catch {};
+                    }
                 }
 
                 if (result == .exit_loop) {
@@ -841,17 +880,9 @@ pub const AgentLoop = struct {
     /// Thực thi tất cả tool_use blocks trong response.
 
     fn executeTools(self: *AgentLoop, act_id: usize, response: *const proto.Response) !void {
+        _ = act_id;
         var results = ArrayList(proto.ToolResult).empty;
         defer results.deinit(self.alloc);
-        
-        var file_snaps = ArrayList(journal_mod.FileSnapshot).empty;
-        defer {
-            for (file_snaps.items) |fs| {
-                self.alloc.free(fs.path);
-                if (fs.previous_content_hash) |h| self.alloc.free(h);
-            }
-            file_snaps.deinit(self.alloc);
-        }
         
         var allocated_strings = ArrayList([]u8).empty;
         defer {
@@ -905,29 +936,8 @@ pub const AgentLoop = struct {
                     // Snapshot file nếu là công cụ chỉnh sửa
                     if (std.mem.eql(u8, tu.name, "file_edit") or std.mem.eql(u8, tu.name, "file_write")) {
                         if (json_mod.findString(tu.input_json, "path")) |path| {
-                            const cwd = std.Io.Dir.cwd();
-                            var prev_hash: ?[]u8 = null;
-                            if (cwd.openFile(self.io, path, .{})) |file| {
-                                defer file.close(self.io);
-                                if (file.stat(self.io)) |stat| {
-                                    if (self.alloc.alloc(u8, @intCast(stat.size))) |buf| {
-                                        defer self.alloc.free(buf);
-                                        if (utils.readAll(self.io, file, buf)) |read_len| {
-                                            if (self.cas.store(self.io, buf[0..read_len])) |h| {
-                                                prev_hash = h;
-                                            } else |_| {}
-                                        } else |_| {}
-                                    } else |_| {}
-                                } else |_| {}
-                            } else |_| {}
-                            
-                            if (self.alloc.dupe(u8, path)) |p| {
-                                file_snaps.append(self.alloc, .{
-                                    .path = p,
-                                    .previous_content_hash = prev_hash,
-                                    }) catch {};
-                            } else |_| {
-                                if (prev_hash) |h| self.alloc.free(h);
+                            if (self.snapshot_tracker) |*t| {
+                                t.beforeFileWrite(path);
                             }
                         }
                     }
@@ -985,15 +995,6 @@ pub const AgentLoop = struct {
 
         if (results.items.len > 0) {
             try self.history.addToolResults(results.items);
-        }
-
-        // Ghi StateDelta
-        if (self.journal) |*j| {
-            // Allocate a stable slice for file_snaps because recordActComplete serializes it
-            j.recordActComplete(self.io, act_id, .{
-                .act_id = act_id,
-                .file_snapshots = file_snaps.items,
-            }) catch {};
         }
     }
 };
