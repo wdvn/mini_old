@@ -67,11 +67,11 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
 
         renderer.finishTurn(.{
             .prompt_tokens = agent.token_estimator.estimate(expanded_input),
-            .completion_tokens = 0,
+            .completion_tokens = agent.last_turn_completion_tokens,
             .context_tokens = ctx_tokens,
-            .max_context_tokens = 128 * 1024,
+            .max_context_tokens = agent.config.context_window,
             .duration_ms = duration,
-            .acts_count = 1,
+            .acts_count = if (agent.last_turn_acts > 0) agent.last_turn_acts else 1,
         });
     }
 
@@ -212,6 +212,7 @@ fn tryExecuteCustomSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.
     main.stdoutPrint("\x1b[90m[command /{s}]\x1b[0m\n", .{cmd_name});
 
     var renderer = chat_stream.TurnRenderer.init(alloc, io);
+    defer renderer.deinit();
     current_renderer = &renderer;
     defer current_renderer = null;
 
@@ -226,11 +227,11 @@ fn tryExecuteCustomSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.
 
     renderer.finishTurn(.{
         .prompt_tokens = agent.token_estimator.estimate(expanded),
-        .completion_tokens = 0,
+        .completion_tokens = agent.last_turn_completion_tokens,
         .context_tokens = ctx_tokens,
-        .max_context_tokens = 128 * 1024,
+        .max_context_tokens = agent.config.context_window,
         .duration_ms = duration,
-        .acts_count = 1,
+        .acts_count = if (agent.last_turn_acts > 0) agent.last_turn_acts else 1,
     });
 
     return true;
