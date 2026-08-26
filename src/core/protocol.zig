@@ -95,6 +95,22 @@ pub const Message = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Usage (RFC-006)
+// ---------------------------------------------------------------------------
+
+/// Thống kê token usage do backend trả về (OpenAI usage object format).
+/// Dùng chung cho mọi backend (openai-compat, claude, ollama).
+pub const Usage = struct {
+    prompt_tokens: u64 = 0,
+    completion_tokens: u64 = 0,
+    total_tokens: u64 = 0,
+    /// Prompt tokens tính giá cache-hit (prompt_tokens - cached_tokens).
+    cached_tokens: u64 = 0,
+    /// Token dành cho reasoning/thinking (DeepSeek reasoner, OpenAI o-series).
+    reasoning_tokens: u64 = 0,
+};
+
+// ---------------------------------------------------------------------------
 // Response
 // ---------------------------------------------------------------------------
 
@@ -112,6 +128,7 @@ pub const StopReason = enum {
     unknown,
 };
 
+
 /// Phản hồi đầy đủ từ một AI backend.
 /// Gọi `deinit` sau khi dùng xong để giải phóng bộ nhớ.
 pub const Response = struct {
@@ -124,6 +141,8 @@ pub const Response = struct {
     http_code: u32 = 200,
     /// Raw debug info từ backend (khi stop_reason == .unknown)
     raw_debug_info: ?[]const u8,
+    /// Token usage thực tế từ backend (RFC-006). Zero nếu backend không trả.
+    usage: Usage = .{},
 
     /// Khởi tạo Response rỗng.
     pub fn init(alloc: Allocator) Response {

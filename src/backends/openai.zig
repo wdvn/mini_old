@@ -53,6 +53,8 @@ pub const Client = struct {
     use_completion_tokens: bool,
     /// Vô hiệu hóa reasoning_effort nếu API không hỗ trợ cùng với tool calls.
     disable_reasoning_effort: bool,
+    /// Vô hiệu hóa stream_options nếu API compat không hỗ trợ (RFC-006 §3.6).
+    disable_stream_options: bool,
 
     /// Khởi tạo client.
     pub fn init(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32) Client {
@@ -65,6 +67,7 @@ pub const Client = struct {
             .max_tokens = max_tokens,
             .use_completion_tokens = false,
             .disable_reasoning_effort = false,
+            .disable_stream_options = false,
         };
     }
 
@@ -81,7 +84,7 @@ pub const Client = struct {
     ) !proto.Response {
         var retry_count: u32 = 0;
         while (retry_count < 3) : (retry_count += 1) {
-            const body = try buildRequestBody(self.alloc, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, system_prompt, msgs, tools);
+            const body = try buildRequestBody(self.alloc, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.disable_stream_options, system_prompt, msgs, tools);
             defer self.alloc.free(body);
 
             // Build URL
@@ -138,6 +141,13 @@ pub const Client = struct {
                     self.disable_reasoning_effort = true;
                     should_retry = true;
                 }
+
+                // RFC-006 §3.6: stream_options không được hỗ trợ bởi API compat cũ
+                if (std.mem.indexOf(u8, raw_resp, "stream_options") != null or
+                    std.mem.indexOf(u8, raw_resp, "include_usage") != null) {
+                    self.disable_stream_options = true;
+                    should_retry = true;
+                }
                 
                 if (should_retry) {
                     if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
@@ -167,6 +177,7 @@ fn buildRequestBody(
     max_tokens: u32,
     use_completion_tokens: bool,
     disable_reasoning_effort: bool,
+    disable_stream_options: bool,
     system_prompt: []const u8,
     msgs: []const proto.Message,
     tools: []const proto.ToolDefinition,
@@ -176,15 +187,17 @@ fn buildRequestBody(
     const w = &buf;
 
     const reasoning_effort_str = if (disable_reasoning_effort) "\"reasoning_effort\":\"none\"," else "";
+    // RFC-006 §3.6: stream_options adaptive — bỏ nếu API compat không hỗ trợ
+    const stream_options_str = if (disable_stream_options) "" else ",\"stream_options\":{\"include_usage\":true}";
 
     if (use_completion_tokens) {
         try w.print(
-            \\{{"model":"{s}","max_completion_tokens":{d},{s}"stream":true,"stream_options":{{"include_usage":true}}
-        , .{ model, max_tokens, reasoning_effort_str });
+            \\{{"model":"{s}","max_completion_tokens":{d},{s}"stream":true{s}
+        , .{ model, max_tokens, reasoning_effort_str, stream_options_str });
     } else {
         try w.print(
-            \\{{"model":"{s}","max_tokens":{d},{s}"stream":true,"stream_options":{{"include_usage":true}}
-        , .{ model, max_tokens, reasoning_effort_str });
+            \\{{"model":"{s}","max_tokens":{d},{s}"stream":true{s}
+        , .{ model, max_tokens, reasoning_effort_str, stream_options_str });
     }
 
     // Tool definitions (đặt trước messages để đảm bảo JSON prefix là tĩnh 100% giữa các lượt)
@@ -388,6 +401,23 @@ const StreamCtx = struct {
             return;
         }
 
+        // RFC-006 §3.1: Usage JSON parse struct (nested optional)
+        const UsagePromptDetails = struct {
+            cached_tokens: ?u64 = null,
+        };
+        const UsageCompletionDetails = struct {
+            reasoning_tokens: ?u64 = null,
+        };
+        const UsageJson = struct {
+            prompt_tokens: ?u64 = null,
+            completion_tokens: ?u64 = null,
+            total_tokens: ?u64 = null,
+            prompt_tokens_details: ?UsagePromptDetails = null,
+            completion_tokens_details: ?UsageCompletionDetails = null,
+            // DeepSeek alias (RFC-006 §3.1)
+            prompt_cache_hit_tokens: ?u64 = null,
+        };
+
         const Chunk = struct {
             const ChoiceDeltaToolCallFunction = struct {
                 name: ?[]const u8 = null,
@@ -402,6 +432,8 @@ const StreamCtx = struct {
             const ChoiceDelta = struct {
                 content: ?[]const u8 = null,
                 reasoning_content: ?[]const u8 = null,
+                // RFC-006 §3.3: OpenAI o-series/GPT-5.x dùng field "reasoning"
+                reasoning: ?[]const u8 = null,
                 tool_calls: ?[]ChoiceDeltaToolCall = null,
             };
             const Choice = struct {
@@ -414,6 +446,8 @@ const StreamCtx = struct {
             created: ?u64 = null,
             model: ?[]const u8 = null,
             choices: ?[]Choice = null,
+            // RFC-006 §3.1: usage chunk (gửi ở chunk cuối khi include_usage=true)
+            usage: ?UsageJson = null,
         };
 
         const parsed = std.json.parseFromSlice(Chunk, self.alloc, data, .{ .ignore_unknown_fields = true }) catch return;
@@ -423,14 +457,18 @@ const StreamCtx = struct {
         if (chunk.choices) |choices| {
             for (choices) |choice| {
                 if (choice.delta) |delta| {
-                    if (delta.reasoning_content) |reasoning| {
-                        if (reasoning.len > 0) {
+                    // RFC-006 §3.3: nhận reasoning từ cả hai biến thể
+                    // DeepSeek-style: delta.reasoning_content
+                    // OpenAI o-series/GPT-5.x: delta.reasoning
+                    const reasoning = delta.reasoning_content orelse delta.reasoning;
+                    if (reasoning) |r| {
+                        if (r.len > 0) {
                             if (!self.think_accum_init) {
                                 self.think_accum = .empty;
                                 self.think_accum_init = true;
                             }
-                            try self.think_accum.appendSlice(self.alloc, reasoning);
-                            if (self.think_cb) |cb| cb(reasoning);
+                            try self.think_accum.appendSlice(self.alloc, r);
+                            if (self.think_cb) |cb| cb(r);
                         }
                     }
                     if (delta.content) |text| {
@@ -455,15 +493,35 @@ const StreamCtx = struct {
                     }
                 }
                 if (choice.finish_reason) |reason| {
+                    // RFC-006 §3.4: map đầy đủ finish_reason của OpenAI
                     if (std.mem.eql(u8, reason, "tool_calls")) {
                         self.response.stop_reason = .tool_use;
                     } else if (std.mem.eql(u8, reason, "stop")) {
                         self.response.stop_reason = .end_turn;
                     } else if (std.mem.eql(u8, reason, "length")) {
                         self.response.stop_reason = .max_tokens;
+                    } else if (std.mem.eql(u8, reason, "function")) {
+                        // Legacy function calling → map như tool_calls
+                        self.response.stop_reason = .tool_use;
+                    } else if (std.mem.eql(u8, reason, "content_filter")) {
+                        // Content filter → .unknown + debug info (không phải end_turn)
+                        self.response.stop_reason = .unknown;
                     }
                 }
             }
+        }
+
+        // RFC-006 §3.1: parse usage từ chunk cuối
+        if (chunk.usage) |u| {
+            const cached = if (u.prompt_tokens_details) |ptd| (ptd.cached_tokens orelse 0) else (u.prompt_cache_hit_tokens orelse 0);
+            const reasoning_tok = if (u.completion_tokens_details) |ctd| (ctd.reasoning_tokens orelse 0) else 0;
+            self.response.usage = .{
+                .prompt_tokens = u.prompt_tokens orelse 0,
+                .completion_tokens = u.completion_tokens orelse 0,
+                .total_tokens = u.total_tokens orelse 0,
+                .cached_tokens = cached,
+                .reasoning_tokens = reasoning_tok,
+            };
         }
     }
 
@@ -625,7 +683,7 @@ test "openai buildRequestBody includes stream_options, static tools prefix and c
         .{ .name = "test_tool", .description = "desc", .input_schema_json = "{}" },
     };
 
-    const body = try buildRequestBody(alloc, "gpt-4o", 1024, false, false, "System prompt test", &msgs, &tools);
+    const body = try buildRequestBody(alloc, "gpt-4o", 1024, false, false, false, "System prompt test", &msgs, &tools);
     defer alloc.free(body);
 
     // Kiểm tra có stream_options include_usage
@@ -638,4 +696,162 @@ test "openai buildRequestBody includes stream_options, static tools prefix and c
     const msgs_pos = std.mem.indexOf(u8, body, "\"messages\":[");
     try testing.expect(tools_pos != null and msgs_pos != null);
     try testing.expect(tools_pos.? < msgs_pos.?);
+}
+
+// --- RFC-006 Tests ---
+
+test "openai buildRequestBody: disable_stream_options omits stream_options" {
+    const alloc = testing.allocator;
+    const msgs = [_]proto.Message{};
+    const tools = [_]proto.ToolDefinition{};
+
+    // disable_stream_options = true → không có stream_options
+    const body = try buildRequestBody(alloc, "gpt-4o", 1024, false, false, true, "test", &msgs, &tools);
+    defer alloc.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "stream_options") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "include_usage") == null);
+}
+
+test "openai stream: parse usage chunk (RFC-006 §3.1)" {
+    const alloc = testing.allocator;
+    var resp = proto.Response.init(alloc);
+    defer resp.deinit();
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = resp,
+        .line_buf = .empty,
+        .tool_calls = .empty,
+    };
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.tool_calls.deinit(alloc);
+
+    try feedLines(&ctx, &.{
+        \\data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}
+        ,
+        \\data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+        ,
+        \\data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":30},"completion_tokens_details":{"reasoning_tokens":10}}}
+        ,
+        \\data: [DONE]
+    });
+
+    try ctx.finalizeToolCalls();
+    try testing.expectEqual(proto.StopReason.end_turn, ctx.response.stop_reason);
+    try testing.expectEqual(@as(u64, 100), ctx.response.usage.prompt_tokens);
+    try testing.expectEqual(@as(u64, 50), ctx.response.usage.completion_tokens);
+    try testing.expectEqual(@as(u64, 150), ctx.response.usage.total_tokens);
+    try testing.expectEqual(@as(u64, 30), ctx.response.usage.cached_tokens);
+    try testing.expectEqual(@as(u64, 10), ctx.response.usage.reasoning_tokens);
+}
+
+test "openai stream: DeepSeek usage alias prompt_cache_hit_tokens (RFC-006 §3.1)" {
+    const alloc = testing.allocator;
+    var resp = proto.Response.init(alloc);
+    defer resp.deinit();
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = resp,
+        .line_buf = .empty,
+        .tool_calls = .empty,
+    };
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.tool_calls.deinit(alloc);
+
+    try feedLines(&ctx, &.{
+        \\data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+        ,
+        \\data: {"choices":[],"usage":{"prompt_tokens":200,"completion_tokens":80,"total_tokens":280,"prompt_cache_hit_tokens":60}}
+        ,
+        \\data: [DONE]
+    });
+
+    try ctx.finalizeToolCalls();
+    try testing.expectEqual(@as(u64, 200), ctx.response.usage.prompt_tokens);
+    try testing.expectEqual(@as(u64, 60), ctx.response.usage.cached_tokens);
+}
+
+test "openai stream: delta.reasoning parsed as thinking (RFC-006 §3.3)" {
+    const alloc = testing.allocator;
+    var resp = proto.Response.init(alloc);
+    defer resp.deinit();
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = resp,
+        .line_buf = .empty,
+        .tool_calls = .empty,
+    };
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.tool_calls.deinit(alloc);
+
+    // OpenAI o-series/GPT-5.x sử dụng field "reasoning" thay vì "reasoning_content"
+    try feedLines(&ctx, &.{
+        \\data: {"choices":[{"delta":{"reasoning":"Let me think"}}]}
+        ,
+        \\data: {"choices":[{"delta":{"reasoning":" about this"}}]}
+        ,
+        \\data: {"choices":[{"delta":{"content":"The answer is 42"}}]}
+        ,
+        \\data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+        ,
+        \\data: [DONE]
+    });
+
+    try ctx.finalizeToolCalls();
+    try testing.expectEqual(proto.StopReason.end_turn, ctx.response.stop_reason);
+    // Có 2 content blocks: thinking + text
+    try testing.expectEqual(@as(usize, 2), ctx.response.content.items.len);
+    // Block đầu: thinking
+    const think_block = ctx.response.content.items[0].thinking;
+    try testing.expectEqualStrings("Let me think about this", think_block.thinking);
+    // Block thứ 2: text
+    const text_block = ctx.response.content.items[1].text;
+    try testing.expectEqualStrings("The answer is 42", text_block);
+}
+
+test "openai stream: finish_reason content_filter maps to unknown (RFC-006 §3.4)" {
+    const alloc = testing.allocator;
+    var resp = proto.Response.init(alloc);
+    defer resp.deinit();
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = resp,
+        .line_buf = .empty,
+        .tool_calls = .empty,
+    };
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.tool_calls.deinit(alloc);
+
+    try feedLines(&ctx, &.{
+        \\data: {"choices":[{"delta":{"content":"I can't"},"finish_reason":"content_filter"}]}
+        ,
+        \\data: [DONE]
+    });
+
+    try ctx.finalizeToolCalls();
+    // content_filter → .unknown, KHÔNG phải .end_turn
+    try testing.expectEqual(proto.StopReason.unknown, ctx.response.stop_reason);
+}
+
+test "openai stream: finish_reason function maps to tool_use (RFC-006 §3.4)" {
+    const alloc = testing.allocator;
+    var resp = proto.Response.init(alloc);
+    defer resp.deinit();
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = resp,
+        .line_buf = .empty,
+        .tool_calls = .empty,
+    };
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.tool_calls.deinit(alloc);
+
+    try feedLines(&ctx, &.{
+        \\data: {"choices":[{"delta":{},"finish_reason":"function"}]}
+        ,
+        \\data: [DONE]
+    });
+
+    try ctx.finalizeToolCalls();
+    // Legacy "function" → .tool_use
+    try testing.expectEqual(proto.StopReason.tool_use, ctx.response.stop_reason);
 }
