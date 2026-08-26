@@ -150,6 +150,37 @@ pub fn findBool(json: []const u8, key: []const u8) bool {
     return std.mem.indexOf(u8, json, pattern) != null;
 }
 
+/// Tìm giá trị số nguyên của key trong JSON object.
+pub fn findInt(json: []const u8, key: []const u8, comptime T: type) ?T {
+    var pattern_buf: [256]u8 = undefined;
+    if (key.len + 4 > pattern_buf.len) return null;
+    const pattern = std.fmt.bufPrint(&pattern_buf, "\"{s}\":", .{key}) catch return null;
+
+    const start_idx = std.mem.indexOf(u8, json, pattern) orelse return null;
+    var val_start = start_idx + pattern.len;
+
+    while (val_start < json.len and (json[val_start] == ' ' or json[val_start] == '\t' or json[val_start] == '\n' or json[val_start] == '\r')) : (val_start += 1) {}
+    if (val_start >= json.len) return null;
+
+    var val_end = val_start;
+    if (val_end < json.len and (json[val_end] == '-' or json[val_end] == '+')) {
+        val_end += 1;
+    }
+    while (val_end < json.len and std.ascii.isDigit(json[val_end])) : (val_end += 1) {}
+    if (val_end == val_start) return null;
+
+    return std.fmt.parseInt(T, json[val_start..val_end], 10) catch null;
+}
+
+test "findInt parse số nguyên đúng từ JSON" {
+    const json_str = "{\"id\":123,\"prompt_tokens\":4500,\"negative\":-42,\"not_number\":\"hello\"}";
+    try std.testing.expectEqual(@as(?u32, 123), findInt(json_str, "id", u32));
+    try std.testing.expectEqual(@as(?u64, 4500), findInt(json_str, "prompt_tokens", u64));
+    try std.testing.expectEqual(@as(?i32, -42), findInt(json_str, "negative", i32));
+    try std.testing.expectEqual(@as(?u32, null), findInt(json_str, "not_number", u32));
+    try std.testing.expectEqual(@as(?u32, null), findInt(json_str, "missing", u32));
+}
+
 test "findStringOwned unescape đúng chuỗi JSON" {
     const alloc = std.testing.allocator;
     // Lệnh shell chứa quote — must survive JSON round-trip nguyên vẹn
