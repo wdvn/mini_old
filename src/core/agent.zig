@@ -161,13 +161,19 @@ pub const AgentLoop = struct {
         const backend: Backend = blk: {
             if (config.openai_compat_url) |url| {
                 main.stderrPrint("[agent] Backend: OpenAI-compat @ {s} ({s})\n", .{ url, config.openai_compat_model });
-                break :blk .{ .openai = openai_mod.Client.init(
+                const proto_mode: openai_mod.ProtocolMode = switch (config.openai_protocol) {
+                    .auto => .auto,
+                    .chat_completions => .chat_completions,
+                    .responses => .responses,
+                };
+                break :blk .{ .openai = openai_mod.Client.initWithProtocol(
                     alloc,
                     url,
                     config.openai_compat_key orelse "",
                     config.openai_compat_api_header,
                     config.openai_compat_model,
                     config.max_tokens,
+                    proto_mode,
                 ) };
             }
             if (config.anthropic_key) |key| {
@@ -693,13 +699,19 @@ pub const AgentLoop = struct {
                 main.stderrPrint("[agent] OPENAI_COMPAT_URL chưa được thiết lập\n", .{});
                 return;
             };
-            self.backend = .{ .openai = openai_mod.Client.init(
+            const proto_mode: openai_mod.ProtocolMode = switch (cfg.openai_protocol) {
+                .auto => .auto,
+                .chat_completions => .chat_completions,
+                .responses => .responses,
+            };
+            self.backend = .{ .openai = openai_mod.Client.initWithProtocol(
                 self.alloc,
                 url,
                 cfg.openai_compat_key orelse "",
                 cfg.openai_compat_api_header,
                 model_override orelse cfg.openai_compat_model,
                 cfg.max_tokens,
+                proto_mode,
             ) };
         } else if (std.mem.eql(u8, backend_name, "claude")) {
             const key = cfg.anthropic_key orelse {

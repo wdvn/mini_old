@@ -32,14 +32,52 @@ const main = @import("../main.zig");
 const utils = @import("../core/utils.zig");
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Protocol Mode & Auto-Negotiation (ISSUE-BACKEND-001)
+// ---------------------------------------------------------------------------
+
+/// Chế độ giao thức cho OpenAI-compatible backend.
+pub const ProtocolMode = enum {
+    auto,
+    chat_completions,
+    responses,
+};
+
+/// Trích xuất root base URL (bỏ /chat/completions hoặc /responses nếu có).
+pub fn getRootApiUrl(base_url: []const u8) []const u8 {
+    var url = std.mem.trimEnd(u8, base_url, "/ \t\r\n");
+    if (std.mem.endsWith(u8, url, "/chat/completions")) {
+        return std.mem.trimEnd(u8, url[0 .. url.len - "/chat/completions".len], "/");
+    }
+    if (std.mem.endsWith(u8, url, "/responses")) {
+        return std.mem.trimEnd(u8, url[0 .. url.len - "/responses".len], "/");
+    }
+    return url;
+}
+
+/// Nhận diện model dòng mới ưu tiên dùng Responses API (GPT-5.6, o3-pro, v.v.).
+pub fn shouldUseResponsesApi(model: []const u8) bool {
+    if (std.mem.startsWith(u8, model, "gpt-5.6") or
+        std.mem.startsWith(u8, model, "gpt-5-sol") or
+        std.mem.startsWith(u8, model, "gpt-5-terra") or
+        std.mem.startsWith(u8, model, "gpt-5-luna") or
+        std.mem.startsWith(u8, model, "o3-pro") or
+        std.mem.startsWith(u8, model, "o1-pro"))
+    {
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
 
-/// OpenAI-compatible streaming client.
+/// OpenAI-compatible streaming client (hỗ trợ cả Chat Completions API & Responses API).
 pub const Client = struct {
     alloc: Allocator,
     /// Base URL của API (ví dụ: "https://api.openai.com/v1" hoặc
-    /// "http://localhost:11434/v1"). Sẽ append "/chat/completions" nếu cần.
+    /// "http://localhost:11434/v1").
     base_url: []const u8,
     /// API key. Có thể là chuỗi rỗng nếu endpoint không cần.
     api_key: []const u8,
@@ -55,6 +93,10 @@ pub const Client = struct {
     disable_reasoning_effort: bool,
     /// Vô hiệu hóa stream_options nếu API compat không hỗ trợ (RFC-006 §3.6).
     disable_stream_options: bool,
+    /// Chế độ giao thức (auto, chat_completions, responses).
+    protocol_mode: ProtocolMode,
+    /// Cache giao thức đã đàm phán thành công (Tier 3: Session Protocol Memory).
+    cached_protocol: ?ProtocolMode,
 
     /// Khởi tạo client.
     pub fn init(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32) Client {
@@ -68,12 +110,30 @@ pub const Client = struct {
             .use_completion_tokens = false,
             .disable_reasoning_effort = false,
             .disable_stream_options = false,
+            .protocol_mode = .auto,
+            .cached_protocol = null,
+        };
+    }
+
+    /// Khởi tạo client với chế độ protocol rõ ràng.
+    pub fn initWithProtocol(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32, protocol_mode: ProtocolMode) Client {
+        return .{
+            .alloc = alloc,
+            .base_url = base_url,
+            .api_key = api_key,
+            .api_header = api_header,
+            .model = model,
+            .max_tokens = max_tokens,
+            .use_completion_tokens = false,
+            .disable_reasoning_effort = false,
+            .disable_stream_options = false,
+            .protocol_mode = protocol_mode,
+            .cached_protocol = null,
         };
     }
 
     /// Gửi messages lên API và nhận phản hồi streaming.
-    /// `text_cb` được gọi với mỗi text chunk khi AI đang sinh text.
-    /// Trả về Response đầy đủ sau khi stream kết thúc.
+    /// Hỗ trợ 3-Tier Dual-Protocol Auto-Negotiation & Adaptive Fallback.
     pub fn sendMessage(
         self: *Client,
         system_prompt: []const u8,
@@ -82,20 +142,28 @@ pub const Client = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !proto.Response {
+        const root_url = getRootApiUrl(self.base_url);
+        var active_protocol: ProtocolMode = blk: {
+            if (self.protocol_mode == .chat_completions) break :blk .chat_completions;
+            if (self.protocol_mode == .responses) break :blk .responses;
+            if (self.cached_protocol) |p| break :blk p;
+            if (shouldUseResponsesApi(self.model)) break :blk .responses;
+            break :blk .chat_completions;
+        };
+
         var retry_count: u32 = 0;
-        while (retry_count < 3) : (retry_count += 1) {
-            const body = try buildRequestBody(self.alloc, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.disable_stream_options, system_prompt, msgs, tools);
+        while (retry_count < 4) : (retry_count += 1) {
+            const body = if (active_protocol == .responses)
+                try buildResponsesRequestBody(self.alloc, self.model, self.max_tokens, self.disable_reasoning_effort, system_prompt, msgs, tools)
+            else
+                try buildRequestBody(self.alloc, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.disable_stream_options, system_prompt, msgs, tools);
             defer self.alloc.free(body);
 
-            // Build URL
+            // Build URL theo giao thức đang kích hoạt
             var url_buf: [512]u8 = undefined;
-            const url = blk: {
-                if (std.mem.endsWith(u8, self.base_url, "/chat/completions")) {
-                    break :blk self.base_url;
-                }
-                const sep = if (std.mem.endsWith(u8, self.base_url, "/")) "" else "/";
-                break :blk std.fmt.bufPrint(&url_buf, "{s}{s}chat/completions", .{ self.base_url, sep }) catch self.base_url;
-            };
+            const endpoint_suffix = if (active_protocol == .responses) "responses" else "chat/completions";
+            const sep = if (std.mem.endsWith(u8, root_url, "/")) "" else "/";
+            const url = std.fmt.bufPrint(&url_buf, "{s}{s}{s}", .{ root_url, sep, endpoint_suffix }) catch self.base_url;
 
             // Build auth header
             var auth_buf: [512]u8 = undefined;
@@ -127,6 +195,35 @@ pub const Client = struct {
             try ctx.finalizeToolCalls();
             ctx.response.http_code = req_http_code;
 
+            // Auto-Negotiation & Adaptive Cross-Protocol Fallback (Tier 2)
+            if (self.protocol_mode == .auto and ctx.raw_accum_init) {
+                const raw_resp = ctx.raw_accum.items;
+                
+                // Fallback 1: Chat Completions -> Responses API khi bị lỗi 400 do không hỗ trợ hoặc xung đột tools/reasoning
+                if (active_protocol == .chat_completions and req_http_code == 400) {
+                    if (std.mem.indexOf(u8, raw_resp, "responses") != null or
+                        std.mem.indexOf(u8, raw_resp, "unsupported_model") != null or
+                        (std.mem.indexOf(u8, raw_resp, "reasoning") != null and tools.len > 0))
+                    {
+                        active_protocol = .responses;
+                        self.cached_protocol = .responses;
+                        if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
+                        ctx.response.deinit();
+                        continue;
+                    }
+                }
+
+                // Fallback 2: Responses API -> Chat Completions khi server cũ trả 404 (chưa có endpoint /responses)
+                if (active_protocol == .responses and (req_http_code == 404 or (req_http_code == 400 and std.mem.indexOf(u8, raw_resp, "not found") != null))) {
+                    active_protocol = .chat_completions;
+                    self.cached_protocol = .chat_completions;
+                    if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
+                    ctx.response.deinit();
+                    continue;
+                }
+            }
+
+            // Retry adaptive parameters trong Chat Completions
             if (req_http_code == 400 and ctx.raw_accum_init) {
                 const raw_resp = ctx.raw_accum.items;
                 var should_retry = false;
@@ -156,6 +253,11 @@ pub const Client = struct {
                 }
             }
 
+            // Ghi nhớ giao thức thành công (Tier 3: Protocol Memory Caching)
+            if (req_http_code == 200 and self.protocol_mode == .auto) {
+                self.cached_protocol = active_protocol;
+            }
+
             if (ctx.response.stop_reason == .unknown and ctx.raw_accum_init) {
                 ctx.response.raw_debug_info = ctx.alloc.dupe(u8, ctx.raw_accum.items) catch null;
             }
@@ -170,6 +272,100 @@ pub const Client = struct {
 // ---------------------------------------------------------------------------
 // Request building
 // ---------------------------------------------------------------------------
+
+/// Xây dựng request body cho OpenAI Responses API (POST /v1/responses).
+fn buildResponsesRequestBody(
+    alloc: Allocator,
+    model: []const u8,
+    max_tokens: u32,
+    disable_reasoning_effort: bool,
+    system_prompt: []const u8,
+    msgs: []const proto.Message,
+    tools: []const proto.ToolDefinition,
+) ![]u8 {
+    var buf = utils.BufWriter.init(alloc);
+    errdefer buf.deinit();
+    const w = &buf;
+
+    _ = max_tokens;
+
+    try w.print("{{\"model\":\"{s}\",\"stream\":true", .{model});
+
+    if (!disable_reasoning_effort) {
+        try w.writeAll(",\"reasoning\":{\"effort\":\"medium\"}");
+    }
+
+    if (system_prompt.len > 0) {
+        const escaped_sys = try json.escape(alloc, system_prompt);
+        defer alloc.free(escaped_sys);
+        try w.print(",\"instructions\":\"{s}\"", .{escaped_sys});
+    }
+
+    if (tools.len > 0) {
+        try w.writeAll(",\"tools\":[");
+        for (tools, 0..) |td, ti| {
+            if (ti > 0) try w.writeByte(',');
+            const escaped_desc = try json.escape(alloc, td.description);
+            defer alloc.free(escaped_desc);
+            try w.print(
+                \\{{"type":"function","name":"{s}","description":"{s}","parameters":{s}}}
+            , .{ td.name, escaped_desc, td.input_schema_json });
+        }
+        try w.writeAll("]");
+    }
+
+    try w.writeAll(",\"input\":[");
+    var first_msg = true;
+    for (msgs) |msg| {
+        if (!first_msg) try w.writeByte(',');
+        first_msg = false;
+
+        // Check if message is entirely tool_results
+        var all_tool_results = true;
+        for (msg.content) |block| {
+            if (block != .tool_result) {
+                all_tool_results = false;
+                break;
+            }
+        }
+
+        if (all_tool_results and msg.content.len > 0) {
+            for (msg.content, 0..) |block, bi| {
+                if (bi > 0) try w.writeByte(',');
+                if (block == .tool_result) {
+                    const tr = block.tool_result;
+                    const escaped = try json.escape(alloc, tr.content);
+                    defer alloc.free(escaped);
+                    try w.print(
+                        \\{{"type":"function_call_output","call_id":"{s}","output":"{s}"}}
+                    , .{ tr.tool_use_id, escaped });
+                }
+            }
+            continue;
+        }
+
+        try w.print("{{\"role\":\"{s}\",", .{msg.role.toJson()});
+        var text_content: ?[]const u8 = null;
+        for (msg.content) |block| {
+            if (block == .text) {
+                text_content = block.text;
+                break;
+            }
+        }
+
+        if (text_content) |tc| {
+            const escaped = try json.escape(alloc, tc);
+            defer alloc.free(escaped);
+            try w.print("\"content\":\"{s}\"", .{escaped});
+        } else {
+            try w.print("\"content\":\"\"", .{});
+        }
+        try w.writeByte('}');
+    }
+    try w.writeAll("]}");
+
+    return buf.toOwnedSlice();
+}
 
 fn buildRequestBody(
     alloc: Allocator,
@@ -347,6 +543,8 @@ const StreamCtx = struct {
     think_accum_init: bool = false,
     raw_accum: ArrayList(u8) = undefined,
     raw_accum_init: bool = false,
+    event_type: [64]u8 = undefined,
+    event_type_len: usize = 0,
 
     fn onChunk(chunk: []const u8, userdata: *anyopaque) void {
         const self: *StreamCtx = @ptrCast(@alignCast(userdata));
@@ -378,10 +576,36 @@ const StreamCtx = struct {
 
     fn processLine(self: *StreamCtx, line: []const u8) !void {
         const trimmed = std.mem.trim(u8, line, " \t\r");
+
+        if (std.mem.startsWith(u8, trimmed, "event: ")) {
+            const ev = trimmed["event: ".len..];
+            const n = @min(ev.len, self.event_type.len);
+            @memcpy(self.event_type[0..n], ev[0..n]);
+            self.event_type_len = n;
+            return;
+        }
+
         if (!std.mem.startsWith(u8, trimmed, "data: ")) return;
 
         const data = trimmed["data: ".len..];
-        if (std.mem.eql(u8, data, "[DONE]")) {
+        const ev = self.event_type[0..self.event_type_len];
+
+        // Xử lý [DONE] hoặc event kết thúc của Responses API
+        if (std.mem.eql(u8, data, "[DONE]") or std.mem.eql(u8, ev, "response.done") or std.mem.eql(u8, ev, "response.completed")) {
+            // Check usage trong Responses API payload nếu có
+            if (std.mem.startsWith(u8, data, "{")) {
+                if (json.findObject(data, "response")) |resp_obj| {
+                    if (json.findObject(resp_obj, "usage")) |u_obj| {
+                        const pt = if (json.findInt(u_obj, "input_tokens", u64)) |v| v else (json.findInt(u_obj, "prompt_tokens", u64) orelse 0);
+                        const ct = if (json.findInt(u_obj, "output_tokens", u64)) |v| v else (json.findInt(u_obj, "completion_tokens", u64) orelse 0);
+                        const tt = if (json.findInt(u_obj, "total_tokens", u64)) |v| v else (pt + ct);
+                        self.response.usage.prompt_tokens = pt;
+                        self.response.usage.completion_tokens = ct;
+                        self.response.usage.total_tokens = tt;
+                    }
+                }
+            }
+
             // Lưu thinking đã tích lũy
             if (self.think_accum_init and self.think_accum.items.len > 0) {
                 const think_text = try self.alloc.dupe(u8, self.think_accum.items);
@@ -400,6 +624,62 @@ const StreamCtx = struct {
             }
             return;
         }
+
+        // Responses API event handlers
+        if (std.mem.eql(u8, ev, "response.output_text.delta") or std.mem.eql(u8, ev, "response.text.delta")) {
+            if (json.findString(data, "delta")) |delta_text| {
+                if (delta_text.len > 0) {
+                    const unescaped = json.unescape(self.alloc, delta_text) catch delta_text;
+                    defer if (unescaped.ptr != delta_text.ptr) self.alloc.free(unescaped);
+                    if (!self.text_accum_init) {
+                        self.text_accum = .empty;
+                        self.text_accum_init = true;
+                    }
+                    try self.text_accum.appendSlice(self.alloc, unescaped);
+                    if (self.text_cb) |cb| cb(unescaped);
+                }
+                return;
+            }
+        }
+
+        if (std.mem.eql(u8, ev, "response.reasoning_text.delta") or std.mem.eql(u8, ev, "response.reasoning.delta")) {
+            if (json.findString(data, "delta")) |delta_text| {
+                if (delta_text.len > 0) {
+                    const unescaped = json.unescape(self.alloc, delta_text) catch delta_text;
+                    defer if (unescaped.ptr != delta_text.ptr) self.alloc.free(unescaped);
+                    if (!self.think_accum_init) {
+                        self.think_accum = .empty;
+                        self.think_accum_init = true;
+                    }
+                    try self.think_accum.appendSlice(self.alloc, unescaped);
+                    if (self.think_cb) |cb| cb(unescaped);
+                }
+                return;
+            }
+        }
+
+        if (std.mem.eql(u8, ev, "response.tool_call.delta") or std.mem.eql(u8, ev, "response.function_call_arguments.delta")) {
+            const index = json.findInt(data, "output_index", u32) orelse json.findInt(data, "index", u32);
+            const call_id = json.findString(data, "call_id") orelse json.findString(data, "id");
+            const name = json.findString(data, "name");
+            const args = json.findString(data, "delta") orelse json.findString(data, "arguments");
+            try self.mergeToolCallDelta(index, call_id, name, args);
+            return;
+        }
+
+        if (std.mem.eql(u8, ev, "response.output_item.done") or std.mem.eql(u8, ev, "response.tool_call.done")) {
+            if (json.findObject(data, "item")) |item_obj| {
+                const item_type = json.findString(item_obj, "type") orelse "";
+                if (std.mem.eql(u8, item_type, "function_call") or std.mem.eql(u8, item_type, "tool_call")) {
+                    const call_id = json.findString(item_obj, "call_id") orelse json.findString(item_obj, "id");
+                    const name = json.findString(item_obj, "name");
+                    const args = json.findString(item_obj, "arguments");
+                    try self.mergeToolCallDelta(null, call_id, name, args);
+                }
+            }
+            return;
+        }
+
 
         // RFC-006 §3.1: Usage JSON parse struct (nested optional)
         const UsagePromptDetails = struct {
@@ -855,3 +1135,113 @@ test "openai stream: finish_reason function maps to tool_use (RFC-006 §3.4)" {
     // Legacy "function" → .tool_use
     try testing.expectEqual(proto.StopReason.tool_use, ctx.response.stop_reason);
 }
+
+// --- ISSUE-BACKEND-001 (Responses API & Auto-Negotiation Tests) ---
+
+test "openai auto-negotiation: getRootApiUrl normalizes endpoints" {
+    try testing.expectEqualStrings("https://api.openai.com/v1", getRootApiUrl("https://api.openai.com/v1"));
+    try testing.expectEqualStrings("https://api.openai.com/v1", getRootApiUrl("https://api.openai.com/v1/"));
+    try testing.expectEqualStrings("https://api.openai.com/v1", getRootApiUrl("https://api.openai.com/v1/chat/completions"));
+    try testing.expectEqualStrings("https://api.openai.com/v1", getRootApiUrl("https://api.openai.com/v1/chat/completions/"));
+    try testing.expectEqualStrings("https://api.openai.com/v1", getRootApiUrl("https://api.openai.com/v1/responses"));
+    try testing.expectEqualStrings("http://localhost:11434/v1", getRootApiUrl("http://localhost:11434/v1/chat/completions"));
+}
+
+test "openai auto-negotiation: shouldUseResponsesApi model detection" {
+    try testing.expect(shouldUseResponsesApi("gpt-5.6-sol"));
+    try testing.expect(shouldUseResponsesApi("gpt-5.6-terra"));
+    try testing.expect(shouldUseResponsesApi("gpt-5.6-luna"));
+    try testing.expect(shouldUseResponsesApi("gpt-5-sol"));
+    try testing.expect(shouldUseResponsesApi("o3-pro"));
+    try testing.expect(shouldUseResponsesApi("o1-pro"));
+
+    try testing.expect(!shouldUseResponsesApi("gpt-4o"));
+    try testing.expect(!shouldUseResponsesApi("gpt-4o-mini"));
+    try testing.expect(!shouldUseResponsesApi("deepseek-chat"));
+    try testing.expect(!shouldUseResponsesApi("qwen2.5-coder"));
+}
+
+test "openai auto-negotiation: buildResponsesRequestBody format" {
+    const alloc = testing.allocator;
+    const msgs = [_]proto.Message{
+        .{
+            .role = .user,
+            .content = &.{
+                .{ .text = "Solve problem" },
+            },
+        },
+    };
+    const tools = [_]proto.ToolDefinition{
+        .{ .name = "bash", .description = "Run shell", .input_schema_json = "{\"type\":\"object\"}" },
+    };
+
+    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "System instructions", &msgs, &tools);
+    defer alloc.free(body);
+
+    try testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-5.6-terra\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"System instructions\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"medium\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"type\":\"function\",\"name\":\"bash\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"input\":[{\"role\":\"user\",\"content\":\"Solve problem\"}]") != null);
+}
+
+test "openai stream: Responses API event-based streaming parse" {
+    const alloc = testing.allocator;
+    var resp = proto.Response.init(alloc);
+    defer resp.deinit();
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = resp,
+        .line_buf = .empty,
+        .tool_calls = .empty,
+    };
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.tool_calls.deinit(alloc);
+
+    try feedLines(&ctx, &.{
+        \\event: response.reasoning_text.delta
+        ,
+        \\data: {"delta":"Thinking step 1. "}
+        ,
+        \\event: response.reasoning_text.delta
+        ,
+        \\data: {"delta":"Thinking step 2."}
+        ,
+        \\event: response.output_text.delta
+        ,
+        \\data: {"delta":"Here is the output."}
+        ,
+        \\event: response.tool_call.delta
+        ,
+        \\data: {"call_id":"call_resp_1","name":"bash","delta":"{\"command\":\"ls\"}"}
+        ,
+        \\event: response.done
+        ,
+        \\data: {"response":{"usage":{"input_tokens":120,"output_tokens":60,"total_tokens":180}}}
+    });
+
+    try ctx.finalizeToolCalls();
+
+    try testing.expectEqual(proto.StopReason.tool_use, ctx.response.stop_reason);
+    try testing.expectEqual(@as(usize, 3), ctx.response.content.items.len);
+
+    // Block 1: Thinking
+    const think = ctx.response.content.items[0].thinking;
+    try testing.expectEqualStrings("Thinking step 1. Thinking step 2.", think.thinking);
+
+    // Block 2: Text
+    const text = ctx.response.content.items[1].text;
+    try testing.expectEqualStrings("Here is the output.", text);
+
+    // Block 3: Tool use
+    const tu = ctx.response.content.items[2].tool_use;
+    try testing.expectEqualStrings("bash", tu.name);
+    try testing.expectEqualStrings("call_resp_1", tu.id);
+    try testing.expectEqualStrings("{\"command\":\"ls\"}", tu.input_json);
+
+    // Usage check
+    try testing.expectEqual(@as(u64, 120), ctx.response.usage.prompt_tokens);
+    try testing.expectEqual(@as(u64, 60), ctx.response.usage.completion_tokens);
+    try testing.expectEqual(@as(u64, 180), ctx.response.usage.total_tokens);
+}
+
