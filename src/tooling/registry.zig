@@ -41,6 +41,9 @@ const hooks = @import("../core/hooks.zig");
 const skills_mod = @import("../core/skills.zig");
 const quickjs = @import("../runtime/quickjs_engine.zig");
 
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn unsetenv(name: [*:0]const u8) c_int;
+
 // ---------------------------------------------------------------------------
 // Global state (single-threaded)
 // ---------------------------------------------------------------------------
@@ -376,6 +379,13 @@ fn matchesEntry(entry_trimmed: []const u8, name: []const u8) bool {
 }
 
 pub fn isPermitted(name: []const u8) bool {
+    // Chặn gọi subagent nếu đã đạt giới hạn độ sâu để phòng đệ quy vô hạn (Leaf Worker Pattern)
+    if (std.mem.eql(u8, name, "invoke_subagent") or std.mem.eql(u8, name, "batch_invoke_subagents")) {
+        const cur_depth = subagent.getCurrentDepth();
+        const max_depth = subagent.getMaxDepth();
+        if (cur_depth >= max_depth) return false;
+    }
+
     if (g_allowlist) |list| {
         // Allowlist: CHỈ cho phép những tool được liệt kê
         var it = std.mem.splitScalar(u8, list, ',');
@@ -523,5 +533,22 @@ test "codeact as native tool: codeact in registry" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Hello from codeact native tool") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "30") != null);
 }
+
+test "registry: subagent depth limit permission" {
+    // Độ sâu 0: cho phép invoke_subagent
+    try std.testing.expect(isPermitted("invoke_subagent"));
+    try std.testing.expect(isPermitted("batch_invoke_subagents"));
+
+    // Đặt độ sâu = 2 (đạt max): tự động chặn
+    _ = setenv("MINI_SUBAGENT_DEPTH", "2", 1);
+    defer _ = unsetenv("MINI_SUBAGENT_DEPTH");
+
+    _ = setenv("MINI_MAX_SUBAGENT_DEPTH", "2", 1);
+    defer _ = unsetenv("MINI_MAX_SUBAGENT_DEPTH");
+
+    try std.testing.expect(!isPermitted("invoke_subagent"));
+    try std.testing.expect(!isPermitted("batch_invoke_subagents"));
+}
+
 
 

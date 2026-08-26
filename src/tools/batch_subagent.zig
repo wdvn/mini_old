@@ -3,6 +3,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const utils = @import("../core/utils.zig");
+const subagent = @import("subagent.zig");
+const main = @import("../main.zig");
+
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn unsetenv(name: [*:0]const u8) c_int;
 
 // Thread worker context
 const WorkerContext = struct {
@@ -60,6 +65,13 @@ fn runSubAgentThread(ctx: *WorkerContext) void {
 }
 
 pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
+    const current_depth = subagent.getCurrentDepth();
+    const max_depth = subagent.getMaxDepth();
+
+    if (current_depth >= max_depth) {
+        return std.fmt.allocPrint(alloc, "Lỗi: Đã đạt giới hạn độ sâu subagent tối đa (depth={d}/{d}). Không thể tạo thêm batch subagent để phòng tránh đệ quy vô hạn.", .{ current_depth, max_depth });
+    }
+
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, input_json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
@@ -71,6 +83,20 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     const num_tasks = tasks_arr.items.len;
     if (num_tasks == 0) {
         return std.fmt.allocPrint(alloc, "Lỗi: mảng 'tasks' trống.", .{});
+    }
+
+    // Thiết lập độ sâu cho các tiến trình con kế thừa
+    var depth_buf: [16]u8 = undefined;
+    const next_depth_str = std.fmt.bufPrintZ(&depth_buf, "{d}", .{current_depth + 1}) catch "1";
+    _ = setenv("MINI_SUBAGENT_DEPTH", next_depth_str.ptr, 1);
+    defer {
+        if (current_depth == 0) {
+            _ = unsetenv("MINI_SUBAGENT_DEPTH");
+        } else {
+            var prev_buf: [16]u8 = undefined;
+            const prev_str = std.fmt.bufPrintZ(&prev_buf, "{d}", .{current_depth}) catch "0";
+            _ = setenv("MINI_SUBAGENT_DEPTH", prev_str.ptr, 1);
+        }
     }
 
     var contexts = try alloc.alloc(WorkerContext, num_tasks);
@@ -124,3 +150,23 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
 
     return result_buf.toOwnedSlice();
 }
+
+// ---------------------------------------------------------------------------
+// Unit Tests
+// ---------------------------------------------------------------------------
+
+test "batch_subagent: depth check logic" {
+    const testing = std.testing;
+
+    _ = setenv("MINI_SUBAGENT_DEPTH", "2", 1);
+    defer _ = unsetenv("MINI_SUBAGENT_DEPTH");
+
+    _ = setenv("MINI_MAX_SUBAGENT_DEPTH", "2", 1);
+    defer _ = unsetenv("MINI_MAX_SUBAGENT_DEPTH");
+
+    const res = try executeTool(testing.allocator, main.getIo(), "{\"tasks\":[\"task1\",\"task2\"]}");
+    defer testing.allocator.free(res);
+
+    try testing.expect(std.mem.indexOf(u8, res, "Đã đạt giới hạn độ sâu subagent tối đa") != null);
+}
+
