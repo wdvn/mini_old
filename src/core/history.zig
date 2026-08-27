@@ -336,6 +336,59 @@ pub const History = struct {
         }
         return false;
     }
+
+    /// Đảm bảo history tương thích OpenAI API:
+    /// Loại bỏ hoặc chuyển đổi các block tool_result mồ côi (không có assistant message mang tool_use tương ứng đi trước).
+    /// Tránh lỗi OpenAI 400: "No tool call found for function call output with call_id ...".
+    pub fn ensureOpenAICompatible(self: *History) bool {
+        var modified = false;
+        var valid_tool_ids = std.StringHashMap(void).init(self.alloc);
+        defer valid_tool_ids.deinit();
+
+        for (self.msgs.items) |msg| {
+            if (msg.role == .assistant) {
+                for (msg.content) |block| {
+                    if (block == .tool_use) {
+                        valid_tool_ids.put(block.tool_use.id, {}) catch {};
+                    }
+                }
+            }
+        }
+
+        for (self.msgs.items) |*msg| {
+            if (msg.role != .assistant) {
+                var has_orphan = false;
+                for (msg.content) |block| {
+                    if (block == .tool_result and !valid_tool_ids.contains(block.tool_result.tool_use_id)) {
+                        has_orphan = true;
+                        break;
+                    }
+                }
+
+                if (has_orphan) {
+                    var new_blocks = self.alloc.alloc(proto.ContentBlock, msg.content.len) catch continue;
+                    for (msg.content, 0..) |block, bi| {
+                        if (block == .tool_result and !valid_tool_ids.contains(block.tool_result.tool_use_id)) {
+                            const formatted = std.fmt.allocPrint(self.alloc, "[Observation]: {s}", .{block.tool_result.content}) catch {
+                                new_blocks[bi] = block;
+                                continue;
+                            };
+                            self.alloc.free(block.tool_result.content);
+                            self.alloc.free(block.tool_result.tool_use_id);
+                            new_blocks[bi] = .{ .text = formatted };
+                        } else {
+                            new_blocks[bi] = block;
+                        }
+                    }
+                    self.alloc.free(msg.content);
+                    msg.content = new_blocks;
+                    msg.role = .user;
+                    modified = true;
+                }
+            }
+        }
+        return modified;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -448,4 +501,26 @@ test "ensureClaudeCompatible đổi role assistant đầu tiên và trả đúng
     // Lần gọi thứ hai: msgs[0] đã là .user → không sửa, trả false
     try std.testing.expect(h.ensureClaudeCompatible() == false);
     try std.testing.expect(h.msgs.items[0].role == .user);
+}
+
+test "ensureOpenAICompatible chuyển đổi orphan tool_result thành text an toàn" {
+    const alloc = std.testing.allocator;
+    var h = History.init(alloc);
+    defer h.deinit();
+
+    // Thêm 1 tool_result mồ côi (không có assistant tool_use trước đó)
+    const blocks = try alloc.alloc(proto.ContentBlock, 1);
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try alloc.dupe(u8, "call_orphan_123"),
+        .content = try alloc.dupe(u8, "output of orphan tool"),
+        .is_error = false,
+    } };
+    try h.msgs.append(alloc, .{ .role = .user, .content = blocks });
+
+    try std.testing.expect(h.ensureOpenAICompatible() == true);
+    try std.testing.expect(h.msgs.items[0].content[0] == .text);
+    try std.testing.expect(std.mem.indexOf(u8, h.msgs.items[0].content[0].text, "output of orphan tool") != null);
+
+    // Lần 2: Đã là text, không sửa nữa
+    try std.testing.expect(h.ensureOpenAICompatible() == false);
 }

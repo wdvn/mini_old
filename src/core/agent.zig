@@ -266,6 +266,13 @@ pub const AgentLoop = struct {
             main.stderrPrint("\x1b[36m[agent]\x1b[0m \x1b[93mĐang suy nghĩ / Phân tích yêu cầu... \x1b[0m\n", .{});
         }
 
+        // Vệ sinh history theo backend
+        if (self.backend == .openai) {
+            _ = self.history.ensureOpenAICompatible();
+        } else if (self.backend == .claude) {
+            _ = self.history.ensureClaudeCompatible();
+        }
+
         // Gửi lên AI backend (streaming)
         var response = try self.sendToBackend(
             act_id,
@@ -460,6 +467,17 @@ pub const AgentLoop = struct {
                                 return .continue_loop;
                             }
                             // Vượt số lần cho phép — rơi xuống error như cũ
+                        }
+
+                        const has_orphan_tool = std.mem.indexOf(u8, raw, "No tool call found for function call output") != null or
+                            std.mem.indexOf(u8, raw, "tool_call_id") != null;
+                        if (has_orphan_tool) {
+                            main.stderrPrint("\n\x1b[33m[agent] OpenAI từ chối do orphan tool_result (HTTP 400). Đang sửa history...\x1b[0m\n", .{});
+                            _ = self.history.ensureOpenAICompatible();
+                            if (self.role_fix_attempts < 2) {
+                                self.role_fix_attempts += 1;
+                                return .continue_loop;
+                            }
                         }
                     }
                 }

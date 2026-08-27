@@ -12,6 +12,13 @@ const Allocator = std.mem.Allocator;
 
 pub const config_mod = @import("core/config.zig");
 pub const agent_mod = @import("core/agent.zig");
+pub const protocol_mod = @import("core/protocol.zig");
+pub const history_mod = @import("core/history.zig");
+pub const backends = struct {
+    pub const openai_mod = @import("backends/openai.zig");
+    pub const claude_mod = @import("backends/claude.zig");
+    pub const ollama_mod = @import("backends/ollama.zig");
+};
 pub const tools_mod = @import("tooling/registry.zig");
 pub const mcp_mod = @import("tooling/mcp.zig");
 pub const utils = @import("core/utils.zig");
