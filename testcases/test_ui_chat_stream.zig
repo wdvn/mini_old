@@ -114,3 +114,28 @@ test "UI Chat Stream: TurnRenderer complete lifecycle" {
         .files_modified = 1,
     });
 }
+
+test "UI Chat Stream: TurnRenderer CodeAct stream in-place" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var renderer = chat_stream.TurnRenderer.init(alloc, io);
+    renderer.startTurn("Kiểm tra CodeAct in-place streaming");
+
+    // Process chunk containing ```js ... ```
+    renderer.processTextChunk("```js\nconst files = mini.glob(\"*.zig\");\nconst result = mini.read(files[0]);\nconsole.log(result);\n```\n");
+    try std.testing.expect(!renderer.is_codeact);
+    try std.testing.expect(!renderer.in_codeact);
+
+    // Test explicit startCodeAct, streamCodeAct, endCodeAct
+    renderer.startCodeAct();
+    try std.testing.expect(renderer.is_codeact);
+    renderer.streamCodeAct("const x = 10;\nconst y = 20;\n");
+    renderer.endCodeAct();
+    try std.testing.expect(!renderer.is_codeact);
+
+    renderer.finishTurn(.{
+        .prompt_tokens = 20,
+        .completion_tokens = 40,
+    });
+}

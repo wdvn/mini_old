@@ -43,6 +43,29 @@ pub const TurnRenderer = struct {
     in_think_tag: bool = false,
     think_tag_buf: [16]u8 = undefined,
     think_tag_len: usize = 0,
+
+    // CodeAct in-place streaming
+    is_codeact: bool = false,
+    in_codeact: bool = false,
+    codeact_start_ms: i64 = 0,
+    codeact_last_update_ms: i64 = 0,
+    codeact_line1_buf: [128]u8 = undefined,
+    codeact_line1_len: usize = 0,
+    codeact_line2_buf: [128]u8 = undefined,
+    codeact_line2_len: usize = 0,
+    codeact_curr_buf: [128]u8 = undefined,
+    codeact_curr_len: usize = 0,
+    codeact_rendered_lines: usize = 0,
+    codeact_total_lines: usize = 0,
+    codeact_closing_backticks: usize = 0,
+    at_codeact_line_start: bool = true,
+
+    // Code fence detection
+    fence_buf: [32]u8 = undefined,
+    fence_len: usize = 0,
+    in_fence_check: bool = false,
+    at_line_start: bool = true,
+
     consecutive_newlines: usize = 1,
     waiting_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     waiting_thread: ?std.Thread = null,
@@ -61,6 +84,20 @@ pub const TurnRenderer = struct {
             .has_printed_response_header = false,
             .in_think_tag = false,
             .think_tag_len = 0,
+            .is_codeact = false,
+            .in_codeact = false,
+            .codeact_start_ms = 0,
+            .codeact_last_update_ms = 0,
+            .codeact_line1_len = 0,
+            .codeact_line2_len = 0,
+            .codeact_curr_len = 0,
+            .codeact_rendered_lines = 0,
+            .codeact_total_lines = 0,
+            .codeact_closing_backticks = 0,
+            .at_codeact_line_start = true,
+            .fence_len = 0,
+            .in_fence_check = false,
+            .at_line_start = true,
             .consecutive_newlines = 1,
             .waiting_active = std.atomic.Value(bool).init(false),
             .waiting_thread = null,
@@ -110,6 +147,23 @@ pub const TurnRenderer = struct {
         self.has_printed_response_header = false;
         self.in_think_tag = false;
         self.think_tag_len = 0;
+
+        self.is_codeact = false;
+        self.in_codeact = false;
+        self.codeact_start_ms = 0;
+        self.codeact_last_update_ms = 0;
+        self.codeact_line1_len = 0;
+        self.codeact_line2_len = 0;
+        self.codeact_curr_len = 0;
+        self.codeact_rendered_lines = 0;
+        self.codeact_total_lines = 0;
+        self.codeact_closing_backticks = 0;
+        self.at_codeact_line_start = true;
+
+        self.fence_len = 0;
+        self.in_fence_check = false;
+        self.at_line_start = true;
+
         self.consecutive_newlines = 1;
         self.highlighter = markdown_mod.StreamHighlighter.init();
 
@@ -237,11 +291,187 @@ pub const TurnRenderer = struct {
         self.write(footer);
     }
 
+    /// Bắt đầu khối CodeAct streaming.
+    pub fn startCodeAct(self: *TurnRenderer) void {
+        self.stopWaiting();
+        if (self.is_thinking) {
+            self.endThinking();
+        }
+        if (self.is_codeact) return;
+        self.is_codeact = true;
+        self.codeact_start_ms = utils.milliTimestamp();
+        self.codeact_last_update_ms = 0;
+        self.codeact_line1_len = 0;
+        self.codeact_line2_len = 0;
+        self.codeact_curr_len = 0;
+        self.codeact_rendered_lines = 0;
+        self.codeact_total_lines = 0;
+        self.codeact_closing_backticks = 0;
+        self.at_codeact_line_start = true;
+        self.highlighter.flush(self.io);
+    }
+
+    /// Stream ký tự/chuỗi trong khối CodeAct (cập nhật in-place tối đa 3 dòng).
+    pub fn streamCodeAct(self: *TurnRenderer, text: []const u8) void {
+        self.stopWaiting();
+        if (!self.is_codeact) {
+            self.startCodeAct();
+        }
+
+        for (text) |c| {
+            if (c == '\n') {
+                if (self.codeact_curr_len > 0 or self.codeact_total_lines > 0) {
+                    // Shift lines
+                    std.mem.copyForwards(u8, &self.codeact_line1_buf, self.codeact_line2_buf[0..self.codeact_line2_len]);
+                    self.codeact_line1_len = self.codeact_line2_len;
+
+                    std.mem.copyForwards(u8, &self.codeact_line2_buf, self.codeact_curr_buf[0..self.codeact_curr_len]);
+                    self.codeact_line2_len = self.codeact_curr_len;
+
+                    self.codeact_curr_len = 0;
+                    self.codeact_total_lines += 1;
+                }
+            } else if (c == '\r') {
+                // ignore \r
+            } else if (c == '\t') {
+                if (self.codeact_curr_len + 2 < self.codeact_curr_buf.len) {
+                    self.codeact_curr_buf[self.codeact_curr_len] = ' ';
+                    self.codeact_curr_len += 1;
+                    self.codeact_curr_buf[self.codeact_curr_len] = ' ';
+                    self.codeact_curr_len += 1;
+                }
+            } else if (c >= 32) {
+                // Giới hạn độ dài tối đa 72 ký tự mỗi dòng để tránh terminal wrap làm lệch con trỏ
+                if (self.codeact_curr_len < 72) {
+                    self.codeact_curr_buf[self.codeact_curr_len] = c;
+                    self.codeact_curr_len += 1;
+                }
+            }
+        }
+
+        const now = utils.milliTimestamp();
+        // Rate-limit redraw mỗi 40ms để terminal chạy mượt mà
+        if (now - self.codeact_last_update_ms >= 40) {
+            self.codeact_last_update_ms = now;
+            self.renderCodeActInPlace(now);
+        }
+    }
+
+    fn renderCodeActInPlace(self: *TurnRenderer, now: i64) void {
+        if (comptime builtin.is_test) return;
+        if (!term.isStdoutTty()) return;
+
+        const diff = if (now >= self.codeact_start_ms) now - self.codeact_start_ms else 0;
+        var dur_buf: [32]u8 = undefined;
+        const dur_str = utils.formatDuration(&dur_buf, @intCast(diff));
+        const frame = self.spinner.nextFrame();
+
+        var h_buf: [128]u8 = undefined;
+        const header_line = std.fmt.bufPrint(&h_buf, " \x1b[35m{s}\x1b[0m \x1b[1;35mCodeAct\x1b[0m \x1b[90m({s})...\x1b[0m", .{
+            frame, dur_str,
+        }) catch " ⚡ CodeAct...";
+
+        var line2_opt: ?[]const u8 = null;
+        var line3_opt: ?[]const u8 = null;
+        var num_lines: usize = 1;
+
+        if (self.codeact_curr_len > 0) {
+            if (self.codeact_line2_len > 0) {
+                line2_opt = self.codeact_line2_buf[0..self.codeact_line2_len];
+                line3_opt = self.codeact_curr_buf[0..self.codeact_curr_len];
+                num_lines = 3;
+            } else {
+                line2_opt = self.codeact_curr_buf[0..self.codeact_curr_len];
+                num_lines = 2;
+            }
+        } else if (self.codeact_line2_len > 0) {
+            if (self.codeact_line1_len > 0) {
+                line2_opt = self.codeact_line1_buf[0..self.codeact_line1_len];
+                line3_opt = self.codeact_line2_buf[0..self.codeact_line2_len];
+                num_lines = 3;
+            } else {
+                line2_opt = self.codeact_line2_buf[0..self.codeact_line2_len];
+                num_lines = 2;
+            }
+        }
+
+        // Di chuyển con trỏ lên vị trí dòng đầu tiên đã render trước đó
+        if (self.codeact_rendered_lines > 1) {
+            for (0..self.codeact_rendered_lines - 1) |_| {
+                term.writeStdout("\x1b[1A");
+            }
+        }
+
+        // Render Dòng 1 (Header)
+        term.writeStdout("\r\x1b[2K");
+        term.writeStdout(header_line);
+
+        // Render Dòng 2
+        if (line2_opt) |l2| {
+            var l2_buf: [256]u8 = undefined;
+            const l2_str = std.fmt.bufPrint(&l2_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m \x1b[2;37m{s}\x1b[0m", .{l2}) catch "";
+            term.writeStdout(l2_str);
+        }
+
+        // Render Dòng 3
+        if (line3_opt) |l3| {
+            var l3_buf: [256]u8 = undefined;
+            const l3_str = std.fmt.bufPrint(&l3_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m \x1b[37m{s}\x1b[0m", .{l3}) catch "";
+            term.writeStdout(l3_str);
+        }
+
+        // Xóa dòng thừa nếu số dòng render lần này ít hơn lần trước
+        if (self.codeact_rendered_lines > num_lines) {
+            const excess = self.codeact_rendered_lines - num_lines;
+            for (0..excess) |_| {
+                term.writeStdout("\n\r\x1b[2K");
+            }
+            for (0..excess) |_| {
+                term.writeStdout("\x1b[1A");
+            }
+        }
+
+        self.codeact_rendered_lines = num_lines;
+    }
+
+    /// Kết thúc khối CodeAct: xóa in-place rendering và chuẩn bị hiển thị Tool Action Card.
+    pub fn endCodeAct(self: *TurnRenderer) void {
+        if (!self.is_codeact) return;
+        self.is_codeact = false;
+
+        if (term.isStdoutTty() and self.codeact_rendered_lines > 0) {
+            if (self.codeact_rendered_lines > 1) {
+                for (0..self.codeact_rendered_lines - 1) |_| {
+                    term.writeStdout("\x1b[1A");
+                }
+            }
+            for (0..self.codeact_rendered_lines) |idx| {
+                term.writeStdout("\r\x1b[2K");
+                if (idx + 1 < self.codeact_rendered_lines) {
+                    term.writeStdout("\n");
+                }
+            }
+            if (self.codeact_rendered_lines > 1) {
+                for (0..self.codeact_rendered_lines - 1) |_| {
+                    term.writeStdout("\x1b[1A");
+                }
+            }
+            term.writeStdout("\r\x1b[2K");
+        }
+        self.codeact_rendered_lines = 0;
+        self.codeact_curr_len = 0;
+        self.codeact_line1_len = 0;
+        self.codeact_line2_len = 0;
+    }
+
     /// Stream câu trả lời của AI ra stdout với Markdown & Code highlighting.
     pub fn streamResponse(self: *TurnRenderer, text: []const u8) void {
         self.stopWaiting();
         if (self.is_thinking) {
             self.endThinking();
+        }
+        if (self.is_codeact) {
+            self.endCodeAct();
         }
 
         const trimmed = std.mem.trim(u8, text, " \r\n\t");
@@ -270,6 +500,9 @@ pub const TurnRenderer = struct {
         self.stopWaiting();
         if (self.is_thinking) {
             self.endThinking();
+        }
+        if (self.is_codeact) {
+            self.endCodeAct();
         }
         self.highlighter.flush(self.io);
 
@@ -336,22 +569,19 @@ pub const TurnRenderer = struct {
         }
     }
 
-    /// Xử lý callback text chung (tự động phân biệt <think>...</think> và response text).
+    /// Xử lý callback text chung (tự động phân biệt <think>...</think>, CodeAct ```js...``` và response text).
     pub fn processTextChunk(self: *TurnRenderer, text: []const u8) void {
-        var start: usize = 0;
         var i: usize = 0;
         while (i < text.len) {
             const c = text[i];
+
+            // 1. Đang trong thẻ <think>
             if (self.in_think_tag) {
                 const expected = "</think>";
                 if (c == '<' or self.think_tag_len > 0) {
-                    if (i > start) {
-                        self.streamThinking(text[start..i]);
-                    }
                     self.think_tag_buf[self.think_tag_len] = c;
                     self.think_tag_len += 1;
                     i += 1;
-                    start = i;
 
                     if (self.think_tag_buf[self.think_tag_len - 1] == expected[self.think_tag_len - 1]) {
                         if (self.think_tag_len == expected.len) {
@@ -364,40 +594,140 @@ pub const TurnRenderer = struct {
                         self.think_tag_len = 0;
                     }
                 } else {
+                    self.streamThinking(text[i .. i + 1]);
                     i += 1;
                 }
-            } else {
-                const expected = "<think>";
-                if (c == '<' or self.think_tag_len > 0) {
-                    if (i > start) {
-                        self.streamResponse(text[start..i]);
-                    }
-                    self.think_tag_buf[self.think_tag_len] = c;
-                    self.think_tag_len += 1;
-                    i += 1;
-                    start = i;
+                continue;
+            }
 
-                    if (self.think_tag_buf[self.think_tag_len - 1] == expected[self.think_tag_len - 1]) {
-                        if (self.think_tag_len == expected.len) {
-                            self.in_think_tag = true;
-                            self.think_tag_len = 0;
-                            self.startThinking();
+            // 2. Đang trong khối CodeAct
+            if (self.in_codeact) {
+                if (self.at_codeact_line_start) {
+                    if (c == '`') {
+                        self.codeact_closing_backticks += 1;
+                        if (self.codeact_closing_backticks == 3) {
+                            self.in_codeact = false;
+                            self.codeact_closing_backticks = 0;
+                            self.at_codeact_line_start = true;
+                            self.endCodeAct();
+                            // Bỏ qua phần còn lại trên dòng đóng ``` cho đến \n
+                            i += 1;
+                            while (i < text.len and text[i] != '\n') : (i += 1) {}
+                            if (i < text.len and text[i] == '\n') i += 1;
+                            continue;
                         }
+                        i += 1;
+                        continue;
                     } else {
-                        self.streamResponse(self.think_tag_buf[0..self.think_tag_len]);
+                        if (self.codeact_closing_backticks > 0) {
+                            var k: usize = 0;
+                            while (k < self.codeact_closing_backticks) : (k += 1) {
+                                self.streamCodeAct("`");
+                            }
+                            self.codeact_closing_backticks = 0;
+                        }
+                    }
+                }
+
+                self.streamCodeAct(text[i .. i + 1]);
+                if (c == '\n') {
+                    self.at_codeact_line_start = true;
+                    self.codeact_closing_backticks = 0;
+                } else {
+                    self.at_codeact_line_start = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            // 3. Đang buffer kiểm tra code fence (```...)
+            if (self.in_fence_check) {
+                if (self.fence_len < 3 and c != '`') {
+                    // Không phải ``` -> flush các backtick đã buffer ra streamResponse
+                    self.in_fence_check = false;
+                    self.streamResponse(self.fence_buf[0..self.fence_len]);
+                    self.fence_len = 0;
+                    self.at_line_start = false;
+                    continue;
+                }
+
+                if (c == '\n') {
+                    self.in_fence_check = false;
+                    const raw_lang = if (self.fence_len > 3) self.fence_buf[3..self.fence_len] else "";
+                    const lang = std.mem.trim(u8, raw_lang, " \r\t");
+
+                    if (std.mem.eql(u8, lang, "js") or
+                        std.mem.eql(u8, lang, "javascript") or
+                        std.mem.eql(u8, lang, "ts") or
+                        std.mem.eql(u8, lang, "typescript") or
+                        std.mem.eql(u8, lang, "codeact") or
+                        std.mem.eql(u8, lang, "node"))
+                    {
+                        self.in_codeact = true;
+                        self.at_codeact_line_start = true;
+                        self.codeact_closing_backticks = 0;
+                        self.startCodeAct();
+                    } else {
+                        // Không phải CodeAct -> stream bình thường
+                        self.streamResponse(self.fence_buf[0..self.fence_len]);
+                        self.streamResponse("\n");
+                    }
+                    self.fence_len = 0;
+                    i += 1;
+                    self.at_line_start = true;
+                    continue;
+                } else {
+                    if (self.fence_len < self.fence_buf.len) {
+                        self.fence_buf[self.fence_len] = c;
+                        self.fence_len += 1;
+                        i += 1;
+                    } else {
+                        // Tràn buffer -> flush bình thường
+                        self.in_fence_check = false;
+                        self.streamResponse(self.fence_buf[0..self.fence_len]);
+                        self.fence_len = 0;
+                    }
+                    continue;
+                }
+            }
+
+            // 4. Kiểm tra mở thẻ <think>
+            const think_expected = "<think>";
+            if (c == '<' or self.think_tag_len > 0) {
+                self.think_tag_buf[self.think_tag_len] = c;
+                self.think_tag_len += 1;
+                i += 1;
+
+                if (self.think_tag_buf[self.think_tag_len - 1] == think_expected[self.think_tag_len - 1]) {
+                    if (self.think_tag_len == think_expected.len) {
+                        self.in_think_tag = true;
                         self.think_tag_len = 0;
+                        self.startThinking();
                     }
                 } else {
-                    i += 1;
+                    self.streamResponse(self.think_tag_buf[0..self.think_tag_len]);
+                    self.think_tag_len = 0;
                 }
+                continue;
             }
-        }
-        if (start < text.len) {
-            if (self.in_think_tag) {
-                self.streamThinking(text[start..]);
+
+            // 5. Kiểm tra bắt đầu code fence ``` ở đầu dòng
+            if (self.at_line_start and c == '`') {
+                self.in_fence_check = true;
+                self.fence_buf[0] = '`';
+                self.fence_len = 1;
+                i += 1;
+                continue;
+            }
+
+            // 6. Ký tự văn bản thông thường
+            self.streamResponse(text[i .. i + 1]);
+            if (c == '\n') {
+                self.at_line_start = true;
             } else {
-                self.streamResponse(text[start..]);
+                self.at_line_start = false;
             }
+            i += 1;
         }
     }
 
@@ -406,6 +736,9 @@ pub const TurnRenderer = struct {
         self.stopWaiting();
         if (self.is_thinking) {
             self.endThinking();
+        }
+        if (self.is_codeact) {
+            self.endCodeAct();
         }
         self.highlighter.flush(self.io);
 

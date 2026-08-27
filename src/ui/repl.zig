@@ -331,5 +331,8 @@ pub fn resetThinkState() void {
         if (r.is_thinking) {
             r.endThinking();
         }
+        if (r.is_codeact) {
+            r.endCodeAct();
+        }
     }
 }
