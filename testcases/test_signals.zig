@@ -43,3 +43,14 @@ test "signals: initSignalHandlers does not panic" {
     signals.setInterrupted(false);
     try testing.expect(!signals.isInterrupted());
 }
+
+test "editor: double Ctrl+C interval tracking" {
+    const editor_mod = mini.editor_mod;
+    var editor = editor_mod.LineEditor.init(testing.allocator);
+    defer editor.deinit();
+
+    try testing.expectEqual(@as(i64, 0), editor.last_ctrl_c_ms);
+    editor.last_ctrl_c_ms = 1000;
+    try testing.expectEqual(@as(i64, 1000), editor.last_ctrl_c_ms);
+}
+

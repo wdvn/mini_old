@@ -17,6 +17,7 @@ const unicode = @import("unicode.zig");
 const history_mod = @import("history.zig");
 const paste_mod = @import("paste.zig");
 const term = @import("terminal.zig");
+const utils = @import("../core/utils.zig");
 
 /// Input limit (byte). Vượt → hiện lỗi, không nhận thêm.
 pub const MAX_INPUT_BYTES = 64 * 1024;
@@ -72,6 +73,8 @@ pub const LineEditor = struct {
     paste_buf: std.ArrayListUnmanaged(u8),
     /// Test-only: bỏ qua ghi stdout trong redraw (không có std.Io hợp lệ).
     suppress_redraw: bool,
+    /// Timestamp lần nhấn Ctrl+C gần nhất (ms).
+    last_ctrl_c_ms: i64,
 
     pub fn init(alloc: Allocator) LineEditor {
         return .{
@@ -100,6 +103,7 @@ pub const LineEditor = struct {
             .paste_undo_pushed = false,
             .paste_buf = .empty,
             .suppress_redraw = false,
+            .last_ctrl_c_ms = 0,
         };
     }
 
@@ -448,7 +452,7 @@ pub const LineEditor = struct {
         var raw = orig_termios;
         raw.lflag.ECHO = false;
         raw.lflag.ICANON = false;
-        raw.lflag.ISIG = true;
+        raw.lflag.ISIG = false; // Nhận byte Ctrl+C (0x03) trực tiếp để editor xử lý hủy dòng / thoát 2 lần
         // Tắt(input) CR/NL translation: paste CRLF phải đến nguyên vẹn
         // (\r\n → 1 space khi sanitize), Enter đến như '\r' (13).
         raw.iflag.ICRNL = false;
@@ -479,7 +483,26 @@ pub const LineEditor = struct {
 
         while (true) {
             var read_buf: [1024]u8 = undefined;
-            const n = try stdin_file.readStreaming(io, &.{&read_buf});
+            const n = stdin_file.readStreaming(io, &.{&read_buf}) catch |err| {
+                if (err == error.Interrupted) {
+                    const now_ms = utils.milliTimestamp();
+                    if (now_ms - self.last_ctrl_c_ms <= 2000 and self.last_ctrl_c_ms > 0) {
+                        stdout_file.writeStreamingAll(io, "^C\r\n") catch {};
+                        return null;
+                    }
+                    self.last_ctrl_c_ms = now_ms;
+                    stdout_file.writeStreamingAll(io, "^C\r\n") catch {};
+                    self.buf.clearRetainingCapacity();
+                    self.pos = 0;
+                    self.rendered_rows = 0;
+                    self.cursor_row = 0;
+                    self.history_index = self.prompt_history.entries.items.len;
+                    self.draft.clearRetainingCapacity();
+                    self.redraw(io, prompt);
+                    continue;
+                }
+                return err;
+            };
             if (n == 0) return null;
 
             // Đang trong paste mode: đưa toàn bộ chunk vào paste parser
@@ -494,22 +517,42 @@ pub const LineEditor = struct {
             var i: usize = 0;
             while (i < n) {
                 const c = read_buf[i];
+                if (c != 3) {
+                    self.last_ctrl_c_ms = 0;
+                }
                 switch (c) {
-                    3 => { // Ctrl+C: Hủy dòng đang nhập, không thoát REPL
+                    3 => { // Ctrl+C: Hủy dòng đang nhập hoặc thoát REPL nếu nhấn 2 lần liên tiếp
+                        const now_ms = utils.milliTimestamp();
                         if (self.rendered_rows > self.cursor_row) {
                             var move_down_buf: [32]u8 = undefined;
                             const seq = std.fmt.bufPrint(&move_down_buf, "\x1b[{d}B", .{self.rendered_rows - self.cursor_row}) catch "";
                             stdout_file.writeStreamingAll(io, seq) catch {};
                         }
-                        stdout_file.writeStreamingAll(io, "^C\r\n") catch {};
-                        self.buf.clearRetainingCapacity();
-                        self.pos = 0;
-                        self.rendered_rows = 0;
-                        self.cursor_row = 0;
-                        self.history_index = self.prompt_history.entries.items.len;
-                        self.draft.clearRetainingCapacity();
-                        self.redraw(io, prompt);
-                        i += 1;
+
+                        if (self.buf.items.len > 0) {
+                            stdout_file.writeStreamingAll(io, "^C\r\n") catch {};
+                            self.buf.clearRetainingCapacity();
+                            self.pos = 0;
+                            self.rendered_rows = 0;
+                            self.cursor_row = 0;
+                            self.history_index = self.prompt_history.entries.items.len;
+                            self.draft.clearRetainingCapacity();
+                            self.last_ctrl_c_ms = now_ms;
+                            self.redraw(io, prompt);
+                            i += 1;
+                        } else {
+                            if (now_ms - self.last_ctrl_c_ms <= 2000 and self.last_ctrl_c_ms > 0) {
+                                stdout_file.writeStreamingAll(io, "^C\r\n") catch {};
+                                return null;
+                            } else {
+                                self.last_ctrl_c_ms = now_ms;
+                                stdout_file.writeStreamingAll(io, "^C\r\n") catch {};
+                                self.rendered_rows = 0;
+                                self.cursor_row = 0;
+                                self.redraw(io, prompt);
+                                i += 1;
+                            }
+                        }
                     },
                     4 => { // Ctrl+D: EOF khi buffer rỗng → thoát REPL
                         if (self.buf.items.len == 0) {

@@ -34,6 +34,7 @@ pub const ui_spinner = @import("ui/spinner.zig");
 pub const ui_diff = @import("ui/diff_renderer.zig");
 pub const ui_markdown = @import("ui/markdown.zig");
 pub const ui_chat_stream = @import("ui/chat_stream.zig");
+pub const editor_mod = @import("ui/editor.zig");
 pub const resetThinkState = ui_repl.resetThinkState;
 pub const quickjs_engine = @import("runtime/quickjs_engine.zig");
 pub const js_bindings = @import("runtime/js_bindings.zig");
