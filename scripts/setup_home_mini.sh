@@ -52,6 +52,7 @@ DIRECTORIES=(
     "${MINI_HOME}/skills"
     "${MINI_HOME}/commands"
     "${MINI_HOME}/sessions"
+    "${MINI_HOME}/acts"
     "${MINI_HOME}/artifacts"
     "${MINI_HOME}/memory"
     "${MINI_HOME}/cas"

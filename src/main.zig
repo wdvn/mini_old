@@ -20,6 +20,7 @@ pub const backends = struct {
     pub const ollama_mod = @import("backends/ollama.zig");
 };
 pub const tools_mod = @import("tooling/registry.zig");
+pub const act_logger_mod = @import("core/act_logger.zig");
 pub const mcp_mod = @import("tooling/mcp.zig");
 pub const utils = @import("core/utils.zig");
 pub const cron_mod = @import("core/cron.zig");

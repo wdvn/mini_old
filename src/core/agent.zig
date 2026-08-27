@@ -41,6 +41,7 @@ const tokens_mod = @import("memact/tokens.zig");
 const snapshot_mod = @import("snapshot.zig");
 const cas_mod = @import("cas.zig");
 pub const journal_mod = @import("journal.zig");
+pub const act_logger_mod = @import("act_logger.zig");
 pub const signals = @import("signals.zig");
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -129,6 +130,8 @@ pub const AgentLoop = struct {
     cas: cas_mod.CAS,
     /// Act Journal (RFC-002). Null nếu chưa processInput.
     journal: ?journal_mod.ActJournal = null,
+    /// Act Logger (Session Replay & Diagnostics).
+    act_logger: ?act_logger_mod.ActLogger = null,
     /// Snapshot tracker (RFC-002/ISSUE-CODEACT-001 M4) — track mini.write/patch/sh.
     snapshot_tracker: ?snapshot_mod.SnapshotTracker = null,
     /// HTTP code của lỗi backend gần nhất (đưa vào journal ErrorDetail).
@@ -204,6 +207,10 @@ pub const AgentLoop = struct {
         const cas_path = try std.fmt.bufPrint(&path_buf, "{s}/.mini/cas", .{home_dir});
         const cas = try cas_mod.CAS.init(alloc, io, cas_path);
 
+        var acts_buf: [256]u8 = undefined;
+        const acts_path = std.fmt.bufPrint(&acts_buf, "{s}/.mini/acts", .{home_dir}) catch "/tmp/mini_acts";
+        const act_logger = act_logger_mod.ActLogger.init(alloc, io, acts_path) catch null;
+
         return .{
             .alloc = alloc,
             .io = io,
@@ -215,6 +222,7 @@ pub const AgentLoop = struct {
             .token_estimator = tokens_mod.TokenEstimator.init(alloc),
             .cas = cas,
             .journal = null,
+            .act_logger = act_logger,
         };
     }
 
@@ -229,6 +237,7 @@ pub const AgentLoop = struct {
         self.token_estimator.deinit();
         self.cas.deinit();
         if (self.journal) |*j| j.deinit();
+        if (self.act_logger) |*al| al.deinit();
         if (self.last_backend_raw_error) |raw| self.alloc.free(raw);
     }
 
@@ -247,6 +256,68 @@ pub const AgentLoop = struct {
         continue_loop,
         exit_loop,
     };
+
+    fn logActDebug(
+        self: *AgentLoop,
+        act_id: usize,
+        input_msgs: []const proto.Message,
+        tool_defs: []const proto.ToolDefinition,
+        response: *const proto.Response,
+        js_code_opt: ?[]const u8,
+        exec_info: act_logger_mod.ActExecutionInfo,
+    ) void {
+        const logger = if (self.act_logger != null) &self.act_logger.? else return;
+
+        var text_acc: ?[]const u8 = null;
+        var think_acc: ?[]const u8 = null;
+        var tool_calls_list = std.ArrayListUnmanaged(proto.ToolUse).empty;
+        defer tool_calls_list.deinit(self.alloc);
+
+        for (response.content.items) |block| {
+            switch (block) {
+                .text => |t| text_acc = t,
+                .thinking => |th| think_acc = th.thinking,
+                .tool_use => |tu| tool_calls_list.append(self.alloc, tu) catch {},
+                else => {},
+            }
+        }
+
+        var snapshots_list = std.ArrayListUnmanaged(act_logger_mod.ActSnapshotInfo).empty;
+        defer snapshots_list.deinit(self.alloc);
+        if (self.snapshot_tracker) |t| {
+            for (t.tracked.items) |tf| {
+                snapshots_list.append(self.alloc, .{
+                    .path = tf.path,
+                    .previous_content_hash = tf.previous_content_hash,
+                }) catch {};
+            }
+        }
+
+        const pid: u32 = @intCast(std.os.linux.getpid());
+        logger.logAct(self.io, .{
+            .session_pid = pid,
+            .act_id = act_id,
+            .timestamp = utils.milliTimestamp(),
+            .backend_name = self.backend.name(),
+            .backend_model = self.backend.model(),
+            .system_prompt = self.config.system_prompt,
+            .messages_count = input_msgs.len,
+            .input_messages = input_msgs,
+            .tool_definitions = tool_defs,
+            .llm_response = .{
+                .http_code = response.http_code,
+                .stop_reason = @tagName(response.stop_reason),
+                .text = text_acc,
+                .thinking = think_acc,
+                .js_code = js_code_opt,
+                .tool_calls = if (tool_calls_list.items.len > 0) tool_calls_list.items else null,
+                .usage = response.usage,
+                .raw_debug_info = response.raw_debug_info,
+            },
+            .execution = exec_info,
+            .snapshots = snapshots_list.items,
+        }) catch {};
+    }
 
     fn executeStep(
         self: *AgentLoop,
@@ -273,11 +344,13 @@ pub const AgentLoop = struct {
             _ = self.history.ensureClaudeCompatible();
         }
 
+        const input_msgs = self.history.messages();
+
         // Gửi lên AI backend (streaming)
         var response = try self.sendToBackend(
             act_id,
             self.config.system_prompt,
-            self.history.messages(),
+            input_msgs,
             tool_defs,
             text_cb,
             think_cb,
@@ -326,6 +399,12 @@ pub const AgentLoop = struct {
                 var res = self.engine.eval(js_code, "agent_codeact.js") catch |e| {
                     const end_err_ms = utils.milliTimestamp();
                     const dur_ms = if (end_err_ms >= start_codeact_ms) @as(u64, @intCast(end_err_ms - start_codeact_ms)) else 0;
+                    self.logActDebug(act_id, input_msgs, tool_defs, &response, js_code, .{
+                        .exec_type = "codeact",
+                        .is_error = true,
+                        .duration_ms = dur_ms,
+                        .error_message = @errorName(e),
+                    });
                     if (signals.isInterrupted()) return error.Interrupted;
                     if (main.ui_repl.current_renderer) |r| {
                         r.finishTool("codeact", @errorName(e), true, dur_ms, null, null);
@@ -339,10 +418,19 @@ pub const AgentLoop = struct {
                 };
                 defer res.deinit();
 
-                if (signals.isInterrupted()) return error.Interrupted;
-
                 const end_codeact_ms = utils.milliTimestamp();
                 const dur_ms = if (end_codeact_ms >= start_codeact_ms) @as(u64, @intCast(end_codeact_ms - start_codeact_ms)) else 0;
+
+                self.logActDebug(act_id, input_msgs, tool_defs, &response, js_code, .{
+                    .exec_type = "codeact",
+                    .stdout = res.stdout,
+                    .return_value_json = res.return_value_json,
+                    .is_error = res.is_error,
+                    .duration_ms = dur_ms,
+                    .error_message = res.error_message,
+                });
+
+                if (signals.isInterrupted()) return error.Interrupted;
 
                 if (!res.is_error) {
                     if (main.ui_repl.current_renderer) |r| {
@@ -403,12 +491,14 @@ pub const AgentLoop = struct {
 
         switch (response.stop_reason) {
             .end_turn, .stop_sequence => {
+                self.logActDebug(act_id, input_msgs, tool_defs, &response, null, .{ .exec_type = "none" });
                 if (main.ui_repl.current_renderer == null) {
                     main.stderrPrint("\n\x1b[92m[agent] ✓ Hoàn thành sau {d} vòng lặp.\x1b[0m\n", .{act_id});
                 }
                 return .exit_loop;
             },
             .max_tokens => {
+                self.logActDebug(act_id, input_msgs, tool_defs, &response, null, .{ .exec_type = "max_tokens" });
                 // Response bị cắt giữa chừng. KHÔNG exit — chèn observation
                 // yêu cầu model tiếp tục đúng từ chỗ dừng (không lặp lại phần đã
                 // viết) để hoàn thành khối đang dở (JS block / tool_use / văn bản).
@@ -424,11 +514,17 @@ pub const AgentLoop = struct {
                 return .continue_loop;
             },
             .tool_use => {
+                self.logActDebug(act_id, input_msgs, tool_defs, &response, null, .{ .exec_type = "tool_call" });
                 try self.executeTools(act_id, &response);
                 main.stderrPrint("\n", .{});
                 return .continue_loop;
             },
             .unknown => {
+                self.logActDebug(act_id, input_msgs, tool_defs, &response, null, .{
+                    .exec_type = "error",
+                    .is_error = true,
+                    .error_message = response.raw_debug_info,
+                });
                 // Phân loại lỗi HTTP. Capture ngữ cảnh trước để error bubble lên
                 // processInput vẫn ghi đủ journal (response bị deinit trên đường).
                 if (response.http_code >= 400) {
