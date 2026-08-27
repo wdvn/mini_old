@@ -58,13 +58,11 @@ pub const TurnRenderer = struct {
     codeact_rendered_lines: usize = 0,
     codeact_total_lines: usize = 0,
     codeact_closing_backticks: usize = 0,
-    at_codeact_line_start: bool = true,
 
     // Code fence detection
     fence_buf: [32]u8 = undefined,
     fence_len: usize = 0,
     in_fence_check: bool = false,
-    at_line_start: bool = true,
 
     consecutive_newlines: usize = 1,
     waiting_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -94,10 +92,8 @@ pub const TurnRenderer = struct {
             .codeact_rendered_lines = 0,
             .codeact_total_lines = 0,
             .codeact_closing_backticks = 0,
-            .at_codeact_line_start = true,
             .fence_len = 0,
             .in_fence_check = false,
-            .at_line_start = true,
             .consecutive_newlines = 1,
             .waiting_active = std.atomic.Value(bool).init(false),
             .waiting_thread = null,
@@ -158,11 +154,9 @@ pub const TurnRenderer = struct {
         self.codeact_rendered_lines = 0;
         self.codeact_total_lines = 0;
         self.codeact_closing_backticks = 0;
-        self.at_codeact_line_start = true;
 
         self.fence_len = 0;
         self.in_fence_check = false;
-        self.at_line_start = true;
 
         self.consecutive_newlines = 1;
         self.highlighter = markdown_mod.StreamHighlighter.init();
@@ -298,6 +292,13 @@ pub const TurnRenderer = struct {
             self.endThinking();
         }
         if (self.is_codeact) return;
+
+        // Nếu văn bản trước đó chưa xuống dòng, ngắt dòng để khối in-place không ghi đè lên text trước đó
+        if (self.consecutive_newlines == 0) {
+            term.writeStdout("\n");
+            self.consecutive_newlines = 1;
+        }
+
         self.is_codeact = true;
         self.codeact_start_ms = utils.milliTimestamp();
         self.codeact_last_update_ms = 0;
@@ -307,7 +308,6 @@ pub const TurnRenderer = struct {
         self.codeact_rendered_lines = 0;
         self.codeact_total_lines = 0;
         self.codeact_closing_backticks = 0;
-        self.at_codeact_line_start = true;
         self.highlighter.flush(self.io);
     }
 
@@ -602,42 +602,29 @@ pub const TurnRenderer = struct {
 
             // 2. Đang trong khối CodeAct
             if (self.in_codeact) {
-                if (self.at_codeact_line_start) {
-                    if (c == '`') {
-                        self.codeact_closing_backticks += 1;
-                        if (self.codeact_closing_backticks == 3) {
-                            self.in_codeact = false;
-                            self.codeact_closing_backticks = 0;
-                            self.at_codeact_line_start = true;
-                            self.endCodeAct();
-                            // Bỏ qua phần còn lại trên dòng đóng ``` cho đến \n
-                            i += 1;
-                            while (i < text.len and text[i] != '\n') : (i += 1) {}
-                            if (i < text.len and text[i] == '\n') i += 1;
-                            continue;
-                        }
+                if (c == '`') {
+                    self.codeact_closing_backticks += 1;
+                    if (self.codeact_closing_backticks == 3) {
+                        self.in_codeact = false;
+                        self.codeact_closing_backticks = 0;
+                        self.endCodeAct();
                         i += 1;
                         continue;
-                    } else {
-                        if (self.codeact_closing_backticks > 0) {
-                            var k: usize = 0;
-                            while (k < self.codeact_closing_backticks) : (k += 1) {
-                                self.streamCodeAct("`");
-                            }
-                            self.codeact_closing_backticks = 0;
-                        }
                     }
-                }
-
-                self.streamCodeAct(text[i .. i + 1]);
-                if (c == '\n') {
-                    self.at_codeact_line_start = true;
-                    self.codeact_closing_backticks = 0;
+                    i += 1;
+                    continue;
                 } else {
-                    self.at_codeact_line_start = false;
+                    if (self.codeact_closing_backticks > 0) {
+                        var k: usize = 0;
+                        while (k < self.codeact_closing_backticks) : (k += 1) {
+                            self.streamCodeAct("`");
+                        }
+                        self.codeact_closing_backticks = 0;
+                    }
+                    self.streamCodeAct(text[i .. i + 1]);
+                    i += 1;
+                    continue;
                 }
-                i += 1;
-                continue;
             }
 
             // 3. Đang buffer kiểm tra code fence (```...)
@@ -647,7 +634,7 @@ pub const TurnRenderer = struct {
                     self.in_fence_check = false;
                     self.streamResponse(self.fence_buf[0..self.fence_len]);
                     self.fence_len = 0;
-                    self.at_line_start = false;
+                    // Tiếp tục vòng lặp để xử lý c như ký tự thông thường
                     continue;
                 }
 
@@ -664,7 +651,6 @@ pub const TurnRenderer = struct {
                         std.mem.eql(u8, lang, "node"))
                     {
                         self.in_codeact = true;
-                        self.at_codeact_line_start = true;
                         self.codeact_closing_backticks = 0;
                         self.startCodeAct();
                     } else {
@@ -674,7 +660,6 @@ pub const TurnRenderer = struct {
                     }
                     self.fence_len = 0;
                     i += 1;
-                    self.at_line_start = true;
                     continue;
                 } else {
                     if (self.fence_len < self.fence_buf.len) {
@@ -711,8 +696,8 @@ pub const TurnRenderer = struct {
                 continue;
             }
 
-            // 5. Kiểm tra bắt đầu code fence ``` ở đầu dòng
-            if (self.at_line_start and c == '`') {
+            // 5. Bắt đầu kiểm tra code fence ``` (có thể xuất hiện ở bất kỳ đâu)
+            if (c == '`') {
                 self.in_fence_check = true;
                 self.fence_buf[0] = '`';
                 self.fence_len = 1;
@@ -722,11 +707,6 @@ pub const TurnRenderer = struct {
 
             // 6. Ký tự văn bản thông thường
             self.streamResponse(text[i .. i + 1]);
-            if (c == '\n') {
-                self.at_line_start = true;
-            } else {
-                self.at_line_start = false;
-            }
             i += 1;
         }
     }
@@ -734,6 +714,11 @@ pub const TurnRenderer = struct {
     /// Hoàn thành toàn bộ Turn và in Telemetry Status Footer.
     pub fn finishTurn(self: *TurnRenderer, stats: TurnStats) void {
         self.stopWaiting();
+        if (self.in_fence_check and self.fence_len > 0) {
+            self.streamResponse(self.fence_buf[0..self.fence_len]);
+            self.fence_len = 0;
+            self.in_fence_check = false;
+        }
         if (self.is_thinking) {
             self.endThinking();
         }

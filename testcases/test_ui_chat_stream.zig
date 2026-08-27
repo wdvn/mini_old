@@ -122,12 +122,17 @@ test "UI Chat Stream: TurnRenderer CodeAct stream in-place" {
     var renderer = chat_stream.TurnRenderer.init(alloc, io);
     renderer.startTurn("Kiểm tra CodeAct in-place streaming");
 
-    // Process chunk containing ```js ... ```
-    renderer.processTextChunk("```js\nconst files = mini.glob(\"*.zig\");\nconst result = mini.read(files[0]);\nconsole.log(result);\n```\n");
+    // 1. Process chunk containing inline code and attached ```js ... ```
+    renderer.processTextChunk("Tôi sẽ xóa branch `luynt`.```js\nconst files = mini.glob(\"*.zig\");\nconst result = mini.read(files[0]);\nconsole.log(result);\n```Đã xóa xong.\n");
     try std.testing.expect(!renderer.is_codeact);
     try std.testing.expect(!renderer.in_codeact);
 
-    // Test explicit startCodeAct, streamCodeAct, endCodeAct
+    // 2. Process chained code blocks without newlines: ```js...``````js...```
+    renderer.processTextChunk("```js\nconst a = 1;\n``````js\nconst b = 2;\n```");
+    try std.testing.expect(!renderer.is_codeact);
+    try std.testing.expect(!renderer.in_codeact);
+
+    // 3. Test explicit startCodeAct, streamCodeAct, endCodeAct
     renderer.startCodeAct();
     try std.testing.expect(renderer.is_codeact);
     renderer.streamCodeAct("const x = 10;\nconst y = 20;\n");
