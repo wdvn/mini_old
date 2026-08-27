@@ -179,6 +179,11 @@ pub const Config = struct {
         \\  - `mini.env(name)`: Đọc biến môi trường
         \\  - `console.log(...)`: In kết quả ra output
         \\
+        \\## Quy tắc tương tác CodeAct (BẮT BUỘC):
+        \\1. Mỗi lượt (turn) bạn chỉ được viết ĐÚNG 1 khối ```js ... ``` duy nhất.
+        \\2. Ngay sau khi đóng thẻ ``` bạn BẮT BUỘC DỪNG LẠI (yield turn) để hệ thống thực thi và trả về kết quả qua lượt tiếp theo.
+        \\3. Tuyệt đối KHÔNG tự giả định output, KHÔNG tự độc thoại suy đoán kết quả và KHÔNG viết nhiều khối code trong cùng một lượt trả lời.
+        \\
         \\Hãy trả lời ngắn gọn, chính xác và hiệu quả bằng tiếng Việt.
     ;
 

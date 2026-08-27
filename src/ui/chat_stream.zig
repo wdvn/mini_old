@@ -285,7 +285,7 @@ pub const TurnRenderer = struct {
         self.write(footer);
     }
 
-    /// Bắt đầu khối CodeAct streaming.
+    /// Bắt đầu khối CodeAct.
     pub fn startCodeAct(self: *TurnRenderer) void {
         self.stopWaiting();
         if (self.is_thinking) {
@@ -293,175 +293,79 @@ pub const TurnRenderer = struct {
         }
         if (self.is_codeact) return;
 
-        // Nếu văn bản trước đó chưa xuống dòng, ngắt dòng để khối in-place không ghi đè lên text trước đó
-        if (self.consecutive_newlines == 0) {
-            term.writeStdout("\n");
-            self.consecutive_newlines = 1;
-        }
-
         self.is_codeact = true;
         self.codeact_start_ms = utils.milliTimestamp();
         self.codeact_last_update_ms = 0;
-        self.codeact_line1_len = 0;
-        self.codeact_line2_len = 0;
         self.codeact_curr_len = 0;
-        self.codeact_rendered_lines = 0;
-        self.codeact_total_lines = 0;
         self.codeact_closing_backticks = 0;
         self.highlighter.flush(self.io);
     }
 
-    /// Stream ký tự/chuỗi trong khối CodeAct (cập nhật in-place tối đa 3 dòng).
+    /// Stream ký tự/chuỗi trong khối CodeAct (cập nhật in-place 1 dòng với spinner và code snippet).
     pub fn streamCodeAct(self: *TurnRenderer, text: []const u8) void {
         self.stopWaiting();
         if (!self.is_codeact) {
             self.startCodeAct();
         }
 
+        // Tích luỹ snippet JS gần nhất (loại bỏ newlines, chỉ giữ các ký tự hiển thị được)
         for (text) |c| {
-            if (c == '\n') {
-                if (self.codeact_curr_len > 0 or self.codeact_total_lines > 0) {
-                    // Shift lines
-                    std.mem.copyForwards(u8, &self.codeact_line1_buf, self.codeact_line2_buf[0..self.codeact_line2_len]);
-                    self.codeact_line1_len = self.codeact_line2_len;
-
-                    std.mem.copyForwards(u8, &self.codeact_line2_buf, self.codeact_curr_buf[0..self.codeact_curr_len]);
-                    self.codeact_line2_len = self.codeact_curr_len;
-
-                    self.codeact_curr_len = 0;
-                    self.codeact_total_lines += 1;
-                }
-            } else if (c == '\r') {
-                // ignore \r
-            } else if (c == '\t') {
-                if (self.codeact_curr_len + 2 < self.codeact_curr_buf.len) {
-                    self.codeact_curr_buf[self.codeact_curr_len] = ' ';
-                    self.codeact_curr_len += 1;
-                    self.codeact_curr_buf[self.codeact_curr_len] = ' ';
-                    self.codeact_curr_len += 1;
+            if (c == '\n' or c == '\r' or c == '\t') {
+                if (self.codeact_curr_len > 0 and self.codeact_curr_buf[self.codeact_curr_len - 1] != ' ') {
+                    if (self.codeact_curr_len < self.codeact_curr_buf.len) {
+                        self.codeact_curr_buf[self.codeact_curr_len] = ' ';
+                        self.codeact_curr_len += 1;
+                    }
                 }
             } else if (c >= 32) {
-                // Giới hạn độ dài tối đa 72 ký tự mỗi dòng để tránh terminal wrap làm lệch con trỏ
-                if (self.codeact_curr_len < 72) {
+                if (self.codeact_curr_len < self.codeact_curr_buf.len) {
+                    self.codeact_curr_buf[self.codeact_curr_len] = c;
+                    self.codeact_curr_len += 1;
+                } else {
+                    const shift = 16;
+                    std.mem.copyForwards(u8, self.codeact_curr_buf[0 .. self.codeact_curr_buf.len - shift], self.codeact_curr_buf[shift..]);
+                    self.codeact_curr_len = self.codeact_curr_buf.len - shift;
                     self.codeact_curr_buf[self.codeact_curr_len] = c;
                     self.codeact_curr_len += 1;
                 }
             }
         }
 
+        if (comptime builtin.is_test) return;
+        if (!term.isStdoutTty()) return;
+
         const now = utils.milliTimestamp();
         // Rate-limit redraw mỗi 40ms để terminal chạy mượt mà
         if (now - self.codeact_last_update_ms >= 40) {
             self.codeact_last_update_ms = now;
-            self.renderCodeActInPlace(now);
+            const diff = if (now >= self.codeact_start_ms) now - self.codeact_start_ms else 0;
+            var dur_buf: [32]u8 = undefined;
+            const dur_str = utils.formatDuration(&dur_buf, @intCast(diff));
+            const frame = self.spinner.nextFrame();
+
+            const snippet = std.mem.trim(u8, self.codeact_curr_buf[0..self.codeact_curr_len], " ");
+            var out_buf: [256]u8 = undefined;
+            const line = if (snippet.len > 0)
+                std.fmt.bufPrint(&out_buf, "\r\x1b[2K \x1b[35m{s}\x1b[0m \x1b[1;35mCodeAct\x1b[0m \x1b[90m({s})...\x1b[0m \x1b[2;37m{s}\x1b[0m", .{
+                    frame, dur_str, snippet,
+                }) catch ""
+            else
+                std.fmt.bufPrint(&out_buf, "\r\x1b[2K \x1b[35m{s}\x1b[0m \x1b[1;35mCodeAct\x1b[0m \x1b[90m({s})...\x1b[0m", .{
+                    frame, dur_str,
+                }) catch "";
+
+            if (line.len > 0) term.writeStdout(line);
         }
-    }
-
-    fn renderCodeActInPlace(self: *TurnRenderer, now: i64) void {
-        if (comptime builtin.is_test) return;
-        if (!term.isStdoutTty()) return;
-
-        const diff = if (now >= self.codeact_start_ms) now - self.codeact_start_ms else 0;
-        var dur_buf: [32]u8 = undefined;
-        const dur_str = utils.formatDuration(&dur_buf, @intCast(diff));
-        const frame = self.spinner.nextFrame();
-
-        var h_buf: [128]u8 = undefined;
-        const header_line = std.fmt.bufPrint(&h_buf, " \x1b[35m{s}\x1b[0m \x1b[1;35mCodeAct\x1b[0m \x1b[90m({s})...\x1b[0m", .{
-            frame, dur_str,
-        }) catch " ⚡ CodeAct...";
-
-        var line2_opt: ?[]const u8 = null;
-        var line3_opt: ?[]const u8 = null;
-        var num_lines: usize = 1;
-
-        if (self.codeact_curr_len > 0) {
-            if (self.codeact_line2_len > 0) {
-                line2_opt = self.codeact_line2_buf[0..self.codeact_line2_len];
-                line3_opt = self.codeact_curr_buf[0..self.codeact_curr_len];
-                num_lines = 3;
-            } else {
-                line2_opt = self.codeact_curr_buf[0..self.codeact_curr_len];
-                num_lines = 2;
-            }
-        } else if (self.codeact_line2_len > 0) {
-            if (self.codeact_line1_len > 0) {
-                line2_opt = self.codeact_line1_buf[0..self.codeact_line1_len];
-                line3_opt = self.codeact_line2_buf[0..self.codeact_line2_len];
-                num_lines = 3;
-            } else {
-                line2_opt = self.codeact_line2_buf[0..self.codeact_line2_len];
-                num_lines = 2;
-            }
-        }
-
-        // Di chuyển con trỏ lên vị trí dòng đầu tiên đã render trước đó
-        if (self.codeact_rendered_lines > 1) {
-            for (0..self.codeact_rendered_lines - 1) |_| {
-                term.writeStdout("\x1b[1A");
-            }
-        }
-
-        // Render Dòng 1 (Header)
-        term.writeStdout("\r\x1b[2K");
-        term.writeStdout(header_line);
-
-        // Render Dòng 2
-        if (line2_opt) |l2| {
-            var l2_buf: [256]u8 = undefined;
-            const l2_str = std.fmt.bufPrint(&l2_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m \x1b[2;37m{s}\x1b[0m", .{l2}) catch "";
-            term.writeStdout(l2_str);
-        }
-
-        // Render Dòng 3
-        if (line3_opt) |l3| {
-            var l3_buf: [256]u8 = undefined;
-            const l3_str = std.fmt.bufPrint(&l3_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m \x1b[37m{s}\x1b[0m", .{l3}) catch "";
-            term.writeStdout(l3_str);
-        }
-
-        // Xóa dòng thừa nếu số dòng render lần này ít hơn lần trước
-        if (self.codeact_rendered_lines > num_lines) {
-            const excess = self.codeact_rendered_lines - num_lines;
-            for (0..excess) |_| {
-                term.writeStdout("\n\r\x1b[2K");
-            }
-            for (0..excess) |_| {
-                term.writeStdout("\x1b[1A");
-            }
-        }
-
-        self.codeact_rendered_lines = num_lines;
     }
 
     /// Kết thúc khối CodeAct: xóa in-place rendering và chuẩn bị hiển thị Tool Action Card.
     pub fn endCodeAct(self: *TurnRenderer) void {
         if (!self.is_codeact) return;
         self.is_codeact = false;
-
-        if (term.isStdoutTty() and self.codeact_rendered_lines > 0) {
-            if (self.codeact_rendered_lines > 1) {
-                for (0..self.codeact_rendered_lines - 1) |_| {
-                    term.writeStdout("\x1b[1A");
-                }
-            }
-            for (0..self.codeact_rendered_lines) |idx| {
-                term.writeStdout("\r\x1b[2K");
-                if (idx + 1 < self.codeact_rendered_lines) {
-                    term.writeStdout("\n");
-                }
-            }
-            if (self.codeact_rendered_lines > 1) {
-                for (0..self.codeact_rendered_lines - 1) |_| {
-                    term.writeStdout("\x1b[1A");
-                }
-            }
+        if (term.isStdoutTty()) {
             term.writeStdout("\r\x1b[2K");
         }
-        self.codeact_rendered_lines = 0;
         self.codeact_curr_len = 0;
-        self.codeact_line1_len = 0;
-        self.codeact_line2_len = 0;
     }
 
     /// Stream câu trả lời của AI ra stdout với Markdown & Code highlighting.

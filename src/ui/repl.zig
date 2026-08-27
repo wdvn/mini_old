@@ -33,6 +33,7 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
 
     while (true) {
         signals.setInterrupted(false);
+        line_editor.last_ctrl_c_ms = 0;
         const line_opt = try line_editor.readLine(io, PROMPT_PREFIX);
         const line = line_opt orelse break;
         defer alloc.free(line);
