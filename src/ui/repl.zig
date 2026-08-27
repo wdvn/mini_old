@@ -329,11 +329,12 @@ pub fn printText(text: []const u8) void {
 
 pub fn resetThinkState() void {
     if (current_renderer) |r| {
-        if (r.is_thinking) {
+        if (r.ui_state == .thinking or r.is_thinking) {
             r.endThinking();
         }
-        if (r.is_codeact) {
+        if (r.ui_state == .codeact_live or r.ui_state == .codeact_ready or r.is_codeact) {
             r.endCodeAct();
         }
+        r.parser.resetAct();
     }
 }
