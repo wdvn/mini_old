@@ -66,11 +66,26 @@ pub const ExecutionMode = enum {
     }
 };
 
+/// Giao thức OpenAI-compatible (ISSUE-BACKEND-001).
+pub const OpenAiProtocol = enum {
+    auto,
+    chat_completions,
+    responses,
+
+    pub fn fromString(s: []const u8) OpenAiProtocol {
+        if (std.mem.eql(u8, s, "responses") or std.mem.eql(u8, s, "response")) return .responses;
+        if (std.mem.eql(u8, s, "chat") or std.mem.eql(u8, s, "chat_completions") or std.mem.eql(u8, s, "completions")) return .chat_completions;
+        return .auto;
+    }
+};
+
 /// Cấu hình đầy đủ của mini-agent, đọc từ biến môi trường.
 pub const Config = struct {
     // Mode
     execution_mode: ExecutionMode = .auto,
     // Backend
+    /// Giao thức OpenAI-compatible (mặc định: auto).
+    openai_protocol: OpenAiProtocol = .auto,
     /// URL OpenAI-compatible (ưu tiên cao nhất). Null = không cấu hình.
     openai_compat_url: ?[]const u8,
     /// API key cho OpenAI-compatible endpoint. Null = không cần key.
@@ -174,6 +189,7 @@ pub const Config = struct {
     /// `alloc` dùng để đọc file system prompt nếu cần.
     pub fn load(alloc: Allocator, env_map: *const std.process.Environ.Map, io: std.Io) !Config {
         const exec_mode = if (env_map.get("MINI_EXECUTION_MODE")) |m| ExecutionMode.fromString(m) else .auto;
+        const openai_proto = if (env_map.get("OPENAI_PROTOCOL") orelse env_map.get("MINI_OPENAI_PROTOCOL") orelse env_map.get("OPENAI_COMPAT_PROTOCOL")) |p| OpenAiProtocol.fromString(p) else .auto;
         const openai_url = env_map.get("OPENAI_COMPAT_URL");
         const openai_key = env_map.get("OPENAI_COMPAT_API_KEY");
         const openai_api_header = env_map.get("OPENAI_COMPAT_API_HEADER") orelse "Authorization";
@@ -289,6 +305,7 @@ pub const Config = struct {
 
         return .{
             .execution_mode = exec_mode,
+            .openai_protocol = openai_proto,
             .openai_compat_url = openai_url,
             .openai_compat_key = openai_key,
             .openai_compat_api_header = openai_api_header,
@@ -457,6 +474,7 @@ fn appendSkillsBlock(alloc: Allocator, env_map: *const std.process.Environ.Map, 
 ///                 `export KEY=VALUE`, `# comment`, dòng trống.
 pub const JsonConfig = struct {
     execution_mode: ?[]const u8 = null,
+    openai_protocol: ?[]const u8 = null,
     openai_compat_url: ?[]const u8 = null,
     openai_compat_api_key: ?[]const u8 = null,
     openai_compat_api_header: ?[]const u8 = null,
@@ -576,6 +594,7 @@ fn tryLoadJsonConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: st
     var count: usize = 0;
 
     if (cfg.execution_mode) |val| count += setEnvDefault(env_map, "MINI_EXECUTION_MODE", val);
+    if (cfg.openai_protocol) |val| count += setEnvDefault(env_map, "OPENAI_PROTOCOL", val);
     if (cfg.openai_compat_url) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_URL", val);
     if (cfg.openai_compat_api_key) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_API_KEY", val);
     if (cfg.openai_compat_api_header) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_API_HEADER", val);
@@ -665,6 +684,7 @@ test "JsonConfig parsing" {
     const json_str =
         \\{
         \\  "execution_mode": "codeact",
+        \\  "openai_protocol": "responses",
         \\  "openai_compat_model": "gpt-4o",
         \\  "max_tokens": 4096,
         \\  "memact_enabled": true
@@ -675,6 +695,7 @@ test "JsonConfig parsing" {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("codeact", parsed.value.execution_mode.?);
+    try std.testing.expectEqualStrings("responses", parsed.value.openai_protocol.?);
     try std.testing.expectEqualStrings("gpt-4o", parsed.value.openai_compat_model.?);
     try std.testing.expectEqual(4096, parsed.value.max_tokens.?);
     try std.testing.expectEqual(true, parsed.value.memact_enabled.?);
