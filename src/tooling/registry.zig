@@ -188,8 +188,8 @@ pub fn executeTool(alloc: Allocator, io: std.Io, name: []const u8, input_json: [
 pub const definitions = [_]proto.ToolDefinition{
     .{
         .name = "codeact",
-        .description = "Thực thi mã JavaScript trong máy ảo QuickJS nhúng với đối tượng toàn cục mini.* (mini.sh, mini.read, mini.write, mini.patch, mini.http). Dùng khi cần tự động hóa nhiều bước phức tạp hoặc xử lý dữ liệu.",
-        .input_schema_json = \\{"type":"object","properties":{"code":{"type":"string","description":"Mã JavaScript cần thực thi trong QuickJS VM"}},"required":["code"]}
+        .description = "Thực thi mã JavaScript trong máy ảo CodeAct nhúng với đối tượng toàn cục mini.* (mini.sh, mini.read, mini.write, mini.patch, mini.http). Dùng khi cần tự động hóa nhiều bước phức tạp hoặc xử lý dữ liệu.",
+        .input_schema_json = \\{"type":"object","properties":{"code":{"type":"string","description":"Mã JavaScript cần thực thi trong CodeAct VM"}},"required":["code"]}
         ,
     },
 
@@ -515,7 +515,7 @@ test "codeact as native tool: codeact in registry" {
     for (definitions) |td| {
         if (std.mem.eql(u8, td.name, "codeact")) {
             found_def = true;
-            try std.testing.expect(std.mem.indexOf(u8, td.description, "QuickJS") != null);
+            try std.testing.expect(std.mem.indexOf(u8, td.description, "CodeAct") != null);
             break;
         }
     }

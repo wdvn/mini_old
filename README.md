@@ -1,6 +1,6 @@
 # mini-agent overview
 
-AI agent chạy terminal, code-centric: agent tự viết JavaScript chạy trong QuickJS nhúng để gọi tools, thay vì gọi từng tool rời rạc
+AI agent chạy terminal, code-centric: agent tự viết JavaScript chạy trong CodeAct nhúng để gọi tools, thay vì gọi từng tool rời rạc
 
 mini-agent là một AI agent dòng lệnh viết bằng Zig: nó nhận prompt, tự lập kế hoạch các bước, và thực thi bằng cách chạy shell, đọc/sửa file, gọi HTTP, tìm kiếm web hoặc điều khiển trình duyệt. Kết quả mỗi vòng được gửi lại model cho đến khi hoàn thành tác vụ; mọi thao tác đều chạy gọn trong một binary không cần runtime bên ngoài.
 
@@ -21,7 +21,7 @@ mini-agent là một AI agent dòng lệnh viết bằng Zig: nó nhận prompt,
 |---|---|---|
 | Backends AI | OpenAI-compatible, Anthropic Claude, Ollama local | [Backends AI](#backends-ai) |
 | Built-in tools | 15 tools: shell, file, glob, grep, HTTP, web search, browser, subagent, artifact | [Tools](#tools) |
-| CodeAct runtime | Agent viết JS trong khối ```js``` chạy trên QuickJS-ng nhúng, gọi API `mini.*` | [Execution modes](#execution-modes) |
+| CodeAct runtime | Agent viết JS trong khối ```js``` chạy trên CodeAct nhúng, gọi API `mini.*` | [Execution modes](#execution-modes) |
 | Session persistence | Lưu/khôi phục hội thoại theo ID hoặc file JSON | [Session](#session-lưu-hội-thoại) |
 | Hooks | Audit logging, telemetry qua script ngoài tại mọi sự kiện | [Hooks](#hooks-giám-sát--observability) |
 | MCP | Dùng tool từ MCP servers ngoài qua stdio JSON-RPC | [MCP](#mcp-model-context-protocol) |
@@ -132,7 +132,7 @@ Cú pháp `.env` hỗ trợ khai báo `KEY=value` (có hoặc không có ngoặc
 ### Tool policy
 
 - Allowlist có ưu tiên cao hơn blocklist: khi set allowlist, chỉ tool trong list mới chạy.
-- Policy áp dụng cho tool gọi trực tiếp qua registry. Khi chạy ở chế độ `codeact`, lệnh shell đi qua API `mini.sh` trong QuickJS và không đi qua check này.
+- Policy áp dụng cho tool gọi trực tiếp qua registry. Khi chạy ở chế độ `codeact`, lệnh shell đi qua API `mini.sh` trong CodeAct và không đi qua check này.
 
 ```bash
 # Chỉ cho phép đọc file và tìm kiếm
@@ -196,7 +196,7 @@ echo "$RESULT" > test_fibonacci.py
 Chế độ thực thi (cờ `-m`/`--mode` hoặc `MINI_EXECUTION_MODE`):
 
 - **`auto`** (mặc định) — model tự chọn cách phản hồi.
-- **`codeact`** — agent viết JavaScript trong khối ```js ... ``` chạy trên QuickJS-ng nhúng (ES2023+), gọi tools qua object `mini.*`:
+- **`codeact`** — agent viết JavaScript trong khối ```js ... ``` chạy trên CodeAct nhúng (ES2023+), gọi tools qua object `mini.*`:
   - File I/O: `mini.read`, `mini.write`, `mini.patch`, `mini.exists`, `mini.stat`.
   - Tìm kiếm: `mini.glob`, `mini.grep`.
   - Shell: `mini.sh`, `mini.shStream`, `mini.shBackground` + quản lý job (`mini.jobStatus`, `mini.jobLogs`, `mini.jobKill`).
@@ -487,7 +487,7 @@ src/
   core/               — agent loop, config, history (MemAct compaction),
                         hooks, journal + CAS snapshot (rollback), artifacts,
                         protocol, JSON utils, cron
-  runtime/            — QuickJS-ng engine, JS bindings (mini.*), background jobs
+  runtime/            — CodeAct engine, JS bindings (mini.*), background jobs
   tools/              — bash, file, glob, grep, http, search, browser,
                         subagent, batch_subagent, artifact
   tooling/            — MCP client, tool registry (definitions + policy)

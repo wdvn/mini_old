@@ -12,7 +12,7 @@
 
 ## 1. Tổng quan vấn đề (Problem Statement)
 
-Kiến trúc Code-Centric Agent (CodeAct) của `mini-agent` cho phép LLM sinh mã JavaScript thực thi trực tiếp trong QuickJS-ng VM nhúng thông qua đối tượng toàn cục `mini.*` (`mini.sh`, `mini.read`, `mini.write`, `mini.patch`, `mini.http`, v.v.).
+Kiến trúc Code-Centric Agent (CodeAct) của `mini-agent` cho phép LLM sinh mã JavaScript thực thi trực tiếp trong CodeAct VM nhúng thông qua đối tượng toàn cục `mini.*` (`mini.sh`, `mini.read`, `mini.write`, `mini.patch`, `mini.http`, v.v.).
 
 Qua phân tích các session chạy thực tế gần đây, việc thực thi tool qua JS CodeAct đang **tách biệt khỏi các cơ chế kiểm soát chính của Agent Loop**, tạo ra 4 lỗ hổng nghiêm trọng:
 
@@ -30,11 +30,11 @@ Qua phân tích các session chạy thực tế gần đây, việc thực thi t
 - **Hậu quả**: Không thể audit lịch sử biến đổi file do CodeAct gây ra và không thể khôi phục (rollback) các thao tác hỏng khi task thất bại.
 
 ### 1.4. Phản hồi Lỗi Self-Correction Chưa Tường Minh
-- Khi JS script ném ngoại lệ hoặc lệnh `mini.sh` thất bại trong QuickJS, thông báo lỗi trả về cho LLM đôi khi bị thiếu thông tin ngữ cảnh hoặc bị cắt vụn, làm giảm khả năng tự sửa lỗi (Self-Correction) của Agent trong lượt tiếp theo.
+- Khi JS script ném ngoại lệ hoặc lệnh `mini.sh` thất bại trong CodeAct, thông báo lỗi trả về cho LLM đôi khi bị thiếu thông tin ngữ cảnh hoặc bị cắt vụn, làm giảm khả năng tự sửa lỗi (Self-Correction) của Agent trong lượt tiếp theo.
 
 ### 1.5. Trùng lặp Scope Biến giữa các Turn (Global Variable Scope Pollution across Acts)
-- QuickJS engine trước đây thực thi các khối mã JS từ LLM bằng `c.JS_Eval(ctx, ..., c.JS_EVAL_TYPE_GLOBAL)`. Mọi khối mã JS trong cùng một session đều dùng chung 1 `JSContext` toàn cục.
-- **Hậu quả trực tiếp**: Nếu ở Turn 1 Agent khai báo `const data = mini.read(...)` hoặc `const lines = ...` ở top-level, sang Turn 2 nếu Agent tiếp tục dùng `const data = ...` ở top-level, QuickJS lập tức ném lỗi `SyntaxError: Identifier 'data' has already been declared`. *(Đã được khắc phục triệt để bằng Per-Act VM Isolation)*.
+- CodeAct engine trước đây thực thi các khối mã JS từ LLM bằng `c.JS_Eval(ctx, ..., c.JS_EVAL_TYPE_GLOBAL)`. Mọi khối mã JS trong cùng một session đều dùng chung 1 `JSContext` toàn cục.
+- **Hậu quả trực tiếp**: Nếu ở Turn 1 Agent khai báo `const data = mini.read(...)` hoặc `const lines = ...` ở top-level, sang Turn 2 nếu Agent tiếp tục dùng `const data = ...` ở top-level, CodeAct lập tức ném lỗi `SyntaxError: Identifier 'data' has already been declared`. *(Đã được khắc phục triệt để bằng Per-Act VM Isolation)*.
 
 ### 1.7. LLM Xuất Thẻ XML Giả Định (`<file_read>`, `<glob>`, `<bash>`) Thay vì Mã JavaScript ````js ... ```` khi ở Chế độ CodeAct
 - Khi bật chế độ CodeAct (`MINI_EXECUTION_MODE=codeact`), mảng native `tools` ở API payload bị ẩn để triệt tiêu Native Function Calling. Tuy nhiên, một số LLM (như DeepSeek, Claude, Ollama) khi không có mảng `tools` ở API payload lại xuất hiện khuynh hướng tưởng tượng các thẻ XML giả lập (ví dụ `<file_read file="..." />`, `<glob pattern="..." />`, `<bash command="..." />`) trong text phản hồi thay vì sinh khối mã ````js ... ````.
@@ -58,7 +58,7 @@ Qua phân tích các session chạy thực tế gần đây, việc thực thi t
                │
                ▼
    ┌──────────────────────┐
-   │  QuickJS-ng Engine   │
+   │    CodeAct Engine    │
    └──────────┬───────────┘
               │ Calls mini.sh() / mini.write()
               ▼
@@ -92,7 +92,7 @@ Qua phân tích các session chạy thực tế gần đây, việc thực thi t
   3. Ghi sự kiện `file_snapshot` bổ sung vào journal.
 
 ### 2.4. Chuẩn hóa Định dạng Lỗi Self-Correction
-- Đóng gói lỗi trong QuickJS theo định dạng chuẩn:
+- Đóng gói lỗi trong CodeAct theo định dạng chuẩn:
   ```
   [CodeAct JavaScript Execution Failed]
   Error Type: <TypeError / ReferenceError / RuntimeError>
@@ -120,7 +120,7 @@ Qua phân tích các session chạy thực tế gần đây, việc thực thi t
 - Bổ sung bộ bóc tách và quy đổi tự động `convertXmlToolTagsToJs` trong `src/core/agent.zig`:
   1. Khi `findJsCodeInResponse` không thấy khối mã markdown ````js ... ````, tự động quét văn bản phản hồi tìm các thẻ XML giả lập như `<file_read>`, `<glob>`, `<grep>`, `<bash>`, `<file_write>`.
   2. Bóc tách thuộc tính và tự động tạo đoạn mã JS thực thi tương đương (ví dụ `mini.read(path)`, `mini.glob(pattern, path)`, `mini.sh(cmd)`).
-  3. Thực thi đoạn mã JS trong QuickJS VM, ghi log stdout và quay lại tiếp tục vòng lặp (`.continue_loop`) thay vì thoát lượt chạy (`✓ Hoàn thành sau 1 vòng lặp`).
+  3. Thực thi đoạn mã JS trong CodeAct VM, ghi log stdout và quay lại tiếp tục vòng lặp (`.continue_loop`) thay vì thoát lượt chạy (`✓ Hoàn thành sau 1 vòng lặp`).
 
 ### 2.9. Mở Rộng Nhận Diện Lỗi HTTP 5xx & Tự Động Retry Backoff
 - Cập nhật phân loại lỗi HTTP status code trong `AgentLoop.executeStep`:
@@ -157,7 +157,7 @@ Qua phân tích các session chạy thực tế gần đây, việc thực thi t
 - [x] **M3: Hook Integration**: Bổ sung pre-hook và post-hook dispatch cho các hàm `mini.*`.
 - [x] **M4: Journal Snapshot Integration**: Tích hợp `ActJournal` snapshot vào `mini.write` và `mini.patch`.
 - [x] **M5: Tool-Calling Suppression**: Ẩn mảng `tools` khi `execution_mode == .codeact` và thắt chặt prompt framing.
-- [x] **M6: Native Tool Standardization**: Đăng ký `codeact` thành native tool trong registry và QuickJS runtime handler.
+- [x] **M6: Native Tool Standardization**: Đăng ký `codeact` thành native tool trong registry và CodeAct runtime handler.
 - [x] **M7: XML Tool Tag Auto-Conversion**: Tự động chuyển đổi thẻ XML giả lập (`<file_read>`, `<glob>`, `<bash>...`) thành mã JS CodeAct và tiếp tục Act loop.
 - [x] **M8: HTTP 5xx Cloudflare Error Standardization**: Mở rộng nhận diện HTTP 5xx (520, 522...) thành `LLMProviderUnavailable` cho backoff retry.
 - [x] **M9: Reactive Emergency Context Compaction**: Bỏ nén chủ động 85%, nén ngữ cảnh phản ứng khi nhận được lỗi `LLMContextWindowExceeded`.

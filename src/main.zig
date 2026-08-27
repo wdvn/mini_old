@@ -453,7 +453,7 @@ fn printHelp() void {
         \\OPTIONS:
         \\  -e, --exec <prompt>    Chạy single-shot và thoát
         \\  --system <file>        Dùng file làm system prompt
-        \\  -m, --mode <mode>      Chế độ thực thi: codeact (QuickJS-ng JS engine), tools (JSON), auto
+        \\  -m, --mode <mode>      Chế độ thực thi: codeact (CodeAct JS engine), tools (JSON), auto
         \\  --session <id>         Tự động nạp/lưu session tại ~/.mini/sessions/<id>.json
         \\  --session-file <path>  Chỉ định đường dẫn file session JSON trực tiếp
         \\  --acp                  Chạy chế độ ACP server (Agent Client Protocol qua stdin/stdout)

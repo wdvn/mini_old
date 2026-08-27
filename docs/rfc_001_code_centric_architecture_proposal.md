@@ -1,8 +1,8 @@
-# PROPOSAL: QUICKJS-NG EMBEDDED CODE-CENTRIC AGENT ARCHITECTURE CHO MINI
+# PROPOSAL: CODEACT EMBEDDED CODE-CENTRIC AGENT ARCHITECTURE CHO MINI
 > **Document**: RFC-001 (Revision 7 — Long-Lived Tasks & Lifecycle Context Tracking)  
 > **Status**: Approved / In Implementation  
 > **Target System**: `mini-agent` (`mini`)  
-> **Core Interpreter**: **Embedded QuickJS-ng (ES2023/ES2024 Modern JavaScript Runtime)**  
+> **Core Interpreter**: **Embedded CodeAct (ES2023/ES2024 Modern JavaScript Runtime)**  
 > **Repository**: [quickjs-ng/quickjs](https://github.com/quickjs-ng/quickjs)  
 > **Author**: Core Team & AI Pair Programmer  
 > **Date**: 20/08/2026  
@@ -25,9 +25,9 @@ Kiến trúc ban đầu của `mini` dựa trên chuẩn **JSON Tool-Calling** t
 
 ---
 
-### 1.2. Giải pháp: QuickJS-ng Code-Centric + Multi-Tier Execution + Context Hooks
+### 1.2. Giải pháp: CodeAct + Multi-Tier Execution + Context Hooks
 Chuyển đổi cơ chế tương tác công cụ của `mini` sang mô hình toàn diện:
-- **QuickJS-ng Engine được nhúng trực tiếp (In-Process VM)** vào binary của `mini` — zero external dependency, ~200-300KB static link.
+- **CodeAct Engine được nhúng trực tiếp (In-Process VM)** vào binary của `mini` — zero external dependency, ~200-300KB static link.
 - Toàn bộ công cụ của `mini` (`fs`, `grep`, `glob`, `http`, `sh`, `artifact`) được export thành **in-process C-ABI bindings** trong object toàn cục **`mini.*`**.
 - **Chiến lược Xử lý Tác vụ Chạy Dài (OpenHands Pattern)**: Cung cấp API chạy nền (`mini.shBackground`), quản lý vòng đời tiến trình qua Job ID, stream output theo thời gian thực và tự động cắt tỉa output buffer.
 - **Tự động Theo dõi Ngữ cảnh & Bộ nhớ Dài hạn (OpenViking Hook Pattern)**: Sử dụng hệ thống **Lifecycle Hooks** (`hooks.zig`) để tự động ghi log phiên, trích xuất memory và đồng bộ với OpenViking Context Database mà không tiêu tốn token gọi tool của LLM.
@@ -94,9 +94,9 @@ Proposal này **KHÔNG** xóa bỏ hệ thống JSON tool-calling hiện tại. 
 ```
 
 ### Cơ chế chuyển đổi (Execution Mode):
-- **`execution_mode = "codeact"` (Mặc định cho cloud LLMs)**: LLM sinh JavaScript hiện đại, chạy qua QuickJS-ng VM.
-- **`execution_mode = "tools"` (Dành cho local/small LLMs)**: Giữ nguyên JSON tool-calling truyền thống.
-- **`execution_mode = "auto"`**: `mini` tự động chọn mode dựa trên model name / metadata backend.
+- **`execution_mode = "codeact"` (Mặc định cho cloud LLMs)**: LLM sinh JavaScript hiện đại, chạy qua CodeAct VM.
+- **`execution_mode = "tools"`**: Chế độ tương thích fallback.
+- **`execution_mode = "auto"`**: LLM tự quyết định.
 
 ---
 
@@ -104,13 +104,13 @@ Proposal này **KHÔNG** xóa bỏ hệ thống JSON tool-calling hiện tại. 
 
 ```
 src/
-├── main.zig                # Composition root, CLI args parser & REPL loop
+├── main.zig                # CLI Entry point & REPL Loop
 ├── core/                   # Điều phối & Quản lý trạng thái
 │   ├── agent_loop.zig      # Hybrid Loop (JS CodeAct ↔ JSON Tools, Self-Correction)
 │   ├── permissions.zig     # Dynamic Security (Ask / Auto / Yolo)
 │   ├── history.zig         # State compaction & History quản lý code executions
 │   └── contracts.zig       # Interfaces, Event types & Token specs
-├── runtime/                # Môi trường thực thi QuickJS-ng
+├── runtime/                # Môi trường thực thi CodeAct
 │   ├── quickjs_engine.zig  # JSRuntime/JSContext management, sandbox, heartbeat watchdog
 │   ├── js_bindings.zig     # C-ABI bindings: export toàn bộ Zig tools sang object `mini.*`
 │   ├── process_manager.zig # Quản lý subprocesses, background jobs (OpenHands Pattern) & non-blocking I/O
@@ -130,13 +130,12 @@ src/
 
 ---
 
-## 5. ĐẶC TẢ API OBJECT `mini.*` TRONG QUICKJS-NG RUNTIME
+## 5. ĐẶC TẢ API OBJECT `mini.*` TRONG CODEACT RUNTIME
 
-Khi QuickJS-ng VM khởi tạo cho mỗi phiên chạy, môi trường được nạp sẵn object toàn cục **`mini`** với các API chuẩn hóa:
+Khi CodeAct VM khởi tạo cho mỗi phiên chạy, môi trường được nạp sẵn object toàn cục **`mini`** với các API chuẩn hóa:
 
-```javascript
-// ===========================================================================
-// ĐẶC TẢ API OBJECT mini (QuickJS-ng ES2023+ Runtime)
+```typescript
+// ĐẶC TẢ API OBJECT mini (CodeAct ES2023+ Runtime)
 // ===========================================================================
 
 // 1. Tìm kiếm & Quét thư mục
@@ -196,7 +195,7 @@ Yếu tố cốt lõi của kiến trúc CodeAct là khả năng **tự debug v�
 │       │                                                              │
 │  [2] Extract code từ markdown ```js ... ```                          │
 │       │                                                              │
-│  [3] Chạy trong QuickJS-ng VM (Multi-Tier Execution & Sandbox)       │
+│  [3] Chạy trong CodeAct VM (Multi-Tier Execution & Sandbox)          │
 │       │                                                              │
 │       ├── SUCCESS (exit ok, có output)                               │
 │       │     └── Output được format + truncate → Gửi về LLM          │
@@ -205,7 +204,7 @@ Yếu tố cốt lõi của kiến trúc CodeAct là khả năng **tự debug v�
 │       │                                                              │
 │       └── ERROR (syntax error / runtime error / timeout)             │
 │             │                                                        │
-│         [4] Format error message từ QuickJS-ng:                      │
+│         [4] Format error message từ CodeAct:                         │
 │             "[JS ERROR] TypeError: mini.grpe is not a function       │
 │                  at runScript (<eval>:12:15)"                        │
 │             + Stack trace đầy đủ                                     │
@@ -243,7 +242,7 @@ Yếu tố cốt lõi của kiến trúc CodeAct là khả năng **tự debug v�
 ┌────────────────────────────────────────────────────────────────────────┐
 │             HỆ THỐNG KIỂM SOÁT THỰC THI ĐA TẦNG CỦA MINI              │
 ├────────────────────────────────────────────────────────────────────────┤
-│ Tầng 1: Heartbeat / Activity Watchdog (QuickJS-ng Level)               │
+│ Tầng 1: Heartbeat / Activity Watchdog (CodeAct Level)                  │
 │   - Chỉ ngắt khi phát hiện CPU Starvation (ví dụ: while(true) {} > 5s) │
 │   - Tự động reset bộ đếm (Heartbeat Renewal) mỗi khi có I/O hoặc Output│
 ├────────────────────────────────────────────────────────────────────────┤
@@ -256,7 +255,7 @@ Yếu tố cốt lõi của kiến trúc CodeAct là khả năng **tự debug v�
 │   - Tạm dừng (PAUSE) toàn bộ watchdog khi chờ prompt xác nhận [y/N]    │
 ├────────────────────────────────────────────────────────────────────────┤
 │ Tầng 4: User Manual Cancellation (Signal Level)                        │
-│   - Bắt Ctrl+C (SIGINT): hủy đồng bộ cả Subprocess và QuickJS VM       │
+│   - Bắt Ctrl+C (SIGINT): hủy đồng bộ cả Subprocess và CodeAct VM       │
 ├────────────────────────────────────────────────────────────────────────┤
 │ Tầng 5: Background Task Manager & Log Inspection (OpenHands Pattern)   │
 │   - Hỗ trợ mini.shBackground("npm run dev") cho dev servers & watchers │
@@ -266,7 +265,7 @@ Yếu tố cốt lõi của kiến trúc CodeAct là khả năng **tự debug v�
 
 #### Chi tiết kỹ thuật:
 
-1. **Heartbeat / Activity Watchdog trong QuickJS-ng**:
+1. **Heartbeat / Activity Watchdog trong CodeAct**:
    - `JS_SetInterruptHandler` **không đếm tổng thời gian wall-clock**, mà chỉ đếm **thời gian CPU thuần liên tục không sinh I/O (`MAX_CPU_BURST_MS = 5000ms`)**.
    - Mỗi khi script gọi `mini.read`, `mini.write`, `mini.sh`, `mini.http` hoặc `console.log(...)`, con trỏ thời gian watchdog được **gia hạn (renew activity)**.
 2. **Quản lý Subprocess Native Timeout (Zig Level)**:
@@ -292,9 +291,9 @@ graph TD
     User["User Prompt"] --> AgentLoop["Agent Loop (mini)"]
     AgentLoop -.->|1. Hook: pre-prompt| HookDispatcher["Hook Dispatcher (hooks.zig)"]
     HookDispatcher -->|Context Recall| OVBridge["openviking_hook.py"]
-    OVBridge -->|Recall Relevant Memories| OVServer["OpenViking Server (:1933)"]
-    
-    AgentLoop -->|2. Execute CodeAct / Tools| Engine["QuickJS-ng Engine"]
+    AgentLoop -->|1. LLM Prompt + System Context| Backend["AI Backend (Claude/OpenAI)"]
+    Backend -->|2. Stream CodeAct JS / Tools| AgentLoop
+    AgentLoop -->|2. Execute CodeAct / Tools| Engine["CodeAct Engine"]
     Engine --> AgentLoop
     
     AgentLoop -.->|3. Hook: post-response| HookDispatcher
@@ -366,7 +365,7 @@ if (modifiedFiles.length > 0) {
 
 ## 10. ĐÁNH GIÁ HIỆU NĂNG & TIẾT KIỆM TÀI NGUYÊN (DỰ KIẾN)
 
-| Tiêu chí | JSON Tool-Calling (Cũ) | QuickJS-ng CodeAct (Mới) | Mức độ cải thiện |
+| Tiêu chí | JSON Tool-Calling (Cũ) | CodeAct (Mới) | Mức độ cải thiện |
 | :--- | :--- | :--- | :--- |
 | **Số LLM Turns (Tác vụ 4 bước)** | 6 – 10 Turns | 1 – 3 Turns (bao gồm retry) | **Giảm 60% – 75%** |
 | **Tỷ lệ sinh mã đúng lần đầu** | N/A (JSON Schema) | ~80% – 88% (Pass@1) | Vượt trội so với Lua (~50%) |
@@ -378,7 +377,7 @@ if (modifiedFiles.length > 0) {
 
 ## 11. LỘ TRÌNH TRIỂN KHAI 4 GIAI ĐOẠN (IMPLEMENTATION ROADMAP)
 
-### Giai đoạn 1: QuickJS-ng Engine, Multi-Tier Watchdog & C-ABI Bindings
+### Giai đoạn 1: CodeAct Engine, Multi-Tier Watchdog & C-ABI Bindings
 - [ ] Tích hợp `quickjs-ng` vào `build.zig` (sử dụng dependency `zig-quickjs-ng` hoặc biên dịch static C library).
 - [ ] Xây dựng `src/runtime/quickjs_engine.zig`:
   - Khởi tạo `JSRuntime` + `JSContext`.
@@ -395,7 +394,7 @@ if (modifiedFiles.length > 0) {
 ### Giai đoạn 2: CodeAct Agent Loop & Lifecycle Context Tracking
 - [ ] Cập nhật `src/core/agent_loop.zig`:
   - Trích xuất CodeBlock (nhận diện ````js ... ```` / ````javascript ... ````).
-  - Vòng lặp Self-Correction (retry tối đa 3 lần dựa trên stack trace QuickJS-ng, fallback JSON tools).
+  - Vòng lặp Self-Correction (retry tối đa 3 lần dựa trên stack trace CodeAct, fallback JSON tools).
   - Cấu hình `execution_mode`: `"codeact"` | `"tools"` | `"auto"`.
 - [ ] Tích hợp **OpenViking Lifecycle Hook Bridge** (`scripts/openviking_hook.py`) kết nối với `src/hooks.zig` để tự động ingest session & recall context.
 - [ ] Nâng cấp System Prompt với tài liệu tham chiếu `mini.*` và các ví dụ JavaScript mẫu chuẩn (bao gồm pattern chạy ngầm và kiểm tra log).

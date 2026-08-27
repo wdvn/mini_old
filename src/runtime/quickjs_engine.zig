@@ -1,6 +1,6 @@
-//! quickjs_engine.zig — QuickJS-ng Embedded Runtime Engine cho mini-agent.
+//! quickjs_engine.zig — Embedded Runtime Engine cho mini-agent.
 //!
-//! Quản lý máy ảo JavaScript nhúng (In-Process QuickJS-ng VM):
+//! Quản lý máy ảo JavaScript nhúng (In-Process CodeAct VM):
 //!   - Sandbox Isolation & Resource Limits (128MB RAM, 1MB Stack)
 //!   - Heartbeat Activity Watchdog (bắt CPU Infinite Loops > 5s burst time, tự động gia hạn khi có I/O)
 //!   - Output Buffer Capture (console.log redirect vào buffer 64KB kèm head-truncation)
@@ -324,11 +324,11 @@ test "quickjs_engine - basic eval & console.log" {
     var engine = try Engine.init(alloc, io);
     defer engine.deinit();
 
-    var res = try engine.eval("console.log('Hello from QuickJS-ng'); 1 + 2 * 3;", "test.js");
+    var res = try engine.eval("console.log('Hello from CodeAct'); 1 + 2 * 3;", "test.js");
     defer res.deinit();
 
     try std.testing.expect(!res.is_error);
-    try std.testing.expectEqualStrings("Hello from QuickJS-ng\n", res.stdout);
+    try std.testing.expectEqualStrings("Hello from CodeAct\n", res.stdout);
     if (res.return_value_json) |v| {
         try std.testing.expectEqualStrings("7", v);
     } else {

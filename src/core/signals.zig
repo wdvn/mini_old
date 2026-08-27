@@ -3,7 +3,7 @@
 //! Đảm bảo khi người dùng nhấn Ctrl+C:
 //! - Đánh dấu cờ atomic `interrupted`
 //! - Ngắt luồng HTTP streaming (SSE)
-//! - Ngắt thực thi QuickJS Engine
+//! - Ngắt thực thi CodeAct Engine
 //! - Giữ nguyên tiến trình REPL và quay lại prompt thay vì crash/exit đột ngột.
 
 const std = @import("std");
@@ -28,7 +28,7 @@ pub fn checkAndResetInterrupted() bool {
     return interrupted.swap(false, .acq_rel);
 }
 
-/// Đăng ký QuickJS Engine đang chạy để ngắt khi nhận SIGINT.
+/// Đăng ký CodeAct Engine đang chạy để ngắt khi nhận SIGINT.
 pub fn registerActiveEngine(engine: ?*quickjs_engine.Engine) void {
     active_engine = engine;
 }

@@ -1,6 +1,6 @@
 //! test_codeact_security.zig — Integration test ISSUE-CODEACT-001 (M10).
 //!
-//! Kiểm tra trong môi trường CodeAct (QuickJS VM):
+//! Kiểm tra trong môi trường CodeAct (CodeAct VM):
 //!   1. MINI_TOOL_BLOCKLIST / MINI_TOOL_ALLOWLIST được enforce tại C-bindings mini.* (M2)
 //!   2. Hook Dispatcher phát pre-tool-use / post-tool-use cho mini.*, kể cả khi bị chặn (M3)
 //!   3. Per-Act VM Isolation — biến toàn cục không rò rỉ giữa 2 lượt eval (M1)

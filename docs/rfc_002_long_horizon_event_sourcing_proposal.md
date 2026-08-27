@@ -78,7 +78,7 @@ Không có hệ thống nào không lỗi. Trong một task chạy dài (Long-Ho
      ┌──────────────────────────────────┼──────────────────────────────────┐
      ▼                                  ▼                                  ▼
 [TẦNG 1: LỖI LLM MODEL]        [TẦNG 2: LỖI CÔNG CỤ/MÔI TRƯỜNG]  [TẦNG 3: LỖI RUNTIME/SYSTEM]
-- 429 Rate Limit / Quota       - Bash exit code != 0              - QuickJS Panic
+- 429 Rate Limit / Quota       - Bash exit code != 0              - CodeAct Panic
 - 503 Provider Overloaded      - Test failure / Compile error     - Disk I/O Snapshot fail
 - Truncated / Malformed JSON   - File not found                   - Tiến trình bị kill
 - Context Window Exceeded      - Patch conflict                   - Memory Corruption
@@ -420,7 +420,7 @@ Proposal không có một dòng nào xử lý tương tác này. Đây là lỗ 
 **7.4a. RAM cost O(N_acts × file_size).** `previous_content` giữ nguyên nội dung đầy đủ trong RAM. Task refactor 500 acts chạm file lớn lặp lại → hàng GB. Không có dedup, content-addressing, hay spill-to-disk. Cho long-horizon thì đây là nghịch lý tự hủy.
 
 **7.4b. Phạm vi phủ không đủ.** Snapshot chỉ cover `file_edit/file_write/patch` (Bước 3 của Action Plan). Nhưng agent này còn:
-- CodeAct: `mini.write()` / `mini.patch()` qua QuickJS — ghi file ngoài tool registry.
+- CodeAct: `mini.write()` / `mini.patch()` qua CodeAct — ghi file ngoài tool registry.
 - `bash`: `sed -i`, `git checkout`, `npm install`, `echo >` — không thể snapshot.
 - Subagents song song (`batch_invoke_subagents`) ghi file đồng thời.
 

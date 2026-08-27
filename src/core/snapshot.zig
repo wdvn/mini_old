@@ -1,10 +1,10 @@
 //! snapshot.zig — SnapshotTracker: CAS snapshot trước/sau khi file bị thay đổi.
 //!
 //! Mở rộng coverage của RFC-002: mọi đường ghi file (tool file_write/file_edit,
-//! mini.write/mini.patch trong QuickJS, bash command chứa redirect, subagent)
+//! mini.write/mini.patch trong CodeAct, bash command chứa redirect, subagent)
 //! đều lưu nội dung cũ vào CAS (~/.mini/cas) và ghi FileSnapshot vào journal.
 //!
-//! Toàn cục singleton vì js_bindings (QuickJS C-ABI) không giữ con trỏ AgentLoop.
+//! Toàn cục singleton vì js_bindings (CodeAct C-ABI) không giữ con trỏ AgentLoop.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

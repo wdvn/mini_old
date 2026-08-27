@@ -16,7 +16,7 @@ Tài liệu này bổ sung cho `AGENTS.md` ở root, tập trung vào phương p
 
 3. **Đối chiếu với RFC & Design Docs**:
    - Trước khi nhận định một hành vi là "lỗi" hay "tính năng", kiểm tra các tài liệu đề xuất tương ứng trong `docs/` (`rfc_001` đến `rfc_007`).
-   - Đảm bảo các giải pháp đề xuất tuân thủ đúng định hướng kiến trúc Code-Centric (QuickJS VM) và Event Sourcing của dự án.
+   - Đảm bảo các giải pháp đề xuất tuân thủ đúng định hướng kiến trúc Code-Centric (CodeAct VM) và Event Sourcing của dự án.
 
 4. **Kiểm chứng đa tầng (Multi-tier Verification)**:
    - Tái hiện lỗi qua unit test nhỏ gọn trong `testcases/test_*.zig` nếu khả thi.

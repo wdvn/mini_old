@@ -1,4 +1,4 @@
-//! js_bindings.zig — C-ABI Export toàn bộ công cụ của mini sang object `mini.*` trong QuickJS-ng.
+//! js_bindings.zig — C-ABI Export toàn bộ công cụ của mini sang object `mini.*` trong CodeAct.
 //!
 //! Cung cấp các API:
 //!   - mini.glob(pattern, basePath?)

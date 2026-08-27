@@ -4,15 +4,15 @@ Hướng dẫn cho AI coding agents làm việc trên repo **mini-agent**. Đọ
 
 ## Tổng quan project
 
-- **Ngôn ngữ**: Zig 0.16.0, thư viện chuẩn only (ngoại lệ: libcurl dynamic link, QuickJS-ng static link).
-- **Loại**: AI agent chạy terminal, kiến trúc Code-Centric (agent viết JS chạy trong QuickJS VM nhúng, gọi tool qua object `mini.*`).
+- **Ngôn ngữ**: Zig 0.16.0, thư viện chuẩn only (ngoại lệ: libcurl dynamic link, CodeAct static link).
+- **Loại**: AI agent chạy terminal, kiến trúc Code-Centric (agent viết JS chạy trong CodeAct VM nhúng, gọi tool qua object `mini.*`).
 - **Layout**:
 
 ```
 src/
   main.zig            — entry point, REPL wiring
   core/               — agent loop, config, history, hooks, protocol, JSON utils
-  runtime/            — QuickJS engine, JS bindings (mini.*), process manager (background jobs)
+  runtime/            — CodeAct engine, JS bindings (mini.*), process manager (background jobs)
   tools/              — tool implementations (bash, file, glob, grep, http, search, subagent, ...)
   tooling/            — MCP client, tool registry
   ui/                 — terminal UI: editor.zig (line editor), repl.zig
@@ -29,7 +29,7 @@ testcases/            — tất cả các file test (standalone, integration, be
 - `zig build` → binary `zig-out/bin/mini`.
 - `zig build run` → build + chạy interactive REPL.
 - `zig build run -- -e "..."` → single-shot mode.
-- `zig build test` → unit tests (root `src/main.zig`, link QuickJS).
+- `zig build test` → unit tests (root `src/main.zig`, link CodeAct).
 - Setup môi trường user: `scripts/setup_home_mini.sh` (tạo/sync `~/.mini/`).
 - Release: `scripts/build_release.sh`.
 - Cross-compile: `zig build -Dtarget=x86_64-linux-gnu` (hoặc `aarch64-linux-gnu`).

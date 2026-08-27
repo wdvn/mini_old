@@ -16,7 +16,7 @@ test "signals: atomic set, check, and reset" {
     try testing.expect(!signals.isInterrupted());
 }
 
-test "signals: quickjs engine interrupt registration" {
+test "signals: codeact engine interrupt registration" {
     const engine = try quickjs.Engine.init(testing.allocator, std.testing.io);
     defer engine.deinit();
 

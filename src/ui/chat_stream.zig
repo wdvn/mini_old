@@ -297,7 +297,7 @@ pub const TurnRenderer = struct {
                 detail = std.fmt.bufPrint(&detail_buf, "\x1b[32m\"{s}\"\x1b[0m", .{q}) catch "";
             }
         } else if (std.mem.eql(u8, name, "codeact")) {
-            detail = "\x1b[35mQuickJS-ng script\x1b[0m";
+            detail = "\x1b[35mCodeAct script\x1b[0m";
         }
 
         var header_buf: [512]u8 = undefined;

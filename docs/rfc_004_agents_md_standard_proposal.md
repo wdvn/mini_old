@@ -41,7 +41,7 @@ Chuẩn: đặt file `AGENTS.md` ở root repo. Agent khi làm việc trong thư
 
 ```markdown
 # mini — Hướng dẫn cho coding agents
-## Tổng quan          → 2 dòng: Zig 0.16 + QuickJS-ng, kiến trúc Code-Centric
+## Tổng quan          → 2 dòng: Zig 0.16 + CodeAct, kiến trúc Code-Centric
 ## Layout src/        → core, runtime, tools, tooling, ui, backends, acp
 ## Build & Run        → zig build / zig build test / zig build run / scripts/build_release.sh
 ## Quy ước code       → comment tiếng Việt, doc-comment //!, không thêm dependency ngoài proposal

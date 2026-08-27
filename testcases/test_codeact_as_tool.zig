@@ -12,7 +12,7 @@ test "codeact as native tool: codeact in registry" {
     for (registry.definitions) |td| {
         if (std.mem.eql(u8, td.name, "codeact")) {
             found_def = true;
-            try std.testing.expect(std.mem.indexOf(u8, td.description, "QuickJS") != null);
+            try std.testing.expect(std.mem.indexOf(u8, td.description, "CodeAct") != null);
             break;
         }
     }

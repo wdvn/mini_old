@@ -116,7 +116,7 @@ pub const AgentLoop = struct {
     history: history_mod.History,
     /// Config đã load.
     config: *const config_mod.Config,
-    /// QuickJS-ng embedded engine cho CodeAct.
+    /// CodeAct embedded engine.
     engine: *quickjs.Engine,
     /// Đếm số lần tự sửa lỗi JavaScript liên tiếp.
     js_retry_count: usize = 0,
@@ -156,7 +156,7 @@ pub const AgentLoop = struct {
     /// Khởi tạo AgentLoop từ config.
     /// Chọn backend dựa trên config theo thứ tự ưu tiên.
     pub fn init(alloc: Allocator, io: std.Io, config: *const config_mod.Config) !AgentLoop {
-        // Khởi tạo QuickJS-ng engine & đăng ký mini bindings
+        // Khởi tạo CodeAct engine & đăng ký mini bindings
         const engine = try quickjs.Engine.init(alloc, io);
         errdefer engine.deinit();
         try js_bindings.registerBindings(engine);
@@ -390,7 +390,7 @@ pub const AgentLoop = struct {
                 if (main.ui_repl.current_renderer) |r| {
                     r.startTool("codeact", "{}");
                 } else {
-                    main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting QuickJS-ng script...\x1b[0m ", .{});
+                    main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting CodeAct script...\x1b[0m ", .{});
                 }
 
                 signals.registerActiveEngine(self.engine);
@@ -1078,7 +1078,7 @@ pub const AgentLoop = struct {
                                 main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
                             }
                         } else if (std.mem.eql(u8, tu.name, "codeact")) {
-                            main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting QuickJS-ng script...\x1b[0m ", .{});
+                            main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting CodeAct script...\x1b[0m ", .{});
                         } else {
                             main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
                         }
