@@ -34,6 +34,7 @@ pub const ActEventType = enum {
     rollback_requested,
     rollback_completed,
     task_completed,
+    task_interrupted,
     /// RFC-003 §4.6: MemAct compaction hoàn tất (observable & reversible qua Act model).
     memact_compacted,
 };

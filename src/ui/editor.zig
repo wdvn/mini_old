@@ -495,7 +495,35 @@ pub const LineEditor = struct {
             while (i < n) {
                 const c = read_buf[i];
                 switch (c) {
-                    3, 4 => return null, // Ctrl+C / Ctrl+D
+                    3 => { // Ctrl+C: Hủy dòng đang nhập, không thoát REPL
+                        if (self.rendered_rows > self.cursor_row) {
+                            var move_down_buf: [32]u8 = undefined;
+                            const seq = std.fmt.bufPrint(&move_down_buf, "\x1b[{d}B", .{self.rendered_rows - self.cursor_row}) catch "";
+                            stdout_file.writeStreamingAll(io, seq) catch {};
+                        }
+                        stdout_file.writeStreamingAll(io, "^C\r\n") catch {};
+                        self.buf.clearRetainingCapacity();
+                        self.pos = 0;
+                        self.rendered_rows = 0;
+                        self.cursor_row = 0;
+                        self.history_index = self.prompt_history.entries.items.len;
+                        self.draft.clearRetainingCapacity();
+                        self.redraw(io, prompt);
+                        i += 1;
+                    },
+                    4 => { // Ctrl+D: EOF khi buffer rỗng → thoát REPL
+                        if (self.buf.items.len == 0) {
+                            stdout_file.writeStreamingAll(io, "\r\n") catch {};
+                            return null;
+                        }
+                        if (self.pos < self.buf.items.len) {
+                            self.pushUndo();
+                            const end = self.pos + self.clusterLenAt(self.pos);
+                            if (self.deleteRange(self.pos, end)) |rem| self.alloc.free(rem);
+                            self.redraw(io, prompt);
+                        }
+                        i += 1;
+                    },
                     13, 10 => { // Enter → submit
                         if (self.rendered_rows > self.cursor_row) {
                             var move_down_buf: [32]u8 = undefined;

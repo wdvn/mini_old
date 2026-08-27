@@ -79,6 +79,7 @@ pub const Client = struct {
         defer ctx.text_accum.deinit(self.alloc);
         defer ctx.think_accum.deinit(self.alloc);
         defer ctx.args_accum.deinit(self.alloc);
+        errdefer ctx.response.deinit();
 
         const headers = [_][]const u8{
             auth_hdr,

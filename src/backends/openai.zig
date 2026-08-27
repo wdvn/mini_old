@@ -115,6 +115,8 @@ pub const Client = struct {
             };
             defer ctx.line_buf.deinit(self.alloc);
             defer ctx.tool_calls.deinit(self.alloc);
+            errdefer ctx.response.deinit();
+            errdefer if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
 
             const headers = [_][]const u8{ auth_header, "Content-Type: application/json" };
             const req_http_code = try http_lib.postStream(self.alloc, main.g_io, .{

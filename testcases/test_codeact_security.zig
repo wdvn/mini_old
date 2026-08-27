@@ -19,6 +19,7 @@ test {
     _ = @import("test_codeact_as_tool.zig");
     _ = @import("test_codeact_vm_isolation.zig");
     _ = @import("test_ui_chat_stream.zig");
+    _ = @import("test_signals.zig");
 }
 
 // ---------------------------------------------------------------------------

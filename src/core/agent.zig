@@ -40,7 +40,8 @@ const js_bindings = @import("../runtime/js_bindings.zig");
 const tokens_mod = @import("memact/tokens.zig");
 const snapshot_mod = @import("snapshot.zig");
 const cas_mod = @import("cas.zig");
-const journal_mod = @import("journal.zig");
+pub const journal_mod = @import("journal.zig");
+pub const signals = @import("signals.zig");
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
@@ -248,6 +249,8 @@ pub const AgentLoop = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !StepResult {
+        if (signals.isInterrupted()) return error.Interrupted;
+
         if (main.ui_repl.current_renderer == null) {
             if (act_id > 1) {
                 main.stderrPrint("\x1b[90m[agent] --- Vòng lặp {d} ---\x1b[0m\n", .{act_id});
@@ -267,6 +270,10 @@ pub const AgentLoop = struct {
             think_cb,
         );
         main.resetThinkState();
+        if (signals.isInterrupted()) {
+            response.deinit();
+            return error.Interrupted;
+        }
         
         defer response.deinit();
 
@@ -300,9 +307,13 @@ pub const AgentLoop = struct {
                     main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting QuickJS-ng script...\x1b[0m ", .{});
                 }
 
+                signals.registerActiveEngine(self.engine);
+                defer signals.registerActiveEngine(null);
+
                 var res = self.engine.eval(js_code, "agent_codeact.js") catch |e| {
                     const end_err_ms = utils.milliTimestamp();
                     const dur_ms = if (end_err_ms >= start_codeact_ms) @as(u64, @intCast(end_err_ms - start_codeact_ms)) else 0;
+                    if (signals.isInterrupted()) return error.Interrupted;
                     if (main.ui_repl.current_renderer) |r| {
                         r.finishTool("codeact", @errorName(e), true, dur_ms, null, null);
                     } else {
@@ -314,6 +325,8 @@ pub const AgentLoop = struct {
                     return .continue_loop;
                 };
                 defer res.deinit();
+
+                if (signals.isInterrupted()) return error.Interrupted;
 
                 const end_codeact_ms = utils.milliTimestamp();
                 const dur_ms = if (end_codeact_ms >= start_codeact_ms) @as(u64, @intCast(end_codeact_ms - start_codeact_ms)) else 0;
@@ -541,6 +554,20 @@ pub const AgentLoop = struct {
 
                 const result = self.executeStep(act_id, tool_defs, text_cb, think_cb) catch |e| {
                     switch (e) {
+                        error.Interrupted => {
+                            if (main.ui_repl.current_renderer) |r| {
+                                r.stopWaiting();
+                                if (r.is_thinking) r.endThinking();
+                                r.ensureNewline();
+                                r.write(" \x1b[33m[Đã dừng bởi người dùng (Ctrl+C)]\x1b[0m\n");
+                            } else {
+                                main.stderrPrint("\n\x1b[33m[Đã dừng bởi người dùng (Ctrl+C)]\x1b[0m\n", .{});
+                            }
+                            if (self.journal) |*j| {
+                                j.recordEvent(self.io, act_id, .task_interrupted, "Người dùng đã dừng tác vụ (Ctrl+C)") catch {};
+                            }
+                            return;
+                        },
                         error.LLMAuthenticationError => {
                             main.stderrPrint("\n\x1b[31m[agent] ⛔ Lỗi xác thực/quyền truy cập backend (HTTP {d})! Vui lòng kiểm tra API key hoặc tài khoản.\x1b[0m\n", .{self.last_backend_http_code});
                             if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Lỗi xác thực/quyền backend — abort", .{
@@ -740,9 +767,14 @@ pub const AgentLoop = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !proto.Response {
+        if (signals.isInterrupted()) return error.Interrupted;
+
         // Primary backend
         const primary = self.backend.send(system_prompt, msgs, tool_defs, text_cb, think_cb);
         if (primary) |resp| return resp else |e| {
+            if (e == error.Interrupted or signals.isInterrupted()) {
+                return error.Interrupted;
+            }
             // Fallback: thử Ollama nếu primary không phải Ollama
             main.stderrPrint("\n[agent] {s} lỗi ({s}), thử Ollama...\n", .{ self.backend.name(), @errorName(e) });
             if (self.backend != .ollama) {
@@ -891,6 +923,7 @@ pub const AgentLoop = struct {
         }
 
         for (response.content.items) |block| {
+            if (signals.isInterrupted()) return error.Interrupted;
             switch (block) {
                 .tool_use => |tu| {
                     const start_tool_ms = utils.milliTimestamp();

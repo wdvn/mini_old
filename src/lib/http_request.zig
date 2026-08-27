@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const signals = @import("../core/signals.zig");
 
 /// Giới hạn body mặc định: 30KB — nhất quán với tool protocol cũ.
 pub const DEFAULT_MAX_BODY_SIZE: usize = 30 * 1024;
@@ -331,11 +332,13 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
     var chunk_buf: [4096]u8 = undefined;
     var total_bytes: usize = 0;
     while (true) {
+        if (signals.isInterrupted()) return error.Interrupted;
         const n = r.readSliceShort(&chunk_buf) catch |e| {
             // Đã đọc được một phần → coi như đủ, không fail cả request
             if (resp_body.items.len > 0) break;
             return e;
         };
+        if (signals.isInterrupted()) return error.Interrupted;
         if (n == 0) break;
         total_bytes += n;
         if (resp_body.items.len < opts.max_body_size) {
@@ -495,7 +498,9 @@ pub fn postStream(
 
     var chunk_buf: [4096]u8 = undefined;
     while (true) {
+        if (signals.isInterrupted()) return error.Interrupted;
         const n = try r.readSliceShort(&chunk_buf);
+        if (signals.isInterrupted()) return error.Interrupted;
         if (n == 0) break;
         on_chunk(chunk_buf[0..n], userdata);
     }

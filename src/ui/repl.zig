@@ -9,6 +9,8 @@ const agent_mod = @import("../core/agent.zig");
 const artifacts_mod = @import("../core/artifacts.zig");
 const editor_mod = @import("editor.zig");
 const main = @import("../main.zig");
+const utils = @import("../core/utils.zig");
+const signals = @import("../core/signals.zig");
 pub const chat_stream = @import("chat_stream.zig");
 
 pub const PROMPT_PREFIX = "\x1b[1;34mYou\x1b[0m > ";
@@ -18,6 +20,7 @@ pub var current_renderer: ?*chat_stream.TurnRenderer = null;
 
 /// Chạy vòng lặp tương tác REPL.
 pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, version: []const u8) !void {
+    signals.initSignalHandlers();
     const stdout = std.Io.File.stdout();
 
     var line_editor = editor_mod.LineEditor.init(alloc);
@@ -29,6 +32,7 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
     try stdout.writeStreamingAll(io, "Gõ /help để xem lệnh, /quit để thoát.\n\n");
 
     while (true) {
+        signals.setInterrupted(false);
         const line_opt = try line_editor.readLine(io, PROMPT_PREFIX);
         const line = line_opt orelse break;
         defer alloc.free(line);
@@ -58,8 +62,14 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
 
         // Gửi đến agent
         agent.processInput(expanded_input, printText, printThinkText) catch |e| {
-            main.stdoutPrint("\x1b[31m[lỗi]\x1b[0m {s}\n", .{@errorName(e)});
+            if (e != error.Interrupted) {
+                main.stdoutPrint("\x1b[31m[lỗi]\x1b[0m {s}\n", .{@errorName(e)});
+            }
         };
+
+        if (signals.checkAndResetInterrupted()) {
+            continue;
+        }
 
         const end_ms = utils.milliTimestamp();
         const duration = if (end_ms >= start_ms) @as(u64, @intCast(end_ms - start_ms)) else 0;
@@ -168,8 +178,6 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
     main.stdoutPrint("Lệnh không hợp lệ: {s}. Gõ /help để xem danh sách.\n", .{input});
     return true;
 }
-
-const utils = @import("../core/utils.zig");
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 fn getEnvVar(name: [*:0]const u8) ?[]const u8 {

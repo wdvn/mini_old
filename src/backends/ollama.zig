@@ -72,6 +72,7 @@ pub const Client = struct {
         };
         defer ctx.line_buf.deinit(self.alloc);
         defer ctx.text_accum.deinit(self.alloc);
+        errdefer ctx.response.deinit();
 
         const headers = [_][]const u8{"Content-Type: application/json"};
         _ = try http_lib.postStream(self.alloc, main.g_io, .{

@@ -18,6 +18,7 @@ pub const utils = @import("core/utils.zig");
 pub const cron_mod = @import("core/cron.zig");
 pub const hooks_mod = @import("core/hooks.zig");
 pub const artifacts_mod = @import("core/artifacts.zig");
+pub const signals_mod = @import("core/signals.zig");
 pub const acp_mod = @import("acp/server.zig");
 pub const ui_repl = @import("ui/repl.zig");
 pub const ui_terminal = @import("ui/terminal.zig");
@@ -71,6 +72,7 @@ pub fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
 // ---------------------------------------------------------------------------
 
 pub fn main(init: std.process.Init) !void {
+    signals_mod.initSignalHandlers();
     g_io = init.io;
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -231,6 +233,10 @@ pub fn main(init: std.process.Init) !void {
 
         try agent.processInput(expanded, ui_repl.printText, ui_repl.printThinkText);
 
+        if (signals_mod.isInterrupted()) {
+            std.process.exit(130);
+        }
+
         const end_ms = utils.milliTimestamp();
         const duration = if (end_ms >= start_ms) @as(u64, @intCast(end_ms - start_ms)) else 0;
         const ctx_tokens = agent.token_estimator.estimateMessages(agent.history.messages());
@@ -270,6 +276,10 @@ pub fn main(init: std.process.Init) !void {
         const start_ms = utils.milliTimestamp();
 
         try agent.processInput(expanded, ui_repl.printText, ui_repl.printThinkText);
+
+        if (signals_mod.isInterrupted()) {
+            std.process.exit(130);
+        }
 
         const end_ms = utils.milliTimestamp();
         const duration = if (end_ms >= start_ms) @as(u64, @intCast(end_ms - start_ms)) else 0;
