@@ -344,7 +344,8 @@ pub const AgentLoop = struct {
             _ = self.history.ensureClaudeCompatible();
         }
 
-        const input_msgs = self.history.messages();
+        const input_msgs_count = self.history.len();
+        const input_msgs = self.history.messages()[0..input_msgs_count];
 
         // Gửi lên AI backend (streaming)
         var response = try self.sendToBackend(
@@ -370,6 +371,9 @@ pub const AgentLoop = struct {
 
         // Thêm response vào history (nếu có nội dung)
         _ = try self.history.addAssistantResponse(&response);
+
+        // Lấy lại slice an toàn sau khi history có thể đã reallocate
+        const valid_input_msgs = self.history.messages()[0..input_msgs_count];
 
         // Tích luỹ token completion
         for (response.content.items) |block| {
@@ -399,7 +403,7 @@ pub const AgentLoop = struct {
                 var res = self.engine.eval(js_code, "agent_codeact.js") catch |e| {
                     const end_err_ms = utils.milliTimestamp();
                     const dur_ms = if (end_err_ms >= start_codeact_ms) @as(u64, @intCast(end_err_ms - start_codeact_ms)) else 0;
-                    self.logActDebug(act_id, input_msgs, tool_defs, &response, js_code, .{
+                    self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, js_code, .{
                         .exec_type = "codeact",
                         .is_error = true,
                         .duration_ms = dur_ms,
@@ -421,7 +425,7 @@ pub const AgentLoop = struct {
                 const end_codeact_ms = utils.milliTimestamp();
                 const dur_ms = if (end_codeact_ms >= start_codeact_ms) @as(u64, @intCast(end_codeact_ms - start_codeact_ms)) else 0;
 
-                self.logActDebug(act_id, input_msgs, tool_defs, &response, js_code, .{
+                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, js_code, .{
                     .exec_type = "codeact",
                     .stdout = res.stdout,
                     .return_value_json = res.return_value_json,
@@ -491,14 +495,14 @@ pub const AgentLoop = struct {
 
         switch (response.stop_reason) {
             .end_turn, .stop_sequence => {
-                self.logActDebug(act_id, input_msgs, tool_defs, &response, null, .{ .exec_type = "none" });
+                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "none" });
                 if (main.ui_repl.current_renderer == null) {
                     main.stderrPrint("\n\x1b[92m[agent] ✓ Hoàn thành sau {d} vòng lặp.\x1b[0m\n", .{act_id});
                 }
                 return .exit_loop;
             },
             .max_tokens => {
-                self.logActDebug(act_id, input_msgs, tool_defs, &response, null, .{ .exec_type = "max_tokens" });
+                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "max_tokens" });
                 // Response bị cắt giữa chừng. KHÔNG exit — chèn observation
                 // yêu cầu model tiếp tục đúng từ chỗ dừng (không lặp lại phần đã
                 // viết) để hoàn thành khối đang dở (JS block / tool_use / văn bản).
@@ -514,13 +518,13 @@ pub const AgentLoop = struct {
                 return .continue_loop;
             },
             .tool_use => {
-                self.logActDebug(act_id, input_msgs, tool_defs, &response, null, .{ .exec_type = "tool_call" });
+                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "tool_call" });
                 try self.executeTools(act_id, &response);
                 main.stderrPrint("\n", .{});
                 return .continue_loop;
             },
             .unknown => {
-                self.logActDebug(act_id, input_msgs, tool_defs, &response, null, .{
+                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{
                     .exec_type = "error",
                     .is_error = true,
                     .error_message = response.raw_debug_info,
