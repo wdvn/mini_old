@@ -117,7 +117,7 @@ test "dual-protocol: Responses API unescapes tool arguments and executes bash wi
 
 test "dual-protocol: Responses API subagent tool extracts task or aliases cleanly" {
     const alloc = testing.allocator;
-    const json_mod = @import("../src/core/json.zig");
+    const json_mod = mini.json_mod;
 
     const valid_json = "{\"task\":\"Khảo sát mã nguồn gateway\"}";
     const task_val = try json_mod.findStringOwned(alloc, valid_json, "task");
