@@ -825,6 +825,13 @@ pub const TurnRenderer = struct {
                 const trimmed = if (u.len > 80) u[0..80] else u;
                 detail = std.fmt.bufPrint(&detail_buf, "\x1b[34m{s}\x1b[0m", .{trimmed}) catch "";
             }
+        } else if (std.mem.eql(u8, name, "session_diagnostics")) {
+            const op = json_mod.findString(input_json, "operation") orelse "list";
+            if (json_mod.findInt(input_json, "pid", i32)) |pid| {
+                detail = std.fmt.bufPrint(&detail_buf, "\x1b[36m{s} pid={d}\x1b[0m", .{ op, pid }) catch "";
+            } else {
+                detail = std.fmt.bufPrint(&detail_buf, "\x1b[36m{s}\x1b[0m", .{op}) catch "";
+            }
         } else if (std.mem.eql(u8, name, "codeact")) {
             detail = "\x1b[35mCodeAct script\x1b[0m";
         } else {

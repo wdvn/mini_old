@@ -36,6 +36,7 @@ const browser_tool = @import("../tools/browser.zig");
 const subagent = @import("../tools/subagent.zig");
 const batch_subagent = @import("../tools/batch_subagent.zig");
 const artifact_tool = @import("../tools/artifact.zig");
+const session_diag = @import("../tools/session_diagnostics.zig");
 const mcp_mod = @import("mcp.zig");
 const hooks = @import("../core/hooks.zig");
 const skills_mod = @import("../core/skills.zig");
@@ -89,6 +90,7 @@ fn executeToolInternal(alloc: Allocator, io: std.Io, name: []const u8, input_jso
     if (std.mem.eql(u8, name, "artifact_write")) return artifact_tool.writeTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "artifact_read"))  return artifact_tool.readTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "artifact_list"))  return artifact_tool.listTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "session_diagnostics")) return session_diag.executeTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "skills"))        return executeSkills(alloc, io, input_json);
     if (std.mem.eql(u8, name, "codeact"))       return executeCodeActTool(alloc, io, input_json);
 
@@ -111,7 +113,7 @@ fn executeCodeActTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u
     defer res.deinit();
 
     var out_buf = utils.BufWriter.init(alloc);
-    errdefer out_buf.deinit();
+    defer out_buf.deinit();
 
     if (!res.is_error) {
         try out_buf.writeAll("[CodeAct Execution Output]\n");
@@ -124,21 +126,14 @@ fn executeCodeActTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u
         if (res.stdout.len == 0 and res.return_value_json == null) {
             try out_buf.writeAll("(Code executed successfully with no output)\n");
         }
+        return alloc.dupe(u8, out_buf.list.items);
     } else {
-        try out_buf.writeAll("[CodeAct Error]\n");
-        if (res.error_message) |msg| {
-            try out_buf.print("message: {s}\n", .{msg});
-        }
-        if (res.stack_trace) |st| {
-            try out_buf.print("stack trace:\n{s}\n", .{st});
-        }
-        if (res.error_message == null and res.stack_trace == null) {
-            try out_buf.print("stdout:\n{s}\n", .{res.stdout});
-        }
+        return std.fmt.allocPrint(alloc,
+            "[CodeAct Error]: {s}\n{s}",
+            .{ res.error_message orelse "Lỗi thực thi JS", res.stdout },
+        );
     }
-    return out_buf.toOwnedSlice();
 }
-
 
 /// Thực thi tool theo tên.
 /// Trả về kết quả dạng string. Caller phải free.
@@ -180,59 +175,56 @@ pub fn executeTool(alloc: Allocator, io: std.Io, name: []const u8, input_json: [
 }
 
 // ---------------------------------------------------------------------------
-// Tool definitions
+// Tool metadata
 // ---------------------------------------------------------------------------
 
-/// Danh sách định nghĩa tất cả built-in tools.
-/// Được gửi lên AI API trong mỗi request.
 pub const definitions = [_]proto.ToolDefinition{
     .{
         .name = "codeact",
-        .description = "Thực thi mã JavaScript trong máy ảo CodeAct nhúng với đối tượng toàn cục mini.* (mini.sh, mini.read, mini.write, mini.patch, mini.http). Dùng khi cần tự động hóa nhiều bước phức tạp hoặc xử lý dữ liệu.",
+        .description = "Thực thi mã JavaScript trong máy ảo CodeAct nhúng với đối tượng toàn cục mini.* (mini.sh, mini.read, mini.write, mini.patch, mini.http, mini.sessions, mini.sessionDetail, mini.sessionKill). Dùng khi cần tự động hóa nhiều bước phức tạp hoặc xử lý dữ liệu.",
         .input_schema_json = \\{"type":"object","properties":{"code":{"type":"string","description":"Mã JavaScript cần thực thi trong CodeAct VM"}},"required":["code"]}
         ,
     },
-
     .{
         .name = "bash",
-        .description = "Chạy lệnh shell và trả về stdout/stderr. Dùng cho git, lệnh hệ thống, chạy script.",
-        .input_schema_json = \\{"type":"object","properties":{"command":{"type":"string","description":"Lệnh shell cần chạy"}},"required":["command"]}
+        .description = "Thực thi lệnh shell qua /bin/sh. Trả về stdout và stderr. CWD là thư mục hiện tại của project. Lệnh nguy hiểm (rm -rf /, dd, shutdown...) bị chặn.",
+        .input_schema_json = \\{"type":"object","properties":{"command":{"type":"string","description":"Lệnh shell cần thực thi"}},"required":["command"]}
         ,
     },
     .{
         .name = "file_read",
-        .description = "Đọc nội dung file. Trả về các dòng có đánh số. Dùng offset/limit cho file lớn.",
-        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"Đường dẫn file"},"offset":{"type":"integer","description":"Bắt đầu từ dòng số (mặc định: 1)"},"limit":{"type":"integer","description":"Số dòng tối đa (mặc định: 2000)"}},"required":["path"]}
+        .description = "Đọc nội dung tệp tin. Hỗ trợ offset và limit (số dòng). Đường dẫn tương đối tính từ project root.",
+        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"Đường dẫn tệp cần đọc"},"offset":{"type":"integer","description":"Dòng bắt đầu (1-indexed, mặc định: 1)"},"limit":{"type":"integer","description":"Số dòng cần đọc (mặc định: toàn bộ, tối đa 2000 dòng)"}},"required":["path"]}
         ,
     },
     .{
         .name = "file_write",
-        .description = "Tạo hoặc ghi đè file với nội dung cho trước. Tạo thư mục cha nếu cần.",
-        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"Đường dẫn file"},"content":{"type":"string","description":"Nội dung cần ghi"}},"required":["path","content"]}
+        .description = "Ghi hoặc ghi đè toàn bộ nội dung tệp tin. Tự động tạo thư mục cha nếu chưa tồn tại. Tuyệt đối không dùng khi chỉ sửa một phần tệp (dùng file_edit).",
+        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"Đường dẫn tệp cần ghi"},"content":{"type":"string","description":"Nội dung đầy đủ của tệp"}},"required":["path","content"]}
         ,
     },
     .{
         .name = "file_edit",
-        .description = "Sửa file: tìm old_string (phải duy nhất trong file) và thay bằng new_string.",
-        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"Đường dẫn file"},"old_string":{"type":"string","description":"Chuỗi cần tìm (phải duy nhất)"},"new_string":{"type":"string","description":"Chuỗi thay thế"}},"required":["path","old_string","new_string"]}
+        .description = "Chỉnh sửa một phần tệp tin bằng cách thay thế đoạn văn bản cũ (old_string) bằng đoạn mới (new_string). old_string phải là duy nhất trong tệp, hoặc dùng replace_all=true.",
+        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"Đường dẫn tệp cần sửa"},"old_string":{"type":"string","description":"Đoạn văn bản chính xác cần thay thế"},"new_string":{"type":"string","description":"Đoạn văn bản mới thay vào"},"replace_all":{"type":"boolean","description":"Thay thế tất cả các lần xuất hiện (mặc định: false)"}},"required":["path","old_string","new_string"]}
         ,
     },
     .{
         .name = "glob",
-        .description = "Tìm file theo wildcard pattern. Hỗ trợ *, **, ? . Ví dụ: **/*.zig, src/*.ts",
-        .input_schema_json = \\{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (ví dụ: **/*.zig)"},"path":{"type":"string","description":"Thư mục gốc để tìm (mặc định: .)"}},"required":["pattern"]}
+        .description = "Tìm kiếm tệp theo glob pattern (vd: \"**/*.zig\", \"src/*.ts\"). Trả về danh sách đường dẫn tương đối. Tự động bỏ qua .git, zig-cache, node_modules.",
+        .input_schema_json = \\{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern cần tìm"},"path":{"type":"string","description":"Thư mục gốc tìm kiếm (mặc định: project root)"}},"required":["pattern"]}
         ,
     },
     .{
         .name = "grep",
-        .description = "Tìm kiếm nội dung trong file. Trả về path:dòng:nội_dòng.",
-        .input_schema_json = \\{"type":"object","properties":{"pattern":{"type":"string","description":"Pattern cần tìm"},"path":{"type":"string","description":"File hoặc thư mục (mặc định: .)"},"case_insensitive":{"type":"string","description":"\"true\" để tìm không phân biệt hoa thường"}},"required":["pattern"]}
+        .description = "Tìm kiếm biểu thức chính quy (regex) hoặc văn bản thô trong nội dung các tệp tin. Trả về đường dẫn, số dòng và nội dung dòng khớp.",
+        .input_schema_json = \\{"type":"object","properties":{"pattern":{"type":"string","description":"Chuỗi hoặc regex cần tìm"},"path":{"type":"string","description":"Thư mục hoặc tệp cần tìm (mặc định: project root)"},"case_insensitive":{"type":"boolean","description":"Không phân biệt hoa thường"},"max_results":{"type":"integer","description":"Giới hạn số kết quả trả về (mặc định: 50)"}},"required":["pattern"]}
         ,
     },
     .{
         .name = "http_request",
-        .description = "Gửi HTTP request đến bất kỳ URL. Hỗ trợ GET, POST, PUT, DELETE, HEAD. Response tối đa 30KB.",
-        .input_schema_json = \\{"type":"object","properties":{"url":{"type":"string","description":"URL đầy đủ (phải có http:// hoặc https://)"},"method":{"type":"string","enum":["GET","POST","PUT","DELETE","HEAD"],"description":"HTTP method (mặc định: GET)"},"body":{"type":"string","description":"Request body (cho POST/PUT)"},"headers":{"type":"object","description":"Custom headers dạng key-value"}},"required":["url"]}
+        .description = "Gửi yêu cầu HTTP/HTTPS. Hỗ trợ GET, POST, PUT, DELETE, PATCH. Trả về status code, headers và response body.",
+        .input_schema_json = \\{"type":"object","properties":{"url":{"type":"string","description":"URL đầy đủ (vd: https://api.example.com/data)"},"method":{"type":"string","enum":["GET","POST","PUT","DELETE","PATCH"],"description":"HTTP method (mặc định: GET)"},"headers":{"type":"object","description":"JSON object chứa các header (vd: {\"Content-Type\": \"application/json\"})"},"body":{"type":"string","description":"Request body (cho POST, PUT, PATCH)"}},"required":["url"]}
         ,
     },
     .{
@@ -266,6 +258,12 @@ pub const definitions = [_]proto.ToolDefinition{
         ,
     },
     .{
+        .name = "session_diagnostics",
+        .description = "Truy xuất thông tin trạng thái các tiến trình mini-agent, subagents và logs session (Event Sourcing Journal tại ~/.mini/sessions). Hỗ trợ kiểm tra tiến trình sống/chết, phân biệt chế độ REPL vs Subagent, xem số Act đã chạy, giải thích trạng thái chuẩn xác và kill tiến trình bị treo.",
+        .input_schema_json = \\{"type":"object","properties":{"operation":{"type":"string","enum":["list","detail","kill"],"description":"list (danh sách session), detail (chi tiết session theo PID), kill (dừng tiến trình)"},"pid":{"type":"integer","description":"PID của tiến trình mini-agent hoặc subagent cần xem chi tiết/dừng"},"signal":{"type":"string","description":"Signal gửi khi kill (mặc định: SIGTERM hoặc SIGKILL)"}},"required":["operation"]}
+        ,
+    },
+    .{
         .name = "artifact_write",
         .description = "Tạo hoặc cập nhật một artifact độc lập (kế hoạch, walkthrough, markdown, html, svg, code diff, mockup). Tự động lưu vào session artifacts và kích hoạt live preview hook.",
         .input_schema_json = \\{"type":"object","properties":{"name":{"type":"string","description":"Tên tệp artifact (ví dụ: plan.md, walkthrough.md, preview.html, diagram.svg)"},"content":{"type":"string","description":"Nội dung tệp artifact"},"title":{"type":"string","description":"Tiêu đề mô tả ngắn cho artifact"},"type":{"type":"string","enum":["markdown","html","svg","code","diff","text"],"description":"Loại artifact (mặc định: markdown)"},"summary":{"type":"string","description":"Tóm tắt ngắn gọn nội dung artifact"},"user_facing":{"type":"string","enum":["true","false"],"description":"true nếu là tài liệu cho người dùng xem"}},"required":["name","content"]}
@@ -289,7 +287,7 @@ pub const definitions = [_]proto.ToolDefinition{
 const core_tools = [_][]const u8{
     "bash", "file_read", "file_write", "file_edit",
     "glob", "grep", "http_request", "web_search", "browser", "invoke_subagent", "batch_invoke_subagents", "skills",
-    "artifact_write", "artifact_read", "artifact_list",
+    "session_diagnostics", "artifact_write", "artifact_read", "artifact_list",
 };
 
 /// Keyword trigger cho extended tools (gửi theo ngữ cảnh).

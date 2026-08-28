@@ -37,6 +37,7 @@ const glob_tool = @import("../tools/glob.zig");
 const grep_tool = @import("../tools/grep.zig");
 const http_lib = @import("../lib/http_request.zig");
 const artifact_tool = @import("../tools/artifact.zig");
+const session_diag = @import("../tools/session_diagnostics.zig");
 const artifacts_mod = @import("../core/artifacts.zig");
 const utils = @import("../core/utils.zig");
 const json_mod = @import("../core/json.zig");
@@ -748,6 +749,74 @@ fn jsMiniEnv(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.J
     return JS_NULL;
 }
 
+// ---------------------------------------------------------------------------
+// mini.sessions()
+// ---------------------------------------------------------------------------
+fn jsMiniSessions(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    _ = argc;
+    _ = argv;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+
+    const res = session_diag.listSessions(engine.alloc, engine.io) catch |e| {
+        return c.JS_ThrowInternalError(ctx, "session error: %s", @errorName(e).ptr);
+    };
+    defer engine.alloc.free(res);
+
+    return c.JS_NewStringLen(ctx, res.ptr, res.len);
+}
+
+// ---------------------------------------------------------------------------
+// mini.sessionDetail(pid)
+// ---------------------------------------------------------------------------
+fn jsMiniSessionDetail(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.sessionDetail requires pid argument");
+
+    var pid: i32 = 0;
+    if (c.JS_ToInt32(ctx, &pid, argv[0]) != 0) {
+        return c.JS_ThrowTypeError(ctx, "pid must be an integer");
+    }
+
+    const res = session_diag.detailSession(engine.alloc, engine.io, pid) catch |e| {
+        return c.JS_ThrowInternalError(ctx, "sessionDetail error: %s", @errorName(e).ptr);
+    };
+    defer engine.alloc.free(res);
+
+    return c.JS_NewStringLen(ctx, res.ptr, res.len);
+}
+
+// ---------------------------------------------------------------------------
+// mini.sessionKill(pid, signal?)
+// ---------------------------------------------------------------------------
+fn jsMiniSessionKill(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.sessionKill requires pid argument");
+
+    var pid: i32 = 0;
+    if (c.JS_ToInt32(ctx, &pid, argv[0]) != 0) {
+        return c.JS_ThrowTypeError(ctx, "pid must be an integer");
+    }
+
+    const signal = if (argc >= 2 and c.JS_IsUndefined(argv[1]) == 0 and c.JS_IsNull(argv[1]) == 0)
+        jsStringSlice(ctx, argv[1], engine.alloc)
+    else
+        null;
+    defer if (signal) |s| engine.alloc.free(s);
+
+    const res = session_diag.killSession(engine.alloc, pid, signal) catch |e| {
+        return c.JS_ThrowInternalError(ctx, "sessionKill error: %s", @errorName(e).ptr);
+    };
+    defer engine.alloc.free(res);
+
+    return c.JS_NewStringLen(ctx, res.ptr, res.len);
+}
+
 /// Đăng ký object toàn cục `mini` vào JSContext
 pub fn registerBindings(engine: *Engine) !void {
     const ctx = engine.ctx.?;
@@ -773,10 +842,13 @@ pub fn registerBindings(engine: *Engine) !void {
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "jobLogs", c.JS_NewCFunction(ctx, jsMiniJobLogs, "jobLogs", 2));
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "jobKill", c.JS_NewCFunction(ctx, jsMiniJobKill, "jobKill", 2));
 
-    // 3. network & session
+    // 3. network & session telemetry
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "http", c.JS_NewCFunction(ctx, jsMiniHttp, "http", 3));
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "artifact", c.JS_NewCFunction(ctx, jsMiniArtifact, "artifact", 3));
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "env", c.JS_NewCFunction(ctx, jsMiniEnv, "env", 1));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "sessions", c.JS_NewCFunction(ctx, jsMiniSessions, "sessions", 0));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "sessionDetail", c.JS_NewCFunction(ctx, jsMiniSessionDetail, "sessionDetail", 1));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "sessionKill", c.JS_NewCFunction(ctx, jsMiniSessionKill, "sessionKill", 2));
 
     // 4. metadata props
     const pwd_val = getenv("PWD");
