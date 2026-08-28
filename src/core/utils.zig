@@ -6,6 +6,25 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+/// Kiểm tra xem tiến trình hiện tại có phải là subagent (được spawn từ cha) hoặc ở chế độ quiet không
+pub fn isSubagent() bool {
+    if (getenv("MINI_SUBAGENT_DEPTH")) |ptr| {
+        const span = std.mem.span(ptr);
+        if (span.len > 0 and !std.mem.eql(u8, span, "0")) {
+            return true;
+        }
+    }
+    if (getenv("MINI_QUIET")) |ptr| {
+        const span = std.mem.span(ptr);
+        if (std.mem.eql(u8, span, "1") or std.mem.eql(u8, span, "true")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Đọc toàn bộ nội dung file vào buffer đã cấp phát.
 /// Tương đương File.readAll() đã bị xóa trong Zig 0.15.2.
 pub fn readAll(io: std.Io, file: std.Io.File, buf: []u8) !usize {

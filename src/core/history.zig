@@ -261,7 +261,7 @@ pub const History = struct {
         std.mem.copyForwards(proto.Message, self.msgs.items[0..keep], self.msgs.items[drop..]);
         self.msgs.items.len = keep;
 
-        main.stderrPrint("[history] Compacted: giữ {d}/{d} messages\n", .{ keep, n });
+        if (!utils.isSubagent()) main.stderrPrint("[history] Compacted: giữ {d}/{d} messages\n", .{ keep, n });
     }
 
     /// Kiểm tra xem lịch sử có vượt quá ngưỡng hay không
@@ -285,7 +285,7 @@ pub const History = struct {
         blocks[0] = .{ .text = summary_copy };
         try self.msgs.append(self.alloc, .{ .role = .assistant, .content = blocks, .tier = .summarized });
 
-        main.stderrPrint("\n[history] Đã dọn dẹp bộ nhớ và lưu tóm tắt ngữ cảnh.\n", .{});
+        if (!utils.isSubagent()) main.stderrPrint("\n[history] Đã dọn dẹp bộ nhớ và lưu tóm tắt ngữ cảnh.\n", .{});
     }
 
     /// Compact theo logic MemAct (bản mới): GIỮ NGUYÊN msgs.items[0] (user prompt gốc),
@@ -323,7 +323,7 @@ pub const History = struct {
         const summary_msg = proto.Message{ .role = .user, .content = blocks, .tier = .summarized };
         try self.msgs.append(self.alloc, summary_msg);
 
-        main.stderrPrint("\n[history] Đã nén ngữ cảnh (MemAct): giữ prompt gốc (index 0), {s} summary tại index 1, drop {d} messages.\n", .{ if (replace_old_summary) "thay thế" else "chèn mới", dropped });
+        if (!utils.isSubagent()) main.stderrPrint("\n[history] Đã nén ngữ cảnh (MemAct): giữ prompt gốc (index 0), {s} summary tại index 1, drop {d} messages.\n", .{ if (replace_old_summary) "thay thế" else "chèn mới", dropped });
     }
 
     /// Đảm bảo history tương thích Claude API (message đầu tiên phải có role .user).

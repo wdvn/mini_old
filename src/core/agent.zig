@@ -164,7 +164,7 @@ pub const AgentLoop = struct {
         // Chọn backend theo thứ tự ưu tiên
         const backend: Backend = blk: {
             if (config.openai_compat_url) |url| {
-                main.stderrPrint("[agent] Backend: OpenAI-compat @ {s} ({s})\n", .{ url, config.openai_compat_model });
+                if (!utils.isSubagent()) main.stderrPrint("[agent] Backend: OpenAI-compat @ {s} ({s})\n", .{ url, config.openai_compat_model });
                 const proto_mode: openai_mod.ProtocolMode = switch (config.openai_protocol) {
                     .auto => .auto,
                     .chat_completions => .chat_completions,
@@ -181,7 +181,7 @@ pub const AgentLoop = struct {
                 ) };
             }
             if (config.anthropic_key) |key| {
-                main.stderrPrint("[agent] Backend: Claude ({s})\n", .{config.claude_model});
+                if (!utils.isSubagent()) main.stderrPrint("[agent] Backend: Claude ({s})\n", .{config.claude_model});
                 break :blk .{ .claude = claude_mod.Client.init(
                     alloc,
                     key,
@@ -190,7 +190,7 @@ pub const AgentLoop = struct {
                 ) };
             }
             // Fallback: Ollama
-            main.stderrPrint("[agent] Backend: Ollama @ {s} ({s})\n", .{ config.ollama_url, config.ollama_model });
+            if (!utils.isSubagent()) main.stderrPrint("[agent] Backend: Ollama @ {s} ({s})\n", .{ config.ollama_url, config.ollama_model });
             break :blk .{ .ollama = ollama_mod.Client.init(
                 alloc,
                 config.ollama_url,
@@ -328,7 +328,7 @@ pub const AgentLoop = struct {
     ) !StepResult {
         if (signals.isInterrupted()) return error.Interrupted;
 
-        if (main.ui_repl.current_renderer == null) {
+        if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
             if (act_id > 1) {
                 main.stderrPrint("\x1b[90m[agent] --- Vòng lặp {d} ---\x1b[0m\n", .{act_id});
             } else {
@@ -512,7 +512,7 @@ pub const AgentLoop = struct {
         switch (response.stop_reason) {
             .end_turn, .stop_sequence => {
                 self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "none" });
-                if (main.ui_repl.current_renderer == null) {
+                if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
                     main.stderrPrint("\n\x1b[92m[agent] ✓ Hoàn thành sau {d} vòng lặp.\x1b[0m\n", .{act_id});
                 }
                 return .exit_loop;

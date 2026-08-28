@@ -26,7 +26,7 @@ fn runSubAgentThread(ctx: *WorkerContext) void {
     var child = std.process.spawn(ctx.io, .{
         .argv = &argv,
         .stdout = .pipe,
-        .stderr = .inherit,
+        .stderr = .pipe,
         .stdin = .ignore,
     }) catch |e| {
         ctx.error_msg = std.fmt.allocPrint(ctx.alloc, "Lỗi khởi chạy: {s}", .{@errorName(e)}) catch null;
@@ -35,6 +35,8 @@ fn runSubAgentThread(ctx: *WorkerContext) void {
 
     var stdout_buf = std.ArrayListUnmanaged(u8).empty;
     defer stdout_buf.deinit(ctx.alloc);
+    var stderr_buf = std.ArrayListUnmanaged(u8).empty;
+    defer stderr_buf.deinit(ctx.alloc);
 
     if (child.stdout) |out_pipe| {
         var chunk: [4096]u8 = undefined;
@@ -42,6 +44,15 @@ fn runSubAgentThread(ctx: *WorkerContext) void {
             const n = out_pipe.readStreaming(ctx.io, &.{&chunk}) catch break;
             if (n == 0) break;
             stdout_buf.appendSlice(ctx.alloc, chunk[0..n]) catch break;
+        }
+    }
+
+    if (child.stderr) |err_pipe| {
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const n = err_pipe.readStreaming(ctx.io, &.{&chunk}) catch break;
+            if (n == 0) break;
+            stderr_buf.appendSlice(ctx.alloc, chunk[0..n]) catch break;
         }
     }
 
@@ -53,13 +64,15 @@ fn runSubAgentThread(ctx: *WorkerContext) void {
     switch (term) {
         .exited => |code| {
             if (code != 0) {
-                ctx.error_msg = std.fmt.allocPrint(ctx.alloc, "Lỗi exit code {d}: {s}", .{ code, stdout_buf.items }) catch null;
+                const err_detail = if (stderr_buf.items.len > 0) stderr_buf.items else stdout_buf.items;
+                ctx.error_msg = std.fmt.allocPrint(ctx.alloc, "Lỗi exit code {d}: {s}", .{ code, err_detail }) catch null;
             } else {
                 ctx.result = ctx.alloc.dupe(u8, stdout_buf.items) catch null;
             }
         },
         else => {
-            ctx.error_msg = std.fmt.allocPrint(ctx.alloc, "Bị crash hoặc kill. Output: {s}", .{ stdout_buf.items }) catch null;
+            const err_detail = if (stderr_buf.items.len > 0) stderr_buf.items else stdout_buf.items;
+            ctx.error_msg = std.fmt.allocPrint(ctx.alloc, "Bị crash hoặc kill. Chi tiết: {s}", .{err_detail}) catch null;
         }
     }
 }

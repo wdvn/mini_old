@@ -293,19 +293,21 @@ pub const Config = struct {
             break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
         };
 
-        main.stderrPrint("[config] Env bindings: OPENAI_COMPAT_URL={s}, OPENAI_COMPAT_MODEL={s}, MINI_HOME={s}\n", .{
-            openai_url orelse "(null)",
-            openai_model,
-            env_map.get("MINI_HOME") orelse "(null)",
-        });
-        main.stderrPrint("[config] Build: {s} | {s} | {s} | zig {s}\n", .{
-            main.BUILD_TIME, main.BUILD_OPTIMIZE, main.BUILD_TARGET, main.ZIG_VERSION,
-        });
-        if (memact_enabled) {
-            const window_src = if (env_map.get("MINI_CONTEXT_WINDOW") != null) "env" else "auto/backend";
-            main.stderrPrint("[config] MemAct: window={d} ({s}), top_k={d}, budget={d}, extract={s}\n", .{
-                context_window, window_src, memact_top_k, memact_memory_budget, memact_extract,
+        if (!utils.isSubagent()) {
+            main.stderrPrint("[config] Env bindings: OPENAI_COMPAT_URL={s}, OPENAI_COMPAT_MODEL={s}, MINI_HOME={s}\n", .{
+                openai_url orelse "(null)",
+                openai_model,
+                env_map.get("MINI_HOME") orelse "(null)",
             });
+            main.stderrPrint("[config] Build: {s} | {s} | {s} | zig {s}\n", .{
+                main.BUILD_TIME, main.BUILD_OPTIMIZE, main.BUILD_TARGET, main.ZIG_VERSION,
+            });
+            if (memact_enabled) {
+                const window_src = if (env_map.get("MINI_CONTEXT_WINDOW") != null) "env" else "auto/backend";
+                main.stderrPrint("[config] MemAct: window={d} ({s}), top_k={d}, budget={d}, extract={s}\n", .{
+                    context_window, window_src, memact_top_k, memact_memory_budget, memact_extract,
+                });
+            }
         }
 
         return .{
@@ -374,7 +376,7 @@ fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, i
                         if (utils.readAll(io, file, buf)) |n| {
                             base_buf = buf;
                             base_text = buf[0..n];
-                            main.stderrPrint("[config] System prompt: {s} ({d} bytes)\n", .{ path, n });
+                            if (!utils.isSubagent()) main.stderrPrint("[config] System prompt: {s} ({d} bytes)\n", .{ path, n });
                         } else |_| {
                             alloc.free(buf);
                         }
@@ -382,7 +384,7 @@ fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, i
                 }
             } else |_| {}
         } else |_| {
-            main.stderrPrint("[config] Không mở được system prompt: {s}, dùng default.\n", .{path});
+            if (!utils.isSubagent()) main.stderrPrint("[config] Không mở được system prompt: {s}, dùng default.\n", .{path});
         }
     }
 
@@ -400,7 +402,7 @@ fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, i
                 defer alloc.free(text);
                 agents_text_accum.appendSlice(alloc, text) catch {};
                 agents_text_accum.appendSlice(alloc, "\n\n") catch {};
-                main.stderrPrint("[config] Loaded global AGENTS.md ({d} bytes)\n", .{text.len});
+                if (!utils.isSubagent()) main.stderrPrint("[config] Loaded global AGENTS.md ({d} bytes)\n", .{text.len});
             }
         }
     }
@@ -414,7 +416,7 @@ fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, i
                 defer alloc.free(text);
                 agents_text_accum.appendSlice(alloc, text) catch {};
                 agents_text_accum.appendSlice(alloc, "\n\n") catch {};
-                main.stderrPrint("[config] Loaded project AGENTS.md ({d} bytes)\n", .{text.len});
+                if (!utils.isSubagent()) main.stderrPrint("[config] Loaded project AGENTS.md ({d} bytes)\n", .{text.len});
             }
         }
     }
@@ -459,7 +461,7 @@ fn appendSkillsBlock(alloc: Allocator, env_map: *const std.process.Environ.Map, 
         };
         alloc.free(b);
         if (prev.buf) |old| alloc.free(old);
-        main.stderrPrint("[config] Loaded {d} skill(s) into system prompt\n", .{n});
+        if (!utils.isSubagent()) main.stderrPrint("[config] Loaded {d} skill(s) into system prompt\n", .{n});
         return .{ .buf = combined, .text = combined };
     }
     return prev;
@@ -625,7 +627,7 @@ fn tryLoadJsonConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: st
     if (cfg.session) |val| count += setEnvDefault(env_map, "MINI_SESSION", val);
 
     if (count > 0) {
-        main.stderrPrint("[config] Loaded {d} settings from {s}\n", .{ count, path });
+        if (!utils.isSubagent()) main.stderrPrint("[config] Loaded {d} settings from {s}\n", .{ count, path });
     }
 }
 
@@ -680,7 +682,7 @@ fn tryLoadFile(env_map: *std.process.Environ.Map, io: std.Io, path: []const u8) 
     }
 
     if (loaded > 0) {
-        main.stderrPrint("[config] Loaded {d} vars from {s}\n", .{ loaded, path });
+        if (!utils.isSubagent()) main.stderrPrint("[config] Loaded {d} vars from {s}\n", .{ loaded, path });
     }
 }
 

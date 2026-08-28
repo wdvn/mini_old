@@ -67,13 +67,15 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     var child = try std.process.spawn(io, .{
         .argv = &argv,
         .stdout = .pipe,
-        .stderr = .inherit,
+        .stderr = .pipe,
         .stdin = .ignore,
     });
 
-    // Đọc toàn bộ stdout
+    // Đọc toàn bộ stdout và stderr
     var stdout_buf = std.ArrayListUnmanaged(u8).empty;
     defer stdout_buf.deinit(alloc);
+    var stderr_buf = std.ArrayListUnmanaged(u8).empty;
+    defer stderr_buf.deinit(alloc);
 
     if (child.stdout) |out_pipe| {
         var chunk: [4096]u8 = undefined;
@@ -84,16 +86,27 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         }
     }
 
+    if (child.stderr) |err_pipe| {
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const n = err_pipe.readStreaming(io, &.{&chunk}) catch break;
+            if (n == 0) break;
+            try stderr_buf.appendSlice(alloc, chunk[0..n]);
+        }
+    }
+
     const term = try child.wait(io);
 
     switch (term) {
         .exited => |code| {
             if (code != 0) {
-                return std.fmt.allocPrint(alloc, "Sub-agent kết thúc với mã lỗi: {d}. Output: {s}", .{ code, stdout_buf.items });
+                const err_detail = if (stderr_buf.items.len > 0) stderr_buf.items else stdout_buf.items;
+                return std.fmt.allocPrint(alloc, "Sub-agent kết thúc với mã lỗi: {d}. Chi tiết: {s}", .{ code, err_detail });
             }
         },
         else => {
-            return std.fmt.allocPrint(alloc, "Sub-agent bị crash hoặc bị kill. Output: {s}", .{ stdout_buf.items });
+            const err_detail = if (stderr_buf.items.len > 0) stderr_buf.items else stdout_buf.items;
+            return std.fmt.allocPrint(alloc, "Sub-agent bị crash hoặc bị kill. Chi tiết: {s}", .{err_detail});
         },
     }
 
