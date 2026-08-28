@@ -59,6 +59,8 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     // trước khi đưa vào /bin/sh, nếu không shell sẽ parse sai (quote thành
     // literal, redirect 2>&1 bị tách token...).
     const command = (try json.findStringOwned(alloc, input_json, "command")) orelse
+        (try json.findStringOwned(alloc, input_json, "cmd")) orelse
+        (try json.findStringOwned(alloc, input_json, "script")) orelse
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'command'", .{});
     defer alloc.free(command);
 

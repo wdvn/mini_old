@@ -288,11 +288,17 @@ pub const TurnRenderer = struct {
     think_snippet_len: usize = 0,
     think_last_update_ms: i64 = 0,
 
-    // CodeAct live state
+    // CodeAct live state (in-place multi-line max 3 lines)
     codeact_start_ms: i64 = 0,
     codeact_last_update_ms: i64 = 0,
     codeact_curr_buf: [128]u8 = undefined,
     codeact_curr_len: usize = 0,
+    codeact_line1_buf: [128]u8 = undefined,
+    codeact_line1_len: usize = 0,
+    codeact_line2_buf: [128]u8 = undefined,
+    codeact_line2_len: usize = 0,
+    codeact_rendered_lines: usize = 0,
+    codeact_total_lines: usize = 0,
 
     waiting_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     waiting_thread: ?std.Thread = null,
@@ -317,6 +323,10 @@ pub const TurnRenderer = struct {
             .codeact_start_ms = 0,
             .codeact_last_update_ms = 0,
             .codeact_curr_len = 0,
+            .codeact_line1_len = 0,
+            .codeact_line2_len = 0,
+            .codeact_rendered_lines = 0,
+            .codeact_total_lines = 0,
             .waiting_active = std.atomic.Value(bool).init(false),
             .waiting_thread = null,
         };
@@ -369,6 +379,10 @@ pub const TurnRenderer = struct {
         self.codeact_start_ms = 0;
         self.codeact_last_update_ms = 0;
         self.codeact_curr_len = 0;
+        self.codeact_line1_len = 0;
+        self.codeact_line2_len = 0;
+        self.codeact_rendered_lines = 0;
+        self.codeact_total_lines = 0;
         self.consecutive_newlines = 1;
         self.highlighter = markdown_mod.StreamHighlighter.init();
         self.parser.resetAct();
@@ -546,6 +560,10 @@ pub const TurnRenderer = struct {
         self.codeact_start_ms = utils.milliTimestamp();
         self.codeact_last_update_ms = 0;
         self.codeact_curr_len = 0;
+        self.codeact_line1_len = 0;
+        self.codeact_line2_len = 0;
+        self.codeact_rendered_lines = 0;
+        self.codeact_total_lines = 0;
         self.highlighter.flush(self.io);
     }
 
@@ -556,51 +574,116 @@ pub const TurnRenderer = struct {
         }
 
         for (text) |c| {
-            if (c == '\n' or c == '\r' or c == '\t') {
-                if (self.codeact_curr_len > 0 and self.codeact_curr_buf[self.codeact_curr_len - 1] != ' ') {
-                    if (self.codeact_curr_len < self.codeact_curr_buf.len) {
-                        self.codeact_curr_buf[self.codeact_curr_len] = ' ';
-                        self.codeact_curr_len += 1;
-                    }
+            if (c == '\n') {
+                if (self.codeact_curr_len > 0 or self.codeact_total_lines > 0) {
+                    std.mem.copyForwards(u8, &self.codeact_line1_buf, self.codeact_line2_buf[0..self.codeact_line2_len]);
+                    self.codeact_line1_len = self.codeact_line2_len;
+
+                    std.mem.copyForwards(u8, &self.codeact_line2_buf, self.codeact_curr_buf[0..self.codeact_curr_len]);
+                    self.codeact_line2_len = self.codeact_curr_len;
+
+                    self.codeact_curr_len = 0;
+                    self.codeact_total_lines += 1;
+                }
+            } else if (c == '\r') {
+                // ignore \r
+            } else if (c == '\t') {
+                if (self.codeact_curr_len + 2 < self.codeact_curr_buf.len) {
+                    self.codeact_curr_buf[self.codeact_curr_len] = ' ';
+                    self.codeact_curr_len += 1;
+                    self.codeact_curr_buf[self.codeact_curr_len] = ' ';
+                    self.codeact_curr_len += 1;
                 }
             } else if (c >= 32) {
-                if (self.codeact_curr_len < self.codeact_curr_buf.len) {
-                    self.codeact_curr_buf[self.codeact_curr_len] = c;
-                    self.codeact_curr_len += 1;
-                } else {
-                    const shift = 16;
-                    std.mem.copyForwards(u8, self.codeact_curr_buf[0 .. self.codeact_curr_buf.len - shift], self.codeact_curr_buf[shift..]);
-                    self.codeact_curr_len = self.codeact_curr_buf.len - shift;
+                if (self.codeact_curr_len < 72) {
                     self.codeact_curr_buf[self.codeact_curr_len] = c;
                     self.codeact_curr_len += 1;
                 }
             }
         }
 
-        if (comptime builtin.is_test) return;
-        if (!term.isStdoutTty()) return;
-
         const now = utils.milliTimestamp();
         if (now - self.codeact_last_update_ms >= 40) {
             self.codeact_last_update_ms = now;
-            const diff = if (now >= self.codeact_start_ms) now - self.codeact_start_ms else 0;
-            var dur_buf: [32]u8 = undefined;
-            const dur_str = utils.formatDuration(&dur_buf, @intCast(diff));
-            const frame = self.spinner.nextFrame();
-
-            const snippet = std.mem.trim(u8, self.codeact_curr_buf[0..self.codeact_curr_len], " ");
-            var out_buf: [256]u8 = undefined;
-            const line = if (snippet.len > 0)
-                std.fmt.bufPrint(&out_buf, "\r\x1b[2K \x1b[35m{s}\x1b[0m \x1b[1;35mCodeAct\x1b[0m \x1b[90m({s})...\x1b[0m \x1b[2;37m{s}\x1b[0m", .{
-                    frame, dur_str, snippet,
-                }) catch ""
-            else
-                std.fmt.bufPrint(&out_buf, "\r\x1b[2K \x1b[35m{s}\x1b[0m \x1b[1;35mCodeAct\x1b[0m \x1b[90m({s})...\x1b[0m", .{
-                    frame, dur_str,
-                }) catch "";
-
-            if (line.len > 0) term.writeStdout(line);
+            self.renderCodeActInPlace(now);
         }
+    }
+
+    fn renderCodeActInPlace(self: *TurnRenderer, now: i64) void {
+        if (comptime builtin.is_test) return;
+        if (!term.isStdoutTty()) return;
+
+        const diff = if (now >= self.codeact_start_ms) now - self.codeact_start_ms else 0;
+        var dur_buf: [32]u8 = undefined;
+        const dur_str = utils.formatDuration(&dur_buf, @intCast(diff));
+        const frame = self.spinner.nextFrame();
+
+        var h_buf: [128]u8 = undefined;
+        const header_line = std.fmt.bufPrint(&h_buf, " \x1b[35m{s}\x1b[0m \x1b[1;35mCodeAct\x1b[0m \x1b[90m({s})...\x1b[0m", .{
+            frame, dur_str,
+        }) catch " ⚡ CodeAct...";
+
+        var line2_opt: ?[]const u8 = null;
+        var line3_opt: ?[]const u8 = null;
+        var num_lines: usize = 1;
+
+        if (self.codeact_curr_len > 0) {
+            if (self.codeact_line2_len > 0) {
+                line2_opt = self.codeact_line2_buf[0..self.codeact_line2_len];
+                line3_opt = self.codeact_curr_buf[0..self.codeact_curr_len];
+                num_lines = 3;
+            } else {
+                line2_opt = self.codeact_curr_buf[0..self.codeact_curr_len];
+                num_lines = 2;
+            }
+        } else if (self.codeact_line2_len > 0) {
+            if (self.codeact_line1_len > 0) {
+                line2_opt = self.codeact_line1_buf[0..self.codeact_line1_len];
+                line3_opt = self.codeact_line2_buf[0..self.codeact_line2_len];
+                num_lines = 3;
+            } else {
+                line2_opt = self.codeact_line2_buf[0..self.codeact_line2_len];
+                num_lines = 2;
+            }
+        }
+
+        // Di chuyển con trỏ lên vị trí dòng đầu tiên đã render trước đó
+        if (self.codeact_rendered_lines > 1) {
+            for (0..self.codeact_rendered_lines - 1) |_| {
+                term.writeStdout("\x1b[1A");
+            }
+        }
+
+        // Render Dòng 1 (Header)
+        term.writeStdout("\r\x1b[2K");
+        term.writeStdout(header_line);
+
+        // Render Dòng 2
+        if (line2_opt) |l2| {
+            var l2_buf: [256]u8 = undefined;
+            const l2_str = std.fmt.bufPrint(&l2_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m \x1b[2;37m{s}\x1b[0m", .{l2}) catch "";
+            term.writeStdout(l2_str);
+        }
+
+        // Render Dòng 3
+        if (line3_opt) |l3| {
+            var l3_buf: [256]u8 = undefined;
+            const l3_str = std.fmt.bufPrint(&l3_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m \x1b[37m{s}\x1b[0m", .{l3}) catch "";
+            term.writeStdout(l3_str);
+        }
+
+        // Xóa dòng thừa nếu số dòng render lần này ít hơn lần trước
+        if (self.codeact_rendered_lines > num_lines) {
+            const excess = self.codeact_rendered_lines - num_lines;
+            for (0..excess) |_| {
+                term.writeStdout("\n\r\x1b[2K");
+            }
+            for (0..excess) |_| {
+                term.writeStdout("\x1b[1A");
+            }
+        }
+
+        self.codeact_rendered_lines = num_lines;
     }
 
     pub fn markCodeActReady(self: *TurnRenderer) void {
@@ -610,14 +693,34 @@ pub const TurnRenderer = struct {
     }
 
     pub fn endCodeAct(self: *TurnRenderer) void {
-        if (self.ui_state != .codeact_live and self.ui_state != .codeact_ready and !self.is_codeact) return;
+        if (!self.is_codeact and self.ui_state != .codeact_live and self.ui_state != .codeact_ready) return;
         self.is_codeact = false;
         self.in_codeact = false;
-        if (term.isStdoutTty()) {
+
+        if (term.isStdoutTty() and self.codeact_rendered_lines > 0) {
+            if (self.codeact_rendered_lines > 1) {
+                for (0..self.codeact_rendered_lines - 1) |_| {
+                    term.writeStdout("\x1b[1A");
+                }
+            }
+            for (0..self.codeact_rendered_lines) |idx| {
+                term.writeStdout("\r\x1b[2K");
+                if (idx + 1 < self.codeact_rendered_lines) {
+                    term.writeStdout("\n");
+                }
+            }
+            if (self.codeact_rendered_lines > 1) {
+                for (0..self.codeact_rendered_lines - 1) |_| {
+                    term.writeStdout("\x1b[1A");
+                }
+            }
             term.writeStdout("\r\x1b[2K");
         }
+
         self.ui_state = .idle;
         self.codeact_curr_len = 0;
+        self.codeact_rendered_lines = 0;
+        self.codeact_total_lines = 0;
     }
 
     // -----------------------------------------------------------------------
@@ -683,55 +786,73 @@ pub const TurnRenderer = struct {
         if (self.ui_state == .thinking or self.is_thinking) {
             self.endThinking();
         }
+        if (self.ui_state == .codeact_ready or self.ui_state == .codeact_live or self.is_codeact) {
+            self.endCodeAct();
+        }
         self.highlighter.flush(self.io);
 
         var detail_buf: [256]u8 = undefined;
         var detail: []const u8 = "";
 
-        if (std.mem.eql(u8, name, "bash")) {
-            if (json_mod.findString(input_json, "command")) |cmd| {
+        if (std.mem.eql(u8, name, "bash") or std.mem.eql(u8, name, "sh") or std.mem.eql(u8, name, "exec")) {
+            if (json_mod.findString(input_json, "command") orelse json_mod.findString(input_json, "cmd")) |cmd| {
                 const trimmed = if (cmd.len > 80) cmd[0..80] else cmd;
                 detail = std.fmt.bufPrint(&detail_buf, "\x1b[35m{s}\x1b[0m", .{trimmed}) catch "";
             }
-        } else if (std.mem.eql(u8, name, "file_read") or std.mem.eql(u8, name, "file_write") or std.mem.eql(u8, name, "file_edit")) {
-            if (json_mod.findString(input_json, "path")) |path| {
+        } else if (std.mem.eql(u8, name, "invoke_subagent") or std.mem.eql(u8, name, "batch_invoke_subagents") or std.mem.eql(u8, name, "subagent")) {
+            if (json_mod.findString(input_json, "task") orelse json_mod.findString(input_json, "prompt") orelse json_mod.findString(input_json, "description")) |t| {
+                const trimmed = if (t.len > 80) t[0..80] else t;
+                detail = std.fmt.bufPrint(&detail_buf, "\x1b[36m\"{s}\"\x1b[0m", .{trimmed}) catch "";
+            }
+        } else if (std.mem.eql(u8, name, "file_read") or std.mem.eql(u8, name, "file_write") or std.mem.eql(u8, name, "file_edit") or std.mem.eql(u8, name, "read_file") or std.mem.eql(u8, name, "write_file") or std.mem.eql(u8, name, "edit_file")) {
+            if (json_mod.findString(input_json, "path") orelse json_mod.findString(input_json, "TargetFile") orelse json_mod.findString(input_json, "file")) |path| {
                 detail = std.fmt.bufPrint(&detail_buf, "\x1b[34m{s}\x1b[0m", .{path}) catch "";
             }
-        } else if (std.mem.eql(u8, name, "web_search")) {
-            if (json_mod.findString(input_json, "query")) |q| {
+        } else if (std.mem.eql(u8, name, "web_search") or std.mem.eql(u8, name, "search")) {
+            if (json_mod.findString(input_json, "query") orelse json_mod.findString(input_json, "q")) |q| {
                 detail = std.fmt.bufPrint(&detail_buf, "\x1b[32m\"{s}\"\x1b[0m", .{q}) catch "";
+            }
+        } else if (std.mem.eql(u8, name, "grep")) {
+            if (json_mod.findString(input_json, "pattern") orelse json_mod.findString(input_json, "query")) |pat| {
+                detail = std.fmt.bufPrint(&detail_buf, "\x1b[33m/{s}/\x1b[0m", .{pat}) catch "";
+            }
+        } else if (std.mem.eql(u8, name, "glob")) {
+            if (json_mod.findString(input_json, "pattern")) |pat| {
+                detail = std.fmt.bufPrint(&detail_buf, "\x1b[33m{s}\x1b[0m", .{pat}) catch "";
+            }
+        } else if (std.mem.eql(u8, name, "http_request") or std.mem.eql(u8, name, "http") or std.mem.eql(u8, name, "fetch")) {
+            if (json_mod.findString(input_json, "url")) |u| {
+                const trimmed = if (u.len > 80) u[0..80] else u;
+                detail = std.fmt.bufPrint(&detail_buf, "\x1b[34m{s}\x1b[0m", .{trimmed}) catch "";
             }
         } else if (std.mem.eql(u8, name, "codeact")) {
             detail = "\x1b[35mCodeAct script\x1b[0m";
+        } else {
+            if (json_mod.findString(input_json, "task") orelse
+                json_mod.findString(input_json, "query") orelse
+                json_mod.findString(input_json, "path") orelse
+                json_mod.findString(input_json, "command") orelse
+                json_mod.findString(input_json, "name") orelse
+                json_mod.findString(input_json, "prompt")) |val|
+            {
+                const trimmed = if (val.len > 80) val[0..80] else val;
+                detail = std.fmt.bufPrint(&detail_buf, "\x1b[90m{s}\x1b[0m", .{trimmed}) catch "";
+            }
         }
 
-        if (self.ui_state == .codeact_ready or self.ui_state == .codeact_live or self.is_codeact) {
-            // Chuyển mượt trực tiếp từ spinner sang Action Card trên cùng dòng (không nhấp nháy, không xóa rồi tạo lại)
-            if (term.isStdoutTty()) {
-                term.writeStdout("\r\x1b[2K");
-            }
-            var header_buf: [512]u8 = undefined;
-            const line = std.fmt.bufPrint(&header_buf, " \x1b[1;33m{s}\x1b[0m \x1b[1;37m{s}\x1b[0m {s}\n", .{
-                term.GLYPH_ACTION, name, detail,
-            }) catch return;
-            self.write(line);
-            self.is_codeact = false;
-            self.in_codeact = false;
-        } else {
-            if (self.consecutive_newlines == 0) {
-                self.ensureNewline();
-            }
-            var header_buf: [512]u8 = undefined;
-            const line = std.fmt.bufPrint(&header_buf, " \x1b[1;33m{s}\x1b[0m \x1b[1;37m{s}\x1b[0m {s}\n", .{
-                term.GLYPH_ACTION, name, detail,
-            }) catch return;
-            self.write(line);
+        if (self.consecutive_newlines == 0) {
+            self.ensureNewline();
         }
+        var header_buf: [512]u8 = undefined;
+        const line = std.fmt.bufPrint(&header_buf, " \x1b[1;33m{s}\x1b[0m \x1b[1;37m{s}\x1b[0m {s}\n", .{
+            term.GLYPH_ACTION, name, detail,
+        }) catch return;
+        self.write(line);
 
         self.ui_state = .tool_executing;
     }
 
-    /// Hoàn thành một Tool Action.
+    /// Hoàn thành một Tool Action và hiển thị output snippet (tối đa 3 dòng).
     pub fn finishTool(self: *TurnRenderer, name: []const u8, result: []const u8, is_error: bool, duration_ms: u64, patch_path: ?[]const u8, patch_diff: ?[]const u8) void {
         if (patch_path) |path| {
             if (patch_diff) |diff| {
@@ -756,6 +877,28 @@ pub const TurnRenderer = struct {
                 term.GLYPH_CHECK, dur_str,
             }) catch return;
             self.write(status_line);
+        }
+
+        // Render tối đa 3 dòng kết quả / output snippet (stream inplace detail)
+        if (patch_diff == null or patch_diff.?.len == 0) {
+            const trimmed_res = std.mem.trim(u8, result, " \r\n\t");
+            if (trimmed_res.len > 0) {
+                var line_it = std.mem.splitScalar(u8, trimmed_res, '\n');
+                var line_count: usize = 0;
+                while (line_it.next()) |raw_line| {
+                    const clean_line = std.mem.trim(u8, raw_line, " \r\t");
+                    if (clean_line.len == 0) continue;
+                    if (line_count >= 3) {
+                        self.write("    \x1b[2;90m...\x1b[0m\n");
+                        break;
+                    }
+                    line_count += 1;
+                    const truncated_line = if (clean_line.len > 120) clean_line[0..120] else clean_line;
+                    var out_line_buf: [256]u8 = undefined;
+                    const out_line = std.fmt.bufPrint(&out_line_buf, "    \x1b[2;90m│\x1b[0m \x1b[90m{s}\x1b[0m\n", .{truncated_line}) catch continue;
+                    self.write(out_line);
+                }
+            }
         }
 
         self.ui_state = .idle;

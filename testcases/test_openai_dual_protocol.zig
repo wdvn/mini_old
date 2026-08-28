@@ -81,3 +81,48 @@ test "dual-protocol: History.ensureOpenAICompatible loại bỏ orphan tool resu
     try testing.expect(h.msgs.items[2].content[0] == .text);
     try testing.expect(std.mem.indexOf(u8, h.msgs.items[2].content[0].text, "orphan output") != null);
 }
+
+test "dual-protocol: History.ensureOpenAICompatible loại bỏ orphan tool_use không có tool_result" {
+    var h = history_mod.History.init(testing.allocator);
+    defer h.deinit();
+
+    const orphan_tu = try testing.allocator.alloc(proto.ContentBlock, 1);
+    orphan_tu[0] = .{ .tool_use = .{
+        .id = try testing.allocator.dupe(u8, "tool_orphan_tu"),
+        .name = try testing.allocator.dupe(u8, "invoke_subagent"),
+        .input_json = try testing.allocator.dupe(u8, "{\"task\":\"scan\"}"),
+    } };
+    try h.msgs.append(testing.allocator, .{ .role = .assistant, .content = orphan_tu });
+
+    const modified = h.ensureOpenAICompatible();
+    try testing.expect(modified == true);
+    try testing.expect(h.msgs.items[0].content[0] == .text);
+    try testing.expect(std.mem.indexOf(u8, h.msgs.items[0].content[0].text, "[Tool Call: invoke_subagent") != null);
+}
+
+test "dual-protocol: Responses API unescapes tool arguments and executes bash without missing command error" {
+    const alloc = testing.allocator;
+    const tools_mod = mini.tools_mod;
+
+    // Giả lập tool input sau khi parse từ SSE Responses API
+    const raw_sse_event_arguments = "{\"command\":\"echo 'unit test success'\"}";
+    
+    // Thực thi trực tiếp qua tool dispatcher
+    const result = try tools_mod.executeTool(alloc, testing.io, "bash", raw_sse_event_arguments);
+    defer alloc.free(result);
+
+    try testing.expect(std.mem.indexOf(u8, result, "unit test success") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "Lỗi: thiếu trường 'command'") == null);
+}
+
+test "dual-protocol: Responses API subagent tool extracts task or aliases cleanly" {
+    const alloc = testing.allocator;
+    const json_mod = @import("../src/core/json.zig");
+
+    const valid_json = "{\"task\":\"Khảo sát mã nguồn gateway\"}";
+    const task_val = try json_mod.findStringOwned(alloc, valid_json, "task");
+    defer if (task_val) |t| alloc.free(t);
+
+    try testing.expect(task_val != null);
+    try testing.expectEqualStrings("Khảo sát mã nguồn gateway", task_val.?);
+}

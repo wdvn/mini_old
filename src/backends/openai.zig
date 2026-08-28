@@ -654,8 +654,10 @@ const StreamCtx = struct {
             if (json.findObject(data, "item")) |item_obj| {
                 const item_type = json.findString(item_obj, "type") orelse "";
                 if (std.mem.eql(u8, item_type, "function_call") or std.mem.eql(u8, item_type, "tool_call")) {
-                    const call_id = json.findString(item_obj, "call_id") orelse json.findString(item_obj, "id");
-                    const name = json.findString(item_obj, "name");
+                    const call_id = (try json.findStringOwned(self.alloc, item_obj, "call_id")) orelse (try json.findStringOwned(self.alloc, item_obj, "id"));
+                    defer if (call_id) |cid| self.alloc.free(cid);
+                    const name = try json.findStringOwned(self.alloc, item_obj, "name");
+                    defer if (name) |n| self.alloc.free(n);
                     const index = json.findInt(data, "output_index", u32);
                     try self.mergeToolCallDelta(index, call_id, name, null);
                 }
@@ -665,9 +667,12 @@ const StreamCtx = struct {
 
         if (std.mem.eql(u8, ev, "response.tool_call.delta") or std.mem.eql(u8, ev, "response.function_call_arguments.delta")) {
             const index = json.findInt(data, "output_index", u32) orelse json.findInt(data, "index", u32);
-            const call_id = json.findString(data, "call_id") orelse json.findString(data, "id");
-            const name = json.findString(data, "name");
-            const args = json.findString(data, "delta") orelse json.findString(data, "arguments");
+            const call_id = (try json.findStringOwned(self.alloc, data, "call_id")) orelse (try json.findStringOwned(self.alloc, data, "id"));
+            defer if (call_id) |cid| self.alloc.free(cid);
+            const name = try json.findStringOwned(self.alloc, data, "name");
+            defer if (name) |n| self.alloc.free(n);
+            const args = (try json.findStringOwned(self.alloc, data, "delta")) orelse (try json.findStringOwned(self.alloc, data, "arguments"));
+            defer if (args) |a| self.alloc.free(a);
             try self.mergeToolCallDelta(index, call_id, name, args);
             return;
         }
@@ -676,10 +681,24 @@ const StreamCtx = struct {
             if (json.findObject(data, "item")) |item_obj| {
                 const item_type = json.findString(item_obj, "type") orelse "";
                 if (std.mem.eql(u8, item_type, "function_call") or std.mem.eql(u8, item_type, "tool_call")) {
-                    const call_id = json.findString(item_obj, "call_id") orelse json.findString(item_obj, "id");
-                    const name = json.findString(item_obj, "name");
-                    const args = json.findString(item_obj, "arguments");
+                    const call_id = (try json.findStringOwned(self.alloc, item_obj, "call_id")) orelse (try json.findStringOwned(self.alloc, item_obj, "id"));
+                    defer if (call_id) |cid| self.alloc.free(cid);
+                    const name = try json.findStringOwned(self.alloc, item_obj, "name");
+                    defer if (name) |n| self.alloc.free(n);
+                    const args = try json.findStringOwned(self.alloc, item_obj, "arguments");
+                    defer if (args) |a| self.alloc.free(a);
                     const index = json.findInt(data, "output_index", u32);
+                    try self.setToolCallFinal(index, call_id, name, args);
+                }
+            } else {
+                const call_id = (try json.findStringOwned(self.alloc, data, "call_id")) orelse (try json.findStringOwned(self.alloc, data, "id"));
+                defer if (call_id) |cid| self.alloc.free(cid);
+                const name = try json.findStringOwned(self.alloc, data, "name");
+                defer if (name) |n| self.alloc.free(n);
+                const args = try json.findStringOwned(self.alloc, data, "arguments");
+                defer if (args) |a| self.alloc.free(a);
+                const index = json.findInt(data, "output_index", u32);
+                if (args != null or call_id != null or name != null) {
                     try self.setToolCallFinal(index, call_id, name, args);
                 }
             }

@@ -144,3 +144,32 @@ test "UI Chat Stream: TurnRenderer CodeAct stream in-place" {
         .completion_tokens = 40,
     });
 }
+
+test "UI Chat Stream: startTool and finishTool multi-line detail and snippet" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var renderer = chat_stream.TurnRenderer.init(alloc, io);
+    renderer.startTurn("Test tool detail and output snippet");
+
+    // 1. invoke_subagent
+    renderer.startTool("invoke_subagent", "{\"task\":\"Khảo sát mã nguồn gateway\"}");
+    renderer.finishTool("invoke_subagent", "Đã phân tích xong 3 files:\n- main.zig\n- openai.zig\n- claude.zig\n- extra.zig", false, 120, null, null);
+
+    // 2. bash
+    renderer.startTool("bash", "{\"cmd\":\"ls -la src/\"}");
+    renderer.finishTool("bash", "main.zig\ncore/\nruntime/\nbackends/", false, 15, null, null);
+
+    // 3. web_search
+    renderer.startTool("web_search", "{\"query\":\"Zig 0.16 breaking changes\"}");
+    renderer.finishTool("web_search", "Found 5 articles", false, 350, null, null);
+
+    // 4. codeact
+    renderer.startTool("codeact", "{}");
+    renderer.finishTool("codeact", "stdout line 1\nstdout line 2", false, 5, null, null);
+
+    renderer.finishTurn(.{
+        .prompt_tokens = 100,
+        .completion_tokens = 200,
+    });
+}

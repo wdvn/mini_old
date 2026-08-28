@@ -39,7 +39,10 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         return std.fmt.allocPrint(alloc, "Lỗi: Đã đạt giới hạn độ sâu subagent tối đa (depth={d}/{d}). Không thể tạo thêm subagent để phòng tránh đệ quy vô hạn.", .{ current_depth, max_depth });
     }
 
-    const task = (try json.findStringOwned(alloc, input_json, "task")) orelse {
+    const task = (try json.findStringOwned(alloc, input_json, "task")) orelse
+        (try json.findStringOwned(alloc, input_json, "prompt")) orelse
+        (try json.findStringOwned(alloc, input_json, "instruction")) orelse
+        (try json.findStringOwned(alloc, input_json, "description")) orelse {
         return std.fmt.allocPrint(alloc, "Lỗi: thiếu tham số 'task'", .{});
     };
     defer alloc.free(task);
