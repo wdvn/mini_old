@@ -385,7 +385,23 @@ pub const AgentLoop = struct {
             }
         }
 
-        // 1. CodeAct: Kiểm tra có khối mã JavaScript trong response không
+        // 1. Native Tool Calling: nếu model gọi tool qua stop_reason .tool_use hoặc có tool_use blocks
+        var has_tool_use_blocks = false;
+        for (response.content.items) |block| {
+            if (block == .tool_use) {
+                has_tool_use_blocks = true;
+                break;
+            }
+        }
+
+        if (response.stop_reason == .tool_use or has_tool_use_blocks) {
+            self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "tool_call" });
+            try self.executeTools(act_id, &response);
+            main.stderrPrint("\n", .{});
+            return .continue_loop;
+        }
+
+        // 2. CodeAct: Kiểm tra có khối mã JavaScript trong response không
         if (self.config.execution_mode != .tools) {
             if (findJsCodeInResponse(self.alloc, &response)) |js_code| {
                 defer self.alloc.free(js_code);

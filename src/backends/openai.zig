@@ -52,6 +52,9 @@ pub fn getRootApiUrl(base_url: []const u8) []const u8 {
     if (std.mem.endsWith(u8, url, "/responses")) {
         return std.mem.trimEnd(u8, url[0 .. url.len - "/responses".len], "/");
     }
+    if (std.mem.endsWith(u8, url, "/response")) {
+        return std.mem.trimEnd(u8, url[0 .. url.len - "/response".len], "/");
+    }
     return url;
 }
 
@@ -317,52 +320,39 @@ fn buildResponsesRequestBody(
     }
 
     try w.writeAll(",\"input\":[");
-    var first_msg = true;
+    var first_item = true;
     for (msgs) |msg| {
-        if (!first_msg) try w.writeByte(',');
-        first_msg = false;
-
-        // Check if message is entirely tool_results
-        var all_tool_results = true;
         for (msg.content) |block| {
-            if (block != .tool_result) {
-                all_tool_results = false;
-                break;
-            }
-        }
-
-        if (all_tool_results and msg.content.len > 0) {
-            for (msg.content, 0..) |block, bi| {
-                if (bi > 0) try w.writeByte(',');
-                if (block == .tool_result) {
-                    const tr = block.tool_result;
+            switch (block) {
+                .text => |t| {
+                    if (t.len == 0) continue;
+                    if (!first_item) try w.writeByte(',');
+                    first_item = false;
+                    const escaped = try json.escape(alloc, t);
+                    defer alloc.free(escaped);
+                    try w.print("{{\"role\":\"{s}\",\"content\":\"{s}\"}}", .{ msg.role.toJson(), escaped });
+                },
+                .tool_use => |tu| {
+                    if (!first_item) try w.writeByte(',');
+                    first_item = false;
+                    const escaped_args = try json.escape(alloc, tu.input_json);
+                    defer alloc.free(escaped_args);
+                    try w.print(
+                        \\{{"type":"function_call","call_id":"{s}","name":"{s}","arguments":"{s}"}}
+                    , .{ tu.id, tu.name, escaped_args });
+                },
+                .tool_result => |tr| {
+                    if (!first_item) try w.writeByte(',');
+                    first_item = false;
                     const escaped = try json.escape(alloc, tr.content);
                     defer alloc.free(escaped);
                     try w.print(
                         \\{{"type":"function_call_output","call_id":"{s}","output":"{s}"}}
                     , .{ tr.tool_use_id, escaped });
-                }
-            }
-            continue;
-        }
-
-        try w.print("{{\"role\":\"{s}\",", .{msg.role.toJson()});
-        var text_content: ?[]const u8 = null;
-        for (msg.content) |block| {
-            if (block == .text) {
-                text_content = block.text;
-                break;
+                },
+                .thinking => {},
             }
         }
-
-        if (text_content) |tc| {
-            const escaped = try json.escape(alloc, tc);
-            defer alloc.free(escaped);
-            try w.print("\"content\":\"{s}\"", .{escaped});
-        } else {
-            try w.print("\"content\":\"\"", .{});
-        }
-        try w.writeByte('}');
     }
     try w.writeAll("]}");
 
@@ -660,6 +650,19 @@ const StreamCtx = struct {
             }
         }
 
+        if (std.mem.eql(u8, ev, "response.output_item.added")) {
+            if (json.findObject(data, "item")) |item_obj| {
+                const item_type = json.findString(item_obj, "type") orelse "";
+                if (std.mem.eql(u8, item_type, "function_call") or std.mem.eql(u8, item_type, "tool_call")) {
+                    const call_id = json.findString(item_obj, "call_id") orelse json.findString(item_obj, "id");
+                    const name = json.findString(item_obj, "name");
+                    const index = json.findInt(data, "output_index", u32);
+                    try self.mergeToolCallDelta(index, call_id, name, null);
+                }
+            }
+            return;
+        }
+
         if (std.mem.eql(u8, ev, "response.tool_call.delta") or std.mem.eql(u8, ev, "response.function_call_arguments.delta")) {
             const index = json.findInt(data, "output_index", u32) orelse json.findInt(data, "index", u32);
             const call_id = json.findString(data, "call_id") orelse json.findString(data, "id");
@@ -669,14 +672,15 @@ const StreamCtx = struct {
             return;
         }
 
-        if (std.mem.eql(u8, ev, "response.output_item.done") or std.mem.eql(u8, ev, "response.tool_call.done")) {
+        if (std.mem.eql(u8, ev, "response.output_item.done") or std.mem.eql(u8, ev, "response.tool_call.done") or std.mem.eql(u8, ev, "response.function_call_arguments.done")) {
             if (json.findObject(data, "item")) |item_obj| {
                 const item_type = json.findString(item_obj, "type") orelse "";
                 if (std.mem.eql(u8, item_type, "function_call") or std.mem.eql(u8, item_type, "tool_call")) {
                     const call_id = json.findString(item_obj, "call_id") orelse json.findString(item_obj, "id");
                     const name = json.findString(item_obj, "name");
                     const args = json.findString(item_obj, "arguments");
-                    try self.mergeToolCallDelta(null, call_id, name, args);
+                    const index = json.findInt(data, "output_index", u32);
+                    try self.setToolCallFinal(index, call_id, name, args);
                 }
             }
             return;
@@ -813,10 +817,8 @@ const StreamCtx = struct {
     fn mergeToolCallDelta(self: *StreamCtx, index: ?u32, id: ?[]const u8, name: ?[]const u8, args: ?[]const u8) !void {
         var slot: ?usize = null;
 
-        if (index) |idx| {
-            // Index nằm trong phạm vi → đúng slot; ngoài phạm vi → tạo mới bên dưới
-            if (idx < self.tool_calls.items.len) slot = idx;
-        } else if (id) |tcid| {
+        // 1. Ưu tiên match theo id (định danh toàn cục duy nhất của tool call)
+        if (id) |tcid| {
             for (self.tool_calls.items, 0..) |tc, i| {
                 if (tc.id.items.len > 0 and std.mem.eql(u8, tc.id.items, tcid)) {
                     slot = i;
@@ -824,7 +826,12 @@ const StreamCtx = struct {
                 }
             }
         }
-        // Fallback cuối: chunk không mang index lẫn id → item đang mở (nếu có)
+        // 2. Match theo index nếu nằm trong phạm vi tool_calls hiện có
+        if (slot == null and index != null) {
+            const idx = index.?;
+            if (idx < self.tool_calls.items.len) slot = idx;
+        }
+        // 3. Fallback: item cuối cùng đang mở
         if (slot == null and index == null and id == null and self.tool_calls.items.len > 0) {
             slot = self.tool_calls.items.len - 1;
         }
@@ -847,6 +854,52 @@ const StreamCtx = struct {
         }
         if (args) |a| {
             if (a.len > 0) try tc.args.appendSlice(self.alloc, a);
+        }
+    }
+
+    /// Cập nhật hoặc ghi đè thông tin hoàn chỉnh của tool_call khi nhận event done
+    fn setToolCallFinal(self: *StreamCtx, index: ?u32, id: ?[]const u8, name: ?[]const u8, args: ?[]const u8) !void {
+        var slot: ?usize = null;
+
+        // 1. Ưu tiên match theo id
+        if (id) |tcid| {
+            for (self.tool_calls.items, 0..) |tc, i| {
+                if (tc.id.items.len > 0 and std.mem.eql(u8, tc.id.items, tcid)) {
+                    slot = i;
+                    break;
+                }
+            }
+        }
+        // 2. Match theo index nếu nằm trong phạm vi
+        if (slot == null and index != null) {
+            const idx = index.?;
+            if (idx < self.tool_calls.items.len) slot = idx;
+        }
+        // 3. Fallback: item cuối cùng đang mở
+        if (slot == null and index == null and id == null and self.tool_calls.items.len > 0) {
+            slot = self.tool_calls.items.len - 1;
+        }
+
+        if (slot == null) {
+            var tc = PartialToolCall.init();
+            if (id) |tcid| try tc.id.appendSlice(self.alloc, tcid);
+            if (name) |n| try tc.name.appendSlice(self.alloc, n);
+            if (args) |a| try tc.args.appendSlice(self.alloc, a);
+            try self.tool_calls.append(self.alloc, tc);
+        } else {
+            const tc = &self.tool_calls.items[slot.?];
+            if (id) |tcid| {
+                if (tc.id.items.len == 0) try tc.id.appendSlice(self.alloc, tcid);
+            }
+            if (name) |n| {
+                if (tc.name.items.len == 0) try tc.name.appendSlice(self.alloc, n);
+            }
+            if (args) |a| {
+                if (a.len > 0) {
+                    tc.args.clearRetainingCapacity();
+                    try tc.args.appendSlice(self.alloc, a);
+                }
+            }
         }
     }
 
@@ -1245,5 +1298,89 @@ test "openai stream: Responses API event-based streaming parse" {
     try testing.expectEqual(@as(u64, 120), ctx.response.usage.prompt_tokens);
     try testing.expectEqual(@as(u64, 60), ctx.response.usage.completion_tokens);
     try testing.expectEqual(@as(u64, 180), ctx.response.usage.total_tokens);
+}
+
+test "openai auto-negotiation: buildResponsesRequestBody multi-turn with function_call and tool_result" {
+    const alloc = testing.allocator;
+    const msgs = [_]proto.Message{
+        .{
+            .role = .user,
+            .content = &.{
+                .{ .text = "Liệt kê files" },
+            },
+        },
+        .{
+            .role = .assistant,
+            .content = &.{
+                .{ .text = "Tôi sẽ chạy lệnh ls." },
+                .{ .tool_use = .{ .id = "call_abc123", .name = "bash", .input_json = "{\"command\":\"ls\"}" } },
+            },
+        },
+        .{
+            .role = .user,
+            .content = &.{
+                .{ .tool_result = .{ .tool_use_id = "call_abc123", .content = "main.zig\nbuild.zig", .is_error = false } },
+            },
+        },
+    };
+    const tools = [_]proto.ToolDefinition{
+        .{ .name = "bash", .description = "Run shell", .input_schema_json = "{\"type\":\"object\"}" },
+    };
+
+    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-luna", 4096, false, "System prompt", &msgs, &tools);
+    defer alloc.free(body);
+
+    // Kiểm tra đã phát sinh đúng format input: user msg -> assistant text -> assistant function_call -> function_call_output
+    try testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"user\",\"content\":\"Liệt kê files\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"assistant\",\"content\":\"Tôi sẽ chạy lệnh ls.\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "{\"type\":\"function_call\",\"call_id\":\"call_abc123\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "{\"type\":\"function_call_output\",\"call_id\":\"call_abc123\",\"output\":\"main.zig\\nbuild.zig\"}") != null);
+}
+
+test "openai stream: Responses API output_item.added and output_item.done does not duplicate arguments" {
+    const alloc = testing.allocator;
+    var resp = proto.Response.init(alloc);
+    defer resp.deinit();
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = resp,
+        .line_buf = .empty,
+        .tool_calls = .empty,
+    };
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.tool_calls.deinit(alloc);
+
+    try feedLines(&ctx, &.{
+        \\event: response.output_item.added
+        ,
+        \\data: {"output_index":0,"item":{"id":"item_1","type":"function_call","call_id":"call_test_1","name":"bash","arguments":""}}
+        ,
+        \\event: response.function_call_arguments.delta
+        ,
+        \\data: {"output_index":0,"call_id":"call_test_1","delta":"{\"command\":"}
+        ,
+        \\event: response.function_call_arguments.delta
+        ,
+        \\data: {"output_index":0,"call_id":"call_test_1","delta":"\"ls\"}"}
+        ,
+        \\event: response.output_item.done
+        ,
+        \\data: {"output_index":0,"item":{"id":"item_1","type":"function_call","call_id":"call_test_1","name":"bash","arguments":"{\"command\":\"ls\"}"}}
+        ,
+        \\event: response.done
+        ,
+        \\data: {"response":{"usage":{"input_tokens":50,"output_tokens":20,"total_tokens":70}}}
+    });
+
+    try ctx.finalizeToolCalls();
+
+    try testing.expectEqual(proto.StopReason.tool_use, ctx.response.stop_reason);
+    try testing.expectEqual(@as(usize, 1), ctx.response.content.items.len);
+
+    const tu = ctx.response.content.items[0].tool_use;
+    try testing.expectEqualStrings("bash", tu.name);
+    try testing.expectEqualStrings("call_test_1", tu.id);
+    // Phải là {"command":"ls"} duy nhất, không bị nhân đôi thành {"command":"ls"}{"command":"ls"}
+    try testing.expectEqualStrings("{\"command\":\"ls\"}", tu.input_json);
 }
 
