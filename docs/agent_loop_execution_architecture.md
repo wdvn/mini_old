@@ -1,10 +1,10 @@
 # Kiến Trúc Vòng Lặp Xử Lý Của Agent (Agent Loop Execution Architecture)
 
-Tài liệu này mô tả chi tiết và trực quan toàn bộ luồng thực thi của **1 Vòng lặp Agent (1 Turn / Multi-Act Loop)** trong `mini-agent` — từ lúc tiếp nhận User Prompt cho đến khi hoàn thành nhiệm vụ và quay về trạng thái nhàn rỗi (REPL Idle) hoặc thoát tiến trình.
+Tài liệu này mô tả chi tiết và trực quan toàn bộ luồng thực thi của **1 Vòng lặp Agent (1 Turn / Multi-Act Loop)** trong `mini-agent` — từ lúc tiếp nhận User Prompt, phân giải đa tầng, thực thi công cụ đơn lẻ cho đến **Mô hình Quy nạp Đệ quy Đa tầng (Hierarchical / Recursive Sub-agent Execution Tree)**.
 
 ---
 
-## 1. Sơ đồ Luồng Tổng Thể (End-to-End Execution Flowchart)
+## 1. Sơ đồ Luồng Tổng Thể Của 1 Vòng Lặp (End-to-End Execution Flowchart)
 
 ```mermaid
 flowchart TD
@@ -40,16 +40,19 @@ flowchart TD
         
         Classify -- "Lỗi Auth / Max Retries" --> AbortAct["Ghi act_failed -> Rollback CAS Snapshot -> Dừng Turn"]
         
-        %% Nhánh Native Tool Calling
-        Classify -- "stop_reason = tool_use" --> ExecNative["Thực thi Native Tool: bash, subagent, session_diagnostics, file..."]
-        ExecNative --> SnapshotCAS["Tạo CAS Snapshot cho file sửa đổi"]
-        SnapshotCAS --> AddToolResult["Thêm tool_result vào History"]
-        AddToolResult --> JournalActDone["Ghi Journal: act_completed & Log Act Replay JSON"]
-        
-        %% Nhánh CodeAct JS Execution
+        %% Nhánh Thực Thi Công Cụ
+        Classify -- "stop_reason = tool_use (Leaf Tool)" --> ExecLeaf["Thực thi Công cụ đơn (bash, grep, file_read, session_diag...)"]
+        Classify -- "stop_reason = tool_use (Sub-Agent Tool)" --> ExecSubTree["QUY NẠP ĐA TẦNG: Spawn Tiến trình Con (invoke_subagent / batch)"]
         Classify -- "stop_reason = end_turn + Có block JS" --> ExecJS["Thực thi JS trong QuickJS VM nhúng (Object mini.*)"]
+        
+        ExecLeaf --> SnapshotCAS["Tạo CAS Snapshot cho file sửa đổi"]
+        ExecSubTree --> CollectSubOut["Thu thập kết quả từ Pipe của Sub-Agent"]
         ExecJS --> AddJSResult["Thêm CodeAct stdout / return value / error vào History"]
-        AddJSResult --> JournalActDone
+        
+        SnapshotCAS --> AddToolResult["Thêm tool_result vào History"]
+        CollectSubOut --> AddToolResult
+        AddJSResult --> JournalActDone["Ghi Journal: act_completed & Log Act Replay JSON"]
+        AddToolResult --> JournalActDone
         
         %% Nhánh Kết thúc Turn
         Classify -- "stop_reason = end_turn + KHÔNG gọi tool/JS" --> TaskCompleted["Ghi Journal: act_completed & task_completed -> Thoát Vòng Lặp"]
@@ -65,7 +68,7 @@ flowchart TD
 
 ---
 
-## 2. Trình Tự Thực Thi Chi Tiết Từng Bước (Detailed Sequence Diagram)
+## 2. Trình Tự Thực Thi 1 Turn Đơn Cấp (Single-Level Sequence Diagram)
 
 ```mermaid
 sequenceDiagram
@@ -144,21 +147,127 @@ sequenceDiagram
 
 ---
 
-## 3. Các Trạng Thái Vòng Lặp & Ý Nghĩa Telemetry
+## 3. Mô Hình Quy Nạp Đa Tầng (Recursive / Inductive Sub-Agent Tree)
+
+Một công cụ như `invoke_subagent` hay `batch_invoke_subagents` **không phải là một hàm lá (Leaf Tool)**, mà là một **Node trung gian sinh cây con (Subtree Generator)**. Mỗi subagent sinh ra một tiến trình độc lập và khởi chạy một vòng lặp `AgentLoop` đệ quy hoàn chỉnh.
+
+### A. Sơ đồ Cây Thực Thi Đa Tầng (Execution Tree)
+
+```mermaid
+graph TD
+    User([User Prompt]) --> RootAgent["Parent AgentLoop (PID: 1000, Depth: 0)"]
+    
+    RootAgent -->|Act 1: tool_use| Sub1["Sub-agent 1 (PID: 1001, Depth: 1)\nTask: 'Điều tra log và trace code'"]
+    RootAgent -->|Act 2: tool_use| Sub2["Sub-agent 2 (PID: 1002, Depth: 1)\nTask: 'Chạy benchmark & refactor'"]
+    RootAgent -->|Act 3: text| FinalResponse["Final Synthesized Answer to User"]
+
+    %% Cây con của Subagent 1
+    Sub1 -->|Sub-Act 1| Leaf1["Leaf Tool: grep 'error' src/"]
+    Sub1 -->|Sub-Act 2| Leaf2["Leaf Tool: file_read src/core/agent.zig"]
+    Sub1 -->|Sub-Act 3| SubReport1["Sub-agent 1 Result (stdout blob)"]
+
+    %% Cây con của Subagent 2
+    Sub2 -->|Sub-Act 1| Leaf3["Leaf Tool: bash 'zig build test'"]
+    Sub2 -->|Sub-Act 2| Leaf4["CodeAct QuickJS: mini.patch(...)"]
+    Sub2 -->|Sub-Act 3| SubReport2["Sub-agent 2 Result (stdout blob)"]
+
+    SubReport1 -->|Pipe stdout| RootAgent
+    SubReport2 -->|Pipe stdout| RootAgent
+```
+
+---
+
+### B. Sơ đồ Tuần Tự Quy Nạp Đệ Quy (Inductive Recursive Sequence Diagram)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Người dùng
+    participant ParentREPL as Parent UI / REPL (Depth 0)
+    participant ParentAgent as Parent AgentLoop (Depth 0, PID 1000)
+    participant SubTool as Subagent Tool Wrapper (src/tools/subagent.zig)
+    participant ChildAgent as Child AgentLoop (Depth 1, PID 1001)
+    participant ChildBackend as Child AI Backend
+    participant LeafTools as Leaf Tools (grep, bash, file_write)
+
+    User->>ParentREPL: Prompt phức tạp (vd: "Điều tra lỗi crash và sửa code")
+    ParentREPL->>ParentAgent: processInput()
+    
+    rect rgb(240, 248, 255)
+        Note over ParentAgent,SubTool: PARENT ACT 1 (Ủy quyền tác vụ con)
+        ParentAgent->>ParentAgent: Backend gọi tool `invoke_subagent`
+        ParentAgent->>ParentREPL: startTool("invoke_subagent", "task: 'Trace bug'")
+        ParentREPL-->>User: Render: "⚡ invoke_subagent (Task: Trace bug)"
+        ParentAgent->>SubTool: executeTool("invoke_subagent", task_json)
+        
+        SubTool->>SubTool: Kiểm tra Guard: MINI_SUBAGENT_DEPTH (0 < 2)
+        SubTool->>ChildAgent: spawn("mini", ["-e", task], env: {DEPTH: 1, QUIET: 1})
+    end
+
+    rect rgb(255, 250, 240)
+        Note over ChildAgent,LeafTools: VÒNG LẶP CON (CHILD AGENT LOOP - Depth 1)
+        Note right of ChildAgent: Khởi tạo History, Journal_1001.jsonl, CAS riêng
+        ChildAgent->>ChildBackend: sendMessage(history)
+        ChildBackend-->>ChildAgent: Response { stop_reason: .tool_use, tool: "grep" }
+        ChildAgent->>LeafTools: executeTool("grep", "query: 'panic'")
+        LeafTools-->>ChildAgent: "Found in line 42"
+        
+        ChildAgent->>ChildBackend: sendMessage(history + tool_result)
+        ChildBackend-->>ChildAgent: Response { stop_reason: .tool_use, tool: "bash" }
+        ChildAgent->>LeafTools: executeTool("bash", "zig build test")
+        LeafTools-->>ChildAgent: "All tests pass"
+        
+        ChildAgent->>ChildBackend: sendMessage(history + tool_result)
+        ChildBackend-->>ChildAgent: Response { stop_reason: .end_turn, content: "Báo cáo: Bug tại dòng 42 đã được vá." }
+        ChildAgent-->>SubTool: In báo cáo ra stdout & exit(0)
+    end
+
+    rect rgb(240, 248, 255)
+        Note over ParentAgent,SubTool: PARENT ACT 1 (Nhận kết quả quy nạp & tiếp tục)
+        SubTool->>SubTool: Đọc toàn bộ stdout pipe từ ChildAgent
+        SubTool-->>ParentAgent: Trả về stdout blob ("Báo cáo: Bug tại dòng 42...")
+        ParentAgent->>ParentREPL: finishTool("invoke_subagent", child_stdout)
+        ParentREPL-->>User: Render: "✓ Hoàn thành (1.8s)" + preview kết quả con
+        ParentAgent->>ParentAgent: Thêm `tool_result` vào Parent History
+    end
+
+    rect rgb(240, 255, 240)
+        Note over ParentAgent,ParentREPL: PARENT ACT 2 (Tổng hợp kết quả cuối cùng)
+        ParentAgent->>ParentREPL: streamTextResponse()
+        ParentREPL-->>User: Render Markdown Streaming: "Tôi đã cho subagent điều tra và hoàn tất sửa lỗi..."
+    end
+```
+
+---
+
+## 4. Cơ Chế Cách Ly & Tổng Hợp Stream Đa Tầng (Stream Aggregation & Isolation)
+
+| Khía cạnh | Tiến trình Cha (Parent - Depth $d$) | Tiến trình Con (Subagent - Depth $d+1$) |
+|---|---|---|
+| **PID & Process** | Chạy interactive REPL hoặc CLI chính. | Subprocess độc lập được spawn qua `std.process.spawn`. |
+| **History & Context** | Quản lý hội thoại chính với người dùng. | Context cục bộ chỉ phục vụ riêng `task` được giao. |
+| **Event Sourcing Journal** | `~/.mini/sessions/journal_<parent_pid>.jsonl` | `~/.mini/sessions/journal_<child_pid>.jsonl` độc lập. |
+| **Telemetry & State** | `executing_act` $\to$ `idle_waiting_input`. | `executing_act` $\to$ `completed` (exit 0). |
+| **Stream UI & Output** | Render trực tiếp ra Terminal (Thinking, Tools, Markdown). | `stdout`/`stderr` được chuyển hướng vào Pipe; banner khởi động bị dập tắt (`QUIET=1`). Kết quả cuối cùng được rollup vào `tool_result` của Cha. |
+| **Depth Guard** | Kiểm tra `depth < max_depth` (mặc định $\le 2$). | Tự động tăng `MINI_SUBAGENT_DEPTH = d + 1`. Chặn fork bomb đệ quy. |
+
+---
+
+## 5. Các Trạng Thái Vòng Lặp & Ý Nghĩa Telemetry
 
 Khi kiểm tra tiến trình qua tool `session_diagnostics` hoặc file journal `~/.mini/sessions/journal_<pid>.jsonl`, trạng thái của tiến trình được định nghĩa chuẩn xác như sau:
 
 | State | Event cuối | Trạng thái OS | Ý nghĩa nghiệp vụ |
 |---|---|---|---|
 | `idle_waiting_input` | `task_completed` | `ALIVE` (`anon_pipe_read`) | **Tiến trình REPL đang rảnh**, đã trả lời xong và đang đứng chờ người dùng gõ câu lệnh tiếp theo tại dấu nhắc `You > `. |
-| `executing_act` | `act_started` | `ALIVE` | Đang gửi request lên LLM backend (chờ streaming) hoặc đang chạy Tool (bash, subagent...). |
+| `executing_act` | `act_started` | `ALIVE` | Đang gửi request lên LLM backend (chờ streaming) hoặc đang chạy Tool / Sub-agent. |
 | `between_acts` | `act_completed` | `ALIVE` | Vừa thực thi xong 1 Act, đang chuẩn bị chuyển ngữ cảnh sang Act tiếp theo. |
 | `completed` | `task_completed` | `DEAD` (Exit 0) | Tiến trình subagent hoặc single-shot `-e` đã hoàn thành toàn bộ công việc và tự thoát an toàn. |
 | `crashed` / `failed`| `act_failed` | `DEAD` / `ALIVE` | Gặp lỗi terminal (xác thực, sập mạng, syntax crash không thể retry). |
 
 ---
 
-## 4. Các Chốt Chặn An Toàn & Khả Năng Tự Phục Hồi (Resilience & Guards)
+## 6. Các Chốt Chặn An Toàn & Khả Năng Tự Phục Hồi (Resilience & Guards)
 
 1. **Subagent Depth Guard (`src/tools/subagent.zig`)**:
    - Kiểm tra `MINI_SUBAGENT_DEPTH <= MINI_MAX_SUBAGENT_DEPTH` (mặc định = 2).
