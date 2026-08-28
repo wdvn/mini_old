@@ -8,50 +8,59 @@ Tài liệu này mô tả chi tiết và trực quan toàn bộ luồng thực t
 
 ```mermaid
 flowchart TD
-    Start([User Input: REPL / CLI -e]) --> InitTurn[Bắt đầu Turn mới: Reset Turn Metrics & State]
-    InitTurn --> AddUserHistory[Thêm User Message vào History]
+    Start(["User Input (REPL / CLI -e)"]) --> InitTurn["Khởi tạo Turn mới: Reset Metrics & Allocator"]
+    InitTurn --> AddUserHist["Thêm User Message vào History"]
+    AddUserHist --> CheckMemAct{"Context Tokens > Threshold?"}
     
+    CheckMemAct -- "YES" --> ProactiveCompact["MemAct: Tóm tắt lịch sử & nén ngữ cảnh chủ động"]
+    CheckMemAct -- "NO" --> EnterLoop
+    ProactiveCompact --> EnterLoop
+
     subgraph ActLoop ["VÒNG LẶP ACT (while true : act_id += 1)"]
         direction TB
-        CheckInterrupted{Người dùng Ctrl+C?}
-        CheckInterrupted -- YES --> HandleInterrupt[Ghi journal: task_interrupted --> Thoát Turn]
-        CheckInterrupted -- NO --> CheckCompaction{Context Tokens > Threshold?}
+        EnterLoop(["Bắt đầu Act"]) --> CheckSignal{"Người dùng nhấn Ctrl+C?"}
         
-        CheckCompaction -- YES --> DoCompaction[MemAct: Tóm tắt lịch sử & drop intermediate messages]
-        CheckCompaction -- NO --> SanitizeHistory[Vệ sinh History 2 chiều: ensureOpenAICompatible / ensureClaudeCompatible]
-        DoCompaction --> SanitizeHistory
+        CheckSignal -- "YES" --> SigInt["Ghi journal: task_interrupted -> Dừng Turn"]
+        CheckSignal -- "NO" --> JournalStart["Ghi Journal: act_started"]
         
-        SanitizeHistory --> FilterTools[Lọc danh sách Tools phù hợp theo execution_mode]
-        FilterTools --> JournalStart[Ghi Journal: act_started]
-        JournalStart --> SendBackend[Gửi Request lên LLM Backend qua SSE Stream]
+        JournalStart --> Sanitize["Vệ sinh History 2 chiều: ensureOpenAICompatible / ensureClaudeCompatible"]
+        Sanitize --> FilterTools["Lọc Tool Definitions theo execution_mode (codeact / tools / auto)"]
+        FilterTools --> SendBackend["Gửi Request lên AI Backend (SSE Streaming)"]
         
-        SendBackend --> StreamUI[Stream Realtime: Thinking, Text, Tool Call Progress]
-        StreamUI --> ClassifyResponse{Phân loại LLM Response}
+        SendBackend --> StreamUI["Stream UI Realtime: Reasoning/Thinking, Markdown Text, Tool Preview"]
+        StreamUI --> AddAssistantHist["Thêm Assistant Response vào History"]
+        AddAssistantHist --> Classify{"Phân loại Response & Stop Reason"}
         
-        %% Nhánh Lỗi Backend
-        ClassifyResponse -- "Lỗi 429 / 5xx" --> RetryBackoff[Exponential Backoff Retry & Record Error]
+        %% Nhánh Lỗi Backend & Phục Hồi
+        Classify -- "Lỗi 429 RateLimit / 5xx" --> RetryBackoff["Ghi llm_call_throttled / provider_error -> Exponential Backoff Sleep -> Retry Act"]
         RetryBackoff --> SendBackend
-        ClassifyResponse -- "Lỗi Context Limit (400)" --> ForceCompact[MemAct Compaction khẩn cấp]
+        
+        Classify -- "Lỗi 400 Context Overflow" --> ForceCompact["Ghi llm_context_overflow -> Kích hoạt MemAct nén khẩn cấp -> Retry Act"]
         ForceCompact --> SendBackend
-        ClassifyResponse -- "Lỗi Auth / Terminal" --> AbortAct[Ghi journal: act_failed & CAS Rollback --> Dừng Turn]
         
-        %% Nhánh Thực Thi Nghiệp Vụ
-        ClassifyResponse -- "stop_reason = tool_use" --> ExecNativeTools[Thực thi Native Tool: bash, subagent, session_diagnostics...]
-        ClassifyResponse -- "stop_reason = end_turn + có CodeAct JS" --> ExecCodeAct[Thực thi CodeAct JS trong QuickJS VM nhúng]
-        ClassifyResponse -- "stop_reason = end_turn + KHÔNG gọi tool" --> TaskFinished[Hoàn thành toàn bộ nhiệm vụ: Ghi task_completed]
+        Classify -- "Lỗi Auth / Max Retries" --> AbortAct["Ghi act_failed -> Rollback CAS Snapshot -> Dừng Turn"]
         
-        ExecNativeTools --> AddToolResult[Thêm Tool Result vào History]
-        ExecCodeAct --> AddCodeActResult[Thêm CodeAct stdout/result vào History]
+        %% Nhánh Native Tool Calling
+        Classify -- "stop_reason = tool_use" --> ExecNative["Thực thi Native Tool: bash, subagent, session_diagnostics, file..."]
+        ExecNative --> SnapshotCAS["Tạo CAS Snapshot cho file sửa đổi"]
+        SnapshotCAS --> AddToolResult["Thêm tool_result vào History"]
+        AddToolResult --> JournalActDone["Ghi Journal: act_completed & Log Act Replay JSON"]
         
-        AddToolResult --> JournalActDone[Ghi Journal: act_completed & Log Act Replay]
-        AddCodeActResult --> JournalActDone
-        JournalActDone --> NextAct[Tiếp tục vòng lặp: act_id += 1]
-        NextAct --> CheckInterrupted
+        %% Nhánh CodeAct JS Execution
+        Classify -- "stop_reason = end_turn + Có block JS" --> ExecJS["Thực thi JS trong QuickJS VM nhúng (Object mini.*)"]
+        ExecJS --> AddJSResult["Thêm CodeAct stdout / return value / error vào History"]
+        AddJSResult --> JournalActDone
+        
+        %% Nhánh Kết thúc Turn
+        Classify -- "stop_reason = end_turn + KHÔNG gọi tool/JS" --> TaskCompleted["Ghi Journal: act_completed & task_completed -> Thoát Vòng Lặp"]
+        
+        JournalActDone --> NextAct(["Chuyển sang Act tiếp theo: act_id += 1"])
+        NextAct --> EnterLoop
     end
-    
-    TaskFinished --> CheckMode{Chế độ Chạy?}
-    CheckMode -- "Interactive REPL (mini)" --> WaitStdin[Quay về dấu nhắc 'You > ' và gọi read(stdin) - State: idle_waiting_input]
-    CheckMode -- "Single-shot / Subagent (mini -e)" --> ExitProcess([exit 0 - Kết thúc tiến trình])
+
+    TaskCompleted --> CheckExecMode{"Chế độ Chạy?"}
+    CheckExecMode -- "Interactive REPL (mini)" --> WaitStdin["In prompt 'You > ' và chờ bàn phím: read(stdin) (Trạng thái: idle_waiting_input)"]
+    CheckExecMode -- "Single-shot / Subagent (mini -e)" --> ExitProcess(["exit 0 - Kết thúc tiến trình (Trạng thái: completed)"])
 ```
 
 ---
@@ -68,46 +77,54 @@ sequenceDiagram
     participant Back as AI Backend (OpenAI / Claude / Ollama)
     participant Tool as Tooling / CodeAct VM (registry.zig / QuickJS)
     participant Jour as ActJournal & CAS (journal.zig / cas.zig)
+    participant ActLog as Act Logger (src/core/act_logger.zig)
 
-    User->>REPL: Nhập prompt (vd: "Kiểm tra tiến trình và tối ưu mã")
+    User->>REPL: Nhập prompt (vd: "Kiểm tra hệ thống và chạy tests")
     REPL->>Loop: processInput(user_text, text_cb, think_cb)
     Loop->>Hist: addUser(user_text)
+    Loop->>Hist: compactContext(act_id) [Kiểm tra & nén chủ động nếu vượt token]
 
     rect rgb(240, 248, 255)
-        Note over Loop,Jour: VÒNG LẶP ACT 1 (Khảo sát & Phân tích)
-        Loop->>Hist: ensureOpenAICompatible() (Vệ sinh orphan tool_use/tool_result)
+        Note over Loop,ActLog: VÒNG LẶP ACT 1 (Khảo sát qua Tool)
         Loop->>Jour: recordEvent(act_id=1, "act_started")
+        Loop->>Hist: ensureOpenAICompatible() [Vệ sinh orphan tool blocks]
         Loop->>Back: sendMessage(stream=true, system_prompt, history, tools)
-        Back-->>REPL: SSE Chunks: reasoning/thinking
-        Back-->>REPL: SSE Chunks: output_text hoặc tool_call.delta
+        Back-->>REPL: SSE chunks: reasoning / thinking
+        Back-->>REPL: SSE chunks: tool_call (name: "session_diagnostics", args: "{\"operation\":\"list\"}")
         Back-->>Loop: Response { stop_reason: .tool_use, tool_calls: [session_diagnostics] }
+        Loop->>Hist: addAssistantResponse(&response)
         
-        Loop->>Tool: executeTool("session_diagnostics", input_json)
+        Loop->>Tool: executeTool("session_diagnostics", "{\"operation\":\"list\"}")
         Tool-->>Loop: output: "[Bảng trạng thái sessions...]"
         Loop->>Hist: addToolResult(call_id, output)
         Loop->>Jour: recordEvent(act_id=1, "act_completed", snapshots)
+        Loop->>ActLog: logAct(act_1.json)
     end
 
     rect rgb(255, 250, 240)
-        Note over Loop,Jour: VÒNG LẶP ACT 2 (Thực thi Tool tiếp theo hoặc Viết mã)
+        Note over Loop,ActLog: VÒNG LẶP ACT 2 (Thực thi Lệnh Shell)
         Loop->>Jour: recordEvent(act_id=2, "act_started")
         Loop->>Back: sendMessage(stream=true, history)
         Back-->>Loop: Response { stop_reason: .tool_use, tool_calls: [bash] }
-        Loop->>Tool: executeTool("bash", "zig build test")
-        Tool-->>Loop: output: "All tests passed"
+        Loop->>Hist: addAssistantResponse(&response)
+        
+        Loop->>Tool: executeTool("bash", "{\"command\":\"zig build test\"}")
+        Tool-->>Loop: output: "All 140 tests passed"
         Loop->>Hist: addToolResult(call_id, output)
         Loop->>Jour: recordEvent(act_id=2, "act_completed")
+        Loop->>ActLog: logAct(act_2.json)
     end
 
     rect rgb(240, 255, 240)
-        Note over Loop,Jour: VÒNG LẶP ACT 3 (Tổng kết câu trả lời)
+        Note over Loop,ActLog: VÒNG LẶP ACT 3 (Trả Lời Hoàn Tất)
         Loop->>Jour: recordEvent(act_id=3, "act_started")
         Loop->>Back: sendMessage(stream=true, history)
-        Back-->>REPL: SSE Stream Text: "Đã kiểm tra xong hệ thống..."
+        Back-->>REPL: SSE Stream Text: "Đã kiểm tra xong: 140/140 tests đều đạt."
         Back-->>Loop: Response { stop_reason: .end_turn, content: [text] }
-        Loop->>Hist: addAssistantResponse(text)
+        Loop->>Hist: addAssistantResponse(&response)
         Loop->>Jour: recordEvent(act_id=3, "act_completed")
         Loop->>Jour: recordEvent(act_id=3, "task_completed")
+        Loop->>ActLog: logAct(act_3.json)
     end
 
     alt Chế độ Interactive REPL
