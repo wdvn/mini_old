@@ -71,68 +71,74 @@ flowchart TD
 sequenceDiagram
     autonumber
     actor User as Người dùng
-    participant REPL as UI / REPL (editor.zig / repl.zig)
+    participant REPL as UI / REPL (ui/repl.zig & chat_stream.zig)
     participant Loop as AgentLoop (src/core/agent.zig)
-    participant Hist as History & MemAct (src/core/history.zig)
+    participant Hist as History & MemAct (core/history.zig & memact/)
     participant Back as AI Backend (OpenAI / Claude / Ollama)
-    participant Tool as Tooling / CodeAct VM (registry.zig / QuickJS)
-    participant Jour as ActJournal & CAS (journal.zig / cas.zig)
-    participant ActLog as Act Logger (src/core/act_logger.zig)
+    participant Tool as Tool Registry / CodeAct VM (registry.zig / QuickJS)
+    participant Jour as ActJournal & CAS (core/journal.zig & cas.zig)
+    participant ActLog as Act Logger (core/act_logger.zig)
 
     User->>REPL: Nhập prompt (vd: "Kiểm tra hệ thống và chạy tests")
     REPL->>Loop: processInput(user_text, text_cb, think_cb)
     Loop->>Hist: addUser(user_text)
-    Loop->>Hist: compactContext(act_id) [Kiểm tra & nén chủ động nếu vượt token]
+    Loop->>Hist: compactContext() (Kiểm tra MemAct nén chủ động nếu vượt token)
 
     rect rgb(240, 248, 255)
-        Note over Loop,ActLog: VÒNG LẶP ACT 1 (Khảo sát qua Tool)
+        Note over Loop,ActLog: VÒNG LẶP ACT 1 (Khảo sát qua Native Tool Calling)
         Loop->>Jour: recordEvent(act_id=1, "act_started")
-        Loop->>Hist: ensureOpenAICompatible() [Vệ sinh orphan tool blocks]
+        Loop->>Hist: ensureOpenAICompatible() (Vệ sinh orphan tool blocks 2 chiều)
         Loop->>Back: sendMessage(stream=true, system_prompt, history, tools)
-        Back-->>REPL: SSE chunks: reasoning / thinking
-        Back-->>REPL: SSE chunks: tool_call (name: "session_diagnostics", args: "{\"operation\":\"list\"}")
-        Back-->>Loop: Response { stop_reason: .tool_use, tool_calls: [session_diagnostics] }
+        Back-->>REPL: SSE chunks: reasoning / thinking -> streamThinking()
+        Back-->>REPL: SSE chunks: tool_call -> startTool("session_diagnostics")
+        REPL-->>User: Render realtime Thinking & Tool Header (⚡ session_diagnostics list)
+        Back-->>Loop: Response (stop_reason: .tool_use, tool_calls: [session_diagnostics])
         Loop->>Hist: addAssistantResponse(&response)
         
         Loop->>Tool: executeTool("session_diagnostics", "{\"operation\":\"list\"}")
-        Tool-->>Loop: output: "[Bảng trạng thái sessions...]"
+        Tool-->>Loop: Tool output string (Bảng trạng thái sessions)
+        Loop->>REPL: finishTool("session_diagnostics", output) -> Preview tối đa 3 dòng
+        REPL-->>User: Render "✓ Hoàn thành (5ms)" + output preview
         Loop->>Hist: addToolResult(call_id, output)
-        Loop->>Jour: recordEvent(act_id=1, "act_completed", snapshots)
+        Loop->>Jour: recordEvent(act_id=1, "act_completed")
         Loop->>ActLog: logAct(act_1.json)
     end
 
     rect rgb(255, 250, 240)
-        Note over Loop,ActLog: VÒNG LẶP ACT 2 (Thực thi Lệnh Shell)
+        Note over Loop,ActLog: VÒNG LẶP ACT 2 (Thực thi CodeAct JS trong QuickJS VM)
         Loop->>Jour: recordEvent(act_id=2, "act_started")
         Loop->>Back: sendMessage(stream=true, history)
-        Back-->>Loop: Response { stop_reason: .tool_use, tool_calls: [bash] }
+        Back-->>REPL: SSE chunks: JS Code Block (```javascript mini.sh(...)```)
+        Back-->>Loop: Response (stop_reason: .end_turn, contains JS code block)
         Loop->>Hist: addAssistantResponse(&response)
         
-        Loop->>Tool: executeTool("bash", "{\"command\":\"zig build test\"}")
-        Tool-->>Loop: output: "All 140 tests passed"
-        Loop->>Hist: addToolResult(call_id, output)
-        Loop->>Jour: recordEvent(act_id=2, "act_completed")
+        Loop->>Tool: engine.eval(js_code) -> QuickJS VM (mini.sh, CAS Snapshot)
+        Tool-->>Loop: Execution output (stdout, return value)
+        Loop->>REPL: finishTool("codeact", stdout) -> Preview rolling 3 dòng
+        Loop->>Hist: addUser("[CodeAct Output]: " + stdout)
+        Loop->>Jour: recordEvent(act_id=2, "act_completed", snapshots)
         Loop->>ActLog: logAct(act_2.json)
     end
 
     rect rgb(240, 255, 240)
-        Note over Loop,ActLog: VÒNG LẶP ACT 3 (Trả Lời Hoàn Tất)
+        Note over Loop,ActLog: VÒNG LẶP ACT 3 (Trả Lời Hoàn Tất & Kết Thúc Turn)
         Loop->>Jour: recordEvent(act_id=3, "act_started")
         Loop->>Back: sendMessage(stream=true, history)
-        Back-->>REPL: SSE Stream Text: "Đã kiểm tra xong: 140/140 tests đều đạt."
-        Back-->>Loop: Response { stop_reason: .end_turn, content: [text] }
+        Back-->>REPL: SSE chunks: Markdown Text -> streamTextResponse()
+        REPL-->>User: Render Markdown Streaming (Syntax Highlighted)
+        Back-->>Loop: Response (stop_reason: .end_turn, content: [text], KHÔNG gọi tool/JS)
         Loop->>Hist: addAssistantResponse(&response)
         Loop->>Jour: recordEvent(act_id=3, "act_completed")
         Loop->>Jour: recordEvent(act_id=3, "task_completed")
         Loop->>ActLog: logAct(act_3.json)
     end
 
-    alt Chế độ Interactive REPL
-        Loop-->>REPL: Hoàn thành Turn (Return)
-        REPL->>User: In prompt "You > " và chờ stdin (anon_pipe_read)
-    else Chế độ Subagent / Single-shot (-e)
+    alt Chế độ Interactive REPL (mini)
+        Loop-->>REPL: Hoàn thành Turn (Return về vòng lặp REPL)
+        REPL->>User: In dấu nhắc "You > " và chờ stdin (read(stdin) - State: idle_waiting_input)
+    else Chế độ Subagent / Single-shot (mini -e)
         Loop-->>REPL: Thoát tiến trình
-        REPL->>User: exit(0)
+        REPL->>User: exit(0) (Trạng thái: completed)
     end
 ```
 
