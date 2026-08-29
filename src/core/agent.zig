@@ -1091,12 +1091,6 @@ pub const AgentLoop = struct {
                             } else {
                                 main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
                             }
-                        } else if (std.mem.eql(u8, tu.name, "web_search")) {
-                            if (json_mod.findString(tu.input_json, "query")) |query| {
-                                main.stderrPrint("\x1b[90m[search]\x1b[0m \x1b[32m{s}\x1b[0m ", .{query});
-                            } else {
-                                main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
-                            }
                         } else if (std.mem.eql(u8, tu.name, "codeact")) {
                             main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting CodeAct script...\x1b[0m ", .{});
                         } else {
@@ -1232,7 +1226,7 @@ pub fn convertXmlToolTagsToJs(alloc: Allocator, text: []const u8) ?[]const u8 {
         const tag_start = std.mem.indexOfPos(u8, text, pos, "<") orelse break;
         pos = tag_start + 1;
 
-        const tag_names = [_][]const u8{ "file_read", "glob", "grep", "bash", "file_write", "file_edit", "http_request", "web_search" };
+        const tag_names = [_][]const u8{ "file_read", "glob", "grep", "bash", "file_write", "file_edit", "http_request" };
         var matched_tag: ?[]const u8 = null;
         for (tag_names) |tn| {
             if (std.mem.startsWith(u8, text[tag_start + 1 ..], tn)) {

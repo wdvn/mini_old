@@ -15,7 +15,7 @@
 //!   - Allowlist có ưu tiên cao hơn blocklist
 //!
 //! ## Core tools (luôn gửi lên API)
-//! bash, file_read, file_write, file_edit, glob, grep, http_request, web_search, skills
+//! bash, file_read, file_write, file_edit, glob, grep, http_request, skills
 //!
 //! ## Extended tools (gửi theo keyword match)
 //! Xem `extended_triggers` bên dưới.
@@ -31,8 +31,6 @@ const file_tool = @import("../tools/file.zig");
 const glob_tool = @import("../tools/glob.zig");
 const grep_tool = @import("../tools/grep.zig");
 const http_tool = @import("../tools/http.zig");
-const search_tool = @import("../tools/search.zig");
-const browser_tool = @import("../tools/browser.zig");
 const subagent = @import("../tools/subagent.zig");
 const batch_subagent = @import("../tools/batch_subagent.zig");
 const artifact_tool = @import("../tools/artifact.zig");
@@ -83,8 +81,6 @@ fn executeToolInternal(alloc: Allocator, io: std.Io, name: []const u8, input_jso
     if (std.mem.eql(u8, name, "glob"))          return glob_tool.executeTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "grep"))          return grep_tool.executeTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "http_request"))  return http_tool.executeTool(alloc, input_json);
-    if (std.mem.eql(u8, name, "web_search"))    return search_tool.executeTool(alloc, input_json);
-    if (std.mem.eql(u8, name, "browser"))       return browser_tool.executeTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "invoke_subagent")) return subagent.executeTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "batch_invoke_subagents")) return batch_subagent.executeTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "artifact_write")) return artifact_tool.writeTool(alloc, io, input_json);
@@ -228,18 +224,6 @@ pub const definitions = [_]proto.ToolDefinition{
         ,
     },
     .{
-        .name = "web_search",
-        .description = "Tìm kiếm web qua DuckDuckGo. Trả về tiêu đề, URL và snippet. Không cần API key.",
-        .input_schema_json = \\{"type":"object","properties":{"query":{"type":"string","description":"Câu tìm kiếm"},"num_results":{"type":"integer","description":"Số kết quả (1-10, mặc định: 5)"}},"required":["query"]}
-        ,
-    },
-    .{
-        .name = "browser",
-        .description = "Điều khiển trình duyệt bằng Playwright. Hỗ trợ goto, click, type, screenshot, html, scroll, drag_drop, exec, upload_file.",
-        .input_schema_json = \\{"type":"object","properties":{"action":{"type":"string","enum":["goto","click","type","screenshot","html","scroll","drag_drop","exec","upload_file"],"description":"Hành động cần thực hiện"},"url":{"type":"string","description":"URL (cho goto)"},"selector":{"type":"string","description":"CSS/XPath selector (cho click/type/drag_drop/upload_file)"},"target_selector":{"type":"string","description":"Selector đích (cho drag_drop)"},"text":{"type":"string","description":"Nội dung cần gõ (cho type)"},"script":{"type":"string","description":"Javascript code (cho exec)"},"direction":{"type":"string","enum":["up","down"],"description":"Hướng cuộn (cho scroll)"},"distance":{"type":"string","description":"Khoảng cách cuộn px (cho scroll)"},"profile_dir":{"type":"string","description":"Thư mục profile để giữ session"},"path":{"type":"string","description":"Đường dẫn lưu ảnh (hoặc đường dẫn file để upload)"}},"required":["action"]}
-        ,
-    },
-    .{
         .name = "invoke_subagent",
         .description = "Gọi một agent con để thực hiện một tác vụ phức tạp (chia để trị). Phù hợp khi cần phân tích thư mục, refactor nhiều file, hoặc xử lý chuỗi hành động dài.",
         .input_schema_json = \\{"type":"object","properties":{"task":{"type":"string","description":"Nhiệm vụ chi tiết dành cho sub-agent"}},"required":["task"]}
@@ -286,7 +270,7 @@ pub const definitions = [_]proto.ToolDefinition{
 /// Các tên tool core (luôn gửi lên API).
 const core_tools = [_][]const u8{
     "bash", "file_read", "file_write", "file_edit",
-    "glob", "grep", "http_request", "web_search", "browser", "invoke_subagent", "batch_invoke_subagents", "skills",
+    "glob", "grep", "http_request", "invoke_subagent", "batch_invoke_subagents", "skills",
     "session_diagnostics", "artifact_write", "artifact_read", "artifact_list",
 };
 

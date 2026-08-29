@@ -808,10 +808,6 @@ pub const TurnRenderer = struct {
             if (json_mod.findString(input_json, "path") orelse json_mod.findString(input_json, "TargetFile") orelse json_mod.findString(input_json, "file")) |path| {
                 detail = std.fmt.bufPrint(&detail_buf, "\x1b[34m{s}\x1b[0m", .{path}) catch "";
             }
-        } else if (std.mem.eql(u8, name, "web_search") or std.mem.eql(u8, name, "search")) {
-            if (json_mod.findString(input_json, "query") orelse json_mod.findString(input_json, "q")) |q| {
-                detail = std.fmt.bufPrint(&detail_buf, "\x1b[32m\"{s}\"\x1b[0m", .{q}) catch "";
-            }
         } else if (std.mem.eql(u8, name, "grep")) {
             if (json_mod.findString(input_json, "pattern") orelse json_mod.findString(input_json, "query")) |pat| {
                 detail = std.fmt.bufPrint(&detail_buf, "\x1b[33m/{s}/\x1b[0m", .{pat}) catch "";

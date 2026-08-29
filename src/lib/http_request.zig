@@ -1,7 +1,7 @@
 //! lib/http_request.zig — HTTP client tập trung cho toàn bộ mini-agent.
 //!
-//! Mọi phần cần gửi HTTP request (tools/http.zig, tools/search.zig,
-//! backends AI, ...) đều gọi qua module này thay vì tự dựng std.http.Client.
+//! Mọi phần cần gửi HTTP request (tools/http.zig, backends AI, ...)
+//! đều gọi qua module này thay vì tự dựng std.http.Client.
 //!
 //! ## API chính
 //!   - `fetch(alloc, io, .{...})` → `Response { status, headers, body, truncated }`

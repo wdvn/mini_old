@@ -156,7 +156,7 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
             \\
             \\## Tools có sẵn
             \\  bash, file_read, file_write, file_edit, artifact_write, artifact_read, artifact_list
-            \\  glob, grep, http_request, web_search, skills, browser, invoke_subagent, batch_invoke_subagents
+            \\  glob, grep, http_request, skills, invoke_subagent, batch_invoke_subagents
             \\
         ) catch {};
         return true;

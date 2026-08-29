@@ -20,7 +20,7 @@ mini-agent là một AI agent dòng lệnh viết bằng Zig: nó nhận prompt,
 | Capability | What it does | Learn more |
 |---|---|---|
 | Backends AI | OpenAI-compatible, Anthropic Claude, Ollama local | [Backends AI](#backends-ai) |
-| Built-in tools | 15 tools: shell, file, glob, grep, HTTP, web search, browser, subagent, artifact | [Tools](#tools) |
+| Built-in tools | 13 tools: shell, file, glob, grep, HTTP, subagent, artifact | [Tools](#tools) |
 | CodeAct runtime | Agent viết JS trong khối ```js``` chạy trên CodeAct nhúng, gọi API `mini.*` | [Execution modes](#execution-modes) |
 | Session persistence | Lưu/khôi phục hội thoại theo ID hoặc file JSON | [Session](#session-lưu-hội-thoại) |
 | Hooks | Audit logging, telemetry qua script ngoài tại mọi sự kiện | [Hooks](#hooks-giám-sát--observability) |
@@ -353,26 +353,6 @@ Gửi HTTP request (GET/POST/PUT/DELETE/HEAD).
 
 Giới hạn: response tối đa 30KB, timeout 30 giây.
 
-### web_search
-
-Tìm kiếm web qua DuckDuckGo Lite, không cần API key. Trả về tiêu đề + URL + snippet.
-
-```json
-{ "query": "Zig 0.16 release notes", "num_results": 10 }
-```
-
-### browser
-
-Điều khiển trình duyệt qua Playwright (yêu cầu `python3` + `pip install playwright`).
-
-```json
-{ "action": "goto", "url": "https://example.com" }
-{ "action": "click", "selector": "#login-btn" }
-{ "action": "type", "selector": "input[name='q']", "text": "Zig programming" }
-{ "action": "screenshot", "path": "output.png" }
-{ "action": "exec", "script": "return document.title;" }
-```
-
 ### invoke_subagent
 
 Gọi một agent con thực hiện tác vụ phức tạp (phân tích thư mục, refactor nhiều file).
@@ -488,7 +468,7 @@ src/
                         hooks, journal + CAS snapshot (rollback), artifacts,
                         protocol, JSON utils, cron
   runtime/            — CodeAct engine, JS bindings (mini.*), background jobs
-  tools/              — bash, file, glob, grep, http, search, browser,
+  tools/              — bash, file, glob, grep, http,
                         subagent, batch_subagent, artifact
   tooling/            — MCP client, tool registry (definitions + policy)
   ui/                 — line editor (UTF-8), REPL, unicode
