@@ -238,10 +238,35 @@ pub const McpServer = struct {
     }
 
     /// Gọi tool theo tên gốc (không prefix). Trả về kết quả (owned).
+    ///
+    /// LƯU Ý: `arguments_json` là chuỗi JSON object đã được unescape ở lớp
+    /// findStringOwned (có thể chứa newline/quote thật từ nội dung tool, VD
+    /// `{"prompt":"Dòng 1\nDòng 2"}`). Nhét thẳng vào JSON-RPC sẽ làm vỡ wire
+    /// format. Ta parse thành `std.json.Value` rồi stringify lại để chuẩn
+    /// hoá escape, giữ `arguments` là một object (đúng MCP spec).
     pub fn callTool(self: *McpServer, tool_name: []const u8, arguments_json: []const u8) ![]u8 {
+        const esc_tool = try json.escape(self.alloc, tool_name);
+        defer self.alloc.free(esc_tool);
+
+        // Ưu tiên: parse JSON rồi stringify lại (chuẩn hoá mọi escape).
+        // Nếu parse fail (ví dụ raw newline trong string → invalid JSON),
+        // fallback sang reserializeJson (chỉ re-escape control chars trong
+        // string values, giữ nguyên JSON structure).
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, arguments_json, .{ .ignore_unknown_fields = true }) catch null;
+        var args_buf: ?[]u8 = null;
+        if (parsed) |*p| {
+            defer p.deinit();
+            args_buf = std.json.Stringify.valueAlloc(self.alloc, p.value, .{}) catch null;
+        }
+        if (args_buf == null) {
+            args_buf = json.reserializeJson(self.alloc, arguments_json) catch null;
+        }
+        defer if (args_buf) |b| self.alloc.free(b);
+        const final_args = args_buf orelse arguments_json;
+
         const params = try std.fmt.allocPrint(self.alloc,
             \\{{"name":"{s}","arguments":{s}}}
-        , .{ tool_name, arguments_json });
+        , .{ esc_tool, final_args });
         defer self.alloc.free(params);
 
         const resp = try self.call("tools/call", params);

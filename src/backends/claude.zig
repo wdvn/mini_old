@@ -352,9 +352,14 @@ const StreamCtx = struct {
             if (self.in_tool_block) {
                 const id = try self.alloc.dupe(u8, self.current_tool_id[0..self.current_tool_id_len]);
                 const name = try self.alloc.dupe(u8, self.current_tool_name[0..self.current_tool_name_len]);
-                const args = if (self.args_accum.items.len > 0)
-                    try self.alloc.dupe(u8, self.args_accum.items)
-                else
+                const args = if (self.args_accum.items.len > 0) blk: {
+                    // partial_json chunks từ Claude SSE chứa escaped text
+                    // (findString trả raw slice, giữ nguyên \" \\n...).
+                    // Unescape ở đây để input_json nhất quán với OpenAI/Ollama
+                    // (raw JSON object, quotes thật).
+                    break :blk json.unescape(self.alloc, self.args_accum.items) catch
+                        try self.alloc.dupe(u8, self.args_accum.items);
+                } else
                     try self.alloc.dupe(u8, "{}");
                 try self.response.content.append(self.alloc, .{ .tool_use = .{
                     .id = id, .name = name, .input_json = args,

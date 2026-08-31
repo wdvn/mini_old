@@ -206,9 +206,131 @@ test "findStringOwned unescape đúng chuỗi JSON" {
     try std.testing.expect(got4 == null);
 }
 
+test "Claude partial_json accumulated → unescape → findStringOwned works" {
+    const alloc = std.testing.allocator;
+
+    // Claude SSE gửi partial_json chunks. findString trả raw slice (escaped).
+    // Simulated: findString(data, "partial_json") trả từng chunk escaped:
+    //   chunk1: {\"comm       (từ "partial_json":"{\"comm")
+    //   chunk2: and\":\"ls\"}  (từ "partial_json":"and\":\"ls\"}")
+    // Accumulated: {\"command\":\"ls\"}
+    const accumulated_escaped = "{\\\"command\\\":\\\"ls\\\"}";
+
+    // Sau unescape (tại content_block_stop) → input_json chuẩn
+    const input_json = try unescape(alloc, accumulated_escaped);
+    defer alloc.free(input_json);
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", input_json);
+
+    // Verify: findStringOwned trên input_json đã unescape → extract được
+    const cmd = (try findStringOwned(alloc, input_json, "command")).?;
+    defer alloc.free(cmd);
+    try std.testing.expectEqualStrings("ls", cmd);
+}
+
+
 // ---------------------------------------------------------------------------
 // Building helpers
 // ---------------------------------------------------------------------------
+
+/// Re-serialize raw JSON text thành wire-format hợp lệ.
+///
+/// Khi `input_json` đã bị unescape (do `std.json.parseFromSlice` hoặc
+/// `findStringOwned`), string values bên trong có thể chứa raw control
+/// chars (newline 0x0A, tab 0x09...) làm vỡ JSON wire format.
+///
+/// Hàm này walk qua JSON, track state in/out string, và:
+///   - Bên ngoài string: giữ nguyên (structural chars `{` `}` `[` `]` `:` `,` `"`)
+///   - Bên trong string: re-escape control chars (`\n` → `\\n`, `\t` → `\\t`...)
+///     nhưng giữ nguyên các escape sequence đã có (ví dụ `\\` `\"`)
+///
+/// Caller phải free kết quả.
+pub fn reserializeJson(alloc: Allocator, raw: []const u8) ![]u8 {
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    errdefer buf.deinit(alloc);
+
+    var in_string = false;
+    var i: usize = 0;
+    while (i < raw.len) {
+        const c = raw[i];
+        if (in_string) {
+            if (c == '\\' and i + 1 < raw.len) {
+                // Escape sequence đã có — giữ nguyên (\\, \", \n, \t, \uXXXX...)
+                try buf.append(alloc, c);
+                i += 1;
+                try buf.append(alloc, raw[i]);
+                i += 1;
+                continue;
+            }
+            if (c == '"') {
+                // Đóng string
+                try buf.append(alloc, c);
+                in_string = false;
+                i += 1;
+                continue;
+            }
+            // Ký tự bên trong string — re-escape control chars
+            switch (c) {
+                '\n' => try buf.appendSlice(alloc, "\\n"),
+                '\r' => try buf.appendSlice(alloc, "\\r"),
+                '\t' => try buf.appendSlice(alloc, "\\t"),
+                0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
+                    var tmp: [8]u8 = undefined;
+                    const s = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch continue;
+                    try buf.appendSlice(alloc, s);
+                },
+                else => try buf.append(alloc, c),
+            }
+            i += 1;
+        } else {
+            // Ngoài string — giữ nguyên mọi ký tự structural
+            if (c == '"') {
+                in_string = true;
+            }
+            try buf.append(alloc, c);
+            i += 1;
+        }
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
+test "reserializeJson: basic" {
+    const alloc = std.testing.allocator;
+
+    // JSON object không có control chars — giữ nguyên
+    const simple = "{\"command\":\"ls\"}";
+    const r1 = try reserializeJson(alloc, simple);
+    defer alloc.free(r1);
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", r1);
+}
+
+test "reserializeJson: raw newline trong string value" {
+    const alloc = std.testing.allocator;
+
+    // Raw newline (0x0A) bên trong string → re-escape thành \\n
+    const input = "{\"prompt\":\"Line 1\nLine 2\"}";
+    const r = try reserializeJson(alloc, input);
+    defer alloc.free(r);
+    try std.testing.expectEqualStrings("{\"prompt\":\"Line 1\\nLine 2\"}", r);
+}
+
+test "reserializeJson: giữ nguyên escape sequences đã có" {
+    const alloc = std.testing.allocator;
+
+    // \\n đã escaped (2 chars: \ + n) → giữ nguyên
+    const input = "{\"prompt\":\"hello\\nworld\"}";
+    const r = try reserializeJson(alloc, input);
+    defer alloc.free(r);
+    try std.testing.expectEqualStrings("{\"prompt\":\"hello\\nworld\"}", r);
+}
+
+test "reserializeJson: raw tab + nested object" {
+    const alloc = std.testing.allocator;
+
+    const input = "{\"a\":\"x\ty\",\"b\":{\"c\":\"ok\"}}";
+    const r = try reserializeJson(alloc, input);
+    defer alloc.free(r);
+    try std.testing.expectEqualStrings("{\"a\":\"x\\ty\",\"b\":{\"c\":\"ok\"}}", r);
+}
 
 /// Escape một chuỗi để nhúng vào JSON string.
 ///
