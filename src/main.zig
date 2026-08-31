@@ -52,6 +52,13 @@ pub const BUILD_TARGET = build_info.target_triple;
 pub const ZIG_VERSION = build_info.zig_version;
 
 pub var g_io: std.Io = undefined;
+pub var g_environ_map: ?*std.process.Environ.Map = null;
+
+/// Lấy environ map của process (snapshot lúc start + biến đã put thêm, vd .env).
+/// Dùng để spawn child với đúng environment hiện tại.
+pub fn getEnvironMap() ?*std.process.Environ.Map {
+    return g_environ_map;
+}
 
 /// Lấy Io instance: tự động dùng std.testing.io khi chạy test (comptime), hoặc g_io khi runtime.
 pub fn getIo() std.Io {
@@ -84,6 +91,7 @@ pub fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
 pub fn main(init: std.process.Init) !void {
     signals_mod.initSignalHandlers();
     g_io = init.io;
+    g_environ_map = init.environ_map;
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();

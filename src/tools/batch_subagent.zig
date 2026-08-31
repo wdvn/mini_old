@@ -6,9 +6,6 @@ const utils = @import("../core/utils.zig");
 const subagent = @import("subagent.zig");
 const main = @import("../main.zig");
 
-extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern fn unsetenv(name: [*:0]const u8) c_int;
-
 // Thread worker context
 const WorkerContext = struct {
     alloc: Allocator,
@@ -28,6 +25,7 @@ fn runSubAgentThread(ctx: *WorkerContext) void {
         .stdout = .pipe,
         .stderr = .pipe,
         .stdin = .ignore,
+        .environ_map = main.getEnvironMap(),
     }) catch |e| {
         ctx.error_msg = std.fmt.allocPrint(ctx.alloc, "Lỗi khởi chạy: {s}", .{@errorName(e)}) catch null;
         return;
@@ -98,17 +96,19 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         return std.fmt.allocPrint(alloc, "Lỗi: mảng 'tasks' trống.", .{});
     }
 
-    // Thiết lập độ sâu cho các tiến trình con kế thừa
+    // Thiết lập độ sâu cho các tiến trình con kế thừa (qua environ_map truyền vào spawn).
     var depth_buf: [16]u8 = undefined;
     const next_depth_str = std.fmt.bufPrintZ(&depth_buf, "{d}", .{current_depth + 1}) catch "1";
-    _ = setenv("MINI_SUBAGENT_DEPTH", next_depth_str.ptr, 1);
+    const env_map = main.getEnvironMap();
+    const prev_depth = if (env_map) |em| em.get("MINI_SUBAGENT_DEPTH") else null;
+    if (env_map) |em| {
+        em.put("MINI_SUBAGENT_DEPTH", next_depth_str) catch {};
+    }
     defer {
-        if (current_depth == 0) {
-            _ = unsetenv("MINI_SUBAGENT_DEPTH");
-        } else {
-            var prev_buf: [16]u8 = undefined;
-            const prev_str = std.fmt.bufPrintZ(&prev_buf, "{d}", .{current_depth}) catch "0";
-            _ = setenv("MINI_SUBAGENT_DEPTH", prev_str.ptr, 1);
+        if (env_map) |em| {
+            // Restore giá trị cũ; nếu không có, đặt "0" (tương đương không phải subagent).
+            const restore = prev_depth orelse "0";
+            em.put("MINI_SUBAGENT_DEPTH", restore) catch {};
         }
     }
 
@@ -171,11 +171,19 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
 test "batch_subagent: depth check logic" {
     const testing = std.testing;
 
-    _ = setenv("MINI_SUBAGENT_DEPTH", "2", 1);
-    defer _ = unsetenv("MINI_SUBAGENT_DEPTH");
+    const env_map = main.getEnvironMap();
+    if (env_map == null) return error.SkipZigTest;
 
-    _ = setenv("MINI_MAX_SUBAGENT_DEPTH", "2", 1);
-    defer _ = unsetenv("MINI_MAX_SUBAGENT_DEPTH");
+    const em = env_map.?;
+    const prev_depth = em.get("MINI_SUBAGENT_DEPTH");
+    const prev_max = em.get("MINI_MAX_SUBAGENT_DEPTH");
+
+    em.put("MINI_SUBAGENT_DEPTH", "2") catch {};
+    em.put("MINI_MAX_SUBAGENT_DEPTH", "2") catch {};
+    defer {
+        if (prev_depth) |v| em.put("MINI_SUBAGENT_DEPTH", v) catch {} else em.put("MINI_SUBAGENT_DEPTH", "0") catch {};
+        if (prev_max) |v| em.put("MINI_MAX_SUBAGENT_DEPTH", v) catch {} else em.put("MINI_MAX_SUBAGENT_DEPTH", "0") catch {};
+    }
 
     const res = try executeTool(testing.allocator, main.getIo(), "{\"tasks\":[\"task1\",\"task2\"]}");
     defer testing.allocator.free(res);

@@ -25,7 +25,7 @@ const Allocator = std.mem.Allocator;
 const proto = @import("../core/protocol.zig");
 const json = @import("../core/json.zig");
 const utils = @import("../core/utils.zig");
-
+const main = @import("../main.zig");
 const bash_tool = @import("../tools/bash.zig");
 const file_tool = @import("../tools/file.zig");
 const glob_tool = @import("../tools/glob.zig");
@@ -40,8 +40,6 @@ const hooks = @import("../core/hooks.zig");
 const skills_mod = @import("../core/skills.zig");
 const quickjs = @import("../runtime/quickjs_engine.zig");
 
-extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern fn unsetenv(name: [*:0]const u8) c_int;
 
 // ---------------------------------------------------------------------------
 // Global state (single-threaded)
@@ -522,11 +520,19 @@ test "registry: subagent depth limit permission" {
     try std.testing.expect(isPermitted("batch_invoke_subagents"));
 
     // Đặt độ sâu = 2 (đạt max): tự động chặn
-    _ = setenv("MINI_SUBAGENT_DEPTH", "2", 1);
-    defer _ = unsetenv("MINI_SUBAGENT_DEPTH");
+    const env_map = main.getEnvironMap();
+    if (env_map == null) return error.SkipZigTest;
 
-    _ = setenv("MINI_MAX_SUBAGENT_DEPTH", "2", 1);
-    defer _ = unsetenv("MINI_MAX_SUBAGENT_DEPTH");
+    const em = env_map.?;
+    const prev_depth = em.get("MINI_SUBAGENT_DEPTH");
+    const prev_max = em.get("MINI_MAX_SUBAGENT_DEPTH");
+
+    em.put("MINI_SUBAGENT_DEPTH", "2") catch {};
+    em.put("MINI_MAX_SUBAGENT_DEPTH", "2") catch {};
+    defer {
+        if (prev_depth) |v| em.put("MINI_SUBAGENT_DEPTH", v) catch {} else em.put("MINI_SUBAGENT_DEPTH", "0") catch {};
+        if (prev_max) |v| em.put("MINI_MAX_SUBAGENT_DEPTH", v) catch {} else em.put("MINI_MAX_SUBAGENT_DEPTH", "0") catch {};
+    }
 
     try std.testing.expect(!isPermitted("invoke_subagent"));
     try std.testing.expect(!isPermitted("batch_invoke_subagents"));
