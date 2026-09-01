@@ -100,8 +100,46 @@ pub const McpServer = struct {
     next_id: i64 = 1,
     /// Argv slice (owned) cần free khi shutdown.
     argv_owned: []const []const u8 = &.{},
-    /// Buffer đọc response line.
-    line_buf: [65536]u8 = undefined,
+    /// Stream buffer cho line reader.
+    recv_buf: ArrayList(u8) = .empty,
+
+    /// Đọc 1 dòng từ stdout_file (bất kể độ dài), tự động buffer chunk 8KB.
+    /// Trả về slice do caller owned (cần free qua self.alloc) hoặc error.McpEof khi EOF.
+    fn readLine(self: *McpServer) ![]u8 {
+        while (true) {
+            if (std.mem.indexOfScalar(u8, self.recv_buf.items, '\n')) |idx| {
+                const raw_line = self.recv_buf.items[0..idx];
+                var end = idx;
+                if (end > 0 and raw_line[end - 1] == '\r') {
+                    end -= 1;
+                }
+                const result = try self.alloc.dupe(u8, raw_line[0..end]);
+                const remaining = self.recv_buf.items[idx + 1 ..];
+                std.mem.copyForwards(u8, self.recv_buf.items[0..remaining.len], remaining);
+                self.recv_buf.items.len = remaining.len;
+                return result;
+            }
+
+            var chunk: [8192]u8 = undefined;
+            const n = self.stdout_file.readStreaming(main.g_io, &.{&chunk}) catch |e| {
+                if (self.recv_buf.items.len > 0) {
+                    const result = try self.alloc.dupe(u8, self.recv_buf.items);
+                    self.recv_buf.clearRetainingCapacity();
+                    return result;
+                }
+                return e;
+            };
+            if (n == 0) {
+                if (self.recv_buf.items.len > 0) {
+                    const result = try self.alloc.dupe(u8, self.recv_buf.items);
+                    self.recv_buf.clearRetainingCapacity();
+                    return result;
+                }
+                return error.McpEof;
+            }
+            try self.recv_buf.appendSlice(self.alloc, chunk[0..n]);
+        }
+    }
 
     /// Gửi JSON-RPC request và đọc response đồng bộ.
     /// Trả về JSON response string (owned).
@@ -145,15 +183,16 @@ pub const McpServer = struct {
             return e;
         };
 
-        const line = readLineFrom(self.stdout_file, &self.line_buf) orelse {
+        const line = self.readLine() catch |e| {
             hooks.dispatch(self.alloc, main.g_io, .{
                 .event = "OnError",
                 .mcp_server = self.name,
                 .mcp_method = method,
-                .error_message = "McpEof",
+                .error_message = @errorName(e),
             });
-            return error.McpEof;
+            return e;
         };
+        defer self.alloc.free(line);
         return try self.alloc.dupe(u8, std.mem.trim(u8, line, " \t\r"));
     }
 
@@ -196,7 +235,10 @@ pub const McpServer = struct {
 
         var i: usize = 1; // skip [
         while (i < tools_arr.len) {
-            if (tools_arr[i] != '{') { i += 1; continue; }
+            if (tools_arr[i] != '{') {
+                i += 1;
+                continue;
+            }
 
             // Tìm object end
             var depth: i32 = 0;
@@ -206,14 +248,20 @@ pub const McpServer = struct {
                     '"' => {
                         i += 1;
                         while (i < tools_arr.len) : (i += 1) {
-                            if (tools_arr[i] == '\\') { i += 1; continue; }
+                            if (tools_arr[i] == '\\') {
+                                i += 1;
+                                continue;
+                            }
                             if (tools_arr[i] == '"') break;
                         }
                     },
                     '{' => depth += 1,
                     '}' => {
                         depth -= 1;
-                        if (depth == 0) { i += 1; break; }
+                        if (depth == 0) {
+                            i += 1;
+                            break;
+                        }
                     },
                     else => {},
                 }
@@ -300,7 +348,8 @@ pub const McpServer = struct {
         self.child.stdout = null;
         _ = self.child.wait(main.g_io) catch {};
 
-        // Giải phóng argv items + slice, và server name.
+        // Giải phóng argv items + slice, recv_buf, và server name.
+        self.recv_buf.deinit(self.alloc);
         for (self.argv_owned) |arg| self.alloc.free(arg);
         if (self.argv_owned.len > 0) self.alloc.free(self.argv_owned);
         self.alloc.free(self.name);
@@ -361,7 +410,10 @@ pub const McpClientManager = struct {
 
         var i: usize = 1; // skip {
         while (i < servers_obj.len) {
-            if (servers_obj[i] != '"') { i += 1; continue; }
+            if (servers_obj[i] != '"') {
+                i += 1;
+                continue;
+            }
 
             // Server name
             const name_start = i + 1;
@@ -381,14 +433,20 @@ pub const McpClientManager = struct {
                     '"' => {
                         i += 1;
                         while (i < servers_obj.len) : (i += 1) {
-                            if (servers_obj[i] == '\\') { i += 1; continue; }
+                            if (servers_obj[i] == '\\') {
+                                i += 1;
+                                continue;
+                            }
                             if (servers_obj[i] == '"') break;
                         }
                     },
                     '{' => depth += 1,
                     '}' => {
                         depth -= 1;
-                        if (depth == 0) { i += 1; break; }
+                        if (depth == 0) {
+                            i += 1;
+                            break;
+                        }
                     },
                     else => {},
                 }
@@ -415,7 +473,10 @@ pub const McpClientManager = struct {
                     const arg_start = j + 1;
                     j += 1;
                     while (j < args_arr.len) : (j += 1) {
-                        if (args_arr[j] == '\\') { j += 1; continue; }
+                        if (args_arr[j] == '\\') {
+                            j += 1;
+                            continue;
+                        }
                         if (args_arr[j] == '"') break;
                     }
                     try argv.append(self.alloc, try self.alloc.dupe(u8, args_arr[arg_start..j]));

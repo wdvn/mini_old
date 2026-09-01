@@ -235,9 +235,20 @@ pub const AcpServer = struct {
         if (self.current_session_id) |old| self.alloc.free(old);
         self.current_session_id = new_id;
 
-        // Reset agent history cho session mới
+        // Reset agent history cho session mới, hoặc khôi phục nếu session file đã tồn tại
         self.agent.clearHistory();
         artifacts_mod.setSessionId(new_id);
+
+        const session_file_path = try self.resolveSessionFilePath(new_id);
+        defer self.alloc.free(session_file_path);
+
+        const cwd = std.Io.Dir.cwd();
+        if (cwd.openFile(self.io, session_file_path, .{})) |f| {
+            f.close(self.io);
+            self.agent.history.restoreFromFile(self.io, session_file_path) catch |e| {
+                main.stderrPrint("[acp] Cảnh báo: Lỗi restore session file '{s}': {s}\n", .{ session_file_path, @errorName(e) });
+            };
+        } else |_| {}
 
         const esc_id = try json_mod.escape(self.alloc, new_id);
         defer self.alloc.free(esc_id);

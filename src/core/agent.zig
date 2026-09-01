@@ -156,10 +156,9 @@ pub const AgentLoop = struct {
     /// Khởi tạo AgentLoop từ config.
     /// Chọn backend dựa trên config theo thứ tự ưu tiên.
     pub fn init(alloc: Allocator, io: std.Io, config: *const config_mod.Config) !AgentLoop {
-        // Khởi tạo CodeAct engine & đăng ký mini bindings
+        // Khởi tạo CodeAct engine (Engine.init tự động gọi registerBindings qua resetContext)
         const engine = try quickjs.Engine.init(alloc, io);
         errdefer engine.deinit();
-        try js_bindings.registerBindings(engine);
 
         // Chọn backend theo thứ tự ưu tiên
         const backend: Backend = blk: {
