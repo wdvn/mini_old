@@ -60,6 +60,45 @@ pub fn sanitizeReset() void {
     sanitize_pending_cr = false;
 }
 
+/// Trạng thái CR đang chờ LF cho chế độ multiline (biến riêng, không đụng single-line).
+var multi_pending_cr: bool = false;
+
+/// Sanitize + append 1 byte theo quy tắc MULTILINE (RFC-008 §5A):
+/// - '\r\n' / '\r' / '\n' → đúng 1 '\n' (giữ nguyên cấu trúc dòng).
+/// - TAB giữ nguyên; control char khác bị bỏ; UTF-8 giữ nguyên.
+/// Trả về true nếu byte được append.
+pub fn sanitizeAppendMultiline(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, c: u8) bool {
+    switch (c) {
+        '\r' => {
+            multi_pending_cr = true;
+            return false; // chờ LF; nếu không có LF sẽ flush '\n' ở byte kế
+        },
+        '\n' => {
+            multi_pending_cr = false;
+            out.append(alloc, '\n') catch return false;
+            return true;
+        },
+        else => {
+            if (multi_pending_cr) {
+                multi_pending_cr = false;
+                out.append(alloc, '\n') catch return false;
+            }
+            if (c == '\t') {
+                out.append(alloc, c) catch return false;
+                return true;
+            }
+            if (c < 32 or c == 0x7f) return false;
+            out.append(alloc, c) catch return false;
+            return true;
+        },
+    }
+}
+
+/// Reset trạng thái sanitize multiline (giữa 2 lần paste).
+pub fn sanitizeMultilineReset() void {
+    multi_pending_cr = false;
+}
+
 fn markerCanContinue(cur: []const u8, c: u8) bool {
     // Hai marker chỉ khác byte index 4 ('0' start / '1' end): ESC [ 2 0|1 ~
     const common = "\x1b[20";

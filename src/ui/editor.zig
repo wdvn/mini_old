@@ -270,6 +270,18 @@ pub const LineEditor = struct {
         return true;
     }
 
+    /// Chèn '\n' tại vị trí cursor (xuống dòng thủ công, RFC-008 §5B).
+    fn insertNewlineAtCursor(self: *LineEditor, io: std.Io, prompt: []const u8) void {
+        if (self.buf.items.len + 1 > MAX_INPUT_BYTES) {
+            self.limit_msg = true;
+            self.redraw(io, prompt);
+            return;
+        }
+        self.pushUndo();
+        _ = self.insertBytes("\n");
+        self.redraw(io, prompt);
+    }
+
     /// Xóa range [start, end). Trả về text đã xóa (caller free) hoặc null.
     fn deleteRange(self: *LineEditor, start: usize, end: usize) ?[]u8 {
         if (start >= end or end > self.buf.items.len) return null;
@@ -406,34 +418,74 @@ pub const LineEditor = struct {
             w.writeAll("\x1b[33m[input limit 64KB — từ chối]\x1b[0m\r\n\x1b[J") catch return;
         }
 
-        // 3. In prompt và buffer
-        w.writeAll(prompt) catch return;
-        w.writeAll(self.buf.items) catch return;
-
-        // 4. Tính toán độ rộng terminal và vị trí cursor thực tế
+        // 3. In prompt + buffer theo dòng logic: \n thật → \r\n + thụt lề
+        //    bằng độ rộng prompt (raw mode: \n không tự về cột 0, phải dùng \r\n).
         const term_size = term.getTerminalSize();
         const cols: usize = if (term_size.cols > 0) term_size.cols else 80;
 
         const prompt_w = unicode.visibleWidth(prompt);
-        const buf_w = unicode.displayWidth(self.buf.items);
-        const total_w = prompt_w + buf_w;
-        const total_rows = total_w / cols;
+        var indent_buf: [64]u8 = undefined;
+        const indent_len = @min(prompt_w, indent_buf.len);
+        @memset(indent_buf[0..indent_len], ' ');
+        const indent = indent_buf[0..indent_len];
 
-        const cursor_offset = prompt_w + unicode.displayWidth(self.buf.items[0..self.pos]);
-        const new_cursor_row = cursor_offset / cols;
-        const new_cursor_col = cursor_offset % cols;
+        var total_rows: usize = 0; // số hàng thêm so với hàng đầu tiên
+        var cur_row: usize = 0;
+        var cur_col: usize = 0;
+        var cursor_placed = false;
 
-        // 5. Di chuyển con trỏ terminal về đúng vị trí (new_cursor_row, new_cursor_col)
-        if (total_rows > new_cursor_row) {
-            w.print("\x1b[{d}A", .{total_rows - new_cursor_row}) catch return;
+        var line_start: usize = 0;
+        var line_idx: usize = 0;
+        var k: usize = 0;
+        while (k <= self.buf.items.len) : (k += 1) {
+            const at_end = k == self.buf.items.len;
+            if (!at_end and self.buf.items[k] != '\n') continue;
+
+            // Dòng logic [line_start..k)
+            const line = self.buf.items[line_start..k];
+            const prefix_w: usize = if (line_idx == 0) prompt_w else indent_len;
+            const lw = prefix_w + unicode.displayWidth(line);
+
+            if (line_idx == 0) {
+                w.writeAll(prompt) catch return;
+            } else {
+                w.writeAll("\r\n") catch return;
+                w.writeAll(indent) catch return;
+            }
+            w.writeAll(line) catch return;
+
+            // Cursor thuộc dòng này?
+            if (!cursor_placed and self.pos <= k) {
+                const in_w = unicode.displayWidth(self.buf.items[line_start..@min(self.pos, k)]);
+                const coff = prefix_w + in_w;
+                cur_row = total_rows + coff / cols;
+                cur_col = coff % cols;
+                cursor_placed = true;
+            }
+
+            // Hàng thêm: dòng đầu chỉ tính wrap, dòng sau tính cả lần xuống dòng
+            if (line_idx == 0) {
+                total_rows += lw / cols;
+            } else {
+                total_rows += 1 + lw / cols;
+            }
+
+            if (at_end) break;
+            line_start = k + 1;
+            line_idx += 1;
+        }
+
+        // 4. Di chuyển con trỏ terminal về (cur_row, cur_col)
+        if (total_rows > cur_row) {
+            w.print("\x1b[{d}A", .{total_rows - cur_row}) catch return;
         }
         w.writeAll("\r") catch return;
-        if (new_cursor_col > 0) {
-            w.print("\x1b[{d}C", .{new_cursor_col}) catch return;
+        if (cur_col > 0) {
+            w.print("\x1b[{d}C", .{cur_col}) catch return;
         }
 
         self.rendered_rows = total_rows;
-        self.cursor_row = new_cursor_row;
+        self.cursor_row = cur_row;
 
         const stdout_file = std.Io.File.stdout();
         stdout_file.writeStreamingAll(io, out_buf[0..w.end]) catch {};
@@ -567,7 +619,7 @@ pub const LineEditor = struct {
                         }
                         i += 1;
                     },
-                    13, 10 => { // Enter → submit
+                    13 => { // Enter → submit (toàn bộ buffer, kể cả multiline)
                         if (self.rendered_rows > self.cursor_row) {
                             var move_down_buf: [32]u8 = undefined;
                             const seq = std.fmt.bufPrint(&move_down_buf, "\x1b[{d}B", .{self.rendered_rows - self.cursor_row}) catch "";
@@ -575,6 +627,10 @@ pub const LineEditor = struct {
                         }
                         stdout_file.writeStreamingAll(io, "\r\n") catch {};
                         return try self.alloc.dupe(u8, self.buf.items);
+                    },
+                    10 => { // Ctrl+J → chèn newline thủ công (RFC-008 §5B)
+                        self.insertNewlineAtCursor(io, prompt);
+                        i += 1;
                     },
                     12 => { // Ctrl+L redraw
                         stdout_file.writeStreamingAll(io, "\x1b[2J\x1b[H") catch {};
@@ -906,6 +962,7 @@ pub const LineEditor = struct {
         self.paste_buf.clearRetainingCapacity();
         self.paste_parser.reset();
         paste_mod.sanitizeReset();
+        paste_mod.sanitizeMultilineReset();
     }
 
     /// Kết thúc paste mode: flush nốt candidate còn hold thành content và chèn vào buffer.
@@ -915,8 +972,9 @@ pub const LineEditor = struct {
         self.paste_undo_pushed = false;
         var tmp: [paste_mod.END_MARKER.len]u8 = undefined;
         const pre = self.paste_parser.pendingCopy(&tmp);
-        for (pre) |b| _ = paste_mod.sanitizeAppend(&self.paste_buf, self.alloc, b);
+        for (pre) |b| _ = paste_mod.sanitizeAppendMultiline(&self.paste_buf, self.alloc, b);
         self.paste_parser.reset();
+        paste_mod.sanitizeMultilineReset();
 
         if (self.paste_buf.items.len > 0) {
             self.pushUndo();
@@ -933,7 +991,7 @@ pub const LineEditor = struct {
             const pre = self.paste_parser.pendingCopy(&tmp);
             switch (self.paste_parser.feed(c)) {
                 .content => |b| {
-                    _ = paste_mod.sanitizeAppend(&self.paste_buf, self.alloc, b);
+                    _ = paste_mod.sanitizeAppendMultiline(&self.paste_buf, self.alloc, b);
                 },
                 .marker => |m| {
                     if (m == .end) {
@@ -943,9 +1001,9 @@ pub const LineEditor = struct {
                 },
                 .none => {},
                 .fail => {
-                    for (pre) |b| _ = paste_mod.sanitizeAppend(&self.paste_buf, self.alloc, b);
+                    for (pre) |b| _ = paste_mod.sanitizeAppendMultiline(&self.paste_buf, self.alloc, b);
                     switch (self.paste_parser.feed(c)) {
-                        .content => |b| _ = paste_mod.sanitizeAppend(&self.paste_buf, self.alloc, b),
+                        .content => |b| _ = paste_mod.sanitizeAppendMultiline(&self.paste_buf, self.alloc, b),
                         .none => {},
                         else => {},
                     }
@@ -1159,11 +1217,31 @@ test "paste thường: content nằm giữa start/end marker" {
     try std.testing.expectEqualStrings("hello pasted", out);
 }
 
-test "paste multiline: mỗi newline thành 1 space (CRLF không double)" {
+test "paste multiline: giữ nguyên newline (RFC-008 §5A)" {
     const alloc = std.testing.allocator;
     const out = try simulatePaste(alloc, "line1\r\nline2\nline3" ++ paste_mod.END_MARKER);
     defer alloc.free(out);
-    try std.testing.expectEqualStrings("line1 line2 line3", out);
+    // CRLF → 1 \n (không double), \n đơn giữ nguyên.
+    try std.testing.expectEqualStrings("line1\nline2\nline3", out);
+}
+
+test "paste multiline giữ indent (tab + space)" {
+    const alloc = std.testing.allocator;
+    const out = try simulatePaste(alloc, "fn x() {\n\treturn 1;\n}" ++ paste_mod.END_MARKER);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("fn x() {\n\treturn 1;\n}", out);
+}
+
+test "insertNewlineAtCursor: chèn \\n giữa buffer, pos đúng" {
+    const alloc = std.testing.allocator;
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+    try e.buf.appendSlice(alloc, "ab");
+    e.pos = 1;
+    e.insertNewlineAtCursor(undefined, "");
+    try std.testing.expectEqualStrings("a\nb", e.buf.items);
+    try std.testing.expectEqual(@as(usize, 2), e.pos);
 }
 
 test "paste chứa ANSI escape không nhầm end-marker" {
