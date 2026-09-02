@@ -224,8 +224,8 @@ pub const Config = struct {
         }
 
         const max_tokens: u32 = blk: {
-            const s = env_map.get("MINI_MAX_TOKENS") orelse break :blk 8192;
-            break :blk std.fmt.parseInt(u32, s, 10) catch 8192;
+            const s = env_map.get("MINI_MAX_TOKENS") orelse break :blk 24000;
+            break :blk std.fmt.parseInt(u32, s, 10) catch 24000;
         };
 
         const memact_enabled = blk: {

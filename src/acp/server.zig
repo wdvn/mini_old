@@ -318,7 +318,11 @@ pub const AcpServer = struct {
         var stop_reason: []const u8 = "end_turn";
         self.agent.processInput(expanded_prompt, acpTextCallback, acpThinkCallback) catch |e| {
             main.stderrPrint("[acp] Agent error during prompt: {s}\n", .{@errorName(e)});
-            stop_reason = "error";
+            stop_reason = switch (e) {
+                error.LLMRateLimitExceeded => "rate_limited",
+                error.LLMProviderUnavailable => "provider_unavailable",
+                else => "error",
+            };
         };
 
         if (self.is_cancelled) {

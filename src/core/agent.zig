@@ -53,9 +53,11 @@ fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
 }
 
 /// Số lần retry tối đa khi gặp rate limit.
-const MAX_RATE_LIMIT_RETRIES = 5;
+const MAX_RATE_LIMIT_RETRIES = 12;
 /// Thời gian chờ ban đầu khi gặp rate limit (giây).
 const RATE_LIMIT_BASE_DELAY_S: u64 = 5;
+/// Cap thời gian backoff tối đa khi gặp rate limit (giây).
+const RATE_LIMIT_MAX_BACKOFF_S: u64 = 120;
 
 // ---------------------------------------------------------------------------
 // Backend union
@@ -742,9 +744,10 @@ pub const AgentLoop = struct {
                             }
                             
                             rate_limit_retries += 1;
-                            if (rate_limit_retries > 5) return e; // Giới hạn 5 lần
+                            if (rate_limit_retries > MAX_RATE_LIMIT_RETRIES) return e; // Giới hạn retry
                             
-                            const backoff_s: u64 = (@as(u64, 1) << @as(u6, @intCast(rate_limit_retries))) * 2;
+                            const raw_backoff: u64 = (@as(u64, 1) << @as(u6, @intCast(rate_limit_retries))) * 2;
+                            const backoff_s: u64 = @min(raw_backoff, RATE_LIMIT_MAX_BACKOFF_S);
                             main.stderrPrint("\n\x1b[33m[agent] ⚠ Rate limit / 503! Thử lại sau {d}s...\x1b[0m\n", .{ backoff_s });
                             std.Io.sleep(self.io, std.Io.Duration.fromSeconds(@intCast(backoff_s)), .awake) catch {};
                             
@@ -815,6 +818,10 @@ pub const AgentLoop = struct {
                         }
                     }
                 };
+
+                // Reset counter khi act thành công: rate limit rải rác giữa turn
+                // dài không cộng dồn chết tích lũy.
+                rate_limit_retries = 0;
 
                 // Flush toàn bộ snapshot mini.write/patch/sh đã track trong act này (M4)
                 var recorded_delta = false;
