@@ -557,17 +557,38 @@ pub const LineEditor = struct {
             };
             if (n == 0) return null;
 
-            // Đang trong paste mode: đưa toàn bộ chunk vào paste parser
+            // Đang trong paste mode: đưa toàn bộ chunk vào paste parser.
+            // pasteFeed trả về offset ngay SAU END marker nếu paste kết thúc
+            // GIỮA chunk — phần còn lại phải xử lý tiếp như input thường
+            // (RCA-001: mất bytes sau END marker).
+            var i: usize = 0;
             if (self.pasting) {
-                self.pasteFeed(io, prompt, read_buf[0..n]);
-                if (self.pasting and self.pasteIdleTimedOut(io, stdin_file)) {
-                    self.endPaste(io, prompt);
+                const consumed = self.pasteFeed(io, prompt, read_buf[0..n]);
+                if (self.pasting) {
+                    if (self.pasteIdleTimedOut(io, stdin_file)) {
+                        self.endPaste(io, prompt);
+                    }
+                    continue;
                 }
-                continue;
+                i = consumed;
             }
 
-            var i: usize = 0;
             while (i < n) {
+                // START marker vừa hoàn tất TRONG chunk này (case 27 gọi
+                // beginPaste): phần còn lại là NỘI DUNG paste, tuyệt đối không
+                // đi qua đường thường — byte '\r' sẽ rơi vào case 13 và submit
+                // nhầm giữa chừng (root cause paste multi-line bị cắt).
+                if (self.pasting) {
+                    const consumed = self.pasteFeed(io, prompt, read_buf[i..n]);
+                    if (!self.pasting) {
+                        i += consumed; // END marker giữa chunk → xử lý nốt phần sau
+                        continue;
+                    }
+                    if (self.pasteIdleTimedOut(io, stdin_file)) {
+                        self.endPaste(io, prompt);
+                    }
+                    break; // vẫn pasting → về vòng read chính
+                }
                 const c = read_buf[i];
                 if (c != 3) {
                     self.last_ctrl_c_ms = 0;
@@ -985,9 +1006,13 @@ pub const LineEditor = struct {
     }
 
     /// Feed các bytes trong paste mode qua state machine (xem paste.zig).
-    fn pasteFeed(self: *LineEditor, io: std.Io, prompt: []const u8, bytes: []const u8) void {
+    /// Trả về offset trong `bytes` NGAY SAU END marker nếu paste kết thúc giữa
+    /// chunk; trả về `bytes.len` nếu hết chunk mà vẫn đang pasting.
+    fn pasteFeed(self: *LineEditor, io: std.Io, prompt: []const u8, bytes: []const u8) usize {
         var tmp: [paste_mod.END_MARKER.len]u8 = undefined;
-        for (bytes) |c| {
+        var idx: usize = 0;
+        while (idx < bytes.len) : (idx += 1) {
+            const c = bytes[idx];
             const pre = self.paste_parser.pendingCopy(&tmp);
             switch (self.paste_parser.feed(c)) {
                 .content => |b| {
@@ -996,7 +1021,10 @@ pub const LineEditor = struct {
                 .marker => |m| {
                     if (m == .end) {
                         self.endPaste(io, prompt);
-                        return;
+                        // RCA-001: trả về offset byte SAU end-marker. Caller
+                        // dùng để xử lý tiếp phần còn lại của chunk như input
+                        // thường (bytes sau END marker không được nuốt).
+                        return idx + 1;
                     }
                 },
                 .none => {},
@@ -1010,13 +1038,16 @@ pub const LineEditor = struct {
                 },
             }
         }
+        return bytes.len;
     }
 
-    /// Trong paste mode: poll stdin 25ms — hết thời gian mà không có byte
+    /// Trong paste mode: poll stdin 100ms — hết thời gian mà không có byte
     /// coi như terminal sẽ không gửi END marker → caller tự thoát paste mode.
+    /// (100ms: đủ rộng cho paste lớn qua SSH/mạng lag, nhỏ hơn TTL luồng
+    /// dummy byte của render khi tab qua lại nên không gây redraw dính — RCA-001.)
     fn pasteIdleTimedOut(_: *LineEditor, _: std.Io, _: std.Io.File) bool {
         var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
-        const ready = std.posix.poll(&fds, 25) catch return true;
+        const ready = std.posix.poll(&fds, 100) catch return true;
         return ready == 0;
     }
 
@@ -1205,7 +1236,7 @@ fn simulatePaste(alloc: Allocator, input: []const u8) ![]u8 {
     defer e.deinit();
     e.suppress_redraw = true;
     e.beginPaste();
-    e.pasteFeed(undefined, "", input);
+    _ = e.pasteFeed(undefined, "", input);
     if (e.pasting) e.endPaste(undefined, "");
     return alloc.dupe(u8, e.buf.items);
 }
@@ -1266,7 +1297,8 @@ test "paste không có end-marker: flush pending, editor không kẹt" {
     defer e.deinit();
     e.suppress_redraw = true;
     e.beginPaste();
-    e.pasteFeed(undefined, "", "dangling\x1b[2");
+    const consumed = e.pasteFeed(undefined, "", "dangling\x1b[2");
+    _ = consumed;
     // Idle timeout path: gọi endPaste như editor sẽ làm.
     e.endPaste(undefined, "");
     try std.testing.expect(!e.pasting);
@@ -1287,7 +1319,48 @@ test "paste đoạn dài không bị lặp redraw hay tràn dòng" {
     e.suppress_redraw = true;
     e.beginPaste();
     const long_text = "// contextTools returns tools that let the producer inspect and compact its // current session. " ** 10;
-    e.pasteFeed(undefined, "", long_text ++ paste_mod.END_MARKER);
+    _ = e.pasteFeed(undefined, "", long_text ++ paste_mod.END_MARKER);
     try std.testing.expect(!e.pasting);
     try std.testing.expect(e.buf.items.len > 500);
+}
+
+// RCA-001: START marker nằm GIỮA chunk — phần sau marker là nội dung paste,
+// không được đi qua đường thường (Enter nhầm → submit giữa chừng).
+test "paste bắt đầu giữa chunk: phần sau START marker vào paste mode" {
+    const alloc = std.testing.allocator;
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+
+    // Mô phỏng main loop nhận 1 chunk: prompt-echo + Enter + START + "l1\r\nl2"
+    const chunk = "abc\r\x1b[200~l1\r\nl2";
+    // Đi qua đường thường tới khi gặp ESC[200~: mô phỏng bằng cách tự feed
+    // phần đầu như main loop (3 ký tự + Enter), sau đó phần còn lại chunk.
+    for ("abc") |ch| _ = e.insertBytes(&.{ch});
+    e.pos = e.buf.items.len;
+    _ = e.handleEscapeSlice(undefined, undefined, "", chunk[4..]);
+    try std.testing.expect(e.pasting); // START marker đã bật paste mode
+
+    // Phần còn lại của chunk ("l1\r\nl2") PHẢI được pasteFeed xử lý:
+    const consumed = e.pasteFeed(undefined, "", chunk[10..]);
+    try std.testing.expectEqual(@as(usize, chunk.len - 10), consumed);
+    e.endPaste(undefined, "");
+    try std.testing.expectEqualStrings("abcl1\nl2", e.buf.items);
+}
+
+// RCA-001: END marker nằm giữa chunk — bytes sau marker là input thường
+// (Enter ngay sau paste → submit, không bị nuốt).
+test "paste kết thúc giữa chunk: bytes sau END marker không bị nuốt" {
+    const alloc = std.testing.allocator;
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+
+    e.beginPaste();
+    const consumed = e.pasteFeed(undefined, "", "abc" ++ paste_mod.END_MARKER ++ "xyz");
+    try std.testing.expect(!e.pasting);
+    try std.testing.expectEqual(@as(usize, 3 + paste_mod.END_MARKER.len), consumed);
+    e.endPaste(undefined, "");
+    try std.testing.expectEqualStrings("abc", e.buf.items);
+    // "xyz" (offset trả về) phải còn lại để caller xử lý như input thường.
 }
