@@ -73,6 +73,11 @@ const server = http.createServer((req, res) => {
     let parsed = {};
     try { parsed = JSON.parse(body || '{}'); } catch {}
     const url = new URL(req.url, 'http://x');
+    if (url.pathname === '/health') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('OK\n');
+      return;
+    }
     const caseName = url.searchParams.get('case');
     let chosen = (caseName && CASES[caseName]) || null;
     if (!chosen) {

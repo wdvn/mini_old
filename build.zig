@@ -96,8 +96,11 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // -----------------------------------------------------------------------
-    // Test step: `zig build test`
+    // Test step: `zig build test` (All-In-One: unit tests + testcases + E2E mock)
     // -----------------------------------------------------------------------
+
+    const skip_e2e = b.option(bool, "skip-e2e", "Bỏ qua E2E tests với mock LLM server") orelse false;
+    const test_port = b.option([]const u8, "test-port", "Port cho mock LLM server (mặc định: 8399)") orelse "8399";
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -120,15 +123,42 @@ pub fn build(b: *std.Build) void {
     testcase_mod.addIncludePath(qjs_path);
     testcase_mod.linkLibrary(qjs_lib);
 
+    // 1. Unit tests (src/main.zig)
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(unit_tests);
 
+    // 2. Integration / Security testcases (testcases/test_codeact_security.zig)
     const testcase_tests = b.addTest(.{ .root_module = testcase_mod });
     const run_testcase_tests = b.addRunArtifact(testcase_tests);
 
-    const test_step = b.step("test", "Chạy unit tests");
-    test_step.dependOn(&run_tests.step);
-    test_step.dependOn(&run_testcase_tests.step);
+    // Step test-unit: chạy riêng unit tests và testcases
+    const test_unit_step = b.step("test-unit", "Chạy riêng unit tests & testcases (không kèm E2E mock)");
+    test_unit_step.dependOn(&run_tests.step);
+    test_unit_step.dependOn(&run_testcase_tests.step);
+
+    // 3. E2E tests với mock LLM server
+    const run_e2e = b.addSystemCommand(&.{
+        "bash",
+        "scripts/run_tests_with_mock.sh",
+        "--e2e-only",
+    });
+    run_e2e.addArtifactArg(exe);
+    run_e2e.addArg(test_port);
+    run_e2e.stdio = .inherit;
+    run_e2e.step.dependOn(b.getInstallStep());
+
+    // Step test-e2e: chạy riêng E2E tests
+    const test_e2e_step = b.step("test-e2e", "Chạy riêng E2E tests với mock LLM server");
+    test_e2e_step.dependOn(&run_e2e.step);
+
+    // Step test chính: ALL-IN-ONE (unit tests -> testcases -> E2E mock LLM)
+    const test_step = b.step("test", "Chạy all-in-one test suite (unit tests + testcases + mock LLM E2E)");
+    test_step.dependOn(test_unit_step);
+    if (!skip_e2e) {
+        // Đảm bảo unit tests hoàn thành thành công trước khi chạy E2E
+        run_e2e.step.dependOn(test_unit_step);
+        test_step.dependOn(&run_e2e.step);
+    }
 }
 
 /// Format Unix timestamp thành "YYYY-MM-DD HH:MM:SS UTC" (không phụ thuộc libc).

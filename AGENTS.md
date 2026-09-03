@@ -29,7 +29,11 @@ testcases/            — tất cả các file test (standalone, integration, be
 - `zig build` → binary `zig-out/bin/mini`.
 - `zig build run` → build + chạy interactive REPL.
 - `zig build run -- -e "..."` → single-shot mode.
-- `zig build test` → unit tests (root `src/main.zig`, link CodeAct).
+- `zig build test` → All-In-One test suite (Unit tests + Testcases + Mock LLM E2E).
+- `zig build test-unit` → Chạy riêng unit tests & testcases (không cần Node.js/mock server).
+- `zig build test-e2e` → Chạy riêng E2E tests với mock LLM server.
+- `zig build test -Dskip-e2e=true` → Chạy test bỏ qua tầng E2E mock.
+- `zig build test -Dtest-port=<port>` → Đổi port cho mock server (mặc định: 8399).
 - Setup môi trường user: `scripts/setup_home_mini.sh` (tạo/sync `~/.mini/`).
 - Release: `scripts/build_release.sh`.
 - Cross-compile: `zig build -Dtarget=x86_64-linux-gnu` (hoặc `aarch64-linux-gnu`).
@@ -51,9 +55,16 @@ testcases/            — tất cả các file test (standalone, integration, be
 
 ## Testing
 
-- Sau khi sửa core/tools/runtime: chạy `zig build test`, phải pass hết trước khi commit.
-- Với UI/editor: test thủ công qua `zig build run`, kiểm tra gõ UTF-8 (tiếng Việt), Ctrl+A/E/U, ↑/↓ history.
-- Với backends: không gọi API thật khi test; kiểm tra logic parse SSE bằng unit test.
+- **Lệnh chuẩn trước khi commit**: Chạy `zig build test` (hoặc `zig build test --summary all`), phải pass toàn bộ 13/13 steps.
+- **Cơ chế All-In-One**:
+  1. *Tầng 1 (Unit tests)*: Test toàn bộ module trong `src/main.zig` (115 tests).
+  2. *Tầng 2 (Integration testcases)*: Test CodeAct VM isolation, security blocklist/allowlist, hooks (`testcases/test_codeact_security.zig`).
+  3. *Tầng 3 (E2E Mock LLM)*: Tự build binary `mini`, khởi chạy `node scripts/mock_llm_server.js` độc lập trên port 8399 và test 3 flow hoàn chỉnh (`simple text`, `long text streaming`, `tool call bash multi-turn`).
+- **Tùy chọn linh hoạt**:
+  - Khi môi trường thiếu Node.js hoặc chỉ muốn test nhanh: `zig build test-unit` hoặc `zig build test -Dskip-e2e=true`.
+  - Khi chỉ muốn test riêng E2E: `zig build test-e2e`.
+- **UI/editor**: Test thủ công qua `zig build run`, kiểm tra gõ UTF-8 (tiếng Việt), multiline paste, Ctrl+A/E/U, ↑/↓ history.
+- **Backends**: Không gọi API thật khi test; kiểm tra logic parse SSE bằng unit test và mock server nội bộ.
 
 ## PR / Commit
 

@@ -1,49 +1,85 @@
 #!/usr/bin/env bash
 # run_tests_with_mock.sh — Test toàn bộ project với mock LLM server.
-# Usage: scripts/run_tests_with_mock.sh [port]
-#   1. Unit tests:        zig build test --summary all
-#   2. Build binary:      zig build
-#   3. E2E với mock LLM:  chạy ./zig-out/bin/mini-agent -e "<prompt>" trỏ vào mock server,
-#                         so khớp output với expectation từng case.
+# Usage:
+#   scripts/run_tests_with_mock.sh [port]                 -> Chạy All-In-One test suite qua zig build test
+#   scripts/run_tests_with_mock.sh --e2e-only <bin> <port> -> Chạy riêng tầng E2E mock (dành cho build.zig)
 set -u
 cd "$(dirname "$0")/.."
 
-PORT="${1:-8399}"
-MOCK_URL="http://127.0.0.1:${PORT}/v1"
-LOG=/tmp/mock_llm_${PORT}.log
-BIN=./zig-out/bin/mini
-PASS=0; FAIL=0
+# ---------- Chế độ 1: Chạy trực tiếp từ terminal (All-In-One qua zig build test) ----------
+if [[ "${1:-}" != "--e2e-only" ]]; then
+  # Đảm bảo zig có trong PATH nếu dùng zvm
+  if ! command -v zig >/dev/null 2>&1; then
+    for candidate in "$HOME/.zvm/0.16.0" "$HOME/.zvm/bin"; do
+      if [[ -x "$candidate/zig" ]]; then
+        export PATH="$candidate:$PATH"
+        break
+      fi
+    done
+  fi
 
-# ---------- Bước 0: binary ----------
+  PORT="${1:-8399}"
+  if [[ $# -gt 0 ]]; then shift; fi
+  echo "=== [All-In-One] Chạy toàn bộ test suite qua zig build test ==="
+  exec zig build test --summary all -Dtest-port="$PORT" "$@"
+fi
+
+# ---------- Chế độ 2: --e2e-only (chạy mock server và E2E testcases) ----------
+shift # Bỏ cờ --e2e-only
+BIN="${1:-./zig-out/bin/mini}"
+PORT="${2:-8399}"
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "[E2E FAIL] 'node' không tìm thấy trong PATH để chạy mock server" >&2
+  exit 1
+fi
+
 if [[ ! -x "$BIN" ]]; then
-  echo "[runner] binary chưa có, build..."
-  zig build || { echo "FATAL: zig build thất bại"; exit 1; }
+  echo "[E2E FAIL] binary '$BIN' không tồn tại hoặc không thể thực thi" >&2
+  exit 1
 fi
 
-# ---------- Bước 1: unit tests ----------
-echo "=== [1/3] zig build test --summary all ==="
-if zig build test --summary all; then
-  echo "[runner] Unit tests: PASS"; PASS=$((PASS+1))
-else
-  echo "[runner] Unit tests: FAIL"; FAIL=$((FAIL+1))
-fi
+MOCK_URL="http://127.0.0.1:${PORT}/v1"
+LOG="/tmp/mock_llm_${PORT}.log"
+TEMP_HOME=$(mktemp -d /tmp/mini-test-home-XXXXXX)
+MOCK_PID=""
+PASS=0
+FAIL=0
 
-# ---------- Bước 2: mock server ----------
-echo "=== [2/3] Khởi động mock LLM server :$PORT ==="
-# Dọn process cũ chiếm port (nguyên nhân treo/kẹt mock cũ)
-fuser -k "${PORT}/tcp" 2>/dev/null; sleep 0.3
+cleanup() {
+  if [[ -n "$MOCK_PID" ]]; then
+    kill "$MOCK_PID" 2>/dev/null || true
+  fi
+  rm -rf "$TEMP_HOME" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+echo "=== [E2E] Khởi động mock LLM server :$PORT ==="
+# Dọn process cũ chiếm port (nếu có)
+fuser -k "${PORT}/tcp" 2>/dev/null || true
+sleep 0.3
 node scripts/mock_llm_server.js "$PORT" >"$LOG" 2>&1 &
 MOCK_PID=$!
-trap 'kill $MOCK_PID 2>/dev/null' EXIT
-for i in $(seq 1 20); do
-  curl -s -o /dev/null "http://127.0.0.1:$PORT/health" && break
+
+READY=0
+for i in $(seq 1 30); do
+  if curl -s -o /dev/null "http://127.0.0.1:$PORT/health"; then
+    READY=1
+    break
+  fi
   sleep 0.1
 done
+
+if [[ $READY -ne 1 ]]; then
+  echo "[E2E FAIL] Không thể kết nối mock LLM server trên :$PORT sau 3s" >&2
+  cat "$LOG" >&2
+  exit 1
+fi
 
 run_case() {
   local name="$1" prompt="$2" expect="$3"     # expect: chuỗi phải xuất hiện trong output
   local out
-  out=$(timeout 30 env MINI_HOME=/tmp/mini-test-home \
+  out=$(timeout 30 env MINI_HOME="$TEMP_HOME" \
         OPENAI_COMPAT_URL="$MOCK_URL" \
         OPENAI_COMPAT_MODEL="mock-model" \
         OPENAI_COMPAT_API_KEY="sk-mock" \
@@ -63,12 +99,12 @@ run_case() {
   fi
 }
 
-echo "=== [3/3] E2E cases (mock LLM) ==="
+echo "=== [E2E] Chạy test cases (mock LLM) ==="
 run_case "simple text response"   "Nói xin chào"                 "Xin chào từ mock LLM!"
 run_case "long text streaming"    "đọc long text help me"        "AAAAAAAAAAAAAAAAAAAA"
 run_case "tool call bash"         "hãy dùng bash chạy echo"      "mock-tool-ok"
 
 echo ""
 echo "======================================"
-echo "KẾT QUẢ: $PASS pass, $FAIL fail"
+echo "KẾT QUẢ E2E: $PASS pass, $FAIL fail"
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1

@@ -20,7 +20,11 @@ Tài liệu này bổ sung cho `AGENTS.md` ở root, tập trung vào phương p
 
 4. **Kiểm chứng đa tầng (Multi-tier Verification)**:
    - Tái hiện lỗi qua unit test nhỏ gọn trong `testcases/test_*.zig` nếu khả thi.
-   - Sau khi sửa chữa, chạy toàn bộ bộ kiểm thử: `zig build test --summary all`.
+   - Sau khi sửa chữa, chạy toàn bộ bộ kiểm thử All-In-One: `zig build test --summary all`.
+     - *Tầng 1 (Unit)*: Unit tests core/tools/ui trong `src/main.zig`.
+     - *Tầng 2 (Security/VM)*: CodeAct security và VM isolation trong `testcases/test_codeact_security.zig`.
+     - *Tầng 3 (E2E Mock LLM)*: Chạy binary `mini` với mock OpenAI SSE server (`scripts/mock_llm_server.js`).
+   - Nếu cần chạy phân lập: `zig build test-unit` (chỉ tầng 1+2), `zig build test-e2e` (chỉ tầng 3), hoặc `zig build test -Dskip-e2e=true`.
 
 ---
 
