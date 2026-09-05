@@ -250,6 +250,40 @@ pub const Client = struct {
                     self.disable_stream_options = true;
                     should_retry = true;
                 }
+
+                // Tự động hạ max_tokens nếu provider báo vượt trần model (ví dụ: Groq giới hạn qwen3.8-27b ở 16384 hoặc compound-mini ở 8192)
+                if (std.mem.indexOf(u8, raw_resp, "max_tokens") != null and
+                    (std.mem.indexOf(u8, raw_resp, "less than or equal to") != null or
+                     std.mem.indexOf(u8, raw_resp, "must be less than") != null or
+                     std.mem.indexOf(u8, raw_resp, "\"param\":\"max_tokens\"") != null or
+                     std.mem.indexOf(u8, raw_resp, "\"param\": \"max_tokens\"") != null))
+                {
+                    var new_limit: ?u32 = null;
+                    if (std.mem.indexOf(u8, raw_resp, "less than or equal to")) |pos| {
+                        var idx = pos + "less than or equal to".len;
+                        while (idx < raw_resp.len and (raw_resp[idx] == ' ' or raw_resp[idx] == '`' or raw_resp[idx] == '\'')) : (idx += 1) {}
+                        var end_idx = idx;
+                        while (end_idx < raw_resp.len and raw_resp[end_idx] >= '0' and raw_resp[end_idx] <= '9') : (end_idx += 1) {}
+                        if (end_idx > idx) {
+                            new_limit = std.fmt.parseInt(u32, raw_resp[idx..end_idx], 10) catch null;
+                        }
+                    }
+                    if (new_limit) |lim| {
+                        if (lim < self.max_tokens) {
+                            self.max_tokens = lim;
+                            should_retry = true;
+                        }
+                    } else if (self.max_tokens > 16384) {
+                        self.max_tokens = 16384;
+                        should_retry = true;
+                    } else if (self.max_tokens > 8192) {
+                        self.max_tokens = 8192;
+                        should_retry = true;
+                    } else if (self.max_tokens > 4096) {
+                        self.max_tokens = 4096;
+                        should_retry = true;
+                    }
+                }
                 
                 if (should_retry) {
                     if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
