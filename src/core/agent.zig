@@ -151,6 +151,7 @@ pub const AgentLoop = struct {
         LLMProviderUnavailable,
         LLMMalformedJsonOutput,
         LLMContextWindowExceeded,
+        ActRetryExhausted,
         UnknownStopReason,
         UserCancelled,
     };
@@ -524,7 +525,11 @@ pub const AgentLoop = struct {
                 // yêu cầu model tiếp tục đúng từ chỗ dừng (không lặp lại phần đã
                 // viết) để hoàn thành khối đang dở (JS block / tool_use / văn bản).
                 self.max_tokens_continues += 1;
-                main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response bị cắt (max_tokens), yêu cầu tiếp tục (lần {d})...\x1b[0m\n", .{self.max_tokens_continues});
+                if (self.max_tokens_continues > 5) {
+                    main.stderrPrint("\n\x1b[31m[agent] ⛔ Đã tiếp tục max_tokens {d} lần liên tiếp mà chưa hoàn thành. Dừng để tránh lặp vô hạn.\x1b[0m\n", .{self.max_tokens_continues});
+                    return .exit_loop;
+                }
+                main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response bị cắt (max_tokens), yêu cầu tiếp tục (lần {d}/5)...\x1b[0m\n", .{self.max_tokens_continues});
                 var buf = utils.BufWriter.init(self.alloc);
                 defer buf.deinit();
                 try buf.print(
@@ -557,9 +562,19 @@ pub const AgentLoop = struct {
 
                 if (response.http_code == 400) {
                     if (response.raw_debug_info) |raw| {
-                        if (std.mem.indexOf(u8, raw, "context_length_exceeded") != null or 
-                            std.mem.indexOf(u8, raw, "max_tokens") != null) {
-                            return error.LLMContextWindowExceeded;
+                        const is_param_max_tokens = std.mem.indexOf(u8, raw, "\"param\":\"max_tokens\"") != null or
+                            std.mem.indexOf(u8, raw, "\"param\": \"max_tokens\"") != null or
+                            std.mem.indexOf(u8, raw, "`max_tokens` must be less than") != null;
+
+                        if (!is_param_max_tokens) {
+                            if (std.mem.indexOf(u8, raw, "context_length_exceeded") != null or
+                                std.mem.indexOf(u8, raw, "maximum context length") != null or
+                                std.mem.indexOf(u8, raw, "context length") != null or
+                                std.mem.indexOf(u8, raw, "prompt is too long") != null or
+                                (std.mem.indexOf(u8, raw, "context_window") != null and std.mem.indexOf(u8, raw, "exceeded") != null))
+                            {
+                                return error.LLMContextWindowExceeded;
+                            }
                         }
                     }
                 }
@@ -754,10 +769,24 @@ pub const AgentLoop = struct {
                             if (self.history.last_compaction_act_id < act_id) {
                                 self.history.truncate(history_len);
                             }
+                            if (try_count > 0) try_count -= 1;
                             continue;
                         },
                         error.LLMContextWindowExceeded => {
-                            main.stderrPrint("\n\x1b[33m[agent] ⚠️ Model báo vượt quá context limit (HTTP 400)! Đang nén MemAct khẩn cấp...\x1b[0m\n", .{});
+                            if (try_count >= max_retries) {
+                                main.stderrPrint("\n\x1b[31m[agent] ⛔ Không thể nén ngữ cảnh thêm sau {d} lần thử. Ngắt tiến trình: {s}\x1b[0m\n", .{ max_retries + 1, @errorName(e) });
+                                if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Quá tải context không thể nén thêm — abort", .{
+                                    .backend = self.backend.name(),
+                                    .model = self.backend.model(),
+                                    .error_name = @errorName(e),
+                                    .http_code = self.last_backend_http_code,
+                                    .attempt = try_count + 1,
+                                    .raw_snippet = self.last_backend_raw_error,
+                                }) catch {};
+                                return e;
+                            }
+
+                            main.stderrPrint("\n\x1b[33m[agent] ⚠️ Model báo vượt quá context limit (HTTP 400)! Đang nén MemAct khẩn cấp (lần {d}/{d})...\x1b[0m\n", .{ try_count + 1, max_retries + 1 });
                             if (self.journal) |*j| j.recordError(self.io, act_id, .llm_context_overflow, "Model báo quá tải context — nén MemAct khẩn cấp", .{
                                 .backend = self.backend.name(),
                                 .model = self.backend.model(),
@@ -847,6 +876,9 @@ pub const AgentLoop = struct {
                     return;
                 }
                 break; 
+            } else {
+                main.stderrPrint("\n\x1b[31m[agent] ⛔ Act {d} thất bại sau {d} lần thử không thể phục hồi. Dừng tác vụ.\x1b[0m\n", .{ act_id, max_retries + 1 });
+                return error.ActRetryExhausted;
             }
         }
     }
