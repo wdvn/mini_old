@@ -60,6 +60,7 @@ Hướng dẫn phương pháp luận chuẩn để điều tra, cô lập và t�
 - Đặt câu hỏi phản biện: "Nếu giả thuyết này đúng, điều gì sẽ xảy ra? Nếu sai, tại sao?"
 - Kiểm tra các corner-case: empty body, partial chunk, unicode characters, zero length string, EOF đột ngột.
 
-### Bước 5: Thực thi & Kiểm thử hồi quy
-- Sửa đổi tối thiểu (minimal blast radius).
-- Chạy `zig build test --summary all` để bảo đảm không gây regression.
+### Bước 5: Kết luận & Đề xuất giải pháp
+- Trình bày rõ ràng: (1) Triệu chứng, (2) Bằng chứng xác thực, (3) Nguyên nhân gốc rễ (Root Cause), (4) Đề xuất phương án xử lý khả thi.
+- DỪNG VÒNG LẶP HÀNH ĐỘNG: Báo cáo kết quả và chờ xác nhận từ người dùng. Tuyệt đối không tự ý sửa đổi hệ thống khi chưa có sự đồng thuận.
+- Khi người dùng xác nhận thực thi, tiến hành áp dụng giải pháp với phạm vi sửa đổi tối thiểu (minimal blast radius) và kiểm thử hồi quy.

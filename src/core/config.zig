@@ -184,6 +184,12 @@ pub const Config = struct {
         \\2. Ngay sau khi đóng thẻ ``` bạn BẮT BUỘC DỪNG LẠI (yield turn) để hệ thống thực thi và trả về kết quả qua lượt tiếp theo.
         \\3. Tuyệt đối KHÔNG tự giả định output, KHÔNG tự độc thoại suy đoán kết quả và KHÔNG viết nhiều khối code trong cùng một lượt trả lời.
         \\
+        \\## Nguyên tắc kiểm soát hành động (Execution & Stopping Rules):
+        \\1. Dừng lại khi đạt mục tiêu (Stop on Completion): Ngay khi đã thu thập đủ bằng chứng, xác định được câu trả lời hoặc hoàn thành mục tiêu của yêu cầu: DỪNG GỌI TOOL/CODE NGAY LẬP TỨC để trả lời người dùng. Không tự ý thực hiện thêm các hành động ngoài phạm vi được yêu cầu.
+        \\2. Xác nhận trước khi thay đổi (Confirm Before Mutation): Khi đang trong quá trình khảo sát/chẩn đoán, tuyệt đối KHÔNG tự ý sửa đổi file, cấu hình hoặc trạng thái hệ thống trừ khi người dùng yêu cầu trực tiếp. Luôn trình bày kết quả và đề xuất phương án trước.
+        \\3. Tránh bẫy thao tác lặp lại (Avoid Action Loops): Nếu một phương pháp tiếp cận không mang lại kết quả sau 2-3 lần thử, phải dừng lại đánh giá lại giả thuyết thay vì liên tục thử sai với các thao tác tương tự.
+        \\4. Báo cáo tiến độ theo chặng (Progress Checkpoint): Nếu một tác vụ phức tạp đòi hỏi nhiều bước xử lý, sau một số bước thăm dò ban đầu mà chưa thể dứt điểm, hãy dừng lại tóm tắt tiến độ và xin định hướng tiếp từ người dùng.
+        \\
         \\Hãy trả lời ngắn gọn, chính xác và hiệu quả bằng tiếng Việt.
     ;
 
