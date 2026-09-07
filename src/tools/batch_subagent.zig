@@ -113,16 +113,29 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     }
 
     var contexts = try alloc.alloc(WorkerContext, num_tasks);
-    var threads = try alloc.alloc(std.Thread, num_tasks);
+    var threads = try alloc.alloc(?std.Thread, num_tasks);
     defer alloc.free(contexts);
     defer alloc.free(threads);
 
     // Bật tất cả thread
     for (tasks_arr.items, 0..) |task_val, i| {
         if (task_val != .string) {
-            contexts[i] = .{ .alloc = alloc, .io = io, .task = "Invalid task format", .result = null, .error_msg = null, .index = i };
-            // Tạo dummy thread để join logic đơn giản
-            threads[i] = try std.Thread.spawn(.{}, runSubAgentThread, .{ &contexts[i] });
+            // Phần tử sai kiểu: KHÔNG spawn thread/process (tránh chạy subagent
+            // với task rác). Ghi lỗi trực tiếp vào context để báo cáo trong
+            // kết quả gộp; join logic vẫn đơn giản nhờ threads[i] = null.
+            contexts[i] = .{
+                .alloc = alloc,
+                .io = io,
+                .task = "",
+                .result = null,
+                .error_msg = std.fmt.allocPrint(
+                    alloc,
+                    "Phần tử tasks[{d}] phải là chuỗi (schema: items.string) — đã bỏ qua, không thực thi.",
+                    .{i},
+                ) catch null,
+                .index = i,
+            };
+            threads[i] = null;
             continue;
         }
         
@@ -138,9 +151,9 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         threads[i] = try std.Thread.spawn(.{}, runSubAgentThread, .{ &contexts[i] });
     }
 
-    // Đợi các thread hoàn thành
-    for (threads) |t| {
-        t.join();
+    // Đợi các thread hoàn thành (bỏ qua slot bị bỏ do task sai kiểu)
+    for (threads) |maybe_t| {
+        if (maybe_t) |t| t.join();
     }
 
     // Gom kết quả
@@ -189,5 +202,33 @@ test "batch_subagent: depth check logic" {
     defer testing.allocator.free(res);
 
     try testing.expect(std.mem.indexOf(u8, res, "Đã đạt giới hạn độ sâu subagent tối đa") != null);
+}
+
+test "batch_subagent: phần tử tasks sai kiểu bị bỏ qua, không spawn process" {
+    const testing = std.testing;
+
+    const env_map = main.getEnvironMap();
+    if (env_map == null) return error.SkipZigTest;
+
+    const em = env_map.?;
+    const prev_depth = em.get("MINI_SUBAGENT_DEPTH");
+    const prev_max = em.get("MINI_MAX_SUBAGENT_DEPTH");
+
+    // Cho phép chạy (depth < max) nhưng toàn bộ task đều sai kiểu
+    // => không được spawn bất kỳ process nào, chỉ ghi lỗi vào kết quả.
+    em.put("MINI_SUBAGENT_DEPTH", "0") catch {};
+    em.put("MINI_MAX_SUBAGENT_DEPTH", "2") catch {};
+    defer {
+        if (prev_depth) |v| em.put("MINI_SUBAGENT_DEPTH", v) catch {} else em.put("MINI_SUBAGENT_DEPTH", "0") catch {};
+        if (prev_max) |v| em.put("MINI_MAX_SUBAGENT_DEPTH", v) catch {} else em.put("MINI_MAX_SUBAGENT_DEPTH", "0") catch {};
+    }
+
+    const res = try executeTool(testing.allocator, main.getIo(), "{\"tasks\":[123, {\"x\":1}]}");
+    defer testing.allocator.free(res);
+
+    // Cả 2 phần tử đều bị báo lỗi schema, không có KẾT QUẢ nào (không spawn).
+    try testing.expect(std.mem.indexOf(u8, res, "tasks[0] phải là chuỗi") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "tasks[1] phải là chuỗi") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "KẾT QUẢ") == null);
 }
 
