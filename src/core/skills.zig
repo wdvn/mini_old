@@ -141,7 +141,9 @@ fn parseSkillFile(alloc: Allocator, io: std.Io, path: []const u8, dir_name: []co
     const content = buf[0..n];
 
     var name: []const u8 = dir_name;
-    var description: []const u8 = "";
+    var desc_buf = std.ArrayList(u8).empty;
+    defer desc_buf.deinit(alloc);
+    var in_desc_multiline = false;
 
     // Frontmatter phải bắt đầu bằng "---" ở dòng đầu
     if (std.mem.startsWith(u8, content, "---\n")) {
@@ -150,12 +152,35 @@ fn parseSkillFile(alloc: Allocator, io: std.Io, path: []const u8, dir_name: []co
         var lines = std.mem.splitScalar(u8, fm, '\n');
         while (lines.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (in_desc_multiline) {
+                if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) {
+                    if (trimmed.len > 0) {
+                        if (desc_buf.items.len > 0 and desc_buf.items.len < MAX_DESC_LEN) {
+                            desc_buf.append(alloc, ' ') catch {};
+                        }
+                        const to_copy = @min(trimmed.len, if (desc_buf.items.len < MAX_DESC_LEN) MAX_DESC_LEN - desc_buf.items.len else 0);
+                        if (to_copy > 0) {
+                            desc_buf.appendSlice(alloc, trimmed[0..to_copy]) catch {};
+                        }
+                    }
+                    continue;
+                } else {
+                    in_desc_multiline = false;
+                }
+            }
+
             if (std.mem.startsWith(u8, trimmed, "name:")) {
                 name = std.mem.trim(u8, trimmed[5..], " \t\"'");
             } else if (std.mem.startsWith(u8, trimmed, "description:")) {
-                var desc = std.mem.trim(u8, trimmed[12..], " \t\"'");
-                if (desc.len > MAX_DESC_LEN) desc = desc[0..MAX_DESC_LEN];
-                description = desc;
+                const rest = std.mem.trim(u8, trimmed[12..], " \t\"'");
+                if (std.mem.eql(u8, rest, ">") or std.mem.eql(u8, rest, ">-") or
+                    std.mem.eql(u8, rest, "|") or std.mem.eql(u8, rest, "|-") or rest.len == 0)
+                {
+                    in_desc_multiline = true;
+                } else {
+                    const to_copy = @min(rest.len, MAX_DESC_LEN);
+                    desc_buf.appendSlice(alloc, rest[0..to_copy]) catch {};
+                }
             }
         }
     }
@@ -168,7 +193,7 @@ fn parseSkillFile(alloc: Allocator, io: std.Io, path: []const u8, dir_name: []co
 
     return .{
         .name = try alloc.dupe(u8, name),
-        .description = try alloc.dupe(u8, description),
+        .description = try alloc.dupe(u8, desc_buf.items),
         .path = try alloc.dupe(u8, path),
     };
 }
@@ -197,9 +222,8 @@ pub fn buildSkillsBlock(alloc: Allocator) !?[]u8 {
         \\
         \\## Available skills
         \\
-        \\Khi task khớp description của một skill bên dưới, đọc file SKILL.md tương ứng
-        \\(và RULES.md / references nếu skill trỏ tới) bằng file_read TRƯỚC KHI làm,
-        \\rồi tuân theo hướng dẫn trong đó. Không cần hỏi lại user về convention.
+        \\Khi task khớp rõ ràng với điều kiện kích hoạt trong description của một skill bên dưới, đọc file SKILL.md tương ứng bằng `mini.read` (hoặc file_read) TRƯỚC KHI thực hiện, rồi tuân theo hướng dẫn trong đó. Không cần hỏi lại user về convention.
+        \\LƯU Ý: Chỉ đọc skill khi thực sự cần thiết cho yêu cầu hiện tại. Tuyệt đối không tự ý kích hoạt các skill ngoài phạm vi nhiệm vụ được yêu cầu.
         \\
         \\
     );
@@ -251,6 +275,51 @@ test "frontmatter parse logic" {
     }
     try testing.expect(found_name);
     try testing.expect(found_desc);
+}
+
+test "frontmatter parse multiline description" {
+    const content =
+        \\---
+        \\name: check-work
+        \\description: >
+        \\  Check your work with a verification subagent.
+        \\  Use when asked to "check work" or "verify".
+        \\metadata:
+        \\  short-description: "Verify"
+        \\---
+        \\# Content
+    ;
+    const body_start = std.mem.indexOfPos(u8, content, 4, "\n---").?;
+    const fm = content[4..body_start];
+    var lines = std.mem.splitScalar(u8, fm, '\n');
+    var desc_buf = std.ArrayList(u8).empty;
+    defer desc_buf.deinit(testing.allocator);
+    var in_desc_multiline = false;
+
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (in_desc_multiline) {
+            if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) {
+                if (trimmed.len > 0) {
+                    if (desc_buf.items.len > 0) {
+                        try desc_buf.append(testing.allocator, ' ');
+                    }
+                    try desc_buf.appendSlice(testing.allocator, trimmed);
+                }
+                continue;
+            } else {
+                in_desc_multiline = false;
+            }
+        }
+        if (std.mem.startsWith(u8, trimmed, "description:")) {
+            const rest = std.mem.trim(u8, trimmed[12..], " \t\"'");
+            if (std.mem.eql(u8, rest, ">") or std.mem.eql(u8, rest, ">-")) {
+                in_desc_multiline = true;
+            }
+        }
+    }
+
+    try testing.expectEqualStrings("Check your work with a verification subagent. Use when asked to \"check work\" or \"verify\".", desc_buf.items);
 }
 
 test "buildSkillsBlock empty khi khong co skill" {
