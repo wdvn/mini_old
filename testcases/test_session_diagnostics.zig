@@ -58,13 +58,53 @@ test "session_diagnostics: analyzeJournal parses throttling and errors accuratel
     try testing.expect(summary.state == .crashed or summary.state == .finished);
 }
 
-test "session_diagnostics: detailSession formats journal_76006 cleanly" {
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+test "session_diagnostics: detailSession formats a hermetic session cleanly" {
     const alloc = testing.allocator;
-    const report = session_diag.detailSession(alloc, testing.io, 76006) catch return;
+
+    // Hermetic: trỏ MINI_HOME tới thư mục tạm và tự tạo journal cho PID của
+    // chính tiến trình test, không phụ thuộc dữ liệu máy thật.
+    const saved_mini_home: ?[:0]const u8 = if (getenv("MINI_HOME")) |mh|
+        try alloc.dupeZ(u8, std.mem.span(mh))
+    else
+        null;
+    defer if (saved_mini_home) |mh| alloc.free(mh);
+
+    var tmp_buf: [64]u8 = undefined;
+    const tmp_dir = try std.fmt.bufPrintZ(&tmp_buf, "/tmp/mini_diag_test_{d}", .{std.os.linux.getpid()});
+    var sess_buf: [128]u8 = undefined;
+    const sess_dir = try std.fmt.bufPrint(&sess_buf, "{s}/sessions", .{tmp_dir});
+    std.Io.Dir.cwd().createDirPath(testing.io, sess_dir) catch {};
+    _ = setenv("MINI_HOME", tmp_dir.ptr, 1);
+    defer {
+        _ = setenv("MINI_HOME", if (saved_mini_home) |mh| mh.ptr else "", 1);
+        std.Io.Dir.cwd().deleteTree(testing.io, tmp_dir) catch {};
+    }
+
+    const my_pid: i32 = @intCast(std.os.linux.getpid());
+    var path_buf: [256]u8 = undefined;
+    const journal_path = try std.fmt.bufPrint(&path_buf, "{s}/sessions/journal_{d}.jsonl", .{ tmp_dir, my_pid });
+
+    const sample_content =
+        \\{"act_id":1,"event_type":"act_started","timestamp":1788919924527,"description":"Bắt đầu Act","delta":null,"error_detail":null}
+        \\{"act_id":1,"event_type":"llm_call_throttled","timestamp":1788919925568,"description":"Rate limit (429) từ backend","delta":null,"error_detail":{"backend":"openai-compat","model":"test-model","error_name":"LLMRateLimitExceeded","http_code":429,"attempt":1,"server_error":"Rate limit exceeded","remedy_hint":"Wait"}}
+        \\
+    ;
+    const f = try std.Io.Dir.cwd().createFile(testing.io, journal_path, .{});
+    try f.writeStreamingAll(testing.io, sample_content);
+    f.close(testing.io);
+
+    const report = try session_diag.detailSession(alloc, testing.io, my_pid);
     defer alloc.free(report);
+
     try testing.expect(report.len > 0);
-    try testing.expect(std.mem.indexOf(u8, report, "Báo cáo Chẩn đoán Session PID `76006`") != null);
-    try testing.expect(std.mem.indexOf(u8, report, "throttled") != null or std.mem.indexOf(u8, report, "crashed") != null or std.mem.indexOf(u8, report, "finished") != null);
+    try testing.expect(std.mem.indexOf(u8, report, "Báo cáo Chẩn đoán Session PID") != null);
+    try testing.expect(std.mem.indexOf(u8, report, "throttled") != null or
+        std.mem.indexOf(u8, report, "crashed") != null or
+        std.mem.indexOf(u8, report, "finished") != null);
+    try testing.expect(std.mem.indexOf(u8, report, "HTTP 429") != null);
 }
 
 

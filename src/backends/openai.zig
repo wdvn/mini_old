@@ -43,33 +43,16 @@ pub const ProtocolMode = enum {
     responses,
 };
 
-/// Trích xuất root base URL (bỏ /chat/completions hoặc /responses nếu có).
+/// Trích xuất root base URL (bỏ suffix endpoint nếu có).
 pub fn getRootApiUrl(base_url: []const u8) []const u8 {
-    var url = std.mem.trimEnd(u8, base_url, "/ \t\r\n");
-    if (std.mem.endsWith(u8, url, "/chat/completions")) {
-        return std.mem.trimEnd(u8, url[0 .. url.len - "/chat/completions".len], "/");
-    }
-    if (std.mem.endsWith(u8, url, "/responses")) {
-        return std.mem.trimEnd(u8, url[0 .. url.len - "/responses".len], "/");
-    }
-    if (std.mem.endsWith(u8, url, "/response")) {
-        return std.mem.trimEnd(u8, url[0 .. url.len - "/response".len], "/");
+    const url = std.mem.trimEnd(u8, base_url, "/ \t\r\n");
+    const suffixes = [_][]const u8{ "/chat/completions", "/responses", "/response" };
+    for (suffixes) |suffix| {
+        if (std.mem.endsWith(u8, url, suffix)) {
+            return std.mem.trimEnd(u8, url[0 .. url.len - suffix.len], "/");
+        }
     }
     return url;
-}
-
-/// Nhận diện model dòng mới ưu tiên dùng Responses API (GPT-5.6, o3-pro, v.v.).
-pub fn shouldUseResponsesApi(model: []const u8) bool {
-    if (std.mem.startsWith(u8, model, "gpt-5.6") or
-        std.mem.startsWith(u8, model, "gpt-5-sol") or
-        std.mem.startsWith(u8, model, "gpt-5-terra") or
-        std.mem.startsWith(u8, model, "gpt-5-luna") or
-        std.mem.startsWith(u8, model, "o3-pro") or
-        std.mem.startsWith(u8, model, "o1-pro"))
-    {
-        return true;
-    }
-    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -150,8 +133,9 @@ pub const Client = struct {
             if (self.protocol_mode == .chat_completions) break :blk .chat_completions;
             if (self.protocol_mode == .responses) break :blk .responses;
             if (self.cached_protocol) |p| break :blk p;
-            if (shouldUseResponsesApi(self.model)) break :blk .responses;
-            break :blk .chat_completions;
+            // Auto mode: mặc định ưu tiên Responses API. Backend chưa hỗ trợ
+            // (404/400 "not found") sẽ tự fallback về chat_completions ở Tier 2.
+            break :blk .responses;
         };
 
         var retry_count: u32 = 0;
@@ -1223,19 +1207,10 @@ test "openai auto-negotiation: getRootApiUrl normalizes endpoints" {
     try testing.expectEqualStrings("http://localhost:11434/v1", getRootApiUrl("http://localhost:11434/v1/chat/completions"));
 }
 
-test "openai auto-negotiation: shouldUseResponsesApi model detection" {
-    try testing.expect(shouldUseResponsesApi("gpt-5.6-sol"));
-    try testing.expect(shouldUseResponsesApi("gpt-5.6-terra"));
-    try testing.expect(shouldUseResponsesApi("gpt-5.6-luna"));
-    try testing.expect(shouldUseResponsesApi("gpt-5-sol"));
-    try testing.expect(shouldUseResponsesApi("o3-pro"));
-    try testing.expect(shouldUseResponsesApi("o1-pro"));
-
-    try testing.expect(!shouldUseResponsesApi("gpt-4o"));
-    try testing.expect(!shouldUseResponsesApi("gpt-4o-mini"));
-    try testing.expect(!shouldUseResponsesApi("deepseek-chat"));
-    try testing.expect(!shouldUseResponsesApi("qwen2.5-coder"));
-}
+// Lưu ý: đã xóa shouldUseResponsesApi() — auto mode mặc định ưu tiên
+// Responses API cho mọi model; backend cũ chưa hỗ trợ sẽ tự fallback về
+// chat_completions qua Adaptive Cross-Protocol Fallback (Tier 2) và cache
+// kết quả (Tier 3). Không còn danh sách model hard-code cần bảo trì.
 
 test "openai auto-negotiation: buildResponsesRequestBody format" {
     const alloc = testing.allocator;

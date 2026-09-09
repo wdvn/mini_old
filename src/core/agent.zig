@@ -90,6 +90,17 @@ pub const Backend = union(enum) {
         };
     }
 
+    /// Vệ sinh history theo yêu cầu định dạng của backend (dispatch thay vì
+    /// if-else rải rác trong agent loop).
+    fn sanitizeHistory(self: *Backend, hist: *history_mod.History) bool {
+        return switch (self.*) {
+            .openai => hist.ensureOpenAICompatible(),
+            .claude => hist.ensureClaudeCompatible(),
+            // Ollama dùng định dạng OpenAI-compatible.
+            .ollama => hist.ensureOpenAICompatible(),
+        };
+    }
+
     /// Gửi message đến backend. Trả về Response đầy đủ.
     fn send(
         self: *Backend,
@@ -363,12 +374,8 @@ pub const AgentLoop = struct {
             main.stderrPrint("\x1b[36m[agent]\x1b[0m \x1b[93mĐang suy nghĩ / Phân tích yêu cầu... \x1b[0m\n", .{});
         }
 
-        // Vệ sinh history theo backend
-        if (self.backend == .openai) {
-            _ = self.history.ensureOpenAICompatible();
-        } else if (self.backend == .claude) {
-            _ = self.history.ensureClaudeCompatible();
-        }
+        // Vệ sinh history theo yêu cầu định dạng của backend.
+        _ = self.backend.sanitizeHistory(&self.history);
 
         const input_msgs_count = self.history.len();
         const input_msgs = self.history.messages()[0..input_msgs_count];

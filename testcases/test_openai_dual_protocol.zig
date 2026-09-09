@@ -14,18 +14,10 @@ test "dual-protocol: getRootApiUrl chuẩn hóa base URL" {
     try testing.expectEqualStrings("http://localhost:11434/v1", openai.getRootApiUrl("http://localhost:11434/v1/"));
 }
 
-test "dual-protocol: shouldUseResponsesApi heuristic cho model thế hệ mới" {
-    try testing.expect(openai.shouldUseResponsesApi("gpt-5.6-luna"));
-    try testing.expect(openai.shouldUseResponsesApi("gpt-5.6-terra"));
-    try testing.expect(openai.shouldUseResponsesApi("gpt-5-sol"));
-    try testing.expect(openai.shouldUseResponsesApi("o3-pro"));
-    try testing.expect(openai.shouldUseResponsesApi("o1-pro"));
-
-    try testing.expect(!openai.shouldUseResponsesApi("gpt-4o"));
-    try testing.expect(!openai.shouldUseResponsesApi("gpt-4o-mini"));
-    try testing.expect(!openai.shouldUseResponsesApi("deepseek-chat"));
-    try testing.expect(!openai.shouldUseResponsesApi("claude-3-5-sonnet"));
-}
+// Đã xóa heuristic shouldUseResponsesApi: chế độ .auto giờ mặc định ưu tiên
+// Responses API cho mọi model; server chưa hỗ trợ sẽ tự fallback về
+// chat_completions qua Adaptive Cross-Protocol Fallback (Tier 2) và cache
+// giao thức thành công (Tier 3: Protocol Memory).
 
 test "dual-protocol: client khởi tạo và protocol enum" {
     const client = openai.Client.initWithProtocol(
