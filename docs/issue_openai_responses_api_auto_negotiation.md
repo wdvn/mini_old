@@ -4,7 +4,7 @@
 |---|---|
 | Mã Issue | **ISSUE-BACKEND-001** |
 | Tên | Tự động đàm phán và chuyển đổi giữa Chat Completions API và Responses API (Dual-Protocol Auto-Negotiation & Adaptive Fallback) |
-| Trạng thái | Proposed |
+| Trạng thái | **Resolved / Implemented** (Đã hoàn thành cơ chế 3-tier auto-negotiation, request translation và protocol session cache) |
 | Phạm vi | `src/backends/openai.zig`, `src/core/config.zig`, `src/core/protocol.zig` |
 | Ngày | 26/08/2026 |
 

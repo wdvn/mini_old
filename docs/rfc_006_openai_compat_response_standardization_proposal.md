@@ -4,7 +4,7 @@
 |---|---|
 | RFC | 006 |
 | Tên | Chuẩn hóa parse response (SSE stream + usage) cho OpenAI/OpenAI-compat |
-| Trạng thái | Draft — chờ review |
+| Trạng thái | **Implemented / Production** — SSE stream chunk parsing (usage, finish_reasons, delta.reasoning, HTTP error path) đã hoàn thành và kiểm thử toàn diện |
 | Phiên bản | 0.1 |
 | Phụ thuộc | Không (RFC-001 liên quan gián tiếp — cùng mô hình backend `core/protocol.zig`) |
 | Tham chiếu | [OpenAI Chat Completions API — streaming](https://platform.openai.com/docs/api-reference/chat/streaming), [Chat Completions object](https://platform.openai.com/docs/api-reference/chat/object); các biến thể compat: [DeepSeek reasoning_content](https://api-docs.deepseek.com/api/create-chat-completion), vLLM, LM Studio, Ollama `/v1` |

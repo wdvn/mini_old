@@ -1,6 +1,6 @@
 # PROPOSAL: CODEACT EMBEDDED CODE-CENTRIC AGENT ARCHITECTURE CHO MINI
 > **Document**: RFC-001 (Revision 7 — Long-Lived Tasks & Lifecycle Context Tracking)  
-> **Status**: Approved / In Implementation  
+> **Status**: Implemented / Production  
 > **Target System**: `mini-agent` (`mini`)  
 > **Core Interpreter**: **Embedded CodeAct (ES2023/ES2024 Modern JavaScript Runtime)**  
 > **Repository**: [quickjs-ng/quickjs](https://github.com/quickjs-ng/quickjs)  

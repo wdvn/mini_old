@@ -4,7 +4,7 @@
 |---|---|
 | RFC | 004 |
 | Tên | Áp dụng chuẩn AGENTS.md (open format cho coding agents) |
-| Trạng thái | Implemented — chờ review |
+| Trạng thái | **Implemented / Production** |
 | Phiên bản | 0.1 |
 | Phụ thuộc | Không phụ thuộc RFC khác (độc lập) |
 | Tham chiếu | [agents.md](https://agents.md) — open format, 60k+ OSS projects |
@@ -17,9 +17,9 @@
 
 ### 1.1. Hiện trạng
 
-- Repo `mini` có `README.md` (29KB) hướng dẫn cho **con người**: cài đặt, tính năng, ví dụ.
+- Repo `mini` có `README.md` hướng dẫn cho **con người**: cài đặt, tính năng, ví dụ.
 - Không có nguồn hướng dẫn **dành riêng cho coding agents** (mini-agent tự chạy trên chính nó, Codex, Jules, Cursor, Claude Code...): lệnh build/test, quy ước code, lưu ý kiến trúc.
-- Agents phải tự đoán hoặc đọc toàn bộ README 29KB → tốn context window, dễ bỏ sót quy ước (ví dụ: comment tiếng Việt, không thêm dependency ngoài proposal, file `test*.zig` là scratch).
+- Agents phải tự đoán hoặc đọc toàn bộ README → tốn context window, dễ bỏ sót quy ước (ví dụ: comment tiếng Việt, không thêm dependency ngoài proposal, file test phải đặt trong `testcases/test_*.zig`).
 
 ### 1.2. Tại sao chọn AGENTS.md
 

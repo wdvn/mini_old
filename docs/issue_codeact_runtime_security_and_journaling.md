@@ -4,7 +4,7 @@
 |---|---|
 | Mã Issue | ISSUE-CODEACT-001 |
 | Tên | Chuẩn hóa Security Policy, Hooks Dispatch & ActJournaling cho CodeAct Runtime |
-| Trạng thái | Proposed |
+| Trạng thái | **Resolved / Implemented** (Đã hoàn thành toàn bộ 8 hạng mục; bảo vệ bởi 45 tests trong `testcases/test_codeact_security.zig`) |
 | Phạm vi | `src/runtime/js_bindings.zig`, `src/runtime/quickjs_engine.zig`, `src/core/agent.zig` |
 | Ngày | 23/08/2026 |
 

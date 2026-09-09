@@ -20,10 +20,10 @@ Tài liệu này bổ sung cho `AGENTS.md` ở root, tập trung vào phương p
 
 4. **Kiểm chứng đa tầng (Multi-tier Verification)**:
    - Tái hiện lỗi qua unit test nhỏ gọn trong `testcases/test_*.zig` nếu khả thi.
-   - Sau khi sửa chữa, chạy toàn bộ bộ kiểm thử All-In-One: `zig build test --summary all`.
-     - *Tầng 1 (Unit)*: Unit tests core/tools/ui trong `src/main.zig`.
-     - *Tầng 2 (Security/VM)*: CodeAct security và VM isolation trong `testcases/test_codeact_security.zig`.
-     - *Tầng 3 (E2E Mock LLM)*: Chạy binary `mini` với mock OpenAI SSE server (`scripts/mock_llm_server.js`).
+   - Sau khi sửa chữa, chạy toàn bộ bộ kiểm thử All-In-One: `zig build test --summary all` (phải pass 13/13 steps, 159 tests passed, 4 skipped).
+     - *Tầng 1 (Unit)*: Unit tests core/tools/ui trong `src/main.zig` (118 tests: 114 passed, 4 skipped).
+     - *Tầng 2 (Security/VM)*: CodeAct security, VM isolation, hooks, CAS file snapshot trong `testcases/test_codeact_security.zig` (45 tests).
+     - *Tầng 3 (E2E Mock LLM)*: Chạy binary `mini` với mock OpenAI SSE server (`scripts/mock_llm_server.js`, 3 flow: simple, long stream, multi-turn bash).
    - Nếu cần chạy phân lập: `zig build test-unit` (chỉ tầng 1+2), `zig build test-e2e` (chỉ tầng 3), hoặc `zig build test -Dskip-e2e=true`.
 
 ---
@@ -58,8 +58,9 @@ Tài liệu này bổ sung cho `AGENTS.md` ở root, tập trung vào phương p
 
 ## 3. Bản đồ thành phần kỹ thuật cần chú ý khi debug
 
-- **Agent Core Loop**: `src/core/agent.zig` (vòng lặp act, phân loại lỗi HTTP, journaling, compaction).
-- **CodeAct VM & JS Bindings**: `src/runtime/quickjs_engine.zig`, `src/runtime/js_bindings.zig`.
-- **Backends & Adapters**: `src/backends/openai.zig`, `src/backends/claude.zig`, `src/backends/ollama.zig`.
-- **UI & Terminal Stream**: `src/ui/chat_stream.zig`, `src/ui/repl.zig`, `src/ui/editor.zig`.
+- **Agent Core Loop**: `src/core/agent.zig` (vòng lặp act, phân loại lỗi HTTP, journaling, reactive compaction, 4 stopping rules).
+- **CodeAct VM & JS Bindings**: `src/runtime/quickjs_engine.zig`, `src/runtime/js_bindings.zig` (Per-Act VM isolation, policy & hook enforcement, CAS file snapshotting).
+- **Backends & Adapters**: `src/backends/openai.zig` (Dual-protocol auto-negotiation, responses API, usage & reasoning parse), `src/backends/claude.zig`, `src/backends/ollama.zig`.
+- **UI & Terminal Stream**: `src/ui/chat_stream.zig` (TurnRenderer, inplace replacement khi retry, ANSI truncation, raw backend error formatting), `src/ui/repl.zig`, `src/ui/editor.zig`, `src/ui/paste.zig`.
 - **Memory & History**: `src/core/history.zig`, `src/core/memact/`.
+- **Tools & Registry**: `src/tooling/registry.zig` (15 built-in tools + MCP dispatcher), `src/tools/session_diagnostics.zig`, `src/core/skills.zig`.

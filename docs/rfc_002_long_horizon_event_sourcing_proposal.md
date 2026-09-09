@@ -1,7 +1,7 @@
 # PROPOSAL: THIẾT KẾ EVENT-DRIVEN ACT ARCHITECTURE CHO MINI
 ### Loại Bỏ `MaxIterationsReached`, Hỗ Trợ Long-Lived Tasks, Rollback State & Xử Lý Toàn Diện Lỗi LLM / Hạ Tầng
 > **Document**: RFC-002 (Revision 4 — Full Failure Spectrum & LLM Fault-Tolerance)  
-> **Status**: Proposed / Under Review  
+> **Status**: Implemented / Production  
 > **Target System**: `mini-agent` (`mini`)  
 > **Reference**: `event_sourcing_long_horizon_agentic_ai.md`  
 > **Author**: Core Team & AI Pair Programmer  

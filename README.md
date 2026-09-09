@@ -19,15 +19,17 @@ mini-agent là một AI agent dòng lệnh viết bằng Zig: nó nhận prompt,
 
 | Capability | What it does | Learn more |
 |---|---|---|
-| Backends AI | OpenAI-compatible, Anthropic Claude, Ollama local | [Backends AI](#backends-ai) |
-| Built-in tools | 13 tools: shell, file, glob, grep, HTTP, subagent, artifact | [Tools](#tools) |
-| CodeAct runtime | Agent viết JS trong khối ```js``` chạy trên CodeAct nhúng, gọi API `mini.*` | [Execution modes](#execution-modes) |
-| Session persistence | Lưu/khôi phục hội thoại theo ID hoặc file JSON | [Session](#session-lưu-hội-thoại) |
-| Hooks | Audit logging, telemetry qua script ngoài tại mọi sự kiện | [Hooks](#hooks-giám-sát--observability) |
+| Backends AI | OpenAI-compatible (Chat Completions & Responses API), Anthropic Claude, Ollama local | [Backends AI](#backends-ai) |
+| Built-in tools | 15 tools: shell, file, glob, grep, HTTP, subagents, artifacts, session diagnostics, skills, codeact | [Tools](#tools) |
+| CodeAct runtime | Agent viết JS trong khối ```js``` chạy trên CodeAct nhúng, gọi API `mini.*` (Per-Act VM isolation) | [Execution modes](#execution-modes) |
+| MemAct | Tự động nén ngữ cảnh (Reactive Compaction) khi vượt giới hạn context window | [MemAct & Context](#memact--context-management) |
+| Workspace `.agent/` | Thư mục cấu hình cục bộ: instructions (`AGENTS.md`), project skills, custom slash commands | [Workspace .agent](#agent-workspace-folder) |
+| Session persistence | Lưu/khôi phục hội thoại và audit journal (`journal_*.jsonl`) theo ID | [Session](#session-lưu-hội-thoại) |
+| Hooks & Sidecars | Script hook tại mọi sự kiện lifecycle, tool call; tích hợp proxy router tối ưu latency/tps | [Hooks](#hooks-giám-sát--observability) |
 | MCP | Dùng tool từ MCP servers ngoài qua stdio JSON-RPC | [MCP](#mcp-model-context-protocol) |
 | ACP | Tích hợp vào Zed AI, JetBrains như external agent | [ACP](#acp-agent-client-protocol) |
 | Artifacts | Xuất kế hoạch, báo cáo, HTML/SVG ra thư mục session, kích hoạt preview hook | [Tools](#tools) |
-| Tool policy | Allowlist/blocklist kiểm soát tool nào được chạy | [Tool policy](#tool-policy) |
+| Tool policy | Allowlist/blocklist kiểm soát tool nào được chạy (áp dụng cả JSON tool và JS bindings) | [Tool policy](#tool-policy) |
 | Cron | Cài cronjob chạy single-shot định kỳ | [Cron](#cron-chạy-định-kỳ) |
 
 ## Quickstart
@@ -72,7 +74,7 @@ Chi tiết build: [Build](#build).
 
 Agent chọn backend theo thứ tự ưu tiên:
 
-1. **OpenAI-compatible** — khi có `OPENAI_COMPAT_URL`
+1. **OpenAI-compatible** — khi có `OPENAI_COMPAT_URL` (hỗ trợ cả Chat Completions API & Responses API với auto-negotiation)
 2. **Anthropic Claude** — khi có `ANTHROPIC_API_KEY`
 3. **Ollama** — fallback local
 
@@ -82,12 +84,19 @@ Agent chọn backend theo thứ tự ưu tiên:
 | `OPENAI_COMPAT_MODEL` | Tên model | `gpt-4o-mini` |
 | `OPENAI_COMPAT_API_KEY` | API key | — |
 | `OPENAI_COMPAT_API_HEADER` | Tên HTTP header chứa key | `Authorization` |
+| `OPENAI_PROTOCOL` | Giao thức OpenAI: `auto`, `chat_completions`, `responses` | `auto` |
 | `ANTHROPIC_API_KEY` | Claude API key | — |
 | `CLAUDE_MODEL` | Claude model ID | `claude-opus-4-5` |
 | `OLLAMA_HOST` | URL Ollama server | `http://localhost:11434` |
 | `OLLAMA_MODEL` | Tên model Ollama | `llama3` |
 
 Đổi backend trong REPL bằng lệnh `/model <backend> [model]`, với `backend` nhận một trong ba giá trị `openai` | `claude` | `ollama`.
+
+#### Dual-Protocol Auto-Negotiation (OpenAI & Responses API)
+
+Với các model reasoning thế hệ mới (ví dụ GPT-5.x, o3-pro) đòi hỏi giao thức Responses API khi kết hợp reasoning với function calling:
+- Khi để `OPENAI_PROTOCOL=auto`, `mini` tự động nhận diện prefix model hoặc tự thích ứng (fallback) giữa `/chat/completions` và `/responses` khi gặp lỗi HTTP 400.
+- Ghi nhớ giao thức thành công trong phiên (Session Cache) để triệt tiêu độ trễ dò tìm ở các turn sau.
 
 Ví dụ endpoint khác nhau:
 
@@ -105,7 +114,7 @@ export OPENAI_COMPAT_URL=http://localhost:1234/v1
 mini-agent đọc cấu hình từ biến môi trường. File `.env` được tự động nạp theo thứ tự:
 
 1. `$MINI_ENV_FILE` — đường dẫn tường minh
-2. `./.env` — thư mục làm việc hiện tại
+2. `./.env` — thư mục làm việc hiện tại (project-level)
 3. `~/.mini/.env` — user-level
 
 > Biến đã có sẵn trong shell environment **không bị ghi đè** bởi file `.env`.
@@ -125,22 +134,40 @@ Cú pháp `.env` hỗ trợ khai báo `KEY=value` (có hoặc không có ngoặc
 | `MINI_TOOL_BLOCKLIST` | Chặn các tool này (comma-separated) | — |
 | `MINI_MCP_CONFIG` | Đường dẫn file `mcp.json` | `<MINI_HOME>/mcp.json` |
 | `MINI_HOOK_COMMAND` | Lệnh hook giám sát | — |
+| `MINI_HOOKS_CONFIG` | Đường dẫn file cấu hình hooks (`hooks.json`) | — |
 | `MINI_SESSION` | Session ID (lưu tại `<MINI_HOME>/sessions/<id>.json`) | — |
 | `MINI_SESSION_FILE` | Đường dẫn file session JSON trực tiếp | — |
 | `MINI_ENV_FILE` | Đường dẫn `.env` tường minh | — |
+| `MINI_BUDGET_MAX_TOKENS` | Giới hạn tổng token tiêu thụ tối đa cho một task (RFC-002) | `0` (không giới hạn) |
+
+### MemAct & Context Management (RFC-003)
+
+| Biến | Mô tả | Mặc định |
+|---|---|---|
+| `MINI_MEMACT_ENABLED` | `"0"` để tắt MemAct | `1` (bật) |
+| `MINI_CONTEXT_WINDOW` | Kích thước context window của model (tokens) | Auto theo backend |
+| `MINI_CTX_COMPACT_THRESHOLD` | Ngưỡng nén chủ động / dự phòng | `0.85` |
+| `MINI_CTX_SAFETY_MARGIN` | Hệ số an toàn context | `0.15` |
+| `MINI_MEMACT_TOP_K` | Số memory item tối đa inject vào prompt | `8` |
+| `MINI_MEMACT_MEMORY_BUDGET` | Ngân sách token dành riêng cho memory block | `2000` |
+| `MINI_MEMACT_EXTRACT` | Chế độ trích xuất bộ nhớ dài hạn: `async`, `sync`, `off` | `async` |
+| `MINI_MEMORY_DIR` | Thư mục lưu memory | `~/.mini/memory` |
+
+> **Cơ chế nén ngữ cảnh Reactive Compaction (v0.3)**: Khi LLM backend báo lỗi tràn ngữ cảnh (ví dụ HTTP 400 Context Length Exceeded), mini-agent tự động kích hoạt quá trình tóm tắt và nén lịch sử (drop-all các message trung gian, dồn bản tóm tắt có cấu trúc tại vị trí index 1, giữ nguyên prompt ban đầu ở index 0) rồi tự động gửi lại request.
 
 ### Tool policy
 
-- Allowlist có ưu tiên cao hơn blocklist: khi set allowlist, chỉ tool trong list mới chạy.
-- Policy áp dụng cho tool gọi trực tiếp qua registry. Khi chạy ở chế độ `codeact`, lệnh shell đi qua API `mini.sh` trong CodeAct và không đi qua check này.
+- Allowlist có ưu tiên cao hơn blocklist: khi set allowlist, chỉ tool trong list mới được chạy.
+- **Bảo đảm đa tầng**: Policy được kiểm soát nghiêm ngặt ở cả **Native JSON Tool Calling** và **CodeAct JavaScript Bindings** (`mini.sh`, `mini.write`, `mini.patch`, `mini.read`, v.v.).
 
 ```bash
 # Chỉ cho phép đọc file và tìm kiếm
 MINI_TOOL_ALLOWLIST=file_read,glob,grep mini-agent
 
-# Chặn bash ở chế độ tools
-MINI_TOOL_BLOCKLIST=bash mini-agent -m tools
+# Chặn lệnh shell ở cả JSON tool lẫn CodeAct VM
+MINI_TOOL_BLOCKLIST=bash mini-agent
 ```
+
 
 ## Cách dùng
 
@@ -197,10 +224,12 @@ Chế độ thực thi (cờ `-m`/`--mode` hoặc `MINI_EXECUTION_MODE`):
 
 - **`auto`** (mặc định) — model tự chọn cách phản hồi.
 - **`codeact`** — agent viết JavaScript trong khối ```js ... ``` chạy trên CodeAct nhúng (ES2023+), gọi tools qua object `mini.*`:
+  - **Per-Act VM Isolation**: Mỗi turn tạo `JSContext` độc lập để bảo vệ scope biến giữa các act, không bị xung đột redeclaration.
   - File I/O: `mini.read`, `mini.write`, `mini.patch`, `mini.exists`, `mini.stat`.
   - Tìm kiếm: `mini.glob`, `mini.grep`.
   - Shell: `mini.sh`, `mini.shStream`, `mini.shBackground` + quản lý job (`mini.jobStatus`, `mini.jobLogs`, `mini.jobKill`).
   - Khác: `mini.http`, `mini.artifact`, `mini.env`.
+  - An toàn: Tự động bắt lỗi XML giả định (`<file_read>`, `<bash>`) chuyển đổi sang JS block; kiểm soát allowlist/blocklist và hook dispatch tại C-bindings.
 - **`tools`** — agent gọi từng tool qua JSON schema truyền thống.
 
 Chạy codeact tường minh:
@@ -208,6 +237,15 @@ Chạy codeact tường minh:
 ```bash
 mini-agent -m codeact -e "Dùng mini.sh chạy 'date +%s' và báo kết quả"
 ```
+
+### Nguyên tắc kiểm soát hành động (Execution & Stopping Rules)
+
+Agent tuân thủ 4 nguyên tắc cốt lõi được nạp trực tiếp vào system prompt:
+1. **Dừng lại khi đạt mục tiêu (Stop on Completion)**: Ngay khi thu thập đủ dữ liệu hoặc hoàn tất tác vụ, agent dừng gọi tool và trả lời ngay, không chạy dư thừa.
+2. **Xác nhận trước khi thay đổi (Confirm Before Mutation)**: Khi đang khảo sát/chẩn đoán, không tự ý sửa đổi file hay cấu hình nếu người dùng chưa yêu cầu trực tiếp.
+3. **Tránh bẫy thao tác lặp lại (Avoid Action Loops)**: Nếu một hướng tiếp cận thất bại sau 2–3 lần thử, agent dừng lại đổi giả thuyết thay vì lặp vô hạn.
+4. **Báo cáo tiến độ theo chặng (Progress Checkpoint)**: Đối với bài toán lớn, agent định kỳ dừng lại tóm tắt tiến độ và xin định hướng tiếp theo.
+
 
 ### Session (lưu hội thoại)
 
@@ -274,6 +312,20 @@ if payload_raw:
 ```bash
 MINI_HOOK_COMMAND='python3 monitor.py >> /tmp/agent_telemetry.log' mini-agent -e "Tạo file /tmp/hello.txt"
 ```
+
+#### Sidecar Proxy Pattern (ví dụ: Định tuyến OpenRouter Low-Latency & High-TPS)
+
+Nếu muốn định tuyến hoặc tối ưu hóa request (như tự động chọn provider có độ trễ thấp nhất hoặc TPS cao nhất trên OpenRouter) **mà không sửa mã nguồn của mini-agent**, bạn có thể sử dụng cơ chế Hook kết hợp Sidecar Proxy:
+
+1. Đặt sidecar proxy script (ví dụ `openrouter_proxy.py`) và hook script tại thư mục `~/.mini/hook/`.
+2. Sidecar proxy chạy nền trên `http://127.0.0.1:8787`, lắng nghe request, tự động thăm dò bảng metrics của OpenRouter (`/api/v1/endpoints/z-scores` hoặc provider latency) và chuyển tiếp request đến provider tối ưu nhất.
+3. Trong `~/.mini/.env`, trỏ:
+   ```bash
+   OPENAI_COMPAT_URL=http://127.0.0.1:8787/v1
+   MINI_HOOK_COMMAND=~/.mini/hook/pre_prompt_hook.sh
+   ```
+4. Hook script `pre_prompt_hook.sh` kiểm tra tiến trình proxy, tự khởi động proxy nếu chưa chạy và ghi nhận audit log trước mỗi lượt prompt.
+
 
 ## Tools
 
@@ -388,6 +440,47 @@ Quản lý artifacts — sản phẩm độc lập (kế hoạch, walkthrough, H
 {}
 ```
 
+### session_diagnostics
+
+Chẩn đoán và phân tích sâu các phiên làm việc của agent:
+- Đọc và phân tích `journal_*.jsonl` trong `~/.mini/sessions/`.
+- Thống kê phân loại lỗi (error taxonomy): `rate_limit_exceeded`, `provider_error` (HTTP 500, 502, 503, Cloudflare 520, 522), `context_length_exceeded`, `timeout`.
+- Đánh giá hiệu quả retry backoff và lịch sử file modification (CAS snapshots).
+
+```json
+{ "action": "analyze_recent", "limit": 5 }
+{ "action": "inspect_session", "session_id": "session-1234" }
+```
+
+### codeact
+
+Thực thi khối lệnh JavaScript trực tiếp trong QuickJS-ng engine nhúng. Kết quả stdout và return value được đưa vào conversation turn tiếp theo.
+
+```json
+{ "code": "const files = mini.glob('**/*.zig'); console.log('Found:', files.length);" }
+```
+
+## Agent Workspace Folder (`.agent/`)
+
+Theo chuẩn **RFC-005**, mỗi project có thể chứa một thư mục `.agent/` ở thư mục gốc để quản lý tri thức và hành vi cục bộ của agent mà không làm ảnh hưởng đến cấu hình toàn cục:
+
+```
+.agent/
+├── AGENTS.md               # Quy tắc và hướng dẫn chuyên sâu cho agent trong project này
+├── config.json             # Cấu hình runtime riêng của project (model, tool allowlist, v.v.)
+├── skills/                 # Skills theo chuẩn Agent Skills (agentskills.io)
+│   ├── codebase-analysis/
+│   │   └── SKILL.md
+│   └── root-cause-analysis/
+│       └── SKILL.md
+└── commands/               # Custom Slash Commands cho REPL
+    ├── review.md           # Kích hoạt qua lệnh /review
+    └── deploy.md           # Kích hoạt qua lệnh /deploy
+```
+
+- **Skills Discovery**: Agent tự động phát hiện và nạp các skills từ `.agent/skills/` (workspace) bên cạnh `~/.mini/skills/` (toàn cục).
+- **Custom Commands**: Bất kỳ file markdown nào trong `.agent/commands/<name>.md` sẽ trở thành lệnh `/<name>` trong chế độ REPL.
+
 ## MCP (Model Context Protocol)
 
 Kết nối MCP servers ngoài qua JSON-RPC 2.0 trên stdio. Tool của server được gọi với tiền tố `<server>__<tool>`.
@@ -447,15 +540,38 @@ Phương thức hỗ trợ:
 - `session/close` — đóng và lưu context.
 - `ping` — kiểm tra liveness.
 
-## Build
+## Build & Test
 
 ```bash
 zig build                 # Debug — binary tại zig-out/bin/mini
 sudo cp zig-out/bin/mini /usr/local/bin/mini-agent   # cài vào PATH
-zig build test            # Unit tests
 zig build -Doptimize=ReleaseSafe   # Production
 zig build -Dtarget=aarch64-linux-gnu  # Cross-compile
 ```
+
+### Bộ kiểm thử All-In-One (Multi-Tier Testing)
+
+Dự án sở hữu bộ test tích hợp All-In-One tự động chạy 13/13 steps (159 tests passed, 4 skipped):
+
+```bash
+# Chạy toàn bộ test suite (Unit + Security Integration + E2E Mock LLM)
+zig build test --summary all
+
+# Chỉ chạy unit tests và CodeAct integration tests (không cần Node.js)
+zig build test-unit
+# hoặc
+zig build test -Dskip-e2e=true
+
+# Chỉ chạy E2E tests với mock LLM server
+zig build test-e2e
+
+# Chỉ định port khác cho mock server nếu port mặc định (8399) bị chiếm
+zig build test -Dtest-port=8400
+```
+
+1. **Tầng 1 (Unit Tests)**: 118 unit tests bao phủ toàn bộ core, protocol, JSON parser, ANSI tokenizer, history, config, và các tool handlers.
+2. **Tầng 2 (Integration Testcases)**: 45 tests trong `testcases/test_codeact_security.zig` kiểm tra nghiêm ngặt cách ly môi trường VM (Per-Act VM isolation), kiểm soát tool policy allowlist/blocklist, hook dispatching, và CAS snapshot rollback.
+3. **Tầng 3 (E2E Mock LLM)**: Khởi chạy mock server SSE nội bộ (`scripts/mock_llm_server.js`), thực hiện 3 luồng end-to-end hoàn chỉnh: single-turn text, long streaming text, và multi-turn tool call bash.
 
 Release đa nền tảng (Linux/macOS/Windows, x86_64/aarch64): `scripts/build_release.sh`, đóng gói vào `releases/`. GitHub Actions build và phát hành tự động khi push tag `v*`.
 

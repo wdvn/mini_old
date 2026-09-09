@@ -4,7 +4,7 @@
 |---|---|
 | RFC | 003 |
 | Tên | MemAct: Context Compaction & Memory Management |
-| Trạng thái | **v0.3 Proposed** — chờ M2c (rewrite agent loop sang reactive). Code hiện tại vẫn chạy behavior v0.2 (proactive window check). M3/M4/M5 deferred như cũ |
+| Trạng thái | **v0.3 Implemented / Production** — Agent Loop đã chuyển hoàn toàn sang Reactive Compaction khi gặp lỗi context length (drop-all + summary tại index 1, giữ nguyên prompt gốc index 0). M3/M4/M5 deferred theo lộ trình |
 | Vai trò | **RFC chuẩn (normative)**: mọi RFC khác khi nói về history / context / memory đều quy chiếu về đây. Thuật ngữ chuẩn: conversation history (tier PINNED/RECENT/SUMMARIZED/ARCHIVED), compaction (reactive — chỉ khi model báo, drop-all + summary dồn), memory (semantic/episodic/project_state). Riêng **prompt input history** của editor (RFC-000) là khối niệm độc lập, không thuộc phạm vi RFC này. |
 | Phiên bản | 0.3 — bỏ toàn bộ cơ chế window-based (TokenEstimator wiring, ContextWindow, ngưỡng %, safety margin); compaction chuyển sang **reactive-only**: chỉ nén khi model/backend báo lỗi context |
 | Phụ thuộc | RFC-001 (Code-Centric CodeAct), RFC-002 (Event-Driven Act) |

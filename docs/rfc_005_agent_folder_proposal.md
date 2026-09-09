@@ -4,7 +4,7 @@
 |---|---|
 | RFC | 005 |
 | Tên | Chuẩn thư mục `.agent/` — vùng chứa cấu hình, skills của agent trong workspace |
-| Trạng thái | Draft — chờ review |
+| Trạng thái | **Implemented / Production** — Thư mục `.agent/` (`AGENTS.md`, `skills/`, `commands/`) và skills discovery loader đã hoạt động chính thức |
 | Phiên bản | 0.3 — bỏ format skill tự chế, chuyển sang chuẩn Agent Skills (agentskills.io); tách state ra khỏi phạm vi |
 | Phụ thuộc | RFC-004 (Áp dụng chuẩn AGENTS.md) |
 | Tham chiếu | Không có chuẩn công khai `.agent` (xác minh 22/08/2026: agents.md spec, opencode, fx đều không định nghĩa thư mục này). RFC này tự định nghĩa convention cho mini. Skills tuân theo chuẩn mở [Agent Skills](https://agentskills.io/specification) (agentskills.io) — xem §2.2. Tham khảo cấu trúc thư mục dot của [vercel-labs/fx](https://github.com/vercel-labs/fx) về cách tổ chức folder theo tool. |

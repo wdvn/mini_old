@@ -10,11 +10,7 @@ Tài liệu này mô tả chi tiết và trực quan toàn bộ luồng thực t
 flowchart TD
     Start(["User Input (REPL / CLI -e)"]) --> InitTurn["Khởi tạo Turn mới: Reset Metrics & Allocator"]
     InitTurn --> AddUserHist["Thêm User Message vào History"]
-    AddUserHist --> CheckMemAct{"Context Tokens > Threshold?"}
-    
-    CheckMemAct -- "YES" --> ProactiveCompact["MemAct: Tóm tắt lịch sử & nén ngữ cảnh chủ động"]
-    CheckMemAct -- "NO" --> EnterLoop
-    ProactiveCompact --> EnterLoop
+    AddUserHist --> EnterLoop
 
     subgraph ActLoop ["VÒNG LẶP ACT (while true : act_id += 1)"]
         direction TB
@@ -25,17 +21,17 @@ flowchart TD
         
         JournalStart --> Sanitize["Vệ sinh History 2 chiều: ensureOpenAICompatible / ensureClaudeCompatible"]
         Sanitize --> FilterTools["Lọc Tool Definitions theo execution_mode (codeact / tools / auto)"]
-        FilterTools --> SendBackend["Gửi Request lên AI Backend (SSE Streaming)"]
+        FilterTools --> SendBackend["Gửi Request lên AI Backend (SSE Streaming / Dual-Protocol Auto-Negotiation)"]
         
-        SendBackend --> StreamUI["Stream UI Realtime: Reasoning/Thinking, Markdown Text, Tool Preview"]
+        SendBackend --> StreamUI["Stream UI Realtime: Reasoning/Thinking, Markdown Text, Inplace Retry & Action Cards"]
         StreamUI --> AddAssistantHist["Thêm Assistant Response vào History"]
         AddAssistantHist --> Classify{"Phân loại Response & Stop Reason"}
         
         %% Nhánh Lỗi Backend & Phục Hồi
-        Classify -- "Lỗi 429 RateLimit / 5xx" --> RetryBackoff["Ghi llm_call_throttled / provider_error -> Exponential Backoff Sleep -> Retry Act"]
+        Classify -- "Lỗi 429 RateLimit / 5xx / 520, 522" --> RetryBackoff["Ghi llm_call_throttled -> Inplace Terminal Overwrite (\x1b[1A\x1b[2K\r) -> Exponential Backoff -> Retry Act"]
         RetryBackoff --> SendBackend
         
-        Classify -- "Lỗi 400 Context Overflow" --> ForceCompact["Ghi llm_context_overflow -> Kích hoạt MemAct nén khẩn cấp -> Retry Act"]
+        Classify -- "Lỗi 400 Context Overflow" --> ForceCompact["Ghi llm_context_overflow -> MemAct Reactive Compaction (drop-all + summary tại index 1, giữ index 0) -> Retry Act"]
         ForceCompact --> SendBackend
         
         Classify -- "Lỗi Auth / Max Retries" --> AbortAct["Ghi act_failed -> Rollback CAS Snapshot -> Dừng Turn"]
@@ -85,7 +81,7 @@ sequenceDiagram
     User->>REPL: Nhập prompt (vd: "Kiểm tra hệ thống và chạy tests")
     REPL->>Agent: processInput(user_text, text_cb, think_cb)
     Agent->>Hist: addUser(user_text)
-    Agent->>Hist: compactContext() (Kiểm tra MemAct nén chủ động nếu vượt token)
+    Note over Agent,Hist: MemAct nén phản ứng (chỉ kích hoạt khi backend trả lỗi tràn token)
 
     rect rgb(240, 248, 255)
         Note over Agent,ActLog: VÒNG LẶP ACT 1 (Khảo sát qua Native Tool Calling)

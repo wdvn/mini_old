@@ -1,9 +1,8 @@
 # RFC-007: REPL Chat Stream & Turn UI Optimization
 
 - **Tác giả:** mini-agent team
-- **Ngày:** 2026-08-24
-- **Trạng thái:** Proposed & In Implementation
-- **Phạm vi:** `src/ui/`, `src/core/agent.zig`, `src/ui/repl.zig`
+- **Ngày:** 2026-08- **Trạng thái:** Implemented / Production
+- **Phạm vi:** `src/ui/`, `src/core/agent.zig`, `src/ui/repl.zig`, `src/ui/chat_stream.zig`
 
 ---
 
@@ -42,7 +41,7 @@ Trong các AI Coding Agent CLI hiện đại (như Claude Code, Aider, Codex CLI
     │ @@ -45,7 +45,7 @@ pub fn readAll(...) !usize {                            │
     │ -    var total: usize = 0;                                                 │
     │ +    var total_read: usize = 0;                                            │
-    ╰────────────────────────────────────────────────────────────────────────────╯
+    │ ╰──────────────────────────────────────────────────────────────────────────╯
     ✓ Applied cleanly • CAS hash: a1f8...
 
  🤖 mini-agent
@@ -69,7 +68,8 @@ src/ui/
   ├── markdown.zig        — Streaming lightweight Markdown & Syntax highlighter
   ├── chat_stream.zig     — TurnRenderer orchestrator điều phối toàn bộ lifecycle 1 turn
   ├── repl.zig            — Kết nối TurnRenderer vào REPL loop
-  └── editor.zig          — Multiline composer & input parser
+  ├── paste.zig           — Incremental bracketed paste state machine
+  └── editor.zig          — Single-line composer & input parser
 ```
 
 ### 3.1. `terminal.zig`: ANSI Primitives & Box Characters
@@ -99,14 +99,23 @@ src/ui/
 ### 3.5. `chat_stream.zig`: Turn Orchestrator
 - Struct `TurnRenderer` theo dõi vòng đời hoàn chỉnh của 1 lượt xử lý:
   - `startTurn(prompt)`: Khởi tạo turn, in header.
-  - `startThinking()` / `streamThinking(text)` / `endThinking()`: Stream suy nghĩ trong khối viền dọc mờ `│`.
+  - `startThinking()` / `streamThinking(text)` / `endThinking()`: Stream suy nghĩ trong khối viền dọc mờ `│` kèm bộ lọc FNV-1a deduplication.
   - `startTool(name, input_json)`: Hiện Action card với spinner.
   - `finishTool(name, result, is_error, duration_ms)`: In kết quả action và diff nếu có.
   - `streamResponse(text)`: Stream câu trả lời qua Markdown highlighter.
   - `finishTurn(stats)`: In thanh footer telemetry tổng kết tokens, latency, context usage.
+
+### 3.6. Inplace Stream Replacement & Raw Backend Error Formatting
+- **Inplace Overwrite khi Retry**:
+  - Khi gặp lỗi backend có thể phục hồi (HTTP 429 Rate Limit, HTTP 503 Overloaded, Cloudflare 520/522/524), `TurnRenderer` ghi nhận trạng thái dòng retry và dùng chuỗi escape VT100 `\x1b[1A\x1b[2K\r` để đè lại dòng thông báo đếm lùi tại chỗ, triệt tiêu hoàn toàn tình trạng in tràn hàng chục dòng cảnh báo ra terminal.
+- **An toàn hiển thị (Anti-Wrap Truncation)**:
+  - Hàm `visibleWidth` tính toán chính xác độ rộng hiển thị (bỏ qua ANSI escape codes, tính 2 cột cho full-width Unicode tiếng Việt/Đông Á) và dùng `truncateAnsi` cắt chuỗi theo kích thước cửa sổ terminal (`term_cols`), ngăn ngừa hiện tượng tự động xuống dòng làm hỏng phép tính lùi con trỏ `\x1b[1A`.
+- **Formatted Backend Raw Response**:
+  - Khi backend trả về lỗi kèm body chi tiết, `formatRawBackendResponse` bóc tách các trường chuẩn (`error.message`, `error.code`, `metadata.limit_source`, `metadata.remedy_hint`). Nếu payload có format lạ, hệ thống tự động thụt lề định dạng JSON và in trong khung viền cảnh báo rõ ràng để người dùng nắm rõ nguyên nhân mà không bị cắt cụt.
 
 ---
 
 ## 4. Tương thích ngược & Chế độ không tương tác
 - Khi chạy single-shot prompt (`mini -e "..."`) hoặc xuất ra pipe/file (`!isatty`), các hiệu ứng spinner động và màu sắc có thể tự động rút gọn hoặc tắt để tránh gây lỗi cho các script tự động hóa.
 - Giữ vững nguyên tắc: Không thêm dependency ngoài, tuân thủ nghiêm ngặt Zig 0.16.0.
+

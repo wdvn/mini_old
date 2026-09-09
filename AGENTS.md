@@ -49,21 +49,26 @@ testcases/            — tất cả các file test (standalone, integration, be
 ## Lưu ý kiến trúc
 
 - Tool calls ưu tiên đi qua JS VM (`runtime/js_bindings.zig`) thay vì thêm path JSON tool-calling mới.
+- **Per-Act VM Isolation**: Mỗi Act khởi tạo một `JSContext` độc lập để triệt tiêu ô nhiễm scope biến toàn cục (`const`/`let`) giữa các turns.
+- **MemAct Reactive Compaction**: Nén ngữ cảnh dạng reactive-only (chỉ kích hoạt khi backend trả lỗi vượt context limit, drop-all + dồn summary tại index 1, bảo tồn prompt gốc index 0).
+- **Dual-Protocol Auto-Negotiation**: Tự động chuyển đổi và nhớ protocol giữa Chat Completions API và Responses API cho OpenAI-compatible endpoints.
+- **Execution & Stopping Rules**: Agent tuân thủ 4 quy tắc dừng (Stop on Completion, Confirm Before Mutation, Avoid Action Loops, Progress Checkpoint).
 - Backends đều conform `core/protocol.zig`; không gọi HTTP trực tiếp trong agent loop.
-- Editor (`ui/editor.zig`) hiện là single-line byte-based — nâng cấp theo lộ trình trong `docs/editor_upgrade_proposal.md` (composer multiline, UTF-8 width, persistent history...).
+- Editor (`ui/editor.zig`) hỗ trợ incremental bracketed paste parser (`ui/paste.zig`), UTF-8 width, single-line byte-based (lộ trình FSM multiline composer tại `docs/rfc_008_user_input_state_machine_proposal.md`).
 - History persistence dự kiến dùng SQLite (libsqlite3 đã reserve trong build.zig).
 
 ## Testing
 
-- **Lệnh chuẩn trước khi commit**: Chạy `zig build test` (hoặc `zig build test --summary all`), phải pass toàn bộ 13/13 steps.
+- **Lệnh chuẩn trước khi commit**: Chạy `zig build test` (hoặc `zig build test --summary all`), phải pass toàn bộ 13/13 steps (159 tests passed, 4 skipped).
 - **Cơ chế All-In-One**:
-  1. *Tầng 1 (Unit tests)*: Test toàn bộ module trong `src/main.zig` (115 tests).
-  2. *Tầng 2 (Integration testcases)*: Test CodeAct VM isolation, security blocklist/allowlist, hooks (`testcases/test_codeact_security.zig`).
+  1. *Tầng 1 (Unit tests)*: Test toàn bộ module trong `src/main.zig` (118 tests: 114 passed, 4 skipped).
+  2. *Tầng 2 (Integration testcases)*: Test CodeAct VM isolation, security blocklist/allowlist, hooks, CAS file snapshot (`testcases/test_codeact_security.zig` — 45 tests).
   3. *Tầng 3 (E2E Mock LLM)*: Tự build binary `mini`, khởi chạy `node scripts/mock_llm_server.js` độc lập trên port 8399 và test 3 flow hoàn chỉnh (`simple text`, `long text streaming`, `tool call bash multi-turn`).
 - **Tùy chọn linh hoạt**:
   - Khi môi trường thiếu Node.js hoặc chỉ muốn test nhanh: `zig build test-unit` hoặc `zig build test -Dskip-e2e=true`.
   - Khi chỉ muốn test riêng E2E: `zig build test-e2e`.
-- **UI/editor**: Test thủ công qua `zig build run`, kiểm tra gõ UTF-8 (tiếng Việt), multiline paste, Ctrl+A/E/U, ↑/↓ history.
+  - Đổi port mock server khi xung đột: `zig build test -Dtest-port=8400`.
+- **UI/editor**: Test thủ công qua `zig build run`, kiểm tra gõ UTF-8 (tiếng Việt), bracketed paste, Ctrl+A/E/U, ↑/↓ history.
 - **Backends**: Không gọi API thật khi test; kiểm tra logic parse SSE bằng unit test và mock server nội bộ.
 
 ## PR / Commit

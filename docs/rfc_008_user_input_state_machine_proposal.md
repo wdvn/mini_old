@@ -1,7 +1,7 @@
 # RFC-008: Terminal User Input State Machine & Multiline Composer Proposal
 
 > **Ngày:** 2026-08-28  
-> **Trạng thái:** Proposed  
+> **Trạng thái:** In Progress / Partially Implemented (Phase 1: Incremental Bracketed Paste Parser tại `src/ui/paste.zig` đã hoàn thành; Phase 2-4 Multiline FSM đang triển khai)  
 > **Tác giả:** mini-agent team  
 > **Mục tiêu:** Thay thế toàn bộ cơ chế phân giải phím/escape ad-hoc bằng **Finite State Machine (FSM)** hình thức 3 tầng, hỗ trợ chuẩn xác Paste nhiều dòng (Bracketed Paste), Alt/Shift Key Combinations, Unicode UTF-8 Graphemes và Multiline Editing.
 
