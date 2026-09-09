@@ -21,6 +21,7 @@ pub const backends = struct {
     pub const ollama_mod = @import("backends/ollama.zig");
 };
 pub const tools_mod = @import("tooling/registry.zig");
+pub const session_diagnostics = @import("tools/session_diagnostics.zig");
 pub const act_logger_mod = @import("core/act_logger.zig");
 pub const mcp_mod = @import("tooling/mcp.zig");
 pub const utils = @import("core/utils.zig");
@@ -71,7 +72,7 @@ pub fn getIo() std.Io {
 /// In formatted string ra stdout.
 pub fn stdoutPrint(comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
-    var w = std.Io.File.stdout().writer(g_io, &buf);
+    var w = std.Io.File.stdout().writer(getIo(), &buf);
     w.interface.print(fmt, args) catch return;
     w.flush() catch {};
 }
@@ -79,7 +80,7 @@ pub fn stdoutPrint(comptime fmt: []const u8, args: anytype) void {
 /// In formatted string ra stderr.
 pub fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
-    var w = std.Io.File.stderr().writer(g_io, &buf);
+    var w = std.Io.File.stderr().writer(getIo(), &buf);
     w.interface.print(fmt, args) catch return;
     w.flush() catch {};
 }

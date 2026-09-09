@@ -517,3 +517,108 @@ test "escape thay byte UTF-8 invalid bằng U+FFFD" {
     defer alloc.free(got3);
     try std.testing.expectEqualStrings("\\\"quo\\\"\u{FFFD}tail", got3);
 }
+
+/// Format thụt dòng (pretty-print với 2 khoảng trắng) cho chuỗi JSON.
+/// Hỗ trợ object {}, array [], chuỗi string có escape ký tự đặc biệt.
+/// Trả về chuỗi mới được cấp phát qua `alloc` (caller sở hữu).
+/// Nếu chuỗi không phải JSON (không bắt đầu bằng { hoặc [), trả về bản dupe nguyên bản.
+pub fn prettyPrint(alloc: Allocator, raw_json: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, raw_json, " \t\r\n");
+    if (trimmed.len == 0 or (trimmed[0] != '{' and trimmed[0] != '[')) {
+        return try alloc.dupe(u8, raw_json);
+    }
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+
+    var indent_level: usize = 0;
+    var in_str = false;
+    var is_escape = false;
+    var i: usize = 0;
+
+    while (i < trimmed.len) : (i += 1) {
+        const c = trimmed[i];
+
+        if (in_str) {
+            try out.append(alloc, c);
+            if (is_escape) {
+                is_escape = false;
+            } else if (c == '\\') {
+                is_escape = true;
+            } else if (c == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+
+        // Bỏ qua khoảng trắng ngoài chuỗi string
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            continue;
+        }
+
+        switch (c) {
+            '"' => {
+                in_str = true;
+                is_escape = false;
+                try out.append(alloc, c);
+            },
+            '{', '[' => {
+                try out.append(alloc, c);
+                // Kiểm tra xem đối tượng có rỗng không: {} hoặc []
+                var next_idx = i + 1;
+                while (next_idx < trimmed.len and (trimmed[next_idx] == ' ' or trimmed[next_idx] == '\t' or trimmed[next_idx] == '\r' or trimmed[next_idx] == '\n')) : (next_idx += 1) {}
+                const closing_char: u8 = if (c == '{') '}' else ']';
+                if (next_idx < trimmed.len and trimmed[next_idx] == closing_char) {
+                    try out.append(alloc, closing_char);
+                    i = next_idx;
+                } else {
+                    indent_level += 1;
+                    try out.append(alloc, '\n');
+                    try out.appendNTimes(alloc, ' ', indent_level * 2);
+                }
+            },
+            '}', ']' => {
+                if (indent_level > 0) indent_level -= 1;
+                try out.append(alloc, '\n');
+                try out.appendNTimes(alloc, ' ', indent_level * 2);
+                try out.append(alloc, c);
+            },
+            ',' => {
+                try out.append(alloc, c);
+                try out.append(alloc, '\n');
+                try out.appendNTimes(alloc, ' ', indent_level * 2);
+            },
+            ':' => {
+                try out.appendSlice(alloc, ": ");
+            },
+            else => {
+                try out.append(alloc, c);
+            },
+        }
+    }
+
+    return out.toOwnedSlice(alloc);
+}
+
+test "prettyPrint format đúng JSON object và array" {
+    const alloc = std.testing.allocator;
+    const raw = "{\"error\":{\"code\":429,\"message\":\"Rate limit: try again, please\"},\"tags\":[\"a\",\"b\"],\"empty\":{}}";
+    const formatted = try prettyPrint(alloc, raw);
+    defer alloc.free(formatted);
+
+    const expected =
+        \\{
+        \\  "error": {
+        \\    "code": 429,
+        \\    "message": "Rate limit: try again, please"
+        \\  },
+        \\  "tags": [
+        \\    "a",
+        \\    "b"
+        \\  ],
+        \\  "empty": {}
+        \\}
+    ;
+    try std.testing.expectEqualStrings(expected, formatted);
+}
+

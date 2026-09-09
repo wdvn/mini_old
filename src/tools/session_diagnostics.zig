@@ -36,6 +36,9 @@ pub const SessionState = enum {
     idle_waiting_input,
     executing_act,
     between_acts,
+    throttled,
+    context_overflow,
+    cancelled,
     completed,
     crashed,
     finished,
@@ -49,10 +52,37 @@ pub const SessionSummary = struct {
     state: SessionState,
     description: []const u8,
     last_act_id: usize = 0,
-    last_event: []const u8 = "",
+    last_event_buf: [64]u8 = [_]u8{0} ** 64,
+    last_event_len: usize = 0,
     last_timestamp: i64 = 0,
     error_count: usize = 0,
     total_events: usize = 0,
+    last_error_code: u32 = 0,
+    last_error_name_buf: [48]u8 = [_]u8{0} ** 48,
+    last_error_name_len: usize = 0,
+    last_error_msg_buf: [256]u8 = [_]u8{0} ** 256,
+    last_error_msg_len: usize = 0,
+
+    pub fn lastEvent(self: *const SessionSummary) []const u8 {
+        if (self.last_event_len == 0) return "unknown";
+        return self.last_event_buf[0..self.last_event_len];
+    }
+
+    pub fn setLastEvent(self: *SessionSummary, ev: []const u8) void {
+        const copy_len = @min(ev.len, self.last_event_buf.len);
+        @memcpy(self.last_event_buf[0..copy_len], ev[0..copy_len]);
+        self.last_event_len = copy_len;
+    }
+
+    pub fn lastErrorName(self: *const SessionSummary) []const u8 {
+        if (self.last_error_name_len == 0) return "";
+        return self.last_error_name_buf[0..self.last_error_name_len];
+    }
+
+    pub fn lastErrorMessage(self: *const SessionSummary) []const u8 {
+        if (self.last_error_msg_len == 0) return "";
+        return self.last_error_msg_buf[0..self.last_error_msg_len];
+    }
 };
 
 fn checkIsAlive(pid: i32) bool {
@@ -98,7 +128,6 @@ pub fn analyzeJournal(alloc: Allocator, io: std.Io, file_path: []const u8, pid: 
         .state = .unknown,
         .description = "",
         .last_act_id = 0,
-        .last_event = "unknown",
         .last_timestamp = 0,
         .error_count = 0,
         .total_events = 0,
@@ -120,6 +149,7 @@ pub fn analyzeJournal(alloc: Allocator, io: std.Io, file_path: []const u8, pid: 
 
     var line_it = std.mem.splitScalar(u8, content, '\n');
     var last_non_empty_line: ?[]const u8 = null;
+    var last_error_line: ?[]const u8 = null;
 
     while (line_it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \r\t");
@@ -129,12 +159,13 @@ pub fn analyzeJournal(alloc: Allocator, io: std.Io, file_path: []const u8, pid: 
 
         if (std.mem.indexOf(u8, trimmed, "\"error_detail\":null") == null and std.mem.indexOf(u8, trimmed, "\"error_detail\":") != null) {
             summary.error_count += 1;
+            last_error_line = trimmed;
         }
     }
 
     if (last_non_empty_line) |last_line| {
         if (json.findString(last_line, "event_type")) |ev| {
-            summary.last_event = try alloc.dupe(u8, ev);
+            summary.setLastEvent(ev);
         }
         if (json.findInt(last_line, "act_id", usize)) |act_id| {
             summary.last_act_id = act_id;
@@ -144,23 +175,50 @@ pub fn analyzeJournal(alloc: Allocator, io: std.Io, file_path: []const u8, pid: 
         }
     }
 
+    // Trích xuất chi tiết lỗi gần nhất nếu có
+    if (last_error_line) |err_line| {
+        if (json.findInt(err_line, "http_code", u32)) |code| {
+            summary.last_error_code = code;
+        }
+        if (json.findString(err_line, "error_name")) |name| {
+            const copy_len = @min(name.len, summary.last_error_name_buf.len);
+            @memcpy(summary.last_error_name_buf[0..copy_len], name[0..copy_len]);
+            summary.last_error_name_len = copy_len;
+        }
+        if (json.findString(err_line, "server_error") orelse json.findString(err_line, "message")) |msg| {
+            const copy_len = @min(msg.len, summary.last_error_msg_buf.len);
+            @memcpy(summary.last_error_msg_buf[0..copy_len], msg[0..copy_len]);
+            summary.last_error_msg_len = copy_len;
+        }
+    }
+
     // Xác định trạng thái nghiệp vụ chuẩn xác
+    const last_ev = summary.lastEvent();
     if (is_alive) {
-        if (std.mem.eql(u8, summary.last_event, "task_completed")) {
+        if (std.mem.eql(u8, last_ev, "task_completed")) {
             if (summary.mode == .repl) {
                 summary.state = .idle_waiting_input;
-                summary.description = "Phiên REPL tương tác đang rảnh, nằm chờ người dùng nhập câu hỏi mới tại dấu nhắc You >";
+                summary.description = "Phiên REPL rảnh, nằm chờ nhập lệnh tại You >";
             } else {
                 summary.state = .completed;
                 summary.description = "Nhiệm vụ đã hoàn tất thành công.";
             }
-        } else if (std.mem.eql(u8, summary.last_event, "act_started")) {
+        } else if (std.mem.eql(u8, last_ev, "task_interrupted")) {
+            summary.state = .cancelled;
+            summary.description = "Tác vụ đã bị người dùng ngắt (Ctrl+C).";
+        } else if (std.mem.eql(u8, last_ev, "llm_call_throttled")) {
+            summary.state = .throttled;
+            summary.description = "Backend đang bị Rate Limit (429/503), chờ thử lại";
+        } else if (std.mem.eql(u8, last_ev, "llm_context_overflow")) {
+            summary.state = .context_overflow;
+            summary.description = "Vượt giới hạn context, đang nén ngữ cảnh MemAct";
+        } else if (std.mem.eql(u8, last_ev, "act_started")) {
             summary.state = .executing_act;
-            summary.description = "Đang thực thi Act (chờ LLM stream phản hồi hoặc đang chạy Tool)";
-        } else if (std.mem.eql(u8, summary.last_event, "act_completed")) {
+            summary.description = "Đang thực thi Act (chờ LLM stream phản hồi hoặc chạy Tool)";
+        } else if (std.mem.eql(u8, last_ev, "act_completed")) {
             summary.state = .between_acts;
             summary.description = "Đã hoàn thành Act gần nhất, đang chuẩn bị cho Act tiếp theo";
-        } else if (std.mem.eql(u8, summary.last_event, "act_failed")) {
+        } else if (std.mem.eql(u8, last_ev, "act_failed")) {
             summary.state = .crashed;
             summary.description = "Act gặp sự cố lỗi";
         } else {
@@ -168,9 +226,15 @@ pub fn analyzeJournal(alloc: Allocator, io: std.Io, file_path: []const u8, pid: 
             summary.description = "Đang hoạt động bình thường";
         }
     } else {
-        if (std.mem.eql(u8, summary.last_event, "task_completed")) {
+        if (std.mem.eql(u8, last_ev, "task_completed")) {
             summary.state = .completed;
             summary.description = "Tiến trình đã hoàn thành và thoát bình thường.";
+        } else if (std.mem.eql(u8, last_ev, "task_interrupted")) {
+            summary.state = .cancelled;
+            summary.description = "Tiến trình đã dừng do người dùng ngắt (Ctrl+C).";
+        } else if (std.mem.eql(u8, last_ev, "act_failed") or std.mem.eql(u8, last_ev, "llm_call_throttled")) {
+            summary.state = .crashed;
+            summary.description = "Tiến trình đã dừng do lỗi backend / chạm trần retry.";
         } else {
             summary.state = .finished;
             summary.description = "Tiến trình đã kết thúc/dừng.";
@@ -194,7 +258,7 @@ pub fn listSessions(alloc: Allocator, io: std.Io) ![]u8 {
     defer w.deinit();
 
     try w.print("## Danh sách Sessions & Subprocesses (~/.mini/sessions)\n\n", .{});
-    try w.print("| PID | Sống | Mode | State | Last Act | Last Event | Chi tiết |\n", .{});
+    try w.print("| PID | Sống | Mode | State | Last Act | Lỗi | Chi tiết |\n", .{});
     try w.print("|---|---|---|---|---|---|---|\n", .{});
 
     var count: usize = 0;
@@ -220,22 +284,31 @@ pub fn listSessions(alloc: Allocator, io: std.Io) ![]u8 {
             .unknown => "Unknown",
         };
         const state_str = switch (summary.state) {
-            .idle_waiting_input => "💤 `idle_waiting_input`",
-            .executing_act => "⚡ `executing_act`",
-            .between_acts => "⏳ `between_acts`",
+            .idle_waiting_input => "💤 `idle`",
+            .executing_act => "⚡ `running`",
+            .between_acts => "⏳ `between`",
+            .throttled => "⚠️ `throttled`",
+            .context_overflow => "🔄 `overflow`",
+            .cancelled => "⏹ `cancelled`",
             .completed => "✓ `completed`",
             .crashed => "❌ `crashed`",
-            .finished => "⏹ `finished`",
+            .finished => "⚪ `finished`",
             .unknown => "`unknown`",
         };
 
-        try w.print("| `{d}` | {s} | {s} | {s} | Act {d} | `{s}` | {s} |\n", .{
+        const err_str = if (summary.error_count > 0)
+            try std.fmt.allocPrint(alloc, "🔴 {d}", .{summary.error_count})
+        else
+            try alloc.dupe(u8, "0");
+        defer alloc.free(err_str);
+
+        try w.print("| `{d}` | {s} | {s} | {s} | Act {d} | {s} | {s} |\n", .{
             summary.pid,
             alive_str,
             mode_str,
             state_str,
             summary.last_act_id,
-            summary.last_event,
+            err_str,
             summary.description,
         });
     }
@@ -267,12 +340,20 @@ pub fn detailSession(alloc: Allocator, io: std.Io, pid: i32) ![]u8 {
     try w.print("- **Chế độ thực thi**: `{s}`\n", .{@tagName(summary.mode)});
     try w.print("- **Trạng thái nghiệp vụ**: `{s}`\n", .{@tagName(summary.state)});
     try w.print("- **Đánh giá bản chất**: **{s}**\n", .{summary.description});
-    try w.print("- **Act mới nhất**: `{d}` (Event: `{s}`)\n", .{ summary.last_act_id, summary.last_event });
-    try w.print("- **Tổng số lỗi ghi nhận**: `{d}`\n", .{summary.error_count});
+    try w.print("- **Act mới nhất**: `{d}` (Event: `{s}`)\n", .{ summary.last_act_id, summary.lastEvent() });
+    try w.print("- **Tổng số sự kiện**: `{d}` (Lỗi ghi nhận: `{d}`)\n", .{ summary.total_events, summary.error_count });
+
+    if (summary.last_error_code > 0 or summary.lastErrorName().len > 0 or summary.lastErrorMessage().len > 0) {
+        try w.print("- **Lỗi gần nhất**: `HTTP {d}` [{s}]: {s}\n", .{
+            summary.last_error_code,
+            if (summary.lastErrorName().len > 0) summary.lastErrorName() else "Error",
+            if (summary.lastErrorMessage().len > 0) summary.lastErrorMessage() else "Không có chi tiết lỗi",
+        });
+    }
     try w.print("- **Đường dẫn Journal**: `{s}`\n\n", .{full_path});
 
     // Trích xuất 10 events gần nhất
-    try w.print("### Các sự kiện gần nhất (Journal Tail):\n```json\n", .{});
+    try w.print("### Các sự kiện gần nhất (Journal Tail):\n\n", .{});
     const file = std.Io.Dir.cwd().openFile(io, full_path, .{}) catch null;
     if (file) |f| {
         defer f.close(io);
@@ -293,12 +374,36 @@ pub fn detailSession(alloc: Allocator, io: std.Io, pid: i32) ![]u8 {
                 }
                 const start_idx = if (lines.items.len > 10) lines.items.len - 10 else 0;
                 for (lines.items[start_idx..]) |line| {
-                    try w.print("{s}\n", .{line});
+                    const act_id = json.findInt(line, "act_id", usize) orelse 0;
+                    const ev = json.findString(line, "event_type") orelse "event";
+                    const desc = json.findString(line, "description") orelse "";
+                    const has_err = std.mem.indexOf(u8, line, "\"error_detail\":null") == null and
+                        std.mem.indexOf(u8, line, "\"error_detail\":") != null;
+
+                    const icon = if (std.mem.eql(u8, ev, "act_completed") or std.mem.eql(u8, ev, "task_completed"))
+                        "✓"
+                    else if (std.mem.eql(u8, ev, "task_interrupted"))
+                        "⏹"
+                    else if (has_err or std.mem.eql(u8, ev, "act_failed"))
+                        "⚠️"
+                    else
+                        "⚡";
+
+                    if (has_err) {
+                        const http_code = json.findInt(line, "http_code", u32) orelse 0;
+                        const err_msg = json.findString(line, "server_error") orelse json.findString(line, "message");
+                        if (http_code > 0 and err_msg != null) {
+                            try w.print("- {s} `[Act {d}]` **`{s}`**: {s} *(HTTP {d}: {s})*\n", .{ icon, act_id, ev, desc, http_code, err_msg.? });
+                        } else {
+                            try w.print("- {s} `[Act {d}]` **`{s}`**: {s}\n", .{ icon, act_id, ev, desc });
+                        }
+                    } else {
+                        try w.print("- {s} `[Act {d}]` **`{s}`**: {s}\n", .{ icon, act_id, ev, desc });
+                    }
                 }
             }
         }
     }
-    try w.print("```\n", .{});
 
     return alloc.dupe(u8, w.list.items);
 }

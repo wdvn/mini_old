@@ -26,6 +26,68 @@ const diff_mod = @import("diff_renderer.zig");
 const markdown_mod = @import("markdown.zig");
 const json_mod = @import("../core/json.zig");
 const utils = @import("../core/utils.zig");
+const signals = @import("../core/signals.zig");
+const main = @import("../main.zig");
+
+/// Tính toán độ dài visual (số cột hiển thị thực tế trên terminal) của một chuỗi,
+/// bỏ qua toàn bộ ANSI escape sequences (dạng `\x1b[...m`, `\x1b[...K`, v.v.).
+pub fn visibleWidth(str: []const u8) usize {
+    var width: usize = 0;
+    var i: usize = 0;
+    while (i < str.len) {
+        if (str[i] == 0x1b and i + 1 < str.len and str[i + 1] == '[') {
+            i += 2;
+            while (i < str.len and str[i] != 'm' and str[i] != 'K' and str[i] != 'J' and str[i] != 'H' and str[i] != 'h' and str[i] != 'l') {
+                i += 1;
+            }
+            if (i < str.len) i += 1;
+            continue;
+        }
+        if (str[i] == '\r' or str[i] == '\n') {
+            i += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(str[i]) catch 1;
+        width += 1;
+        i += len;
+    }
+    return width;
+}
+
+/// Cắt ngắn chuỗi có ANSI color sao cho visual width <= max_cols.
+/// Tự động đóng lại mã màu ANSI với `\x1b[0m` ở cuối nếu bị cắt ngắn.
+pub fn truncateAnsi(buf: []u8, str: []const u8, max_cols: usize) []const u8 {
+    if (visibleWidth(str) <= max_cols) return str;
+    if (max_cols <= 3) return "";
+
+    const target_cols = max_cols - 3;
+    var current_width: usize = 0;
+    var i: usize = 0;
+    var last_safe_idx: usize = 0;
+
+    while (i < str.len) {
+        if (str[i] == 0x1b and i + 1 < str.len and str[i + 1] == '[') {
+            i += 2;
+            while (i < str.len and str[i] != 'm' and str[i] != 'K' and str[i] != 'J' and str[i] != 'H' and str[i] != 'h' and str[i] != 'l') {
+                i += 1;
+            }
+            if (i < str.len) i += 1;
+            last_safe_idx = i;
+            continue;
+        }
+        if (str[i] == '\r' or str[i] == '\n') {
+            i += 1;
+            continue;
+        }
+        const seq_len = std.unicode.utf8ByteSequenceLength(str[i]) catch 1;
+        if (current_width + 1 > target_cols) break;
+        current_width += 1;
+        i += seq_len;
+        last_safe_idx = i;
+    }
+
+    return std.fmt.bufPrint(buf, "{s}...\x1b[0m", .{str[0..last_safe_idx]}) catch str[0..last_safe_idx];
+}
 
 pub const TurnStats = struct {
     prompt_tokens: usize = 0,
@@ -300,6 +362,8 @@ pub const TurnRenderer = struct {
     codeact_rendered_lines: usize = 0,
     codeact_total_lines: usize = 0,
 
+    last_error_signature: u64 = 0,
+
     waiting_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     waiting_thread: ?std.Thread = null,
 
@@ -327,6 +391,7 @@ pub const TurnRenderer = struct {
             .codeact_line2_len = 0,
             .codeact_rendered_lines = 0,
             .codeact_total_lines = 0,
+            .last_error_signature = 0,
             .waiting_active = std.atomic.Value(bool).init(false),
             .waiting_thread = null,
         };
@@ -334,6 +399,149 @@ pub const TurnRenderer = struct {
 
     pub fn deinit(self: *TurnRenderer) void {
         self.stopWaiting();
+        self.clearInplaceLine();
+    }
+
+    // -----------------------------------------------------------------------
+    // In-place Terminal Rendering Primitives (Anti-wrap & ANSI safe)
+    // -----------------------------------------------------------------------
+
+    /// Ghi đè dòng in-place hiện tại an toàn, chống tràn cột (anti line-wrap).
+    pub fn renderInplaceLine(self: *TurnRenderer, text: []const u8) void {
+        _ = self;
+        if (comptime builtin.is_test) return;
+        if (!term.isStdoutTty()) return;
+
+        const win = term.getTerminalSize();
+        const max_cols: usize = if (win.cols > 2) win.cols - 1 else 80;
+
+        var trunc_buf: [512]u8 = undefined;
+        const safe_text = truncateAnsi(&trunc_buf, text, max_cols);
+
+        term.writeStdout("\r\x1b[2K");
+        term.writeStdout(safe_text);
+    }
+
+    /// Xóa dòng in-place hiện tại và đưa con trỏ về đầu dòng.
+    pub fn clearInplaceLine(self: *TurnRenderer) void {
+        _ = self;
+        if (comptime builtin.is_test) return;
+        if (!term.isStdoutTty()) return;
+        term.writeStdout("\r\x1b[2K");
+    }
+
+    /// Reset signature lỗi khi act thành công hoặc kết thúc turn.
+    pub fn resetErrorSignature(self: *TurnRenderer) void {
+        self.last_error_signature = 0;
+        self.clearInplaceLine();
+    }
+
+    /// Băm 64-bit FNV-1a error signature kết hợp giữa HTTP code và raw response body.
+    pub fn computeErrorSignature(http_code: u32, raw_opt: ?[]const u8) u64 {
+        var hash: u64 = 0xcbf29ce484222325 ^ @as(u64, http_code);
+        hash *%= 0x100000001b3;
+        if (raw_opt) |raw| {
+            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            for (trimmed) |b| {
+                hash ^= b;
+                hash *%= 0x100000001b3;
+            }
+        }
+        return hash;
+    }
+
+    /// Hiển thị khối lỗi backend tổng quát (generic), không phụ thuộc vào schema hay format cụ thể của bất kỳ provider nào.
+    pub fn showBackendError(self: *TurnRenderer, http_code: u32, raw_opt: ?[]const u8) void {
+        self.stopWaiting();
+        if (self.ui_state == .thinking or self.is_thinking) {
+            self.endThinking();
+        }
+        self.clearInplaceLine();
+        self.ensureNewline();
+
+        if (http_code > 0) {
+            main.stderrPrint("\n\x1b[1;31m[agent] ⛔ Lỗi từ backend (HTTP {d})\x1b[0m\n", .{http_code});
+        } else {
+            main.stderrPrint("\n\x1b[1;31m[agent] ⛔ Lỗi kết nối backend\x1b[0m\n", .{});
+        }
+
+        if (raw_opt) |raw| {
+            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            if (trimmed.len > 0) {
+                // Tự động format thụt lề nếu là JSON hợp lệ; nếu là HTML/text thuần thì giữ nguyên bản
+                const pretty = json_mod.prettyPrint(std.heap.page_allocator, trimmed) catch null;
+                defer if (pretty) |p| std.heap.page_allocator.free(p);
+                const to_print = if (pretty) |p| p else trimmed;
+
+                if (http_code > 0) {
+                    main.stderrPrint("\x1b[90m--- RAW BACKEND RESPONSE (HTTP {d}) ---\x1b[0m\n{s}\n\x1b[90m---------------------------------------\x1b[0m\n", .{ http_code, to_print });
+                } else {
+                    main.stderrPrint("\x1b[90m--- RAW BACKEND RESPONSE ---\x1b[0m\n{s}\n\x1b[90m----------------------------\x1b[0m\n", .{to_print});
+                }
+                return;
+            }
+        }
+        if (http_code >= 400) {
+            main.stderrPrint("\x1b[90m--- RAW BACKEND RESPONSE (HTTP {d}) ---\x1b[0m\n(Không có nội dung trả về từ server)\n\x1b[90m---------------------------------------\x1b[0m\n", .{http_code});
+        }
+    }
+
+    /// Xử lý hiển thị lỗi Throttled (Rate limit 429 / 503) kèm cơ chế deduplication tự động.
+    pub fn showBackendThrottled(self: *TurnRenderer, http_code: u32, raw_opt: ?[]const u8) void {
+        self.stopWaiting();
+        if (self.is_thinking) self.endThinking();
+
+        const current_sig = computeErrorSignature(http_code, raw_opt);
+        const is_same_error = (self.last_error_signature != 0 and current_sig == self.last_error_signature);
+
+        if (!is_same_error) {
+            self.last_error_signature = current_sig;
+            self.showBackendError(http_code, raw_opt);
+        } else {
+            self.clearInplaceLine();
+        }
+    }
+
+    /// Thực hiện đếm ngược inplace mượt mà trên đúng 1 dòng (với Braille spinner và realtime countdown).
+    /// Hỗ trợ kiểm tra signals.isInterrupted() để thoát ngay lập tức khi nhận Ctrl+C.
+    pub fn waitRetryCountdown(self: *TurnRenderer, io: std.Io, backoff_s: u64, attempt: usize, max_attempts: usize) !void {
+        if (!term.isStdoutTty()) {
+            main.stderrPrint("[agent] ⚠ Rate limit / 503 (lần {d}/{d})! Thử lại sau {d}s...\n", .{ attempt, max_attempts, backoff_s });
+            std.Io.sleep(io, std.Io.Duration.fromSeconds(@intCast(backoff_s)), .awake) catch {};
+            return;
+        }
+
+        var s = spinner_mod.Spinner.start();
+        const total_ms: u64 = backoff_s * 1000;
+        const start_ms = utils.milliTimestamp();
+
+        while (true) {
+            if (signals.isInterrupted()) {
+                self.clearInplaceLine();
+                return error.Interrupted;
+            }
+            const now = utils.milliTimestamp();
+            const elapsed = if (now >= start_ms) @as(u64, @intCast(now - start_ms)) else 0;
+            if (elapsed >= total_ms) break;
+
+            const remaining_ms = total_ms - elapsed;
+            const remaining_s = (remaining_ms + 999) / 1000;
+
+            const frame = s.nextFrame();
+            var buf: [256]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, " \x1b[33m{s}\x1b[0m \x1b[1;33m[agent]\x1b[0m \x1b[33m⚠ Rate limit / 503 (lần {d}/{d})! Thử lại sau {d}s... \x1b[90m(Ctrl+C để hủy)\x1b[0m", .{
+                frame, attempt, max_attempts, remaining_s,
+            }) catch "";
+            if (line.len > 0) self.renderInplaceLine(line);
+
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(80), .awake) catch {};
+        }
+
+        var retry_buf: [256]u8 = undefined;
+        const retry_line = std.fmt.bufPrint(&retry_buf, " \x1b[36m{s}\x1b[0m \x1b[90m[agent] Đang thử lại kết nối backend (lần {d}/{d})...\x1b[0m", .{
+            s.nextFrame(), attempt + 1, max_attempts,
+        }) catch "";
+        if (retry_line.len > 0) self.renderInplaceLine(retry_line);
     }
 
     /// Ghi chuỗi ra terminal và cập nhật trạng thái dòng / newlines liên tiếp.
@@ -386,6 +594,7 @@ pub const TurnRenderer = struct {
         self.consecutive_newlines = 1;
         self.highlighter = markdown_mod.StreamHighlighter.init();
         self.parser.resetAct();
+        self.resetErrorSignature();
 
         // Bật ngay live spinner trong khi chờ backend phản hồi TTFT
         self.startWaiting();
@@ -410,10 +619,10 @@ pub const TurnRenderer = struct {
             var dur_buf: [32]u8 = undefined;
             const dur_str = utils.formatDuration(&dur_buf, s.elapsedMs());
             var buf: [128]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, "\r\x1b[2K \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})...\x1b[0m", .{
+            const line = std.fmt.bufPrint(&buf, " \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})...\x1b[0m", .{
                 frame, dur_str,
             }) catch break;
-            term.writeStdout(line);
+            self.renderInplaceLine(line);
             _ = usleep(80 * 1000);
         }
     }
@@ -426,9 +635,7 @@ pub const TurnRenderer = struct {
             th.join();
             self.waiting_thread = null;
         }
-        if (term.isStdoutTty()) {
-            term.writeStdout("\r\x1b[2K");
-        }
+        self.clearInplaceLine();
     }
 
     /// Xử lý stream event typed từ Parser
@@ -517,15 +724,15 @@ pub const TurnRenderer = struct {
             const snippet = std.mem.trim(u8, self.think_snippet_buf[0..self.think_snippet_len], " ");
             var out_buf: [256]u8 = undefined;
             const line = if (snippet.len > 0)
-                std.fmt.bufPrint(&out_buf, "\r\x1b[2K \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})...\x1b[0m \x1b[2;90m{s}\x1b[0m", .{
+                std.fmt.bufPrint(&out_buf, " \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})...\x1b[0m \x1b[2;90m{s}\x1b[0m", .{
                     frame, dur_str, snippet,
                 }) catch ""
             else
-                std.fmt.bufPrint(&out_buf, "\r\x1b[2K \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})...\x1b[0m", .{
+                std.fmt.bufPrint(&out_buf, " \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})...\x1b[0m", .{
                     frame, dur_str,
                 }) catch "";
 
-            if (line.len > 0) term.writeStdout(line);
+            if (line.len > 0) self.renderInplaceLine(line);
         }
     }
 
@@ -926,6 +1133,7 @@ pub const TurnRenderer = struct {
         }
         self.parser.resetAct();
         self.ui_state = .idle;
+        self.resetErrorSignature();
 
         term.writeStdout("\n");
 

@@ -43,6 +43,9 @@ const cas_mod = @import("cas.zig");
 pub const journal_mod = @import("journal.zig");
 pub const act_logger_mod = @import("act_logger.zig");
 pub const signals = @import("signals.zig");
+const chat_stream = @import("../ui/chat_stream.zig");
+const term = @import("../ui/terminal.zig");
+const spinner_mod = @import("../ui/spinner.zig");
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
@@ -251,6 +254,27 @@ pub const AgentLoop = struct {
         self.last_backend_raw_error = null;
         if (raw) |r| {
             self.last_backend_raw_error = self.alloc.dupe(u8, r) catch null;
+        }
+    }
+
+    /// In đầy đủ nội dung raw error response trả về từ AI backend (nếu có) thông qua TurnRenderer.
+    pub fn printRawBackendResponse(raw_opt: ?[]const u8, http_code: u32) void {
+        if (main.ui_repl.current_renderer) |r| {
+            r.showBackendError(http_code, raw_opt);
+        } else {
+            var dummy = chat_stream.TurnRenderer.init(std.heap.page_allocator, main.getIo());
+            dummy.showBackendError(http_code, raw_opt);
+        }
+    }
+
+    /// Đếm ngược thời gian chờ retry inplace trên cùng một dòng (kèm Braille spinner) thông qua TurnRenderer.
+    /// Hỗ trợ ngắt ngay lập tức khi nhận Ctrl+C.
+    pub fn waitWithInplaceCountdown(self: *AgentLoop, backoff_s: u64, attempt: usize, max_attempts: usize) !void {
+        if (main.ui_repl.current_renderer) |r| {
+            try r.waitRetryCountdown(self.io, backoff_s, attempt, max_attempts);
+        } else {
+            var dummy = chat_stream.TurnRenderer.init(std.heap.page_allocator, self.io);
+            try dummy.waitRetryCountdown(self.io, backoff_s, attempt, max_attempts);
         }
     }
 
@@ -614,18 +638,20 @@ pub const AgentLoop = struct {
                     }
                 }
 
-                main.stderrPrint("[agent] Cảnh báo: stop_reason không xác định (HTTP {d})\n", .{response.http_code});
-                if (response.raw_debug_info) |raw| {
-                    main.stderrPrint("\n--- RAW BACKEND RESPONSE ---\n{s}\n----------------------------\n", .{raw});
-                } else {
-                    main.stderrPrint("\n--- RAW BACKEND RESPONSE ---\n(Không có nội dung trả về từ server)\n----------------------------\n", .{});
+                if (main.ui_repl.current_renderer) |r| {
+                    r.stopWaiting();
+                    if (r.is_thinking) r.endThinking();
+                    r.ensureNewline();
                 }
+                main.stderrPrint("[agent] Cảnh báo: stop_reason không xác định (HTTP {d})\n", .{response.http_code});
+                printRawBackendResponse(response.raw_debug_info, response.http_code);
                 // Đảm bảo ngữ cảnh đã capture (HTTP < 400 nhưng response rác)
                 self.setLastErrorContext(response.http_code, response.raw_debug_info);
                 return error.UnknownStopReason;
             },
         }
     }
+
 
     /// Xử lý input của user qua agentic loop.
     /// `text_cb`: được gọi với mỗi text chunk khi AI đang stream.
@@ -714,6 +740,7 @@ pub const AgentLoop = struct {
                             if (main.ui_repl.current_renderer) |r| {
                                 r.stopWaiting();
                                 if (r.is_thinking) r.endThinking();
+                                r.clearInplaceLine();
                                 r.ensureNewline();
                                 r.write(" \x1b[33m[Đã dừng bởi người dùng (Ctrl+C)]\x1b[0m\n");
                             } else {
@@ -725,6 +752,11 @@ pub const AgentLoop = struct {
                             return;
                         },
                         error.LLMAuthenticationError => {
+                            if (main.ui_repl.current_renderer) |r| {
+                                r.showBackendError(self.last_backend_http_code, self.last_backend_raw_error);
+                            } else {
+                                printRawBackendResponse(self.last_backend_raw_error, self.last_backend_http_code);
+                            }
                             main.stderrPrint("\n\x1b[31m[agent] ⛔ Lỗi xác thực/quyền truy cập backend (HTTP {d})! Vui lòng kiểm tra API key hoặc tài khoản.\x1b[0m\n", .{self.last_backend_http_code});
                             if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Lỗi xác thực/quyền backend — abort", .{
                                 .backend = self.backend.name(),
@@ -737,6 +769,12 @@ pub const AgentLoop = struct {
                             return e;
                         },
                         error.LLMRateLimitExceeded, error.LLMProviderUnavailable => {
+                            if (main.ui_repl.current_renderer) |r| {
+                                r.showBackendThrottled(self.last_backend_http_code, self.last_backend_raw_error);
+                            } else {
+                                printRawBackendResponse(self.last_backend_raw_error, self.last_backend_http_code);
+                            }
+
                             // Journal: đủ ngữ cảnh debug — backend, model, error name,
                             // HTTP code (classify từ response), lần thử, raw body server.
                             if (self.journal) |*j| {
@@ -757,15 +795,26 @@ pub const AgentLoop = struct {
                                     .raw_snippet = self.last_backend_raw_error,
                                 }) catch {};
                             }
-                            
+
                             rate_limit_retries += 1;
-                            if (rate_limit_retries > MAX_RATE_LIMIT_RETRIES) return e; // Giới hạn retry
-                            
+                            if (rate_limit_retries > MAX_RATE_LIMIT_RETRIES) {
+                                if (main.ui_repl.current_renderer) |r| {
+                                    r.clearInplaceLine();
+                                }
+                                main.stderrPrint("\n\x1b[31m[agent] ⛔ Đã thử lại {d} lần nhưng backend vẫn báo lỗi rate limit / 503. Dừng tác vụ.\x1b[0m\n", .{MAX_RATE_LIMIT_RETRIES});
+                                return e; // Giới hạn retry
+                            }
+
                             const raw_backoff: u64 = (@as(u64, 1) << @as(u6, @intCast(rate_limit_retries))) * 2;
                             const backoff_s: u64 = @min(raw_backoff, RATE_LIMIT_MAX_BACKOFF_S);
-                            main.stderrPrint("\n\x1b[33m[agent] ⚠ Rate limit / 503! Thử lại sau {d}s...\x1b[0m\n", .{ backoff_s });
-                            std.Io.sleep(self.io, std.Io.Duration.fromSeconds(@intCast(backoff_s)), .awake) catch {};
-                            
+
+                            if (main.ui_repl.current_renderer) |r| {
+                                try r.waitRetryCountdown(self.io, backoff_s, rate_limit_retries, MAX_RATE_LIMIT_RETRIES);
+                            } else {
+                                main.stderrPrint("[agent] ⚠ Rate limit / 503 (lần {d}/{d})! Thử lại sau {d}s...\n", .{ rate_limit_retries, MAX_RATE_LIMIT_RETRIES, backoff_s });
+                                std.Io.sleep(self.io, std.Io.Duration.fromSeconds(@intCast(backoff_s)), .awake) catch {};
+                            }
+
                             if (self.history.last_compaction_act_id < act_id) {
                                 self.history.truncate(history_len);
                             }
@@ -773,6 +822,11 @@ pub const AgentLoop = struct {
                             continue;
                         },
                         error.LLMContextWindowExceeded => {
+                            if (main.ui_repl.current_renderer) |r| {
+                                r.showBackendError(self.last_backend_http_code, self.last_backend_raw_error);
+                            } else {
+                                printRawBackendResponse(self.last_backend_raw_error, self.last_backend_http_code);
+                            }
                             if (try_count >= max_retries) {
                                 main.stderrPrint("\n\x1b[31m[agent] ⛔ Không thể nén ngữ cảnh thêm sau {d} lần thử. Ngắt tiến trình: {s}\x1b[0m\n", .{ max_retries + 1, @errorName(e) });
                                 if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Quá tải context không thể nén thêm — abort", .{
@@ -807,6 +861,17 @@ pub const AgentLoop = struct {
                         },
 
                         else => {
+                            if (self.last_backend_raw_error != null and self.last_backend_http_code >= 400) {
+                                if (main.ui_repl.current_renderer) |r| {
+                                    r.showBackendError(self.last_backend_http_code, self.last_backend_raw_error);
+                                } else {
+                                    printRawBackendResponse(self.last_backend_raw_error, self.last_backend_http_code);
+                                }
+                            } else if (main.ui_repl.current_renderer) |r| {
+                                r.stopWaiting();
+                                if (r.is_thinking) r.endThinking();
+                                r.ensureNewline();
+                            }
                             if (try_count == max_retries) {
                                 main.stderrPrint("\n[agent] Act {d} lỗi liên tiếp {d} lần. Ngắt tiến trình: {s}\n", .{ act_id, max_retries + 1, @errorName(e) });
                                 if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Act lỗi terminal — abort", .{
@@ -851,6 +916,9 @@ pub const AgentLoop = struct {
                 // Reset counter khi act thành công: rate limit rải rác giữa turn
                 // dài không cộng dồn chết tích lũy.
                 rate_limit_retries = 0;
+                if (main.ui_repl.current_renderer) |r| {
+                    r.resetErrorSignature();
+                }
 
                 // Flush toàn bộ snapshot mini.write/patch/sh đã track trong act này (M4)
                 var recorded_delta = false;
@@ -953,15 +1021,27 @@ pub const AgentLoop = struct {
     ) !proto.Response {
         if (signals.isInterrupted()) return error.Interrupted;
 
+        if (main.ui_repl.current_renderer) |r| {
+            r.startWaiting();
+        }
+
         // Primary backend
         const primary = self.backend.send(system_prompt, msgs, tool_defs, text_cb, think_cb);
         if (primary) |resp| return resp else |e| {
             if (e == error.Interrupted or signals.isInterrupted()) {
                 return error.Interrupted;
             }
+            if (main.ui_repl.current_renderer) |r| {
+                r.stopWaiting();
+                if (r.is_thinking) r.endThinking();
+                r.ensureNewline();
+            }
             // Fallback: thử Ollama nếu primary không phải Ollama
             main.stderrPrint("\n[agent] {s} lỗi ({s}), thử Ollama...\n", .{ self.backend.name(), @errorName(e) });
             if (self.backend != .ollama) {
+                if (main.ui_repl.current_renderer) |r| {
+                    r.startWaiting();
+                }
                 var fallback = ollama_mod.Client.init(
                     self.alloc,
                     self.config.ollama_url,
@@ -985,6 +1065,11 @@ pub const AgentLoop = struct {
                     }
                     return resp;
                 } else |fb_err| {
+                    if (main.ui_repl.current_renderer) |r| {
+                        r.stopWaiting();
+                        if (r.is_thinking) r.endThinking();
+                        r.ensureNewline();
+                    }
                     // Journal: fallback cũng thất bại — ghi cả 2 lỗi để debug
                     // (primary + ollama fallback) trong cùng 1 event.
                     if (self.journal) |*j| {

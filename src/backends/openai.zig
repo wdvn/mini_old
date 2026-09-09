@@ -263,8 +263,10 @@ pub const Client = struct {
                 self.cached_protocol = active_protocol;
             }
 
-            if (ctx.response.stop_reason == .unknown and ctx.raw_accum_init) {
-                ctx.response.raw_debug_info = ctx.alloc.dupe(u8, ctx.raw_accum.items) catch null;
+            if ((ctx.response.stop_reason == .unknown or req_http_code >= 400) and ctx.raw_accum_init) {
+                if (ctx.response.raw_debug_info == null) {
+                    ctx.response.raw_debug_info = ctx.alloc.dupe(u8, ctx.raw_accum.items) catch null;
+                }
             }
             if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
 
@@ -545,7 +547,7 @@ const StreamCtx = struct {
             self.raw_accum = .empty;
             self.raw_accum_init = true;
         }
-        if (self.raw_accum.items.len < 4096) {
+        if (self.raw_accum.items.len < 64 * 1024) {
             self.raw_accum.appendSlice(self.alloc, chunk) catch {};
         }
 

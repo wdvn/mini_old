@@ -73,20 +73,32 @@ pub const Client = struct {
         defer ctx.line_buf.deinit(self.alloc);
         defer ctx.text_accum.deinit(self.alloc);
         errdefer ctx.response.deinit();
+        errdefer if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
 
         const headers = [_][]const u8{"Content-Type: application/json"};
-        _ = try http_lib.postStream(self.alloc, main.g_io, .{
+        const req_http_code = try http_lib.postStream(self.alloc, main.g_io, .{
             .url = url,
             .headers = &headers,
             .body = body,
         }, StreamCtx.onChunk, &ctx);
+
+        ctx.response.http_code = req_http_code;
 
         // Lưu text còn lại
         if (ctx.text_accum.items.len > 0) {
             const text = try self.alloc.dupe(u8, ctx.text_accum.items);
             try ctx.response.content.append(ctx.alloc, .{ .text = text });
         }
-        if (ctx.response.stop_reason == .unknown) ctx.response.stop_reason = .end_turn;
+        if (req_http_code >= 400 or ctx.response.stop_reason == .unknown) {
+            if (ctx.raw_accum_init and ctx.response.raw_debug_info == null) {
+                ctx.response.raw_debug_info = ctx.alloc.dupe(u8, ctx.raw_accum.items) catch null;
+            }
+        }
+        if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
+
+        if (req_http_code < 400 and ctx.response.stop_reason == .unknown) {
+            ctx.response.stop_reason = .end_turn;
+        }
 
         return ctx.response;
     }
@@ -166,9 +178,19 @@ const StreamCtx = struct {
     text_cb: ?*const fn ([]const u8) void,
     line_buf: ArrayList(u8),
     text_accum: ArrayList(u8),
+    raw_accum: ArrayList(u8) = undefined,
+    raw_accum_init: bool = false,
 
     fn onChunk(chunk: []const u8, userdata: *anyopaque) void {
         const self: *StreamCtx = @ptrCast(@alignCast(userdata));
+        if (!self.raw_accum_init) {
+            self.raw_accum = .empty;
+            self.raw_accum_init = true;
+        }
+        if (self.raw_accum.items.len < 64 * 1024) {
+            self.raw_accum.appendSlice(self.alloc, chunk) catch {};
+        }
+
         for (chunk) |c| {
             if (c == '\n') {
                 self.processLine(self.line_buf.items) catch {};
