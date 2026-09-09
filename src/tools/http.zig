@@ -1,8 +1,8 @@
-//! tools/http.zig — Tool gửi HTTP request tới bất kỳ URL.
+//! tools/http.zig — HTTP request tool.
 //!
-//! Thin wrapper quanh `lib/http_request.zig` (HTTP client tập trung):
-//! parse input JSON của tool protocol rồi gọi `http_lib.fetch` và
-//! format kết quả bằng `http_lib.formatResponseText`.
+//! Thin wrapper around `lib/http_request.zig` (centralized HTTP client):
+//! parses tool protocol JSON input, calls `http_lib.fetch`, and
+//! formats output with `http_lib.formatResponseText`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -14,11 +14,11 @@ const main = @import("../main.zig");
 // Tool entry point
 // ---------------------------------------------------------------------------
 
-/// Thực thi tool http_request.
+/// Execute http_request tool.
 /// Input: {"url":"...", "method":"GET", "body":"...", "headers":{...}}
 pub fn executeTool(alloc: Allocator, input_json: []const u8) ![]u8 {
     const url = (try json.findStringOwned(alloc, input_json, "url")) orelse
-        return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'url'", .{});
+        return std.fmt.allocPrint(alloc, "Error: missing 'url' parameter", .{});
     defer alloc.free(url);
     const method = json.findString(input_json, "method") orelse "GET";
     const body = try json.findStringOwned(alloc, input_json, "body");
@@ -28,8 +28,8 @@ pub fn executeTool(alloc: Allocator, input_json: []const u8) ![]u8 {
     return httpRequest(alloc, url, method, body, headers_json);
 }
 
-/// Gửi HTTP request, trả về text cho tool protocol:
-/// dòng status, các header, blank line, body (đã truncate ở 30KB).
+/// Send HTTP request and format response for tool protocol:
+/// status line, headers, blank line, body (truncated at 30KB).
 pub fn httpRequest(
     alloc: Allocator,
     url: []const u8,

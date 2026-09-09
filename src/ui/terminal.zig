@@ -1,7 +1,7 @@
-//! terminal.zig — ANSI Escape Codes, Colors, Box Drawing & Terminal Primitives cho mini-agent (RFC-007).
+//! terminal.zig — ANSI Escape Codes, Colors, Box Drawing & Terminal Primitives for mini-agent (RFC-007).
 //!
-//! Cung cấp các hằng số và tiện ích điều khiển terminal, tô màu cú pháp,
-//! vẽ khung viền (box drawing) và quản lý con trỏ theo chuẩn ANSI.
+//! Provides constants and utilities for terminal control, syntax coloring,
+//! box drawing, and cursor management according to ANSI standards.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -75,7 +75,7 @@ pub const GLYPH_BULLET = "•";
 // Output helpers
 // ---------------------------------------------------------------------------
 
-/// Ghi raw bytes ra stdout an toàn (bỏ qua khi chạy test để tránh block mock Io).
+/// Safely write raw bytes to stdout (skipped during testing to prevent blocking mock Io).
 pub fn writeStdout(bytes: []const u8) void {
     if (comptime builtin.is_test) return;
     std.Io.File.stdout().writeStreamingAll(main.getIo(), bytes) catch {};
@@ -85,25 +85,25 @@ pub fn writeStdout(bytes: []const u8) void {
 // Cursor & Screen Control
 // ---------------------------------------------------------------------------
 
-/// Xóa dòng hiện tại và đưa con trỏ về đầu dòng.
+/// Clear current line and move cursor to beginning of line.
 pub fn clearLine(io: std.Io) void {
     _ = io;
     writeStdout("\r\x1b[2K");
 }
 
-/// Ẩn con trỏ terminal.
+/// Hide terminal cursor.
 pub fn hideCursor(io: std.Io) void {
     _ = io;
     writeStdout("\x1b[?25l");
 }
 
-/// Hiện con trỏ terminal.
+/// Show terminal cursor.
 pub fn showCursor(io: std.Io) void {
     _ = io;
     writeStdout("\x1b[?25h");
 }
 
-/// Di chuyển con trỏ lên `n` dòng.
+/// Move cursor up by `n` lines.
 pub fn cursorUp(io: std.Io, n: usize) void {
     _ = io;
     if (n == 0) return;
@@ -112,7 +112,7 @@ pub fn cursorUp(io: std.Io, n: usize) void {
     writeStdout(seq);
 }
 
-/// Di chuyển con trỏ xuống `n` dòng.
+/// Move cursor down by `n` lines.
 pub fn cursorDown(io: std.Io, n: usize) void {
     _ = io;
     if (n == 0) return;
@@ -131,7 +131,7 @@ const CWinSize = extern struct {
     ws_ypixel: u16,
 };
 
-/// Kiểm tra stdout có phải là TTY không.
+/// Check whether stdout is a TTY.
 pub fn isStdoutTty() bool {
     if (comptime builtin.is_test) return false;
     if (builtin.os.tag == .windows) return true;
@@ -143,7 +143,7 @@ pub const WinSize = struct {
     cols: u16,
 };
 
-/// Lấy kích thước terminal hiện tại (rows, cols). Fallback 24x80 nếu không lấy được.
+/// Get current terminal window size (rows, cols). Fallback to 24x80 if unavailable.
 pub fn getTerminalSize() WinSize {
     if (comptime builtin.is_test) return .{ .rows = 24, .cols = 80 };
     if (builtin.os.tag == .linux or builtin.os.tag == .macos) {

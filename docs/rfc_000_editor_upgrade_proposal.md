@@ -1,142 +1,142 @@
-# Proposal: Nâng cấp Editor mini-agent → Multiline Composer
+# Proposal: mini-agent Editor Upgrade → Multiline Composer
 
-> Ngày: 2025 — Tham chiếu: [vercel-labs/fx](https://github.com/vercel-labs/fx)
-> Phạm vi: `src/ui/editor.zig` (258 dòng), `src/ui/repl.zig`
+> Date: 2025 — Reference: [vercel-labs/fx](https://github.com/vercel-labs/fx)
+> Scope: `src/ui/editor.zig` (258 lines), `src/ui/repl.zig`
 
 ---
 
-## 1. Tình trạng hiện tại
+## 1. Current State
 
-Editor hiện tại là **single-line, byte-based**:
+The legacy editor was **single-line, byte-based**:
 
-- Buffer tĩnh `buf: [8192]u8`, truncate im lặng khi vượt.
-- Xử lý byte thô → gõ UTF-8 (tiếng Việt, emoji) làm lệch cursor và vỡ render.
-- History in-memory (mất khi thoát process).
+- Static buffer `buf: [8192]u8`, silent truncation on overflow.
+- Raw byte processing → typing UTF-8 (multibyte characters, emoji) misaligned cursor and broke terminal rendering.
+- In-memory history (lost on process exit).
 - Keymap: Ctrl+A/E/U, Backspace/Delete, Home/End (ESC O H/F), ↑/↓ history, Ctrl+C/D exit.
-- Bracketed paste: newline → space (mọi paste đều dính thành 1 dòng).
-- Escape parsing thủ công (đoán mò), không hỗ trợ Alt+<key>, không phân giải combo chính xác.
+- Bracketed paste: newline → space (all pasted content collapsed into a single line).
+- Manual escape parsing (ad-hoc guessing), no Alt+<key> support, ambiguous combo resolution.
 
-**Hệ quả:** không soạn được prompt nhiều dòng, paste code dài bị hỏng format, undo không có, không copy/cut, không tham chiếu file bằng `@`.
+**Consequences:** Unable to compose multiline prompts, pasting long code broke formatting, no undo, no copy/cut, no `@` file references.
 
 ---
 
-## 2. Gap analysis so với fx
+## 2. Gap Analysis vs. fx
 
-### Đã có (không cần làm lại)
-| Tính năng | Ghi chú |
+### Already Implemented (No rework needed)
+| Feature | Notes |
 |---|---|
 | Single-line editing, cursor move | OK |
-| History ↑/↓ in-memory | OK, thiếu persistence |
+| In-memory History ↑/↓ | OK, lacks disk persistence |
 | Ctrl+A/E/U, Home/End | OK |
-| Bracketed paste cơ bản | Có nhưng newline→space |
+| Basic bracketed paste | Present, but collapsed newline→space |
 | Ctrl+C/D exit | OK |
 
-### Thiếu — 13 nhóm, xếp theo dependency
+### Missing — 13 Groups, Ordered by Dependency
 
-| # | Nhóm | Tính năng cụ thể (từ fx) | Độ khó | Ưu tiên |
+| # | Group | Specific Feature (from fx) | Complexity | Priority |
 |---|---|---|---|---|
-| 1 | **UTF-8 / unicode width** | `display_width`, grapheme cluster, emoji, tab stops | Trung bình | 🔴 P0 |
-| 2 | **Buffer động** | `ArrayList(u8)` thay `[8192]u8` | Dễ | 🔴 P0 |
-| 3 | **Word motion** | word_left/right, delete_word_left/right, text_boundaries | Dễ | 🔴 P0 |
-| 4 | **Multiline composer** | Alt+Enter insert_newline, visual_up/down, page_up/down, paragraph_up/down, draft navigation, preferred-column, composer_line_continuation (backslash) | Khó | 🔴 P0 |
-| 5 | **Persistent history** | Lưu JSONL ra disk: text + pasted blocks + skill tokens; Ctrl+P/N. *Ghi chú: đây là **prompt input history** (những gì user gõ vào composer, theo mô hình `prompt_history_store` của fx) — không phải conversation history; semantics conversation history tuân theo RFC-003.* | Trung bình | 🟠 P1 |
-| 6 | **Large-paste placeholder** | Paste >1000 chars → `[pasted block]`, expand khi submit | Trung bình | 🟠 P1 |
-| 7 | **Undo/Redo + Kill ring** | Ctrl+Z/Y edit_history snapshot; Ctrl+W/K cut, Ctrl+Y yank (ring 5 mục) | Trung bình | 🟠 P1 |
-| 8 | **Input limit + reject** | max_message_bytes, hiển thị lỗi rõ ràng thay vì truncate im lặng | Dễ | 🟠 P1 |
-| 9 | **Kitty keyboard protocol / modifyOtherKeys** | Phân giải chính xác Ctrl/Alt/Shift combos | Trung bình | 🟡 P2 |
-| 10 | **Ctrl+L redraw, line-continuation** | Trivial addons | Dễ | 🟡 P2 |
-| 11 | **Selection** | anchor/extend, select_all, copy/cut selection, collapse | Khó | 🟡 P2 (cần multiline) |
-| 12 | **Inline pickers** | @file, @model, @skill, slash-command autocomplete overlay | Khó | 🟢 P3 |
-| 13 | **Image attachments** | Attach ảnh vào composer | Khó | 🟢 P3 (phụ thuộc transport) |
+| 1 | **UTF-8 / unicode width** | `display_width`, grapheme clusters, emoji, tab stops | Medium | 🔴 P0 |
+| 2 | **Dynamic buffer** | `ArrayList(u8)` instead of `[8192]u8` | Easy | 🔴 P0 |
+| 3 | **Word motion** | word_left/right, delete_word_left/right, text_boundaries | Easy | 🔴 P0 |
+| 4 | **Multiline composer** | Alt+Enter insert_newline, visual_up/down, page_up/down, paragraph_up/down, draft navigation, preferred-column, composer_line_continuation (backslash) | Hard | 🔴 P0 |
+| 5 | **Persistent history** | Save JSONL to disk: text + pasted blocks + skill tokens; Ctrl+P/N. *Note: this refers to **prompt input history** (what the user types into the composer, following fx's `prompt_history_store` model) — not conversation history; conversation history semantics conform to RFC-003.* | Medium | 🟠 P1 |
+| 6 | **Large-paste placeholder** | Paste >1000 chars → `[pasted block]`, expand on submit | Medium | 🟠 P1 |
+| 7 | **Undo/Redo + Kill ring** | Ctrl+Z/Y edit_history snapshot; Ctrl+W/K cut, Ctrl+Y yank (5-item ring) | Medium | 🟠 P1 |
+| 8 | **Input limit + reject** | max_message_bytes, clear error display instead of silent truncation | Easy | 🟠 P1 |
+| 9 | **Kitty keyboard protocol / modifyOtherKeys** | Precise resolution for Ctrl/Alt/Shift combos | Medium | 🟡 P2 |
+| 10 | **Ctrl+L redraw, line-continuation** | Trivial addons | Easy | 🟡 P2 |
+| 11 | **Selection** | anchor/extend, select_all, copy/cut selection, collapse | Hard | 🟡 P2 (requires multiline) |
+| 12 | **Inline pickers** | @file, @model, @skill, slash-command autocomplete overlay | Hard | 🟢 P3 |
+| 13 | **Image attachments** | Attach images to composer | Hard | 🟢 P3 (depends on transport) |
 
 ---
 
-## 3. Kiến trúc đề xuất
+## 3. Proposed Architecture
 
-### 3.1 Tách module (theo mô hình fx, đơn giản hóa)
+### 3.1 Modular Decomposition (simplified fx model)
 
 ```
 src/ui/
-  editor.zig          → giữ làm orchestrator, nhận input event
-  composer.zig        → MỚI: multiline state (dòng, cursor 2D, anchor selection)
-  unicode.zig         → MỚI: display_width, grapheme iteration, tab stops
-  history.zig         → MỚI: persistent JSONL + in-memory ring (prompt input history — RFC-003 không áp dụng)
-  edit_history.zig    → MỚI: undo/redo snapshots
-  escape_parser.zig   → MỚI: thay thế manual escape parsing, hỗ trợ kitty protocol
-  paste.zig           → MỚI: bracketed paste + placeholder + block store
+  editor.zig          → Orchestrator, receives input events
+  composer.zig        → NEW: Multiline state (lines, 2D cursor, anchor selection)
+  unicode.zig         → NEW: display_width, grapheme iteration, tab stops
+  history.zig         → NEW: Persistent JSONL + in-memory ring (prompt input history — RFC-003 does not apply)
+  edit_history.zig    → NEW: Undo/redo snapshots
+  escape_parser.zig   → NEW: Replaces manual escape parsing, supports kitty protocol
+  paste.zig           → NEW: Bracketed paste + placeholder + block store
 ```
 
-### 3.2 Composer state (thay buffer 1 chiều)
+### 3.2 Composer State (Replacing 1D Buffer)
 
 ```zig
 pub const Composer = struct {
-    lines: std.ArrayList([]const u8),   // nội dung theo dòng
-    cursor: Position,                    // { row, col } theo grapheme
-    anchor: ?Position,                   // selection anchor
-    preferred_col: usize,                // giữ cột khi đi lên/xuống
-    undo_stack: [16]Snapshot,            // ring buffer
+    lines: std.ArrayList([]const u8),   // Line content
+    cursor: Position,                    // { row, col } by grapheme
+    anchor: ?Position,                   // Selection anchor
+    preferred_col: usize,                // Preserved column on up/down
+    undo_stack: [16]Snapshot,            // Ring buffer
     redo_stack: [16]Snapshot,
     kill_ring: [5][]const u8,            // Ctrl+W/K/Y
-    pasted_blocks: std.ArrayList(PastedBlock), // placeholder refs
-    max_message_bytes: usize,            // input limit, reject thay vì truncate
+    pasted_blocks: std.ArrayList(PastedBlock), // Placeholder refs
+    max_message_bytes: usize,            // Input limit, reject instead of truncate
 };
 ```
 
-### 3.3 Thứ tự render 2 chiều
+### 3.3 2D Render Pipeline
 
-1. Tính display_width từng grapheme (`unicode.zig`).
-2. Wrap theo terminal width, track visual↔logical mapping.
-3. Render từ cursor row → lên trên; prompt prefix chỉ ở dòng đầu.
+1. Calculate display_width for each grapheme (`unicode.zig`).
+2. Wrap according to terminal width, track visual↔logical mapping.
+3. Render from cursor row → upward; prompt prefix appears only on the first line.
 
 ---
 
-## 4. Lộ trình 4 phase
+## 4. 4-Phase Roadmap
 
-### Phase 0 — Quick wins (1–2 ngày)
-- [ ] Buffer động `ArrayList(u8)` (nhóm 2)
-- [ ] UTF-8 display_width + grapheme cursor movement (nhóm 1)
-- [ ] Word motion: Alt+B/F, Alt+D/Backspace (nhóm 3)
-- [ ] Ctrl+L redraw, input limit + reject message (nhóm 8, 10 một phần)
+### Phase 0 — Quick Wins (1–2 days)
+- [ ] Dynamic buffer `ArrayList(u8)` (Group 2)
+- [ ] UTF-8 display_width + grapheme cursor movement (Group 1)
+- [ ] Word motion: Alt+B/F, Alt+D/Backspace (Group 3)
+- [ ] Ctrl+L redraw, input limit + reject message (Groups 8, 10 partial)
 
-**Definition of done:** gõ tiếng Việt/emoji không vỡ, di chuyển theo từ hoạt động.
+**Definition of Done:** Multibyte UTF-8 and emoji render without distortion; word navigation works smoothly.
 
-### Phase 1 — Multiline composer (3–5 ngày) 🔴 then chốt
-- [ ] Tách `composer.zig`, cursor 2D, wrap logic
+### Phase 1 — Multiline Composer (3–5 days) 🔴 Critical
+- [ ] Separate `composer.zig`, 2D cursor, wrapping logic
 - [ ] Alt+Enter insert newline, Enter submit
 - [ ] visual_up/down, page_up/down, paragraph_up/down, preferred-column
-- [ ] Backslash line-continuation khi Enter
-- [ ] Render multiline: xóa đúng số dòng, prompt prefix dòng đầu
+- [ ] Backslash line-continuation upon Enter
+- [ ] Multiline rendering: correctly erase line counts, prompt prefix on first line
 
-**Definition of done:** soạn prompt 10 dòng, di chuyển tự nhiên như editor thật.
+**Definition of Done:** Compose 10-line prompts, navigate naturally like a real text editor.
 
-### Phase 2 — History, paste, undo (3–4 ngày)
-- [ ] Persistent history JSONL (text + timestamps), Ctrl+P/N song song ↑/↓
-- [ ] Large-paste placeholder: >1000 chars → `[Pasted block #n]`, expand khi submit
-- [ ] Undo/Redo Ctrl+Z/Y (snapshot trước mỗi mutation)
+### Phase 2 — History, Paste, Undo (3–4 days)
+- [ ] Persistent history JSONL (text + timestamps), Ctrl+P/N alongside ↑/↓
+- [ ] Large-paste placeholder: >1000 chars → `[Pasted block #n]`, expand upon submit
+- [ ] Undo/Redo Ctrl+Z/Y (snapshot before each mutation)
 - [ ] Kill ring Ctrl+W/K/Y
 
-**Definition of done:** paste 5000 dòng không đơ terminal, undo hoạt động, history sống sót qua restart.
+**Definition of Done:** Pasting 5000 lines does not freeze terminal, undo works, history survives restart.
 
-### Phase 3 — Input chính xác + selection (3–4 ngày)
-- [ ] Escape parser chuẩn: CSI, SS3, kitty keyboard protocol, modifyOtherKeys
-- [ ] Selection: Shift+motion set anchor, select_all Ctrl+A double-tap
+### Phase 3 — Precise Input + Selection (3–4 days)
+- [ ] Standard escape parser: CSI, SS3, kitty keyboard protocol, modifyOtherKeys
+- [ ] Selection: Shift+motion set anchor, select_all via double-tap Ctrl+A
 - [ ] Copy/cut selection, collapse
-- [ ] Inline picker @file (glob) + slash-command (nếu có command registry)
+- [ ] Inline picker @file (glob) + slash-command (when command registry exists)
 
-**Definition of done:** Alt+<key> phân giải 100%, select + copy đoạn text, @ gợi ý file.
+**Definition of Done:** Alt+<key> resolves 100%, select and copy text ranges, `@` autocompletes files.
 
 ---
 
-## 5. Rủi ro & lưu ý
+## 5. Risks & Mitigations
 
-| Rủi ro | Giảm thiểu |
+| Risk | Mitigation |
 |---|---|
-| Multiline render xung đột với stream output của model | Chỉ re-render composer zone, chốt layout khi model đang stream |
-| Kitty protocol không supported trên terminal cũ | Feature-detect bằng response, fallback CSI parsing |
-| Snapshot undo tốn RAM với buffer lớn | Ring buffer 16 mục, chỉ diff hoặc cap 4KB/snapshot |
-| Persistent history chứa dữ liệu nhạy cảm | Opt-in qua config, ghi rõ trong docs; format JSONL dễ audit |
+| Multiline rendering conflicts with streaming model output | Only re-render composer zone, freeze layout while model streams |
+| Kitty protocol unsupported on older terminals | Feature-detect via response query, fallback to CSI parsing |
+| Snapshot undo consumes excessive RAM on large buffers | 16-entry ring buffer, diff-only or cap at 4KB/snapshot |
+| Persistent history contains sensitive data | Opt-in via config, documented clearly; JSONL format allows easy auditing |
 
-## 6. Out of scope (defer)
-- Image attachments (nhóm 13) — chờ transport/model support.
-- Mouse wheel navigation — sau khi composer ổn định.
-- @model/@skill picker — sau khi có model/skill registry.
+## 6. Out of Scope (Deferred)
+- Image attachments (Group 13) — awaiting transport/model support.
+- Mouse wheel navigation — deferred until composer stabilizes.
+- @model/@skill picker — deferred until model/skill registry is available.

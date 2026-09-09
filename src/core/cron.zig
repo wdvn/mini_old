@@ -57,7 +57,7 @@ pub fn installCronjob(alloc: Allocator, io: std.Io, cron_expr: []const u8, exe_p
     });
     
     if (child_s.stdin) |in| {
-        // Ghi dữ liệu và đóng pipe
+        // Write data and close pipe
         try in.writeStreamingAll(io, current_cron.items);
         in.close(io);
         child_s.stdin = null;

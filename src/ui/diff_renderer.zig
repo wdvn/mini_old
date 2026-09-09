@@ -1,7 +1,7 @@
-//! diff_renderer.zig — Unified Diff Visualizer & Patch Styler cho mini-agent (RFC-007).
+//! diff_renderer.zig — Unified Diff Visualizer & Patch Styler for mini-agent (RFC-007).
 //!
-//! Hiển thị các khối Diff màu (Red/Green/Cyan) có viền khung trang nhã,
-//! giúp người dùng quan sát trực quan các thay đổi mã nguồn do Agent thực hiện.
+//! Renders colored Diff blocks (Red/Green/Cyan) with elegant box frames,
+//! allowing users to visually inspect code changes performed by the Agent.
 
 const std = @import("std");
 const term = @import("terminal.zig");
@@ -11,7 +11,7 @@ pub const DiffOptions = struct {
     show_box: bool = true,
 };
 
-/// Render một chuỗi patch / unified diff ra stdout với định dạng màu sắc.
+/// Render a patch string / unified diff to stdout with color formatting.
 pub fn renderDiff(io: std.Io, file_path: []const u8, patch_content: []const u8, options: DiffOptions) void {
     _ = io;
     if (options.show_box) {

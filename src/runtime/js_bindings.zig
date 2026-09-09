@@ -1,6 +1,6 @@
-//! js_bindings.zig — C-ABI Export toàn bộ công cụ của mini sang object `mini.*` trong CodeAct.
+//! js_bindings.zig — C-ABI export of all mini tools to the `mini.*` object in CodeAct.
 //!
-//! Cung cấp các API:
+//! Provides the following APIs:
 //!   - mini.glob(pattern, basePath?)
 //!   - mini.grep(pattern, path?, opts?)
 //!   - mini.read(path, offset?, limit?)
@@ -48,11 +48,11 @@ const snapshot_mod = @import("../core/snapshot.zig");
 
 // ---------------------------------------------------------------------------
 // Security & auditing guard (ISSUE-CODEACT-001 M2/M3/M4)
-// Mọi binding mini.* nguy hiểm phải đi qua guard này trước khi thực thi.
+// All dangerous mini.* bindings must pass through this guard before execution.
 // ---------------------------------------------------------------------------
 
-/// Kiểm tra policy (allowlist/blocklist) (ISSUE-CODEACT-001 M2).
-/// Map tên mini.* -> tên tool policy. True = BỊ CHẶN.
+/// Check policy (allowlist/blocklist) (ISSUE-CODEACT-001 M2).
+/// Map mini.* name -> tool policy name. True = BLOCKED.
 fn guardPolicy(engine: *Engine, tool_name: []const u8) bool {
     _ = engine;
     return !registry.isPermitted(tool_name);
@@ -112,7 +112,7 @@ fn jsMiniGlob(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
     var idx: u32 = 0;
     while (it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \r\t");
-        if (trimmed.len > 0 and !std.mem.startsWith(u8, trimmed, "Tìm thấy 0") and !std.mem.startsWith(u8, trimmed, "Không tìm thấy")) {
+        if (trimmed.len > 0 and !std.mem.startsWith(u8, trimmed, "No files") and !std.mem.endsWith(u8, trimmed, "file(s) found.") and !std.mem.startsWith(u8, trimmed, "... (limited to")) {
             const str_val = c.JS_NewStringLen(ctx, trimmed.ptr, trimmed.len);
             _ = c.JS_SetPropertyUint32(ctx, arr, idx, str_val);
             idx += 1;
@@ -234,7 +234,7 @@ fn jsMiniWrite(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
     const content = jsStringSlice(ctx, argv[1], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid content");
     defer engine.alloc.free(content);
 
-    // M2: policy check — mini.write map sang tool 'file_write'
+    // M2: policy check — mini.write maps to 'file_write' tool
     if (guardPolicy(engine, "file_write")) {
         hooks.dispatch(engine.alloc, engine.io, .{
             .event = "post-tool-use", .tool_name = "file_write",
@@ -246,7 +246,7 @@ fn jsMiniWrite(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
         .event = "pre-tool-use", .tool_name = "file_write", .input_json = path,
     });
 
-    // M4: snapshot nội dung cũ vào CAS/journal TRƯỚC khi ghi
+    // M4: snapshot old content to CAS/journal BEFORE writing
     if (snapshot_mod.getTracker()) |t| t.beforeFileWrite(path);
 
     const res = file_tool.writeFile(engine.alloc, engine.io, path, content) catch |e| {
@@ -258,7 +258,7 @@ fn jsMiniWrite(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
     };
     defer engine.alloc.free(res);
 
-    // M4: flush snapshot sau khi ghi
+    // M4: flush snapshot after writing
     if (snapshot_mod.getTracker()) |t| t.afterFileWrite(0, path);
 
     // M3: post-hook
@@ -291,7 +291,7 @@ fn jsMiniPatch(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
     const new_str = jsStringSlice(ctx, argv[2], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid newStr");
     defer engine.alloc.free(new_str);
 
-    // M2: policy check — mini.patch map sang tool 'file_edit'
+    // M2: policy check — mini.patch maps to 'file_edit' tool
     if (guardPolicy(engine, "file_edit")) {
         hooks.dispatch(engine.alloc, engine.io, .{
             .event = "post-tool-use", .tool_name = "file_edit",
@@ -303,7 +303,7 @@ fn jsMiniPatch(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
         .event = "pre-tool-use", .tool_name = "file_edit", .input_json = path,
     });
 
-    // M4: snapshot trước khi sửa
+    // M4: snapshot before editing
     if (snapshot_mod.getTracker()) |t| t.beforeFileWrite(path);
 
     const res = file_tool.editFile(engine.alloc, engine.io, path, old_str, new_str) catch |e| {
@@ -321,7 +321,7 @@ fn jsMiniPatch(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
         .input_json = path, .tool_result = res,
     });
 
-    const is_ok = std.mem.indexOf(u8, res, "Đã sửa file") != null;
+    const is_ok = std.mem.indexOf(u8, res, "Modified") != null;
     const obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, if (is_ok) 1 else 0));
     _ = c.JS_SetPropertyStr(ctx, obj, "message", c.JS_NewStringLen(ctx, res.ptr, res.len));
@@ -382,15 +382,15 @@ fn jsMiniSh(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JS
     const command = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid command");
     defer engine.alloc.free(command);
 
-    // Xây dựng JSON cho bash tool — escape chuỗi command (có thể chứa
-    // quote/newline) để round-trip JSON được parse đúng phía tool.
+    // Build JSON for bash tool — escape command string (may contain
+    // quotes/newlines) so round-trip JSON parses correctly on tool side.
     var json_w = utils.BufWriter.init(engine.alloc);
     defer json_w.deinit();
     const cmd_escaped = json_mod.escape(engine.alloc, command) catch return JS_EXCEPTION;
     defer engine.alloc.free(cmd_escaped);
     json_w.print("{{\"command\":\"{s}\"}}", .{cmd_escaped}) catch return JS_EXCEPTION;
 
-    // M2: policy check — mini.sh map sang tool 'bash'
+    // M2: policy check — mini.sh maps to 'bash' tool
     if (guardPolicy(engine, "bash")) {
         hooks.dispatch(engine.alloc, engine.io, .{
             .event = "post-tool-use", .tool_name = "bash",
@@ -402,7 +402,7 @@ fn jsMiniSh(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JS
         .event = "pre-tool-use", .tool_name = "bash", .input_json = command,
     });
 
-    // M4: snapshot các path có nguy cơ bị lệnh ghi (sed -i, >, tee, mv, cp, rm...)
+    // M4: snapshot paths at risk of write commands (sed -i, >, tee, mv, cp, rm...)
     {
         var arena = std.heap.ArenaAllocator.init(engine.alloc);
         defer arena.deinit();
@@ -578,9 +578,9 @@ fn jsMiniJobKill(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c
 // ---------------------------------------------------------------------------
 // mini.http(method, url, opts?)
 //   opts: { body?: string, headers?: {k:v}, max_body_size?: int, timeout_s?: int }
-//   Trả về: { status: int, body: string, truncated: bool, headers: {k:v} }
+//   Returns: { status: int, body: string, truncated: bool, headers: {k:v} }
 // ---------------------------------------------------------------------------
-/// Đọc property string từ JS object. Trả null nếu property không tồn tại.
+/// Read string property from JS object. Returns null if property does not exist.
 fn jsOptString(ctx: ?*c.JSContext, obj: c.JSValue, key: [*:0]const u8, alloc: Allocator) ?[]u8 {
     const v = c.JS_GetPropertyStr(ctx, obj, key);
     defer c.JS_FreeValue(ctx, v);
@@ -588,7 +588,7 @@ fn jsOptString(ctx: ?*c.JSContext, obj: c.JSValue, key: [*:0]const u8, alloc: Al
     return jsStringSlice(ctx, v, alloc);
 }
 
-/// Đọc property int từ JS object. Trả null nếu property không tồn tại / lỗi.
+/// Read int property from JS object. Returns null if property does not exist / error.
 fn jsOptInt(ctx: ?*c.JSContext, obj: c.JSValue, key: [*:0]const u8) ?i64 {
     const v = c.JS_GetPropertyStr(ctx, obj, key);
     defer c.JS_FreeValue(ctx, v);
@@ -598,8 +598,8 @@ fn jsOptInt(ctx: ?*c.JSContext, obj: c.JSValue, key: [*:0]const u8) ?i64 {
     return out;
 }
 
-/// Stringify JS object (argv) thành JSON string cho headers_json của lib.
-/// Dùng JS_JSONStringify của QuickJS — đảm bảo escape đúng mọi giá trị.
+/// Stringify JS object (argv) to JSON string for library headers_json.
+/// Uses QuickJS JS_JSONStringify — ensures proper escaping of all values.
 fn jsObjectToJsonString(ctx: ?*c.JSContext, obj: c.JSValue, alloc: Allocator) ?[]u8 {
     const s = c.JS_JSONStringify(ctx, obj, JS_UNDEFINED, JS_UNDEFINED);
     defer c.JS_FreeValue(ctx, s);
@@ -643,7 +643,7 @@ fn jsMiniHttp(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
         }
     }
 
-    // M2: policy check — mini.http map sang tool 'http_request'
+    // M2: policy check — mini.http maps to 'http_request' tool
     if (guardPolicy(engine, "http_request")) {
         hooks.dispatch(engine.alloc, engine.io, .{
             .event = "post-tool-use", .tool_name = "http_request",
@@ -681,8 +681,8 @@ fn jsMiniHttp(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
 
     const headers_obj = c.JS_NewObject(ctx);
     for (res.headers) |h| {
-        // JS_SetProperty steal val và không steal atom — theo chuẩn QuickJS:
-        // tạo string → chuyển atom (atom giữ string sống) → set → free atom ref.
+        // JS_SetProperty steals val and does not steal atom — per QuickJS convention:
+        // create string -> convert to atom (atom keeps string alive) -> set -> free atom ref.
         const name = c.JS_NewStringLen(ctx, h.name.ptr, h.name.len);
         const atom = c.JS_ValueToAtom(ctx, name);
         c.JS_FreeValue(ctx, name);
@@ -817,7 +817,7 @@ fn jsMiniSessionKill(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv:
     return c.JS_NewStringLen(ctx, res.ptr, res.len);
 }
 
-/// Đăng ký object toàn cục `mini` vào JSContext
+/// Register global `mini` object into JSContext
 pub fn registerBindings(engine: *Engine) !void {
     const ctx = engine.ctx.?;
     const global_obj = c.JS_GetGlobalObject(ctx);

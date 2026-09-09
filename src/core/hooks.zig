@@ -1,6 +1,6 @@
-//! hooks.zig — Hệ thống Lifecycle, Streaming và MCP Hooks toàn diện cho mini-agent.
+//! hooks.zig — Comprehensive Lifecycle, Streaming, and MCP Hooks system for mini-agent.
 //!
-//! Hỗ trợ 3 nhóm hooks:
+//! Supports 3 groups of hooks:
 //! 1. Claude Code CLI Hooks: pre-prompt, post-response, pre-tool-use, post-tool-use
 //! 2. API Streaming Events: message_start, content_block_start, content_block_delta,
 //!                           content_block_stop, message_delta, message_stop
@@ -12,34 +12,34 @@ const json = @import("json.zig");
 const utils = @import("utils.zig");
 const main = @import("../main.zig");
 
-/// Lệnh shell toàn cục cho hook. Null = không kích hoạt.
+/// Global shell command for hook. Null = disabled.
 var g_hook_cmd: ?[]const u8 = null;
 
-/// Callback type cho in-memory hook listener.
+/// Callback type for in-memory hook listener.
 pub const HookListener = *const fn (payload: HookPayload) void;
 var g_hook_listener: ?HookListener = null;
 
-/// Thiết lập lệnh hook toàn cục.
+/// Set global hook command.
 pub fn setHookCommand(cmd: ?[]const u8) void {
     g_hook_cmd = cmd;
 }
 
-/// Lấy lệnh hook hiện tại.
+/// Get current hook command.
 pub fn getHookCommand() ?[]const u8 {
     return g_hook_cmd;
 }
 
-/// Thiết lập hook listener in-memory.
+/// Set in-memory hook listener.
 pub fn setHookListener(listener: ?HookListener) void {
     g_hook_listener = listener;
 }
 
-/// Lấy hook listener in-memory hiện tại.
+/// Get current in-memory hook listener.
 pub fn getHookListener() ?HookListener {
     return g_hook_listener;
 }
 
-/// Struct chứa thông số dữ liệu phát ra từ sự kiện hook.
+/// Struct holding payload data emitted by hook events.
 pub const HookPayload = struct {
     event: []const u8,
     tool_id: ?[]const u8 = null,
@@ -61,14 +61,14 @@ pub const HookPayload = struct {
     artifact_path: ?[]const u8 = null,
     artifact_type: ?[]const u8 = null,
     artifact_title: ?[]const u8 = null,
-    // Trường cho hook events RFC-003 §4.6 (session/memory context)
+    // Fields for hook events RFC-003 §4.6 (session/memory context)
     ctx_budget: ?u64 = null,
     ctx_used: ?u64 = null,
     session_file: ?[]const u8 = null,
     memory_dir: ?[]const u8 = null,
 };
 
-/// Phát sự kiện hook. Chạy không ngắt câu lệnh chính nếu hook lỗi.
+/// Dispatch hook event. Executes without interrupting main command if hook fails.
 pub fn dispatch(alloc: Allocator, io: std.Io, payload: HookPayload) void {
     if (g_hook_listener) |listener| {
         listener(payload);
@@ -82,7 +82,7 @@ pub fn dispatch(alloc: Allocator, io: std.Io, payload: HookPayload) void {
     _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
     const timestamp = ts.sec;
 
-    // 1. Build JSON payload trên stdin
+    // 1. Build JSON payload on stdin
     var json_w = utils.BufWriter.init(alloc);
     defer json_w.deinit();
 
@@ -106,7 +106,7 @@ pub fn dispatch(alloc: Allocator, io: std.Io, payload: HookPayload) void {
     if (payload.artifact_path) |v| appendJsonString(alloc, &json_w, "artifact_path", v);
     if (payload.artifact_type) |v| appendJsonString(alloc, &json_w, "artifact_type", v);
     if (payload.artifact_title) |v| appendJsonString(alloc, &json_w, "artifact_title", v);
-    // Serialize trường context RFC-003 §4.6: số in trực tiếp, chuỗi qua appendJsonString
+    // Serialize context fields RFC-003 §4.6: numbers formatted directly, strings via appendJsonString
     if (payload.ctx_budget) |v| json_w.print(",\"ctx_budget\":{d}", .{v}) catch return;
     if (payload.ctx_used) |v| json_w.print(",\"ctx_used\":{d}", .{v}) catch return;
     if (payload.session_file) |v| appendJsonString(alloc, &json_w, "session_file", v);
@@ -115,7 +115,7 @@ pub fn dispatch(alloc: Allocator, io: std.Io, payload: HookPayload) void {
     json_w.writeAll("}\n") catch return;
     const json_bytes = json_w.list.items;
 
-    // 2. Build command shell với các biến môi trường
+    // 2. Build shell command with environment variables
     var sh_w = utils.BufWriter.init(alloc);
     defer sh_w.deinit();
 
@@ -140,7 +140,7 @@ pub fn dispatch(alloc: Allocator, io: std.Io, payload: HookPayload) void {
     appendEnvString(alloc, &sh_w, "MINI_ARTIFACT_PATH", payload.artifact_path);
     appendEnvString(alloc, &sh_w, "MINI_ARTIFACT_TYPE", payload.artifact_type);
     appendEnvString(alloc, &sh_w, "MINI_ARTIFACT_TITLE", payload.artifact_title);
-    // Export env cho context RFC-003 §4.6: số in thủ công theo pattern sh_w.print
+    // Export env for context RFC-003 §4.6: numbers formatted manually via sh_w.print
     if (payload.ctx_budget) |v| sh_w.print("export MINI_CTX_BUDGET='{d}'; ", .{v}) catch return;
     if (payload.ctx_used) |v| sh_w.print("export MINI_CTX_USED='{d}'; ", .{v}) catch return;
     appendEnvString(alloc, &sh_w, "MINI_SESSION_FILE", payload.session_file);
@@ -156,7 +156,7 @@ pub fn dispatch(alloc: Allocator, io: std.Io, payload: HookPayload) void {
         .stdout = .ignore,
         .stderr = .pipe,
     }) catch |e| {
-        main.stderrPrint("[hooks] Cảnh báo: không khởi chạy được hook command: {s}\n", .{@errorName(e)});
+        main.stderrPrint("[hooks] Warning: unable to spawn hook command: {s}\n", .{@errorName(e)});
         return;
     };
 
@@ -173,7 +173,7 @@ pub fn dispatch(alloc: Allocator, io: std.Io, payload: HookPayload) void {
     }
 
     const term = child.wait(io) catch |e| {
-        main.stderrPrint("[hooks] Cảnh báo: lỗi wait hook: {s}\n", .{@errorName(e)});
+        main.stderrPrint("[hooks] Warning: error waiting for hook: {s}\n", .{@errorName(e)});
         return;
     };
 
@@ -181,14 +181,14 @@ pub fn dispatch(alloc: Allocator, io: std.Io, payload: HookPayload) void {
         .exited => |code| {
             if (code != 0) {
                 if (err_len > 0) {
-                    main.stderrPrint("[hooks] Cảnh báo: hook '{s}' thoát với code {d}: {s}\n", .{ payload.event, code, err_buf[0..err_len] });
+                    main.stderrPrint("[hooks] Warning: hook '{s}' exited with code {d}: {s}\n", .{ payload.event, code, err_buf[0..err_len] });
                 } else {
-                    main.stderrPrint("[hooks] Cảnh báo: hook '{s}' thoát với code {d}\n", .{ payload.event, code });
+                    main.stderrPrint("[hooks] Warning: hook '{s}' exited with code {d}\n", .{ payload.event, code });
                 }
             }
         },
         .signal => |sig| {
-            main.stderrPrint("[hooks] Cảnh báo: hook process bị terminated bởi signal {d}\n", .{@intFromEnum(sig)});
+            main.stderrPrint("[hooks] Warning: hook process terminated by signal {d}\n", .{@intFromEnum(sig)});
         },
         else => {},
     }

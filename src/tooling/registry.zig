@@ -1,24 +1,24 @@
-//! tools.zig — Registry và dispatcher cho toàn bộ tool system.
+//! registry.zig — Registry and dispatcher for the tool system.
 //!
-//! Module trung tâm điều phối lời gọi tool từ AI đến handler tương ứng.
+//! Central module routing tool calls from AI to corresponding handlers.
 //!
-//! ## Luồng hoạt động
-//! 1. Agent nhận `tool_use` từ AI (name + input_json)
-//! 2. Agent gọi `executeTool(alloc, name, input_json)`
-//! 3. Registry kiểm tra policy (allowlist/blocklist)
-//! 4. Dispatch đến handler tương ứng
-//! 5. Nếu không tìm thấy → thử MCP manager
+//! ## Execution Flow
+//! 1. Agent receives `tool_use` from AI (name + input_json)
+//! 2. Agent calls `executeTool(alloc, name, input_json)`
+//! 3. Registry validates policy (allowlist/blocklist)
+//! 4. Dispatch to corresponding handler
+//! 5. If not found → attempt MCP manager
 //!
 //! ## Policy
-//!   - Allowlist: nếu được set, CHỈ các tool trong list mới được chạy
-//!   - Blocklist: các tool trong list bị từ chối
-//!   - Allowlist có ưu tiên cao hơn blocklist
+//!   - Allowlist: if set, ONLY tools in the list are allowed to execute
+//!   - Blocklist: tools in the list are denied
+//!   - Allowlist takes precedence over blocklist
 //!
-//! ## Core tools (luôn gửi lên API)
+//! ## Core tools (always sent to API)
 //! bash, file_read, file_write, file_edit, glob, grep, http_request, skills
 //!
-//! ## Extended tools (gửi theo keyword match)
-//! Xem `extended_triggers` bên dưới.
+//! ## Extended tools (sent conditionally on keyword matches)
+//! See `extended_triggers` below.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -40,27 +40,26 @@ const hooks = @import("../core/hooks.zig");
 const skills_mod = @import("../core/skills.zig");
 const quickjs = @import("../runtime/quickjs_engine.zig");
 
-
 // ---------------------------------------------------------------------------
 // Global state (single-threaded)
 // ---------------------------------------------------------------------------
 
-/// MCP manager — set bởi main.zig sau khi khởi tạo MCP.
+/// MCP manager — set by main.zig after MCP initialization.
 var g_mcp: ?*mcp_mod.McpClientManager = null;
 
-/// Allowlist comma-separated. Null = không giới hạn.
+/// Allowlist comma-separated. Null = unlimited.
 var g_allowlist: ?[]const u8 = null;
 
-/// Blocklist comma-separated. Null = không chặn gì.
+/// Blocklist comma-separated. Null = nothing blocked.
 var g_blocklist: ?[]const u8 = null;
 
-/// Thiết lập MCP manager để fallback khi không có built-in tool khớp.
+/// Configure MCP manager fallback when no built-in tool matches.
 pub fn setMcpManager(m: ?*mcp_mod.McpClientManager) void {
     g_mcp = m;
 }
 
-/// Thiết lập policy cho tool execution.
-/// allowlist và blocklist là pointer vào config strings (không copy).
+/// Set policy for tool execution.
+/// allowlist and blocklist are pointers to config strings (not copied).
 pub fn setPolicy(allowlist: ?[]const u8, blocklist: ?[]const u8) void {
     g_allowlist = allowlist;
     g_blocklist = blocklist;
@@ -72,29 +71,29 @@ pub fn setPolicy(allowlist: ?[]const u8, blocklist: ?[]const u8) void {
 
 fn executeToolInternal(alloc: Allocator, io: std.Io, name: []const u8, input_json: []const u8) ![]u8 {
     // Built-in tool dispatch
-    if (std.mem.eql(u8, name, "bash"))          return bash_tool.executeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "file_read"))     return file_tool.readTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "file_write"))    return file_tool.writeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "file_edit"))     return file_tool.editTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "glob"))          return glob_tool.executeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "grep"))          return grep_tool.executeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "http_request"))  return http_tool.executeTool(alloc, input_json);
-    if (std.mem.eql(u8, name, "invoke_subagent")) return subagent.executeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "bash"))                  return bash_tool.executeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "file_read"))             return file_tool.readTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "file_write"))            return file_tool.writeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "file_edit"))             return file_tool.editTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "glob"))                  return glob_tool.executeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "grep"))                  return grep_tool.executeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "http_request"))          return http_tool.executeTool(alloc, input_json);
+    if (std.mem.eql(u8, name, "invoke_subagent"))       return subagent.executeTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "batch_invoke_subagents")) return batch_subagent.executeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "artifact_write")) return artifact_tool.writeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "artifact_read"))  return artifact_tool.readTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "artifact_list"))  return artifact_tool.listTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "session_diagnostics")) return session_diag.executeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "skills"))        return executeSkills(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "codeact"))       return executeCodeActTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "artifact_write"))        return artifact_tool.writeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "artifact_read"))         return artifact_tool.readTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "artifact_list"))         return artifact_tool.listTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "session_diagnostics"))   return session_diag.executeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "skills"))                return executeSkills(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "codeact"))               return executeCodeActTool(alloc, io, input_json);
 
-    // MCP fallback: tên có dạng "server__toolname"
+    // MCP fallback: names follow "server__toolname" format
     if (g_mcp) |mgr| {
         if (mgr.callTool(name, input_json)) |result| return result;
     }
 
     return std.fmt.allocPrint(alloc,
-        "Tool không tồn tại: '{s}'. Dùng tool 'skills' để xem danh sách.", .{name},
+        "Tool does not exist: '{s}'. Use 'skills' tool to view available tools.", .{name},
     );
 }
 
@@ -124,17 +123,17 @@ fn executeCodeActTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u
     } else {
         return std.fmt.allocPrint(alloc,
             "[CodeAct Error]: {s}\n{s}",
-            .{ res.error_message orelse "Lỗi thực thi JS", res.stdout },
+            .{ res.error_message orelse "JS execution error", res.stdout },
         );
     }
 }
 
-/// Thực thi tool theo tên.
-/// Trả về kết quả dạng string. Caller phải free.
+/// Execute tool by name.
+/// Returns string result. Caller must free.
 pub fn executeTool(alloc: Allocator, io: std.Io, name: []const u8, input_json: []const u8) ![]u8 {
     // Policy check
     if (!isPermitted(name)) {
-        const err_msg = try std.fmt.allocPrint(alloc, "Tool '{s}' bị từ chối bởi policy hiện tại.", .{name});
+        const err_msg = try std.fmt.allocPrint(alloc, "Tool '{s}' is denied by current policy.", .{name});
         hooks.dispatch(alloc, io, .{
             .event = "post-tool-use",
             .tool_name = name,
@@ -154,7 +153,7 @@ pub fn executeTool(alloc: Allocator, io: std.Io, name: []const u8, input_json: [
     var is_error = false;
     const res = executeToolInternal(alloc, io, name, input_json) catch |e| blk: {
         is_error = true;
-        break :blk try std.fmt.allocPrint(alloc, "Lỗi tool: {s}", .{@errorName(e)});
+        break :blk try std.fmt.allocPrint(alloc, "Tool error: {s}", .{@errorName(e)});
     };
 
     hooks.dispatch(alloc, io, .{
@@ -175,129 +174,129 @@ pub fn executeTool(alloc: Allocator, io: std.Io, name: []const u8, input_json: [
 pub const definitions = [_]proto.ToolDefinition{
     .{
         .name = "codeact",
-        .description = "Thực thi mã JavaScript trong máy ảo CodeAct nhúng với đối tượng toàn cục mini.* (mini.sh, mini.read, mini.write, mini.patch, mini.http, mini.sessions, mini.sessionDetail, mini.sessionKill). Dùng khi cần tự động hóa nhiều bước phức tạp hoặc xử lý dữ liệu.",
-        .input_schema_json = \\{"type":"object","properties":{"code":{"type":"string","description":"Mã JavaScript cần thực thi trong CodeAct VM"}},"required":["code"]}
+        .description = "Execute JavaScript in an embedded CodeAct VM with mini.* global API (mini.sh, mini.read, mini.write, mini.patch, mini.http, mini.sessions, mini.sessionDetail, mini.sessionKill). Use for automating complex multi-step logic or data processing.",
+        .input_schema_json = \\{"type":"object","properties":{"code":{"type":"string","description":"JavaScript code to execute in CodeAct VM"}},"required":["code"]}
         ,
     },
     .{
         .name = "bash",
-        .description = "Thực thi lệnh shell qua /bin/sh. Trả về stdout và stderr. CWD là thư mục hiện tại của project. Lệnh nguy hiểm (rm -rf /, dd, shutdown...) bị chặn.",
-        .input_schema_json = \\{"type":"object","properties":{"command":{"type":"string","description":"Lệnh shell cần thực thi"}},"required":["command"]}
+        .description = "Execute shell commands via /bin/sh. Returns stdout and stderr. CWD is the project root. Dangerous commands (rm -rf /, dd, shutdown...) are blocked.",
+        .input_schema_json = \\{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"}},"required":["command"]}
         ,
     },
     .{
         .name = "file_read",
-        .description = "Đọc nội dung tệp tin. Hỗ trợ offset và limit (số dòng). Đường dẫn tương đối tính từ project root.",
-        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"Đường dẫn tệp cần đọc"},"offset":{"type":"integer","description":"Dòng bắt đầu (1-indexed, mặc định: 1)"},"limit":{"type":"integer","description":"Số dòng cần đọc (mặc định: toàn bộ, tối đa 2000 dòng)"}},"required":["path"]}
+        .description = "Read file contents. Supports line-based offset and limit. Relative paths are resolved against project root.",
+        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"File path to read"},"offset":{"type":"integer","description":"Starting line (1-indexed, default: 1)"},"limit":{"type":"integer","description":"Number of lines to read (default: all, max 2000 lines)"}},"required":["path"]}
         ,
     },
     .{
         .name = "file_write",
-        .description = "Ghi hoặc ghi đè toàn bộ nội dung tệp tin. Tự động tạo thư mục cha nếu chưa tồn tại. Tuyệt đối không dùng khi chỉ sửa một phần tệp (dùng file_edit).",
-        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"Đường dẫn tệp cần ghi"},"content":{"type":"string","description":"Nội dung đầy đủ của tệp"}},"required":["path","content"]}
+        .description = "Write or overwrite entire file content. Automatically creates parent directories if needed. Do NOT use for small partial edits (use file_edit).",
+        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"File path to write"},"content":{"type":"string","description":"Full file content"}},"required":["path","content"]}
         ,
     },
     .{
         .name = "file_edit",
-        .description = "Chỉnh sửa một phần tệp tin bằng cách thay thế đoạn văn bản cũ (old_string) bằng đoạn mới (new_string). old_string phải là duy nhất trong tệp, hoặc dùng replace_all=true.",
-        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"Đường dẫn tệp cần sửa"},"old_string":{"type":"string","description":"Đoạn văn bản chính xác cần thay thế"},"new_string":{"type":"string","description":"Đoạn văn bản mới thay vào"},"replace_all":{"type":"boolean","description":"Thay thế tất cả các lần xuất hiện (mặc định: false)"}},"required":["path","old_string","new_string"]}
+        .description = "Edit part of a file by replacing old_string with new_string. old_string must be unique in the file, or use replace_all=true.",
+        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"File path to edit"},"old_string":{"type":"string","description":"Exact substring to replace"},"new_string":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace all occurrences (default: false)"}},"required":["path","old_string","new_string"]}
         ,
     },
     .{
         .name = "glob",
-        .description = "Tìm kiếm tệp theo glob pattern (vd: \"**/*.zig\", \"src/*.ts\"). Trả về danh sách đường dẫn tương đối. Tự động bỏ qua .git, zig-cache, node_modules.",
-        .input_schema_json = \\{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern cần tìm"},"path":{"type":"string","description":"Thư mục gốc tìm kiếm (mặc định: project root)"}},"required":["pattern"]}
+        .description = "Find files by wildcard pattern (e.g. \"**/*.zig\", \"src/*.ts\"). Returns list of relative paths. Automatically skips .git, zig-cache, node_modules.",
+        .input_schema_json = \\{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern to search"},"path":{"type":"string","description":"Base directory (default: project root)"}},"required":["pattern"]}
         ,
     },
     .{
         .name = "grep",
-        .description = "Tìm kiếm biểu thức chính quy (regex) hoặc văn bản thô trong nội dung các tệp tin. Trả về đường dẫn, số dòng và nội dung dòng khớp.",
-        .input_schema_json = \\{"type":"object","properties":{"pattern":{"type":"string","description":"Chuỗi hoặc regex cần tìm"},"path":{"type":"string","description":"Thư mục hoặc tệp cần tìm (mặc định: project root)"},"case_insensitive":{"type":"boolean","description":"Không phân biệt hoa thường"},"max_results":{"type":"integer","description":"Giới hạn số kết quả trả về (mặc định: 50)"}},"required":["pattern"]}
+        .description = "Search for regex or raw text within file contents. Returns file path, line numbers, and matching lines.",
+        .input_schema_json = \\{"type":"object","properties":{"pattern":{"type":"string","description":"Search pattern or regex"},"path":{"type":"string","description":"Directory or file to search (default: project root)"},"case_insensitive":{"type":"boolean","description":"Case-insensitive search"},"max_results":{"type":"integer","description":"Max results to return (default: 50)"}},"required":["pattern"]}
         ,
     },
     .{
         .name = "http_request",
-        .description = "Gửi yêu cầu HTTP/HTTPS. Hỗ trợ GET, POST, PUT, DELETE, PATCH. Trả về status code, headers và response body.",
-        .input_schema_json = \\{"type":"object","properties":{"url":{"type":"string","description":"URL đầy đủ (vd: https://api.example.com/data)"},"method":{"type":"string","enum":["GET","POST","PUT","DELETE","PATCH"],"description":"HTTP method (mặc định: GET)"},"headers":{"type":"object","description":"JSON object chứa các header (vd: {\"Content-Type\": \"application/json\"})"},"body":{"type":"string","description":"Request body (cho POST, PUT, PATCH)"}},"required":["url"]}
+        .description = "Send HTTP/HTTPS requests. Supports GET, POST, PUT, DELETE, PATCH. Returns status code, headers, and response body.",
+        .input_schema_json = \\{"type":"object","properties":{"url":{"type":"string","description":"Full URL (e.g. https://api.example.com/data)"},"method":{"type":"string","enum":["GET","POST","PUT","DELETE","PATCH"],"description":"HTTP method (default: GET)"},"headers":{"type":"object","description":"JSON object with headers (e.g. {\"Content-Type\": \"application/json\"})"},"body":{"type":"string","description":"Request body (for POST, PUT, PATCH)"}},"required":["url"]}
         ,
     },
     .{
         .name = "invoke_subagent",
-        .description = "Gọi một agent con để thực hiện một tác vụ phức tạp (chia để trị). Phù hợp khi cần phân tích thư mục, refactor nhiều file, hoặc xử lý chuỗi hành động dài.",
-        .input_schema_json = \\{"type":"object","properties":{"task":{"type":"string","description":"Nhiệm vụ chi tiết dành cho sub-agent"}},"required":["task"]}
+        .description = "Spawn a subagent to perform a complex task (divide-and-conquer). Best for directory exploration, multifile refactorings, or long action sequences.",
+        .input_schema_json = \\{"type":"object","properties":{"task":{"type":"string","description":"Detailed task for subagent"}},"required":["task"]}
         ,
     },
     .{
         .name = "batch_invoke_subagents",
-        .description = "Gọi nhiều agent con chạy song song để xử lý các tác vụ độc lập. Phù hợp cho batch processing (ví dụ: upload nhiều video cùng lúc).",
-        .input_schema_json = \\{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"string"},"description":"Danh sách các nhiệm vụ chi tiết dành cho các sub-agent"}},"required":["tasks"]}
+        .description = "Spawn multiple subagents in parallel to process independent tasks. Ideal for batch processing workflows.",
+        .input_schema_json = \\{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"string"},"description":"List of tasks for parallel subagents"}},"required":["tasks"]}
         ,
     },
     .{
         .name = "skills",
-        .description = "Xem danh sách skills (convention packages tại ~/.mini/skills) và tools. operation=\"list\" để liệt kê tất cả, operation=\"detail\" với name=<skill|tool> để xem chi tiết. Skill là các quy ước/hướng dẫn viết sẵn (SKILL.md); tool là hàm thực thi.",
-        .input_schema_json = \\{"type":"object","properties":{"operation":{"type":"string","enum":["list","detail"],"description":"list hoặc detail"},"name":{"type":"string","description":"Tên skill hoặc tool (cho detail)"}},"required":[]}
+        .description = "Inspect available skills (from ~/.mini/skills) and tools. operation=\"list\" lists all, operation=\"detail\" with name=<skill|tool> shows details. Skills are pre-written guidelines (SKILL.md); tools are executable functions.",
+        .input_schema_json = \\{"type":"object","properties":{"operation":{"type":"string","enum":["list","detail"],"description":"list or detail"},"name":{"type":"string","description":"Skill or tool name (for detail)"}},"required":[]}
         ,
     },
     .{
         .name = "session_diagnostics",
-        .description = "Truy xuất thông tin trạng thái các tiến trình mini-agent, subagents và logs session (Event Sourcing Journal tại ~/.mini/sessions). Hỗ trợ kiểm tra tiến trình sống/chết, phân biệt chế độ REPL vs Subagent, xem số Act đã chạy, giải thích trạng thái chuẩn xác và kill tiến trình bị treo.",
-        .input_schema_json = \\{"type":"object","properties":{"operation":{"type":"string","enum":["list","detail","kill"],"description":"list (danh sách session), detail (chi tiết session theo PID), kill (dừng tiến trình)"},"pid":{"type":"integer","description":"PID của tiến trình mini-agent hoặc subagent cần xem chi tiết/dừng"},"signal":{"type":"string","description":"Signal gửi khi kill (mặc định: SIGTERM hoặc SIGKILL)"}},"required":["operation"]}
+        .description = "Query process status, subagents, and session logs (Event Sourcing Journal in ~/.mini/sessions). Inspect process liveness, REPL vs Subagent mode, executed acts, operational state, or terminate hanging processes.",
+        .input_schema_json = \\{"type":"object","properties":{"operation":{"type":"string","enum":["list","detail","kill"],"description":"list (session list), detail (session detail by PID), kill (stop process)"},"pid":{"type":"integer","description":"PID of mini-agent or subagent process"},"signal":{"type":"string","description":"Signal for kill (default: SIGTERM or SIGKILL)"}},"required":["operation"]}
         ,
     },
     .{
         .name = "artifact_write",
-        .description = "Tạo hoặc cập nhật một artifact độc lập (kế hoạch, walkthrough, markdown, html, svg, code diff, mockup). Tự động lưu vào session artifacts và kích hoạt live preview hook.",
-        .input_schema_json = \\{"type":"object","properties":{"name":{"type":"string","description":"Tên tệp artifact (ví dụ: plan.md, walkthrough.md, preview.html, diagram.svg)"},"content":{"type":"string","description":"Nội dung tệp artifact"},"title":{"type":"string","description":"Tiêu đề mô tả ngắn cho artifact"},"type":{"type":"string","enum":["markdown","html","svg","code","diff","text"],"description":"Loại artifact (mặc định: markdown)"},"summary":{"type":"string","description":"Tóm tắt ngắn gọn nội dung artifact"},"user_facing":{"type":"string","enum":["true","false"],"description":"true nếu là tài liệu cho người dùng xem"}},"required":["name","content"]}
+        .description = "Create or update an independent artifact (plan, walkthrough, markdown, html, svg, code diff, mockup). Automatically saves to session artifacts and triggers live preview hooks.",
+        .input_schema_json = \\{"type":"object","properties":{"name":{"type":"string","description":"Artifact filename (e.g., plan.md, walkthrough.md, preview.html, diagram.svg)"},"content":{"type":"string","description":"Artifact content"},"title":{"type":"string","description":"Short title for artifact"},"type":{"type":"string","enum":["markdown","html","svg","code","diff","text"],"description":"Artifact type (default: markdown)"},"summary":{"type":"string","description":"Brief summary of artifact content"},"user_facing":{"type":"string","enum":["true","false"],"description":"true if intended for user presentation"}},"required":["name","content"]}
         ,
     },
     .{
         .name = "artifact_read",
-        .description = "Đọc nội dung một artifact đã lưu trong session hiện tại theo tên.",
-        .input_schema_json = \\{"type":"object","properties":{"name":{"type":"string","description":"Tên artifact cần đọc (ví dụ: plan.md)"}},"required":["name"]}
+        .description = "Read content of a saved artifact in the current session by name.",
+        .input_schema_json = \\{"type":"object","properties":{"name":{"type":"string","description":"Name of artifact to read (e.g., plan.md)"}},"required":["name"]}
         ,
     },
     .{
         .name = "artifact_list",
-        .description = "Liệt kê danh sách tất cả artifacts kèm metadata và đường dẫn trong session hiện tại.",
+        .description = "List all artifacts along with metadata and paths in the current session.",
         .input_schema_json = \\{"type":"object","properties":{},"required":[]}
         ,
     },
 };
 
-/// Các tên tool core (luôn gửi lên API).
+/// Core tool names (always sent to API).
 const core_tools = [_][]const u8{
     "bash", "file_read", "file_write", "file_edit",
     "glob", "grep", "http_request", "invoke_subagent", "batch_invoke_subagents", "skills",
     "session_diagnostics", "artifact_write", "artifact_read", "artifact_list",
 };
 
-/// Keyword trigger cho extended tools (gửi theo ngữ cảnh).
+/// Keyword triggers for extended tools (sent conditionally).
 const Trigger = struct {
     tool: []const u8,
     keywords: []const []const u8,
 };
 
 const extended_triggers = [_]Trigger{
-    // Không có extended tools trong phiên bản minimal này.
-    // Thêm ở đây khi bổ sung tools mới.
+    // None in this minimal version.
+    // Add here when introducing new extended tools.
 };
 
 // ---------------------------------------------------------------------------
 // Tool selection
 // ---------------------------------------------------------------------------
 
-/// Buffer cho filtered tool list (module-level, single-threaded safe).
+/// Buffer for filtered tool list (module-level, single-threaded safe).
 var filtered_buf: [definitions.len + 64]proto.ToolDefinition = undefined;
 
-/// Trả về tất cả tool definitions.
+/// Return all tool definitions.
 pub fn getDefinitions() []const proto.ToolDefinition {
     return &definitions;
 }
 
-/// Trả về tool definitions phù hợp với user message.
-/// Core tools luôn được include. Extended tools chỉ khi có keyword match.
-/// MCP tools được append thêm nếu có McpManager.
+/// Return tool definitions relevant to user message.
+/// Core tools are always included. Extended tools are added on keyword match.
+/// MCP tools are appended if McpManager is available.
 pub fn getRelevantDefinitions(alloc: Allocator, user_text: []const u8) []const proto.ToolDefinition {
     var count: usize = 0;
 
@@ -309,11 +308,11 @@ pub fn getRelevantDefinitions(alloc: Allocator, user_text: []const u8) []const p
         count += 1;
     }
 
-    // Extended tools theo keyword
+    // Extended tools by keyword
     for (&extended_triggers) |*t| {
         for (t.keywords) |kw| {
             if (containsCI(user_text, kw)) {
-                // Tìm definition
+                // Find definition
                 for (&definitions) |*td| {
                     if (std.mem.eql(u8, td.name, t.tool) and isPermitted(td.name)) {
                         filtered_buf[count] = td.*;
@@ -347,11 +346,11 @@ fn isCoreTool(name: []const u8) bool {
     return false;
 }
 
-/// So khớp 1 entry policy (đã trim whitespace) với tên tool.
-/// Entry kết thúc bằng '*' → wildcard prefix match trên phần trước '*'.
-/// Entry thường → exact match.
+/// Match policy entry (trimmed) with tool name.
+/// Entry ending in '*' -> wildcard prefix match on prefix before '*'.
+/// Regular entry -> exact match.
 fn matchesEntry(entry_trimmed: []const u8, name: []const u8) bool {
-    // Wildcard prefix: entry = "mcp*" match mọi name bắt đầu bằng "mcp"
+    // Wildcard prefix: entry = "mcp*" matches all names starting with "mcp"
     if (entry_trimmed.len > 0 and entry_trimmed[entry_trimmed.len - 1] == '*') {
         return std.mem.startsWith(u8, name, entry_trimmed[0 .. entry_trimmed.len - 1]);
     }
@@ -359,7 +358,7 @@ fn matchesEntry(entry_trimmed: []const u8, name: []const u8) bool {
 }
 
 pub fn isPermitted(name: []const u8) bool {
-    // Chặn gọi subagent nếu đã đạt giới hạn độ sâu để phòng đệ quy vô hạn (Leaf Worker Pattern)
+    // Block subagent calls if depth limit reached to avoid infinite recursion (Leaf Worker Pattern)
     if (std.mem.eql(u8, name, "invoke_subagent") or std.mem.eql(u8, name, "batch_invoke_subagents")) {
         const cur_depth = subagent.getCurrentDepth();
         const max_depth = subagent.getMaxDepth();
@@ -367,12 +366,12 @@ pub fn isPermitted(name: []const u8) bool {
     }
 
     if (g_allowlist) |list| {
-        // Allowlist: CHỈ cho phép những tool được liệt kê
+        // Allowlist: ONLY allow listed tools
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |entry| {
             if (matchesEntry(std.mem.trim(u8, entry, " \t"), name)) return true;
         }
-        return false; // không có trong allowlist
+        return false; // not in allowlist
     }
     if (g_blocklist) |list| {
         var it = std.mem.splitScalar(u8, list, ',');
@@ -399,11 +398,11 @@ fn containsCI(text: []const u8, kw: []const u8) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Skills tool (liệt kê skills từ ~/.mini/skills + tools)
+// Skills tool (lists skills from ~/.mini/skills + tools)
 // ---------------------------------------------------------------------------
 
-/// Đọc nội dung file SKILL.md (hoặc RULES.md) của một skill.
-/// Trả về null nếu không đọc được.
+/// Read SKILL.md (or RULES.md) of a skill.
+/// Returns null if unable to read.
 fn readSkillFile(alloc: Allocator, io: std.Io, skill_path: []const u8) ?[]u8 {
     const cwd = std.Io.Dir.cwd();
     const file = cwd.openFile(io, skill_path, .{}) catch return null;
@@ -423,9 +422,9 @@ fn executeSkills(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
 
     if (std.mem.eql(u8, operation, "detail")) {
         const name = json.findString(input_json, "name") orelse
-            return std.fmt.allocPrint(alloc, "Lỗi: cần trường 'name' cho operation detail", .{});
+            return std.fmt.allocPrint(alloc, "Error: 'name' field required for detail operation", .{});
 
-        // 1. Thử match skill thật trong ~/.mini/skills
+        // 1. Try matching real skill in ~/.mini/skills
         if (skills_mod.getSkills()) |skills| {
             for (skills) |s| {
                 if (std.mem.eql(u8, s.name, name)) {
@@ -436,12 +435,12 @@ fn executeSkills(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
                             .{ s.name, s.path, content },
                         );
                     }
-                    return std.fmt.allocPrint(alloc, "Skill '{s}' tồn tại nhưng không đọc được `{s}`.", .{ s.name, s.path });
+                    return std.fmt.allocPrint(alloc, "Skill '{s}' exists but could not read `{s}`.", .{ s.name, s.path });
                 }
             }
         }
 
-        // 2. Fallback: match tool trong registry
+        // 2. Fallback: match tool in registry
         for (&definitions) |*td| {
             if (std.mem.eql(u8, td.name, name)) {
                 return std.fmt.allocPrint(alloc,
@@ -450,17 +449,17 @@ fn executeSkills(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
                 );
             }
         }
-        return std.fmt.allocPrint(alloc, "Không tìm thấy skill hoặc tool '{s}'.", .{name});
+        return std.fmt.allocPrint(alloc, "Skill or tool '{s}' not found.", .{name});
     }
 
-    // List all: skills trước, tools sau
+    // List all: skills first, tools next
     var buf = utils.BufWriter.init(alloc);
     errdefer buf.deinit();
     const w = &buf;
 
     if (skills_mod.getSkills()) |skills| {
         try w.writeAll("## Skills (~/.mini/skills)\n\n");
-        try w.writeAll("Skill = quy ước/hướng dẫn (SKILL.md). Dùng `skills` operation=detail để xem nội dung, hoặc file_read trực tiếp path.\n\n");
+        try w.writeAll("Skill = conventions/instructions (SKILL.md). Use 'skills' operation=detail to view content, or file_read directly.\n\n");
         for (skills) |s| {
             try w.print("  📄 **{s}** — {s}\n  ↳ `{s}`\n", .{ s.name, s.description, s.path });
         }
@@ -515,11 +514,11 @@ test "codeact as native tool: codeact in registry" {
 }
 
 test "registry: subagent depth limit permission" {
-    // Độ sâu 0: cho phép invoke_subagent
+    // Depth 0: allow invoke_subagent
     try std.testing.expect(isPermitted("invoke_subagent"));
     try std.testing.expect(isPermitted("batch_invoke_subagents"));
 
-    // Đặt độ sâu = 2 (đạt max): tự động chặn
+    // Set depth = 2 (max): automatically block
     const env_map = main.getEnvironMap();
     if (env_map == null) return error.SkipZigTest;
 
@@ -537,6 +536,3 @@ test "registry: subagent depth limit permission" {
     try std.testing.expect(!isPermitted("invoke_subagent"));
     try std.testing.expect(!isPermitted("batch_invoke_subagents"));
 }
-
-
-

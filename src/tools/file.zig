@@ -1,18 +1,17 @@
-//! tools/file.zig — Tool đọc, ghi và sửa file.
+//! tools/file.zig — File read, write, and edit tools.
 //!
-//! ## Các hàm tool
-//!   - `file_read`  — đọc file, hỗ trợ offset/limit theo dòng
-//!   - `file_write` — ghi/tạo file (tạo thư mục cha nếu cần)
-//!   - `file_edit`  — tìm chuỗi duy nhất và thay thế
+//! ## Tool functions
+//!   - `file_read`  — reads file, supports line-based offset/limit
+//!   - `file_write` — writes/creates file (creates parent directories if needed)
+//!   - `file_edit`  — finds a unique string and replaces it
 //!
 //! ## File paths
-//! Tất cả path đều được resolve từ CWD của process.
-//! Absolute path cũng được hỗ trợ.
+//! All paths resolve relative to process CWD. Absolute paths are also supported.
 //!
-//! ## Giới hạn
-//!   - file_read: tối đa 1MB, tối đa 2000 dòng mỗi lần đọc
-//!   - file_write: tối đa 10MB
-//!   - file_edit: old_string phải là chuỗi duy nhất trong file
+//! ## Limits
+//!   - file_read: max 1MB, max 2000 lines per read
+//!   - file_write: max 10MB
+//!   - file_edit: old_string must appear exactly once in file
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -27,11 +26,11 @@ const MAX_LINES_PER_READ = 2000;
 // Dispatch entry points
 // ---------------------------------------------------------------------------
 
-/// Tool file_read: đọc nội dung file với line numbers.
+/// Tool file_read: reads file content with line numbers.
 /// Input: {"path":"...", "offset":10, "limit":50}
 pub fn readTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     const path = (try json.findStringOwned(alloc, input_json, "path")) orelse
-        return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'path'", .{});
+        return std.fmt.allocPrint(alloc, "Error: missing 'path' parameter", .{});
     defer alloc.free(path);
 
     const offset: usize = blk: {
@@ -46,59 +45,59 @@ pub fn readTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     return readFile(alloc, io, path, offset, @min(limit, MAX_LINES_PER_READ));
 }
 
-/// Tool file_write: ghi nội dung vào file (tạo mới hoặc ghi đè).
+/// Tool file_write: writes content to file (creates or overwrites).
 /// Input: {"path":"...", "content":"..."}
 pub fn writeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     const path = (try json.findStringOwned(alloc, input_json, "path")) orelse
-        return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'path'", .{});
+        return std.fmt.allocPrint(alloc, "Error: missing 'path' parameter", .{});
     defer alloc.free(path);
     const content = (try json.findStringOwned(alloc, input_json, "content")) orelse
-        return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'content'", .{});
+        return std.fmt.allocPrint(alloc, "Error: missing 'content' parameter", .{});
     defer alloc.free(content);
 
     return writeFile(alloc, io, path, content);
 }
 
-/// Tool file_edit: tìm old_string (phải duy nhất) và thay bằng new_string.
+/// Tool file_edit: finds unique old_string and replaces it with new_string.
 /// Input: {"path":"...", "old_string":"...", "new_string":"..."}
 pub fn editTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     const path = (try json.findStringOwned(alloc, input_json, "path")) orelse
-        return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'path'", .{});
+        return std.fmt.allocPrint(alloc, "Error: missing 'path' parameter", .{});
     defer alloc.free(path);
     const old_str = (try json.findStringOwned(alloc, input_json, "old_string")) orelse
-        return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'old_string'", .{});
+        return std.fmt.allocPrint(alloc, "Error: missing 'old_string' parameter", .{});
     defer alloc.free(old_str);
     const new_str = (try json.findStringOwned(alloc, input_json, "new_string")) orelse
-        return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'new_string'", .{});
+        return std.fmt.allocPrint(alloc, "Error: missing 'new_string' parameter", .{});
     defer alloc.free(new_str);
 
     return editFile(alloc, io, path, old_str, new_str);
 }
 
 // ---------------------------------------------------------------------------
-// Core functions (dùng được từ code khác)
+// Core functions
 // ---------------------------------------------------------------------------
 
-/// Đọc file với line numbers. offset=0 bắt đầu từ dòng 1.
-/// Trả về string dạng "1: nội dung\n2: nội dung\n..."
+/// Read file with line numbers. offset=0 starts at line 1.
+/// Returns string formatted as "1: content\n2: content\n..."
 pub fn readFile(alloc: Allocator, io: std.Io, path: []const u8, offset: usize, limit: usize) ![]u8 {
     const cwd = std.Io.Dir.cwd();
     const file = cwd.openFile(io, path, .{}) catch |e| {
-        return std.fmt.allocPrint(alloc, "Lỗi mở file '{s}': {s}", .{ path, @errorName(e) });
+        return std.fmt.allocPrint(alloc, "Error opening file '{s}': {s}", .{ path, @errorName(e) });
     };
     defer file.close(io);
 
     const stat = file.stat(io) catch |e| {
-        return std.fmt.allocPrint(alloc, "Lỗi stat '{s}': {s}", .{ path, @errorName(e) });
+        return std.fmt.allocPrint(alloc, "Error stating file '{s}': {s}", .{ path, @errorName(e) });
     };
     if (stat.size > MAX_READ_SIZE) {
-        return std.fmt.allocPrint(alloc, "File quá lớn ({d} bytes). Dùng offset/limit.", .{stat.size});
+        return std.fmt.allocPrint(alloc, "File too large ({d} bytes). Use offset/limit.", .{stat.size});
     }
 
     const raw = alloc.alloc(u8, @intCast(stat.size)) catch return error.OutOfMemory;
     defer alloc.free(raw);
     const n = utils.readAll(io, file, raw) catch |e| {
-        return std.fmt.allocPrint(alloc, "Lỗi đọc '{s}': {s}", .{ path, @errorName(e) });
+        return std.fmt.allocPrint(alloc, "Error reading '{s}': {s}", .{ path, @errorName(e) });
     };
 
     var result = utils.BufWriter.init(alloc);
@@ -115,85 +114,85 @@ pub fn readFile(alloc: Allocator, io: std.Io, path: []const u8, offset: usize, l
         count += 1;
     }
 
-    if (count == 0) try w.writeAll("(file trống hoặc offset vượt quá số dòng)");
+    if (count == 0) try w.writeAll("(file empty or offset exceeds line count)");
     return result.toOwnedSlice();
 }
 
-/// Ghi nội dung vào file. Tạo thư mục cha nếu chưa tồn tại.
+/// Write content to file. Creates parent directories if not present.
 pub fn writeFile(alloc: Allocator, io: std.Io, path: []const u8, content: []const u8) ![]u8 {
     if (content.len > MAX_WRITE_SIZE) {
-        return std.fmt.allocPrint(alloc, "Nội dung quá lớn ({d} bytes).", .{content.len});
+        return std.fmt.allocPrint(alloc, "Content too large ({d} bytes).", .{content.len});
     }
 
-    // Tạo thư mục cha nếu cần
+    // Create parent directories if needed
     if (std.fs.path.dirname(path)) |dir| {
         std.Io.Dir.cwd().createDirPath(io, dir) catch {};
     }
 
     const cwd = std.Io.Dir.cwd();
     const file = cwd.createFile(io, path, .{ .truncate = true }) catch |e| {
-        return std.fmt.allocPrint(alloc, "Lỗi tạo file '{s}': {s}", .{ path, @errorName(e) });
+        return std.fmt.allocPrint(alloc, "Error creating file '{s}': {s}", .{ path, @errorName(e) });
     };
     defer file.close(io);
 
     file.writeStreamingAll(io, content) catch |e| {
-        return std.fmt.allocPrint(alloc, "Lỗi ghi '{s}': {s}", .{ path, @errorName(e) });
+        return std.fmt.allocPrint(alloc, "Error writing '{s}': {s}", .{ path, @errorName(e) });
     };
 
-    return std.fmt.allocPrint(alloc, "Đã ghi {d} bytes vào '{s}'.", .{ content.len, path });
+    return std.fmt.allocPrint(alloc, "Wrote {d} bytes to '{s}'.", .{ content.len, path });
 }
 
-/// Tìm old_string (duy nhất) trong file và thay bằng new_string.
-/// Trả về lỗi nếu old_string xuất hiện nhiều lần.
+/// Find unique old_string in file and replace it with new_string.
+/// Returns an error if old_string occurs multiple times.
 pub fn editFile(alloc: Allocator, io: std.Io, path: []const u8, old_str: []const u8, new_str: []const u8) ![]u8 {
-    // Đọc file
+    // Read file
     const cwd = std.Io.Dir.cwd();
     const file_r = cwd.openFile(io, path, .{}) catch |e| {
-        return std.fmt.allocPrint(alloc, "Lỗi mở '{s}': {s}", .{ path, @errorName(e) });
+        return std.fmt.allocPrint(alloc, "Error opening '{s}': {s}", .{ path, @errorName(e) });
     };
     defer file_r.close(io);
 
-    const stat = file_r.stat(io) catch return std.fmt.allocPrint(alloc, "Lỗi stat", .{});
-    if (stat.size > MAX_READ_SIZE) return std.fmt.allocPrint(alloc, "File quá lớn.", .{});
+    const stat = file_r.stat(io) catch return std.fmt.allocPrint(alloc, "Error stating file", .{});
+    if (stat.size > MAX_READ_SIZE) return std.fmt.allocPrint(alloc, "File too large.", .{});
 
     const buf = alloc.alloc(u8, @intCast(stat.size)) catch return error.OutOfMemory;
     defer alloc.free(buf);
-    const n = utils.readAll(io, file_r, buf) catch return std.fmt.allocPrint(alloc, "Lỗi đọc.", .{});
+    const n = utils.readAll(io, file_r, buf) catch return std.fmt.allocPrint(alloc, "Error reading file.", .{});
     const content = buf[0..n];
 
-    // Tìm old_string
+    // Find old_string
     const first = std.mem.indexOf(u8, content, old_str) orelse {
         return std.fmt.allocPrint(alloc,
-            "Không tìm thấy old_string trong '{s}'.\nold_string: {s}",
+            "Could not find old_string in '{s}'.\nold_string: {s}",
             .{ path, old_str[0..@min(old_str.len, 100)] },
         );
     };
 
-    // Kiểm tra không có xuất hiện thứ hai
+    // Verify no second occurrence
     if (std.mem.indexOf(u8, content[first + 1 ..], old_str) != null) {
         return std.fmt.allocPrint(alloc,
-            "old_string không duy nhất trong '{s}'. Hãy cung cấp chuỗi cụ thể hơn.",
+            "old_string is not unique in '{s}'. Please provide a more specific string.",
             .{path},
         );
     }
 
-    // Build kết quả
+    // Build result
     var result = std.ArrayListUnmanaged(u8).empty;
     errdefer result.deinit(alloc);
     try result.appendSlice(alloc, content[0..first]);
     try result.appendSlice(alloc, new_str);
     try result.appendSlice(alloc, content[first + old_str.len ..]);
 
-    // Ghi lại
+    // Write back
     const file_w = cwd.createFile(io, path, .{ .truncate = true }) catch |e| {
-        return std.fmt.allocPrint(alloc, "Lỗi ghi '{s}': {s}", .{ path, @errorName(e) });
+        return std.fmt.allocPrint(alloc, "Error writing '{s}': {s}", .{ path, @errorName(e) });
     };
     defer file_w.close(io);
     file_w.writeStreamingAll(io, result.items) catch |e| {
-        return std.fmt.allocPrint(alloc, "Lỗi ghi '{s}': {s}", .{ path, @errorName(e) });
+        return std.fmt.allocPrint(alloc, "Error writing '{s}': {s}", .{ path, @errorName(e) });
     };
 
-    return std.fmt.allocPrint(alloc, "Đã sửa '{s}': thay {d} ký tự bằng {d} ký tự.", .{
+    return std.fmt.allocPrint(alloc, "Modified '{s}': replaced {d} characters with {d} characters.", .{
         path, old_str.len, new_str.len,
     });
 }

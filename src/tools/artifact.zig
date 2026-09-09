@@ -1,8 +1,8 @@
-//! tools/artifact.zig — Tool tạo, đọc và quản lý Artifacts cho Agent.
+//! tools/artifact.zig — Tool for creating, reading, and managing Agent artifacts.
 //!
-//! Cho phép Agent xuất các sản phẩm công việc độc lập (kế hoạch, walkthrough,
-//! diagrams, code diffs, html previews) ra thư mục artifact của session và
-//! tự động kích hoạt event hook thời gian thực (Level D).
+//! Enables the Agent to output standalone work products (plans, walkthroughs,
+//! diagrams, code diffs, html previews) to the session artifact directory and
+//! automatically trigger real-time event hooks (Level D).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -10,14 +10,14 @@ const json = @import("../core/json.zig");
 const artifacts = @import("../core/artifacts.zig");
 const hooks = @import("../core/hooks.zig");
 
-/// Tool artifact_write: Tạo hoặc cập nhật một artifact.
+/// Tool artifact_write: Create or update an artifact.
 /// Input: {"name":"...", "content":"...", "title":"...", "type":"markdown", "summary":"...", "user_facing":true}
 pub fn writeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     const name = (try json.findStringOwned(alloc, input_json, "name")) orelse
-        return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'name' cho artifact", .{});
+        return std.fmt.allocPrint(alloc, "Error: missing 'name' parameter for artifact", .{});
     defer alloc.free(name);
     const content = (try json.findStringOwned(alloc, input_json, "content")) orelse
-        return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'content' cho artifact", .{});
+        return std.fmt.allocPrint(alloc, "Error: missing 'content' parameter for artifact", .{});
     defer alloc.free(content);
 
     const title = json.findString(input_json, "title");
@@ -30,11 +30,11 @@ pub fn writeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         if (std.mem.eql(u8, uf, "false")) user_facing = false;
     }
 
-    // Ghi file artifact và cập nhật metadata
+    // Write artifact file and update metadata
     const path = try artifacts.writeArtifact(alloc, io, name, title, content, art_type, summary, user_facing);
     defer alloc.free(path);
 
-    // Bắn sự kiện thời gian thực qua Hooks (Level D: Live Preview / External UI)
+    // Dispatch real-time hook event (Level D: Live Preview / External UI)
     hooks.dispatch(alloc, io, .{
         .event = "artifact_saved",
         .artifact_name = name,
@@ -44,22 +44,22 @@ pub fn writeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     });
 
     return std.fmt.allocPrint(alloc,
-        "Đã lưu artifact thành công tại: [{s}](file://{s})\nSession: {s} | Type: {s}",
+        "Successfully saved artifact at: [{s}](file://{s})\nSession: {s} | Type: {s}",
         .{ name, path, artifacts.getSessionId(), art_type },
     );
 }
 
-/// Tool artifact_read: Đọc nội dung một artifact đã lưu.
+/// Tool artifact_read: Read contents of a saved artifact.
 /// Input: {"name":"..."}
 pub fn readTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     const name = (try json.findStringOwned(alloc, input_json, "name")) orelse
-        return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'name'", .{});
+        return std.fmt.allocPrint(alloc, "Error: missing 'name' parameter", .{});
     defer alloc.free(name);
 
     return artifacts.readArtifact(alloc, io, name);
 }
 
-/// Tool artifact_list: Liệt kê tất cả artifacts trong session hiện tại.
+/// Tool artifact_list: List all artifacts in the current session.
 /// Input: {}
 pub fn listTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     _ = input_json;

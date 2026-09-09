@@ -1,17 +1,17 @@
 //! backend/openai.zig — OpenAI-compatible streaming client.
 //!
-//! Hỗ trợ bất kỳ API nào tương thích OpenAI Chat Completions:
+//! Supports any API compatible with OpenAI Chat Completions:
 //!   - OpenAI (api.openai.com)
-//!   - Ollama (qua /v1/chat/completions)
-//!   - LM Studio, vLLM, OpenRouter, các endpoint custom...
+//!   - Ollama (via /v1/chat/completions)
+//!   - LM Studio, vLLM, OpenRouter, custom endpoints...
 //!
-//! ## Định dạng request
-//! POST {base_url}/chat/completions (nếu base_url chưa có /chat/completions)
+//! ## Request format
+//! POST {base_url}/chat/completions (if base_url does not already include /chat/completions)
 //! ```json
 //! { "model": "...", "stream": true, "messages": [...], "tools": [...] }
 //! ```
 //!
-//! ## Định dạng SSE response
+//! ## SSE response format
 //! ```
 //! data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}
 //! data: {"choices":[{"delta":{"tool_calls":[{"id":"...","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
@@ -19,8 +19,8 @@
 //! ```
 //!
 //! ## Tool calls
-//! Tool calls được tích lũy qua nhiều chunk (arguments có thể đến theo từng mảnh).
-//! Sau khi nhận `[DONE]`, danh sách tool calls hoàn chỉnh được thêm vào Response.
+//! Tool calls are accumulated across multiple chunks (arguments may arrive in fragments).
+//! After receiving `[DONE]`, the complete list of tool calls is appended to Response.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -36,14 +36,14 @@ const utils = @import("../core/utils.zig");
 // Protocol Mode & Auto-Negotiation (ISSUE-BACKEND-001)
 // ---------------------------------------------------------------------------
 
-/// Chế độ giao thức cho OpenAI-compatible backend.
+/// Protocol mode for OpenAI-compatible backend.
 pub const ProtocolMode = enum {
     auto,
     chat_completions,
     responses,
 };
 
-/// Trích xuất root base URL (bỏ suffix endpoint nếu có).
+/// Extracts root base URL (strips endpoint suffixes if present).
 pub fn getRootApiUrl(base_url: []const u8) []const u8 {
     const url = std.mem.trimEnd(u8, base_url, "/ \t\r\n");
     const suffixes = [_][]const u8{ "/chat/completions", "/responses", "/response" };
@@ -59,32 +59,32 @@ pub fn getRootApiUrl(base_url: []const u8) []const u8 {
 // Client
 // ---------------------------------------------------------------------------
 
-/// OpenAI-compatible streaming client (hỗ trợ cả Chat Completions API & Responses API).
+/// OpenAI-compatible streaming client (supports both Chat Completions API & Responses API).
 pub const Client = struct {
     alloc: Allocator,
-    /// Base URL của API (ví dụ: "https://api.openai.com/v1" hoặc
+    /// API base URL (e.g. "https://api.openai.com/v1" or
     /// "http://localhost:11434/v1").
     base_url: []const u8,
-    /// API key. Có thể là chuỗi rỗng nếu endpoint không cần.
+    /// API key. May be empty string if endpoint does not require authentication.
     api_key: []const u8,
-    /// Header để gửi API key.
+    /// Header name to send API key.
     api_header: []const u8,
-    /// Tên model (ví dụ: "gpt-4o-mini", "llama3").
+    /// Model name (e.g. "gpt-4o-mini", "llama3").
     model: []const u8,
-    /// Số token tối đa trong response.
+    /// Maximum tokens in response.
     max_tokens: u32,
-    /// Sử dụng max_completion_tokens thay vì max_tokens.
+    /// Use max_completion_tokens instead of max_tokens.
     use_completion_tokens: bool,
-    /// Vô hiệu hóa reasoning_effort nếu API không hỗ trợ cùng với tool calls.
+    /// Disable reasoning_effort if API does not support it alongside tool calls.
     disable_reasoning_effort: bool,
-    /// Vô hiệu hóa stream_options nếu API compat không hỗ trợ (RFC-006 §3.6).
+    /// Disable stream_options if compat API does not support it (RFC-006 §3.6).
     disable_stream_options: bool,
-    /// Chế độ giao thức (auto, chat_completions, responses).
+    /// Protocol mode (auto, chat_completions, responses).
     protocol_mode: ProtocolMode,
-    /// Cache giao thức đã đàm phán thành công (Tier 3: Session Protocol Memory).
+    /// Cached successfully negotiated protocol (Tier 3: Session Protocol Memory).
     cached_protocol: ?ProtocolMode,
 
-    /// Khởi tạo client.
+    /// Initialize client.
     pub fn init(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32) Client {
         return .{
             .alloc = alloc,
@@ -101,7 +101,7 @@ pub const Client = struct {
         };
     }
 
-    /// Khởi tạo client với chế độ protocol rõ ràng.
+    /// Initialize client with explicit protocol mode.
     pub fn initWithProtocol(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32, protocol_mode: ProtocolMode) Client {
         return .{
             .alloc = alloc,
@@ -118,8 +118,8 @@ pub const Client = struct {
         };
     }
 
-    /// Gửi messages lên API và nhận phản hồi streaming.
-    /// Hỗ trợ 3-Tier Dual-Protocol Auto-Negotiation & Adaptive Fallback.
+    /// Send messages to API and receive streaming response.
+    /// Supports 3-Tier Dual-Protocol Auto-Negotiation & Adaptive Fallback.
     pub fn sendMessage(
         self: *Client,
         system_prompt: []const u8,
@@ -133,8 +133,8 @@ pub const Client = struct {
             if (self.protocol_mode == .chat_completions) break :blk .chat_completions;
             if (self.protocol_mode == .responses) break :blk .responses;
             if (self.cached_protocol) |p| break :blk p;
-            // Auto mode: mặc định ưu tiên Responses API. Backend chưa hỗ trợ
-            // (404/400 "not found") sẽ tự fallback về chat_completions ở Tier 2.
+            // Auto mode: default to prioritizing Responses API. Backend not supporting it
+            // (404/400 "not found") will automatically fallback to chat_completions in Tier 2.
             break :blk .responses;
         };
 
@@ -146,7 +146,7 @@ pub const Client = struct {
                 try buildRequestBody(self.alloc, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.disable_stream_options, system_prompt, msgs, tools);
             defer self.alloc.free(body);
 
-            // Build URL theo giao thức đang kích hoạt
+            // Build URL according to active protocol
             var url_buf: [512]u8 = undefined;
             const endpoint_suffix = if (active_protocol == .responses) "responses" else "chat/completions";
             const sep = if (std.mem.endsWith(u8, root_url, "/")) "" else "/";
@@ -188,7 +188,7 @@ pub const Client = struct {
             if (self.protocol_mode == .auto and ctx.raw_accum_init) {
                 const raw_resp = ctx.raw_accum.items;
                 
-                // Fallback 1: Chat Completions -> Responses API khi bị lỗi 400 do không hỗ trợ hoặc xung đột tools/reasoning
+                // Fallback 1: Chat Completions -> Responses API on 400 error due to lack of support or tools/reasoning conflict
                 if (active_protocol == .chat_completions and req_http_code == 400) {
                     if (std.mem.indexOf(u8, raw_resp, "responses") != null or
                         std.mem.indexOf(u8, raw_resp, "unsupported_model") != null or
@@ -202,7 +202,7 @@ pub const Client = struct {
                     }
                 }
 
-                // Fallback 2: Responses API -> Chat Completions khi server cũ trả 404 (chưa có endpoint /responses)
+                // Fallback 2: Responses API -> Chat Completions when older server returns 404 (endpoint /responses does not exist)
                 if (active_protocol == .responses and (req_http_code == 404 or (req_http_code == 400 and std.mem.indexOf(u8, raw_resp, "not found") != null))) {
                     active_protocol = .chat_completions;
                     self.cached_protocol = .chat_completions;
@@ -212,7 +212,7 @@ pub const Client = struct {
                 }
             }
 
-            // Retry adaptive parameters trong Chat Completions
+            // Retry adaptive parameters in Chat Completions
             if (req_http_code == 400 and ctx.raw_accum_init) {
                 const raw_resp = ctx.raw_accum.items;
                 var should_retry = false;
@@ -228,7 +228,7 @@ pub const Client = struct {
                     should_retry = true;
                 }
 
-                // RFC-006 §3.6: stream_options không được hỗ trợ bởi API compat cũ
+                // RFC-006 §3.6: stream_options not supported by older compat APIs
                 if (std.mem.indexOf(u8, raw_resp, "stream_options") != null or
                     std.mem.indexOf(u8, raw_resp, "include_usage") != null) {
                     self.disable_stream_options = true;
@@ -242,7 +242,7 @@ pub const Client = struct {
                 }
             }
 
-            // Ghi nhớ giao thức thành công (Tier 3: Protocol Memory Caching)
+            // Remember successful protocol (Tier 3: Protocol Memory Caching)
             if (req_http_code == 200 and self.protocol_mode == .auto) {
                 self.cached_protocol = active_protocol;
             }
@@ -264,7 +264,7 @@ pub const Client = struct {
 // Request building
 // ---------------------------------------------------------------------------
 
-/// Xây dựng request body cho OpenAI Responses API (POST /v1/responses).
+/// Build request body for OpenAI Responses API (POST /v1/responses).
 fn buildResponsesRequestBody(
     alloc: Allocator,
     model: []const u8,
@@ -361,7 +361,7 @@ fn buildRequestBody(
     const w = &buf;
 
     const reasoning_effort_str = if (disable_reasoning_effort) "\"reasoning_effort\":\"none\"," else "";
-    // RFC-006 §3.6: stream_options adaptive — bỏ nếu API compat không hỗ trợ
+    // RFC-006 §3.6: adaptive stream_options — omit if compat API does not support it
     const stream_options_str = if (disable_stream_options) "" else ",\"stream_options\":{\"include_usage\":true}";
 
     if (use_completion_tokens) {
@@ -374,7 +374,7 @@ fn buildRequestBody(
         , .{ model, max_tokens, reasoning_effort_str, stream_options_str });
     }
 
-    // Tool definitions (đặt trước messages để đảm bảo JSON prefix là tĩnh 100% giữa các lượt)
+    // Tool definitions (placed before messages to ensure static 100% JSON prefix between turns)
     if (tools.len > 0) {
         try w.writeAll(",\"tools\":[");
         for (tools, 0..) |td, ti| {
@@ -568,9 +568,9 @@ const StreamCtx = struct {
         const data = trimmed["data: ".len..];
         const ev = self.event_type[0..self.event_type_len];
 
-        // Xử lý [DONE] hoặc event kết thúc của Responses API
+        // Handle [DONE] or Responses API completion event
         if (std.mem.eql(u8, data, "[DONE]") or std.mem.eql(u8, ev, "response.done") or std.mem.eql(u8, ev, "response.completed")) {
-            // Check usage trong Responses API payload nếu có
+            // Check usage in Responses API payload if present
             if (std.mem.startsWith(u8, data, "{")) {
                 if (json.findObject(data, "response")) |resp_obj| {
                     if (json.findObject(resp_obj, "usage")) |u_obj| {
@@ -584,19 +584,19 @@ const StreamCtx = struct {
                 }
             }
 
-            // Lưu thinking đã tích lũy
+            // Save accumulated thinking
             if (self.think_accum_init and self.think_accum.items.len > 0) {
                 const think_text = try self.alloc.dupe(u8, self.think_accum.items);
                 try self.response.content.append(self.alloc, .{ .thinking = .{ .thinking = think_text, .signature = "" } });
                 self.think_accum.clearRetainingCapacity();
             }
-            // Lưu text đã tích lũy vào response
+            // Save accumulated text into response
             if (self.text_accum_init and self.text_accum.items.len > 0) {
                 const text = try self.alloc.dupe(u8, self.text_accum.items);
                 try self.response.content.append(self.alloc, .{ .text = text });
                 self.text_accum.clearRetainingCapacity();
             }
-            // Chỉ set thành end_turn nếu chưa set tool_use hay max_tokens
+            // Only set to end_turn if tool_use or max_tokens not already set
             if (self.response.stop_reason == .unknown) {
                 self.response.stop_reason = .end_turn;
             }
@@ -723,7 +723,7 @@ const StreamCtx = struct {
             const ChoiceDelta = struct {
                 content: ?[]const u8 = null,
                 reasoning_content: ?[]const u8 = null,
-                // RFC-006 §3.3: OpenAI o-series/GPT-5.x dùng field "reasoning"
+                // RFC-006 §3.3: OpenAI o-series/GPT-5.x uses field "reasoning"
                 reasoning: ?[]const u8 = null,
                 tool_calls: ?[]ChoiceDeltaToolCall = null,
             };
@@ -737,7 +737,7 @@ const StreamCtx = struct {
             created: ?u64 = null,
             model: ?[]const u8 = null,
             choices: ?[]Choice = null,
-            // RFC-006 §3.1: usage chunk (gửi ở chunk cuối khi include_usage=true)
+            // RFC-006 §3.1: usage chunk (sent in last chunk when include_usage=true)
             usage: ?UsageJson = null,
         };
 
@@ -748,7 +748,7 @@ const StreamCtx = struct {
         if (chunk.choices) |choices| {
             for (choices) |choice| {
                 if (choice.delta) |delta| {
-                    // RFC-006 §3.3: nhận reasoning từ cả hai biến thể
+                    // RFC-006 §3.3: receive reasoning from both variants
                     // DeepSeek-style: delta.reasoning_content
                     // OpenAI o-series/GPT-5.x: delta.reasoning
                     const reasoning = delta.reasoning_content orelse delta.reasoning;
@@ -773,9 +773,9 @@ const StreamCtx = struct {
                         }
                     }
                     if (delta.tool_calls) |tool_calls| {
-                        // Gộp theo index (chuẩn OpenAI streaming): DeepSeek và đa số
-                        // provider compat chỉ gửi id ở chunk đầu, các chunk sau chỉ có
-                        // index + arguments — không được append mù vào item cuối.
+                        // Merge by index (OpenAI streaming standard): DeepSeek and most
+                        // compat providers only send id in the first chunk; subsequent chunks
+                        // have only index + arguments — cannot blindly append to last item.
                         for (tool_calls) |tc_obj| {
                             const fname = if (tc_obj.function) |f| f.name else null;
                             const fargs = if (tc_obj.function) |f| f.arguments else null;
@@ -784,7 +784,7 @@ const StreamCtx = struct {
                     }
                 }
                 if (choice.finish_reason) |reason| {
-                    // RFC-006 §3.4: map đầy đủ finish_reason của OpenAI
+                    // RFC-006 §3.4: fully map OpenAI finish_reason
                     if (std.mem.eql(u8, reason, "tool_calls")) {
                         self.response.stop_reason = .tool_use;
                     } else if (std.mem.eql(u8, reason, "stop")) {
@@ -792,17 +792,17 @@ const StreamCtx = struct {
                     } else if (std.mem.eql(u8, reason, "length")) {
                         self.response.stop_reason = .max_tokens;
                     } else if (std.mem.eql(u8, reason, "function")) {
-                        // Legacy function calling → map như tool_calls
+                        // Legacy function calling → map as tool_calls
                         self.response.stop_reason = .tool_use;
                     } else if (std.mem.eql(u8, reason, "content_filter")) {
-                        // Content filter → .unknown + debug info (không phải end_turn)
+                        // Content filter → .unknown + debug info (not end_turn)
                         self.response.stop_reason = .unknown;
                     }
                 }
             }
         }
 
-        // RFC-006 §3.1: parse usage từ chunk cuối
+        // RFC-006 §3.1: parse usage from last chunk
         if (chunk.usage) |u| {
             const cached = if (u.prompt_tokens_details) |ptd| (ptd.cached_tokens orelse 0) else (u.prompt_cache_hit_tokens orelse 0);
             const reasoning_tok = if (u.completion_tokens_details) |ctd| (ctd.reasoning_tokens orelse 0) else 0;
@@ -816,13 +816,13 @@ const StreamCtx = struct {
         }
     }
 
-    /// Gộp 1 tool_call delta vào danh sách, định vị slot theo index (chuẩn
-    /// OpenAI streaming). Fallback: match id, rồi item cuối. DeepSeek-style:
-    /// chunk đầu mang id+name, các chunk sau chỉ index+arguments.
+    /// Merge 1 tool_call delta into the list, locating slot by index (standard
+    /// OpenAI streaming). Fallback: match id, then last item. DeepSeek-style:
+    /// first chunk has id+name, subsequent chunks only index+arguments.
     fn mergeToolCallDelta(self: *StreamCtx, index: ?u32, id: ?[]const u8, name: ?[]const u8, args: ?[]const u8) !void {
         var slot: ?usize = null;
 
-        // 1. Ưu tiên match theo id (định danh toàn cục duy nhất của tool call)
+        // 1. Prioritize match by id (globally unique identifier of tool call)
         if (id) |tcid| {
             for (self.tool_calls.items, 0..) |tc, i| {
                 if (tc.id.items.len > 0 and std.mem.eql(u8, tc.id.items, tcid)) {
@@ -831,24 +831,24 @@ const StreamCtx = struct {
                 }
             }
         }
-        // 2. Match theo index nếu nằm trong phạm vi tool_calls hiện có
+        // 2. Match by index if within range of existing tool_calls
         if (slot == null and index != null) {
             const idx = index.?;
             if (idx < self.tool_calls.items.len) slot = idx;
         }
-        // 3. Fallback: item cuối cùng đang mở
+        // 3. Fallback: last open item
         if (slot == null and index == null and id == null and self.tool_calls.items.len > 0) {
             slot = self.tool_calls.items.len - 1;
         }
 
-        // Chưa có slot → tạo item mới
+        // No slot yet → create new item
         if (slot == null) {
             var tc = PartialToolCall.init();
             if (id) |tcid| try tc.id.appendSlice(self.alloc, tcid);
             try self.tool_calls.append(self.alloc, tc);
             slot = self.tool_calls.items.len - 1;
         } else if (id) |tcid| {
-            // Slot đã tồn tại nhưng chưa có id → cập nhật
+            // Slot already exists but has no id → update
             const tc = &self.tool_calls.items[slot.?];
             if (tc.id.items.len == 0) try tc.id.appendSlice(self.alloc, tcid);
         }
@@ -862,11 +862,11 @@ const StreamCtx = struct {
         }
     }
 
-    /// Cập nhật hoặc ghi đè thông tin hoàn chỉnh của tool_call khi nhận event done
+    /// Update or overwrite complete tool_call information upon receiving done event
     fn setToolCallFinal(self: *StreamCtx, index: ?u32, id: ?[]const u8, name: ?[]const u8, args: ?[]const u8) !void {
         var slot: ?usize = null;
 
-        // 1. Ưu tiên match theo id
+        // 1. Prioritize match by id
         if (id) |tcid| {
             for (self.tool_calls.items, 0..) |tc, i| {
                 if (tc.id.items.len > 0 and std.mem.eql(u8, tc.id.items, tcid)) {
@@ -875,12 +875,12 @@ const StreamCtx = struct {
                 }
             }
         }
-        // 2. Match theo index nếu nằm trong phạm vi
+        // 2. Match by index if within range
         if (slot == null and index != null) {
             const idx = index.?;
             if (idx < self.tool_calls.items.len) slot = idx;
         }
-        // 3. Fallback: item cuối cùng đang mở
+        // 3. Fallback: last open item
         if (slot == null and index == null and id == null and self.tool_calls.items.len > 0) {
             slot = self.tool_calls.items.len - 1;
         }
@@ -912,8 +912,8 @@ const StreamCtx = struct {
         for (self.tool_calls.items, 0..) |*tc, ti| {
             defer tc.deinit(self.alloc);
             if (tc.name.items.len == 0) continue;
-            // Provider không gửi id (một số compat/proxy) → sinh id dự phòng
-            // để tool_result luôn khớp tool_call_id (tránh 400 từ API).
+            // Provider did not send id (some compat/proxies) → generate fallback id
+            // so tool_result always matches tool_call_id (avoiding 400 from API).
             const id = if (tc.id.items.len > 0)
                 try self.alloc.dupe(u8, tc.id.items)
             else
@@ -1026,12 +1026,12 @@ test "openai buildRequestBody includes stream_options, static tools prefix and c
     const body = try buildRequestBody(alloc, "gpt-4o", 1024, false, false, false, "System prompt test", &msgs, &tools);
     defer alloc.free(body);
 
-    // Kiểm tra có stream_options include_usage
+    // Check for stream_options include_usage
     try testing.expect(std.mem.indexOf(u8, body, "\"stream_options\":{\"include_usage\":true}") != null);
-    // Kiểm tra System message được format sạch không có tab
+    // Check that System message is cleanly formatted without tabs
     try testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"system\",\"content\":\"System prompt test\"}") != null);
 
-    // Kiểm tra "tools" xuất hiện TRƯỚC "messages" để giữ prefix tĩnh 100%
+    // Verify "tools" appears BEFORE "messages" to keep prefix 100% static
     const tools_pos = std.mem.indexOf(u8, body, "\"tools\":[");
     const msgs_pos = std.mem.indexOf(u8, body, "\"messages\":[");
     try testing.expect(tools_pos != null and msgs_pos != null);
@@ -1045,7 +1045,7 @@ test "openai buildRequestBody: disable_stream_options omits stream_options" {
     const msgs = [_]proto.Message{};
     const tools = [_]proto.ToolDefinition{};
 
-    // disable_stream_options = true → không có stream_options
+    // disable_stream_options = true → no stream_options
     const body = try buildRequestBody(alloc, "gpt-4o", 1024, false, false, true, "test", &msgs, &tools);
     defer alloc.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "stream_options") == null);
@@ -1123,7 +1123,7 @@ test "openai stream: delta.reasoning parsed as thinking (RFC-006 §3.3)" {
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
-    // OpenAI o-series/GPT-5.x sử dụng field "reasoning" thay vì "reasoning_content"
+    // OpenAI o-series/GPT-5.x uses field "reasoning" instead of "reasoning_content"
     try feedLines(&ctx, &.{
         \\data: {"choices":[{"delta":{"reasoning":"Let me think"}}]}
         ,
@@ -1138,12 +1138,12 @@ test "openai stream: delta.reasoning parsed as thinking (RFC-006 §3.3)" {
 
     try ctx.finalizeToolCalls();
     try testing.expectEqual(proto.StopReason.end_turn, ctx.response.stop_reason);
-    // Có 2 content blocks: thinking + text
+    // Has 2 content blocks: thinking + text
     try testing.expectEqual(@as(usize, 2), ctx.response.content.items.len);
-    // Block đầu: thinking
+    // First block: thinking
     const think_block = ctx.response.content.items[0].thinking;
     try testing.expectEqualStrings("Let me think about this", think_block.thinking);
-    // Block thứ 2: text
+    // Second block: text
     const text_block = ctx.response.content.items[1].text;
     try testing.expectEqualStrings("The answer is 42", text_block);
 }
@@ -1168,7 +1168,7 @@ test "openai stream: finish_reason content_filter maps to unknown (RFC-006 §3.4
     });
 
     try ctx.finalizeToolCalls();
-    // content_filter → .unknown, KHÔNG phải .end_turn
+    // content_filter → .unknown, NOT .end_turn
     try testing.expectEqual(proto.StopReason.unknown, ctx.response.stop_reason);
 }
 
@@ -1207,10 +1207,10 @@ test "openai auto-negotiation: getRootApiUrl normalizes endpoints" {
     try testing.expectEqualStrings("http://localhost:11434/v1", getRootApiUrl("http://localhost:11434/v1/chat/completions"));
 }
 
-// Lưu ý: đã xóa shouldUseResponsesApi() — auto mode mặc định ưu tiên
-// Responses API cho mọi model; backend cũ chưa hỗ trợ sẽ tự fallback về
-// chat_completions qua Adaptive Cross-Protocol Fallback (Tier 2) và cache
-// kết quả (Tier 3). Không còn danh sách model hard-code cần bảo trì.
+// Note: removed shouldUseResponsesApi() — auto mode defaults to prioritizing
+// Responses API for all models; older backends not supporting it will automatically
+// fallback to chat_completions via Adaptive Cross-Protocol Fallback (Tier 2) and
+// cache the result (Tier 3). No hardcoded model list to maintain.
 
 test "openai auto-negotiation: buildResponsesRequestBody format" {
     const alloc = testing.allocator;
@@ -1302,13 +1302,13 @@ test "openai auto-negotiation: buildResponsesRequestBody multi-turn with functio
         .{
             .role = .user,
             .content = &.{
-                .{ .text = "Liệt kê files" },
+                .{ .text = "List files" },
             },
         },
         .{
             .role = .assistant,
             .content = &.{
-                .{ .text = "Tôi sẽ chạy lệnh ls." },
+                .{ .text = "I will run the ls command." },
                 .{ .tool_use = .{ .id = "call_abc123", .name = "bash", .input_json = "{\"command\":\"ls\"}" } },
             },
         },
@@ -1326,9 +1326,9 @@ test "openai auto-negotiation: buildResponsesRequestBody multi-turn with functio
     const body = try buildResponsesRequestBody(alloc, "gpt-5.6-luna", 4096, false, "System prompt", &msgs, &tools);
     defer alloc.free(body);
 
-    // Kiểm tra đã phát sinh đúng format input: user msg -> assistant text -> assistant function_call -> function_call_output
-    try testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"user\",\"content\":\"Liệt kê files\"}") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"assistant\",\"content\":\"Tôi sẽ chạy lệnh ls.\"}") != null);
+    // Verify correct input format generated: user msg -> assistant text -> assistant function_call -> function_call_output
+    try testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"user\",\"content\":\"List files\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"assistant\",\"content\":\"I will run the ls command.\"}") != null);
     try testing.expect(std.mem.indexOf(u8, body, "{\"type\":\"function_call\",\"call_id\":\"call_abc123\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}") != null);
     try testing.expect(std.mem.indexOf(u8, body, "{\"type\":\"function_call_output\",\"call_id\":\"call_abc123\",\"output\":\"main.zig\\nbuild.zig\"}") != null);
 }
@@ -1376,7 +1376,7 @@ test "openai stream: Responses API output_item.added and output_item.done does n
     const tu = ctx.response.content.items[0].tool_use;
     try testing.expectEqualStrings("bash", tu.name);
     try testing.expectEqualStrings("call_test_1", tu.id);
-    // Phải là {"command":"ls"} duy nhất, không bị nhân đôi thành {"command":"ls"}{"command":"ls"}
+    // Must be unique {"command":"ls"}, not duplicated into {"command":"ls"}{"command":"ls"}
     try testing.expectEqualStrings("{\"command\":\"ls\"}", tu.input_json);
 }
 

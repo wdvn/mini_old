@@ -1,187 +1,187 @@
-# RFC-005: Chuẩn thư mục `.agent/` trong workspace cho mini-agent
+# RFC-005: `.agent/` Workspace Directory Standard for mini-agent
 
-| Thuộc tính | Giá trị |
+| Attribute | Value |
 |---|---|
 | RFC | 005 |
-| Tên | Chuẩn thư mục `.agent/` — vùng chứa cấu hình, skills của agent trong workspace |
-| Trạng thái | **Implemented / Production** — Thư mục `.agent/` (`AGENTS.md`, `skills/`, `commands/`) và skills discovery loader đã hoạt động chính thức |
-| Phiên bản | 0.3 — bỏ format skill tự chế, chuyển sang chuẩn Agent Skills (agentskills.io); tách state ra khỏi phạm vi |
-| Phụ thuộc | RFC-004 (Áp dụng chuẩn AGENTS.md) |
-| Tham chiếu | Không có chuẩn công khai `.agent` (xác minh 22/08/2026: agents.md spec, opencode, fx đều không định nghĩa thư mục này). RFC này tự định nghĩa convention cho mini. Skills tuân theo chuẩn mở [Agent Skills](https://agentskills.io/specification) (agentskills.io) — xem §2.2. Tham khảo cấu trúc thư mục dot của [vercel-labs/fx](https://github.com/vercel-labs/fx) về cách tổ chức folder theo tool. |
-| Tác giả | mini-agent |
-| Ngày | 22/08/2026 |
+| Title | `.agent/` Directory Standard — Workspace container for agent configuration and skills |
+| Status | **Implemented / Production** — `.agent/` directory (`AGENTS.md`, `skills/`, `commands/`) and skills discovery loader are fully active in production |
+| Version | 0.3 — Replaced proprietary skill formats with the Agent Skills standard (agentskills.io); separated state management |
+| Dependencies | RFC-004 (Adopting the AGENTS.md Standard) |
+| References | No public `.agent` directory standard (verified 2026-08-22: agents.md spec, opencode, fx do not define this folder). This RFC establishes mini's internal convention. Skills follow the open [Agent Skills](https://agentskills.io/specification) standard (agentskills.io) — see §2.2. Refer to [vercel-labs/fx](https://github.com/vercel-labs/fx) dot folder structures for tool organization patterns. |
+| Author | mini-agent |
+| Date | 2026-08-22 |
 
 ---
 
-## 1. Vấn đề (Motivation)
+## 1. Motivation
 
-### 1.1. Hiện trạng
+### 1.1. Current State
 
-Mini hiện rải cấu hình của agent ở nhiều nơi không thống nhất:
+Previously, mini scattered agent configuration across several disjointed locations:
 
-- **AGENTS.md** (RFC-004): hướng dẫn cho agent nằm ở root, file lẻ.
-- **Skills**: `src/core/skills.zig` đã nạp skills theo chuẩn Agent Skills (agentskills.io) nhưng chỉ từ `~/.mini/skills/` (global) — project không có chỗ đặt skill dùng chung cho team.
-- **Slash commands**: hardcode trong `handleSlashCommand()` (src/ui/repl.zig:56) — người dùng không định nghĩa lệnh riêng cho project được.
-- **Artifacts**: `src/core/artifacts.zig` chỉ in-session — mất khi thoát, không có nơi lưu bền vững theo project.
+- **AGENTS.md** (RFC-004): Agent instructions lived at root as an isolated file.
+- **Skills**: `src/core/skills.zig` loaded skills following the Agent Skills standard (agentskills.io) but only from `~/.mini/skills/` (global) — leaving teams without a project-level repository for shared skills.
+- **Slash commands**: Hardcoded in `handleSlashCommand()` (src/ui/repl.zig:56) — preventing users from defining custom commands for their project.
+- **Artifacts**: `src/core/artifacts.zig` were in-session only — lost on process exit, lacking durable persistence per project.
 
-State runtime (session, history, background jobs) **không thuộc phạm vi RFC này** — xem phân công ở §2.2.
+Runtime state (sessions, history, background jobs) **falls outside the scope of this RFC** — see assignments in §2.2.
 
-### 1.2. Vì sao cần thư mục `.agent/`
+### 1.2. Why an `.agent/` Directory is Needed
 
-- **Tập trung**: một nơi duy nhất cho cấu hình và skills của agent trong workspace.
-- **Khác biệt với AGENTS.md**: AGENTS.md chỉ là *instructions* (văn bản hướng dẫn, chuẩn mở cho mọi agent). `.agent/` là *cấu hình runtime* — cấu hình cụ thể của mini. Hai thứ bổ sung nhau, không thay thế nhau.
-- **Git-friendly**: `.agent/` chứa phần commit (skills, cấu hình dùng chung cho team) và phần output runtime (tuỳ chọn ignore). Phân tách rõ qua `.agent/.gitignore` mặc định.
-- **Nhất quán với hệ sinh thái**: cùng triết lý `.git/`, `.vscode/`, `.idea/` — thư mục dot ở root do tool sở hữu và quản lý.
+- **Centralized**: A single home for agent configuration and skills within the workspace.
+- **Distinct from AGENTS.md**: AGENTS.md consists purely of *instructions* (guidance text, an open standard across all agents). `.agent/` contains *runtime configuration* — settings specific to mini. They complement each other rather than overlap.
+- **Git-friendly**: `.agent/` contains committed assets (skills, shared team config) alongside runtime output (optionally ignored). Clearly segregated via `.agent/.gitignore`.
+- **Ecosystem Consistency**: Aligns with established conventions like `.git/`, `.vscode/`, `.idea/` — root-level dot directories owned and managed by tooling.
 
-### 1.3. Lưu ý về tính chuẩn hóa
+### 1.3. Standardization Notes
 
-**Không tồn tại chuẩn công khai `.agent`** (đã kiểm tra: agents.md chỉ định nghĩa file `AGENTS.md`; opencode dùng `.opencode/` riêng; fx không dùng thư mục `.agent`). Đây là **convention riêng của mini**, đặt tên `.agent` vì:
-- Ngắn, chung chung, không dính thương hiệu → dễ cho agent khác adopt nếu muốn.
-- Thống nhất với AGENTS.md (file instructions) → agent tìm `.agent/` ngay cạnh AGENTS.md.
+**No public `.agent` directory standard currently exists** (verified: agents.md only specifies the `AGENTS.md` file; opencode uses `.opencode/`; fx avoids `.agent` folders). This is **mini's internal convention**, named `.agent` because:
+- It is concise, neutral, and unbranded → easily adopted by other agents if desired.
+- It sits harmoniously alongside `AGENTS.md` → agents discover `.agent/` right next to `AGENTS.md`.
 
-Nếu tương lai có chuẩn cộng đồng trùng tên, mini sẽ review lại tên gọi.
+Should an official community standard emerge under the same name in the future, mini will review and adapt accordingly.
 
 ---
 
-## 2. Thiết kế (Design)
+## 2. Design
 
-### 2.1. Cấu trúc thư mục
+### 2.1. Directory Structure
 
 ```
 .agent/
-├── AGENTS.md          # Instructions riêng cho mini (RFC-004, open format) — commit
-├── .gitignore         # Mặc định: ignore output/ — commit
-├── config.json        # Cấu hình project-level: model, backends, permissions — commit (không chứa secrets)
-├── skills/            # User-defined skills — commit (chuẩn agentskills.io)
-│   ├── deploy/        #   Mỗi skill = 1 thư mục con, tối thiểu chứa SKILL.md
-│   │   ├── SKILL.md   #     Required: frontmatter YAML (name, description) + instructions
-│   │   └── scripts/   #     Optional: script thực thi
+├── AGENTS.md          # Agent-runtime instructions for mini (RFC-004, open format) — committed
+├── .gitignore         # Default: ignore output/ — committed
+├── config.json        # Project-level configuration: model, backends, permissions — committed (no secrets)
+├── skills/            # User-defined skills — committed (agentskills.io standard)
+│   ├── deploy/        #   Each skill = 1 subdirectory containing at least SKILL.md
+│   │   ├── SKILL.md   #     Required: YAML frontmatter (name, description) + instructions
+│   │   └── scripts/   #     Optional: executable scripts
 │   └── review/
 │       └── SKILL.md
-├── commands/          # User-defined slash commands — commit
-│   └── commit.md      #   Mỗi command = 1 file markdown → /commit
-└── output/            #   Artifacts bền vững — KHÔNG commit (tuỳ chọn)
+├── commands/          # User-defined slash commands — committed
+│   └── commit.md      #   Each command = 1 markdown file → /commit
+└── output/            #   Durable artifacts — NOT committed (optional)
     └── walkthrough.md
 ```
 
-### 2.2. Quy ước chi tiết
+### 2.2. Detailed Conventions
 
-#### AGENTS.md lồng nhau (nested)
+#### Nested AGENTS.md
 
-- `.agent/AGENTS.md`: instructions mức agent-runtime (cách mini hành xử trong project này: tool preferences, escalation rules).
-- AGENTS.md ở root vẫn được ưu tiên đọc theo RFC-004 — không thay đổi.
-- Agent đọc cả hai: root trước (project-wide), `.agent/` sau (mini-specific).
+- `.agent/AGENTS.md`: Agent-runtime instructions (how mini operates in this repository: tool preferences, escalation rules).
+- Root `AGENTS.md` remains prioritized under RFC-004 — unchanged.
+- Agent reads both: root first (project-wide instructions), `.agent/` second (mini-specific runtime guidance).
 
-#### Skills (chuẩn Agent Skills — agentskills.io)
+#### Skills (Agent Skills Standard — agentskills.io)
 
-Skill trong `.agent/skills/` tuân theo **đúng chuẩn mở Agent Skills** (xác minh 22/08/2026, [specification](https://agentskills.io/specification)) — cùng chuẩn mà layer global `~/.mini/skills/` (`src/core/skills.zig`) đang dùng. Mini không tự chế format skill riêng.
+Skills in `.agent/skills/` conform **strictly to the open Agent Skills specification** (verified 2026-08-22, [specification](https://agentskills.io/specification)) — identical to the global `~/.mini/skills/` layer (`src/core/skills.zig`). Mini does not invent a custom proprietary skill format.
 
-Một skill = **một thư mục con** chứa tối thiểu `SKILL.md`:
+Each skill is **a subdirectory** containing at minimum a `SKILL.md` file:
 
 ```
 .agent/skills/deploy/
 ├── SKILL.md          # Required: YAML frontmatter + markdown instructions
-├── scripts/          # Optional: code thực thi (bash, python, js...)
-├── references/       # Optional: tài liệu tham khảo (agent đọc khi cần)
-└── assets/           # Optional: template, tài nguyên tĩnh
+├── scripts/          # Optional: executable code (bash, python, js...)
+├── references/       # Optional: reference documentation (read on-demand)
+└── assets/           # Optional: templates and static assets
 ```
 
-`SKILL.md` bắt buộc có YAML frontmatter:
+`SKILL.md` requires YAML frontmatter:
 
 ```markdown
 ---
 name: deploy
-description: Triển khai mini lên server staging. Use when user yêu cầu deploy, push bản build lên staging.
+description: Deploy mini to staging servers. Use when user requests deployment or pushing builds to staging.
 ---
-Nội dung: các bước agent cần làm khi được yêu cầu deploy...
+Instructions: steps the agent must perform when deploy is requested...
 ```
 
-Ràng buộc theo spec (mini validate khi nạp):
+Specification Constraints (validated by mini on load):
 
-| Field | Bắt buộc | Ràng buộc |
+| Field | Required | Constraints |
 |---|---|---|
-| `name` | Yes | 1–64 ký tự, lowercase `a-z 0-9` + hyphen, không hyphen đầu/cuối/liên tiếp, **phải trùng tên thư mục cha** |
-| `description` | Yes | 1–1024 ký tự, mô tả cả *what* lẫn *when to use* |
-| `license` | No | Tên license hoặc file license bundled |
-| `compatibility` | No | ≤500 ký tự, yêu cầu môi trường (product, packages, network) |
-| `metadata` | No | Map string→string tuỳ ý |
-| `allowed-tools` | No | Space-separated tools được pre-approve (experimental) |
+| `name` | Yes | 1–64 characters, lowercase `a-z 0-9` + hyphens, no leading/trailing/consecutive hyphens, **must match parent directory name** |
+| `description` | Yes | 1–1024 characters, describing both *what* it does and *when to use* it |
+| `license` | No | License name or bundled license file reference |
+| `compatibility` | No | ≤500 characters, environment requirements (runtime, packages, network) |
+| `metadata` | No | Arbitrary string-to-string key-value map |
+| `allowed-tools` | No | Space-separated list of pre-approved tools (experimental) |
 
-Điểm khác so với thiết kế v0.1 (file lẻ `skills/<name>.md` tự chế):
-- Skill là **thư mục** bundle (SKILL.md + scripts + references + assets), không phải 1 file markdown — cho phép skill kèm code và tài nguyên.
-- Tên skill lấy từ frontmatter và **phải khớp tên thư mục** — spec check.
-- Tái dùng nguyên `parseSkillFile()` của `src/core/skills.zig` (parse `name`/`description`, fallback tên thư mục) — chỉ thêm nguồn quét `.agent/skills/` cạnh `~/.mini/skills/`.
+Differences from the v0.1 draft (which used ad-hoc `skills/<name>.md` files):
+- Skills are **directory bundles** (`SKILL.md` + `scripts` + `references` + `assets`), not isolated markdown files — enabling bundled scripts and resources.
+- Skill names from frontmatter **must match the directory name** — strict spec compliance.
+- Reuses `parseSkillFile()` from `src/core/skills.zig` (parses `name`/`description`, falls back to folder name) — simply adding `.agent/skills/` alongside `~/.mini/skills/`.
 
-**Progressive disclosure** (theo spec): prompt chỉ nạp `name` + `description` (~50 token/skill, tối đa 32 skills, description ≤512 bytes — giới hạn hiện có của mini); body SKILL.md (<500 dòng khuyến nghị) chỉ nạp khi skill được kích hoạt; `scripts/`/`references/` chỉ đọc khi task cần.
+**Progressive Disclosure** (per spec): Prompts initially inject only `name` + `description` (~50 tokens/skill, max 32 skills, description ≤512 bytes — mini's current budget); the `SKILL.md` body (<500 lines recommended) loads only when a skill is activated; `scripts/` and `references/` are read on-demand.
 
-#### Slash commands mở rộng
+#### Extensible Slash Commands
 
-- `.agent/commands/<name>.md` → đăng ký `/name` động trong REPL, ưu tiên sau built-in.
-- Body là prompt template, hỗ trợ placeholder `$ARGUMENTS`, `$1`...`$9`.
+- `.agent/commands/<name>.md` → Registers dynamic `/name` in the REPL, evaluated after built-in commands.
+- File body serves as prompt template, supporting `$ARGUMENTS`, `$1`...`$9` placeholders.
 
-#### Phân công scope với RFC-002 & RFC-003 (state & memory)
+#### Scope Demarcation with RFC-002 & RFC-003 (State & Memory)
 
-State runtime của mini **không nằm trong `.agent/`**. Phân công:
+Mini's runtime state **does not live in `.agent/`**. Division of responsibilities:
 
-| Loại state | Nơi lưu | RFC chủ quản |
+| State Category | Storage Path | Governed By |
 |---|---|---|
-| Raw conversation history (append-only, resume/audit session) | `~/.mini/sessions/` (hiện trạng, giữ nguyên) | RFC-002 |
-| Memory đã extract (semantic/episodic/project_state) | `MINI_MEMACT_MEMORY_DIR` (default `~/.mini/memory/<project_hash>/`) | RFC-003 |
-| Background jobs (pid, log path, status) | `~/.mini/` (hiện trạng, giữ nguyên) | — |
-| Artifacts bền vững theo project | `.agent/output/` | RFC-005 (thư mục này) |
+| Raw conversation history (append-only, resume/audit) | `~/.mini/sessions/` (preserved as-is) | RFC-002 |
+| Extracted memory (semantic/episodic/project_state) | `MINI_MEMACT_MEMORY_DIR` (default `~/.mini/memory/<project_hash>/`) | RFC-003 |
+| Background jobs (pid, log path, status) | `~/.mini/` (preserved as-is) | — |
+| Durable project artifacts | `.agent/output/` | RFC-005 (this folder) |
 
-Lý do tách state khỏi `.agent/`:
-- Session/history gắn với máy và user, không gắn với repo — commit theo workspace vô ích và dễ lộ nội dung nhạy cảm (log hội thoại chứa cả nội dung file đã đọc).
-- RFC-003 đã định nghĩa memory layout theo `project_hash` global; thêm nơi lưu state thứ hai trong workspace gây trùng lặp cơ chế discovery.
-- `.agent/` giữ đúng một trách nhiệm: **cấu hình + skills + output dùng chung theo project**.
-- Tham khảo fx: fx lưu session portable trong `~/.fx/sessions/<session-id>/` — mini cũng chọn hướng global (qua `~/.mini/`), không in-workspace.
+Rationale for separating state from `.agent/`:
+- Sessions and history belong to the developer and machine, not the repository — committing them into workspaces risks leaking sensitive file contents and logs.
+- RFC-003 already manages memory layouts globally by `project_hash`; adding a second state store in the workspace causes redundant discovery mechanisms.
+- `.agent/` maintains a single responsibility: **shared project configuration + skills + durable output**.
+- Consistent with fx: fx persists portable sessions in `~/.fx/sessions/<session-id>/` — mini similarly uses a global path (`~/.mini/`) rather than in-workspace state.
 
-#### Phân tách commit/ignore
+#### Commit / Ignore Separation
 
-`.agent/.gitignore` mặc định (mini tự tạo lần đầu chạy):
+Default `.agent/.gitignore` (automatically created by mini on initial run):
 
 ```gitignore
 output/
 ```
 
-→ Team commit AGENTS.md, config.json, skills/, commands/; output runtime không đẩy lên.
+→ Teams commit `AGENTS.md`, `config.json`, `skills/`, `commands/`; runtime output remains local.
 
-### 2.3. Discovery & fallback
+### 2.3. Discovery & Fallback
 
-1. Tìm `.agent/` từ cwd đi lên đến root thư mục (giống cách git tìm `.git/`).
-2. Không tìm thấy → tạo ngầm + seed `.gitignore` mặc định (không tạo AGENTS.md — RFC-004 khuyến khích user tự viết).
-3. Cấu hình merge order: built-in defaults → `~/.config/mini/` (global) → `.agent/config.json` (project) → flags CLI.
-4. Skills discovery order: `~/.mini/skills/` (global, user cá nhân) → `.agent/skills/` (project, team dùng chung). Trùng `name` → project override global.
+1. Search upward for `.agent/` starting from `cwd` to filesystem root (similar to `.git/` lookup).
+2. If not found → implicitly create and seed default `.gitignore` (does not create AGENTS.md — RFC-004 recommends authors write this).
+3. Configuration merge order: built-in defaults → `~/.config/mini/` (global) → `.agent/config.json` (project) → CLI flags.
+4. Skills discovery order: `~/.mini/skills/` (global, personal user) → `.agent/skills/` (project, team shared). On `name` collision → project overrides global.
 
 ---
 
-## 3. Lộ trình (Roadmap)
+## 3. Roadmap
 
-| Phase | Nội dung | Độ phức tạp |
+| Phase | Description | Complexity |
 |---|---|---|
-| 1 | Discovery `.agent/` + tạo seed `.gitignore` + đọc `.agent/AGENTS.md` vào system prompt | Thấp |
-| 2 | `config.json` project-level, merge vào Config hiện có | Trung bình |
-| 3 | Skills theo chuẩn agentskills.io: mở rộng `loadSkills()` quét thêm `.agent/skills/*/SKILL.md`, validate spec (name khớp thư mục, giới hạn độ dài) | Trung bình |
-| 4 | Slash commands động từ `.agent/commands/` | Trung bình |
+| 1 | Discover `.agent/` + seed `.gitignore` + inject `.agent/AGENTS.md` into system prompt | Low |
+| 2 | Project-level `config.json`, merged into active `Config` | Medium |
+| 3 | Skills conforming to agentskills.io: expand `loadSkills()` to scan `.agent/skills/*/SKILL.md`, enforce spec validations | Medium |
+| 4 | Dynamic slash commands from `.agent/commands/` | Medium |
 
-Phase 1-2 không phá vỡ gì; Phase 3-4 thay đổi hành vi tool `skills`, REPL — cần test retro. Artifacts bền vững vào `.agent/output/` làm sau, không chặn phase nào.
+Phases 1-2 are completely backward compatible; Phases 3-4 modify tool `skills` behavior and REPL commands. Durable artifacts in `.agent/output/` can follow without blocking core phases.
 
 ---
 
-## 4. Rủi ro & đáp ứng
+## 4. Risks & Mitigations
 
-| Rủi ro | Đáp ứng |
+| Risk | Mitigation |
 |---|---|
-| Trùng tên chuẩn tương lai | Ghi rõ đây là convention riêng; sẵn sàng rename qua migration script |
-| User không muốn thư mục mới trong repo | Opt-out qua config `agent_folder = false`; chỉ tạo khi cần ghi output |
-| User nhầm `.agent/` chứa state/session | Đã tách state ra khỏi `.agent/` (xem §2.2); docs + tên thư mục con rõ ràng |
-| Skills markdown tăng surface attack (prompt injection qua skill file) | Skills chỉ được nạp từ workspace hiện tại; cảnh báo khi skill yêu cầu chạy tool nguy hiểm |
-| Skill không conform spec agentskills.io (name lệch thư mục, description quá dài) | Validate khi nạp: bỏ qua + cảnh báo, không crash; schema đơn giản (flat YAML) không cần thư viện YAML đầy đủ |
+| Collision with future formal standard | Clarified as mini convention; ready to rename via migration script if required |
+| Users resisting new workspace dot directories | Opt-out via `agent_folder = false`; only created when writing output |
+| Users mistaking `.agent/` as state/session container | Runtime state decoupled from `.agent/` (see §2.2); explicit docs and subfolder names |
+| Skills markdown increases attack surface (prompt injection via skill file) | Skills only loaded from active workspace; warn when skills request sensitive tools |
+| Non-conforming skills (name mismatch, oversize description) | Validation on load: warn and skip without crashing; flat YAML schema avoids heavy parser dependencies |
 
 ---
 
-## 5. Câu hỏi mở
+## 5. Open Questions
 
-1. `.agent/config.json` có nên hỗ trợ secrets (API keys) hay bắt buộc env vars? Hiện đề xuất cấm secrets trong config commit.
-2. **Quyết định định dạng file config**: Sử dụng `config.json` thay vì `config.toml` để sử dụng `std.json` có sẵn trong Zig 0.16.0 standard library, tránh kéo thêm external TOML dependency (tuân thủ quy ước thiết kế trong `AGENTS.md`).
-2. Có nên đặt tên `.mini/` thay vì `.agent/` để tránh nhầm là chuẩn công khai? Câu hỏi đặt ra cho review.
+1. Should `.agent/config.json` support secrets (API keys) or require environment variables? Recommendation: prohibit secrets in committed configuration.
+2. **Config File Format Decision**: Adopted `config.json` instead of `config.toml` to leverage standard `std.json` in Zig 0.16.0 standard library, avoiding external TOML dependencies (abiding by design rules in `AGENTS.md`).
+3. Should the directory be named `.mini/` instead of `.agent/` to avoid confusion with open standards? Open for review.

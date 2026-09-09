@@ -1,23 +1,23 @@
-//! acp.zig — Agent Client Protocol (ACP) server cho mini-agent.
+//! acp.zig — Agent Client Protocol (ACP) server for mini-agent.
 //!
-//! Giao thức Agent Client Protocol (ACP) là chuẩn mở (JSON-RPC 2.0 over stdio)
-//! cho phép mini-agent tích hợp trực tiếp với các IDE/Editor như Zed AI,
-//! JetBrains, và các client ACP khác.
+//! The Agent Client Protocol (ACP) is an open standard (JSON-RPC 2.0 over stdio)
+//! enabling mini-agent to integrate directly with IDEs/Editors such as Zed AI,
+//! JetBrains, and other ACP clients.
 //!
-//! ## Các phương thức được hỗ trợ:
-//!   - `initialize`        — Bắt tay, đàm phán protocolVersion và capabilities
-//!   - `session/new`        — Tạo phiên làm việc mới, thiết lập cwd, cấp phát sessionId
-//!   - `session/load`       — Nạp lại phiên làm việc đã lưu từ trước
-//!   - `session/prompt`     — Xử lý turn prompt của người dùng, stream `session/update`
-//!   - `session/cancel`     — Huỷ lượt xử lý hiện tại
-//!   - `session/close`      — Đóng và lưu phiên làm việc
-//!   - `ping`               — Kiểm tra kết nối liveness
+//! ## Supported methods:
+//!   - `initialize`        — Handshake, negotiate protocolVersion and capabilities
+//!   - `session/new`        — Create new session, set cwd, allocate sessionId
+//!   - `session/load`       — Reload previously saved session
+//!   - `session/prompt`     — Process user prompt turn, stream `session/update`
+//!   - `session/cancel`     — Cancel current turn processing
+//!   - `session/close`      — Close and persist session
+//!   - `ping`               — Connection liveness check
 //!
-//! ## Thông báo streaming (`session/update`):
-//!   - `agent_message_chunk` — Stream các đoạn text phản hồi của AI
-//!   - `agent_thought_chunk` — Stream các đoạn suy nghĩ (thinking/reasoning)
-//!   - `tool_call`           — Báo hiệu khi AI bắt đầu gọi tool
-//!   - `tool_call_update`    — Báo cáo kết quả/trạng thái hoàn thành của tool
+//! ## Streaming notifications (`session/update`):
+//!   - `agent_message_chunk` — Stream AI response text chunks
+//!   - `agent_thought_chunk` — Stream thinking/reasoning chunks
+//!   - `tool_call`           — Signal when AI initiates a tool call
+//!   - `tool_call_update`    — Report tool completion status/result
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -125,16 +125,16 @@ pub const AcpServer = struct {
         }
     }
 
-    /// Chạy server vòng lặp đọc JSON-RPC từ stdin và phản hồi trên stdout.
+    /// Run server loop reading JSON-RPC from stdin and replying on stdout.
     pub fn run(self: *AcpServer) !void {
-        main.stderrPrint("[acp] Khởi động ACP server (stdin/stdout JSON-RPC 2.0)...\n", .{});
+        main.stderrPrint("[acp] Starting ACP server (stdin/stdout JSON-RPC 2.0)...\n", .{});
         hooks_mod.setHookListener(acpHookListener);
         defer hooks_mod.setHookListener(null);
 
         const stdin_file = std.Io.File.stdin();
 
         while (true) {
-            // Xử lý client đóng stdin (EOF) như kết thúc bình thường thay vì propagate error
+            // Handle client closing stdin (EOF) as normal termination rather than propagating error
             const line_opt = readLineAlloc(self.alloc, self.io, stdin_file) catch |e| switch (@as(anyerror, e)) {
                 error.EndOfStream, error.BrokenPipe => null,
                 else => return e,
@@ -146,11 +146,11 @@ pub const AcpServer = struct {
             if (trimmed.len == 0) continue;
 
             self.handleMessage(trimmed) catch |e| {
-                main.stderrPrint("[acp] Lỗi xử lý message: {s}\n", .{@errorName(e)});
+                main.stderrPrint("[acp] Message processing error: {s}\n", .{@errorName(e)});
             };
         }
 
-        main.stderrPrint("[acp] Đã dừng ACP server (stdin EOF).\n", .{});
+        main.stderrPrint("[acp] Stopped ACP server (stdin EOF).\n", .{});
     }
 
     // -----------------------------------------------------------------------
@@ -175,14 +175,14 @@ pub const AcpServer = struct {
         }
 
         const method = msg.method orelse {
-            // Notification response hoặc message không hợp lệ
+            // Notification response or invalid message
             return;
         };
 
         if (std.mem.eql(u8, method, "initialize")) {
             try self.handleInitialize(msg.id);
         } else if (std.mem.eql(u8, method, "notifications/initialized") or std.mem.eql(u8, method, "initialized")) {
-            main.stderrPrint("[acp] Client initialized acknowledgement nhận được.\n", .{});
+            main.stderrPrint("[acp] Client initialized acknowledgement received.\n", .{});
         } else if (std.mem.eql(u8, method, "session/new")) {
             try self.handleSessionNew(msg.id, msg.params_json);
         } else if (std.mem.eql(u8, method, "session/load")) {
@@ -196,7 +196,7 @@ pub const AcpServer = struct {
         } else if (std.mem.eql(u8, method, "ping")) {
             try self.sendResult(msg.id, "{}");
         } else {
-            main.stderrPrint("[acp] Method không xác định: {s}\n", .{method});
+            main.stderrPrint("[acp] Unknown method: {s}\n", .{method});
             if (msg.id) |id| {
                 try self.sendError(id, -32601, "Method not found");
             }
@@ -216,7 +216,7 @@ pub const AcpServer = struct {
 
     fn handleSessionNew(self: *AcpServer, id_opt: ?JsonId, params_json: ?[]const u8) !void {
         var req_session_id: ?[]const u8 = null;
-        // Tùy chọn cwd và mcpServers từ params
+        // Optional cwd and mcpServers from params
         if (params_json) |p| {
             if (json_mod.findString(p, "cwd")) |cwd_path| {
                 main.stderrPrint("[acp] Session new cwd: {s}\n", .{cwd_path});
@@ -235,7 +235,7 @@ pub const AcpServer = struct {
         if (self.current_session_id) |old| self.alloc.free(old);
         self.current_session_id = new_id;
 
-        // Reset agent history cho session mới, hoặc khôi phục nếu session file đã tồn tại
+        // Reset agent history for new session, or restore if session file exists
         self.agent.clearHistory();
         artifacts_mod.setSessionId(new_id);
 
@@ -246,7 +246,7 @@ pub const AcpServer = struct {
         if (cwd.openFile(self.io, session_file_path, .{})) |f| {
             f.close(self.io);
             self.agent.history.restoreFromFile(self.io, session_file_path) catch |e| {
-                main.stderrPrint("[acp] Cảnh báo: Lỗi restore session file '{s}': {s}\n", .{ session_file_path, @errorName(e) });
+                main.stderrPrint("[acp] Warning: Failed to restore session file '{s}': {s}\n", .{ session_file_path, @errorName(e) });
             };
         } else |_| {}
 
@@ -274,7 +274,7 @@ pub const AcpServer = struct {
         self.current_session_id = try self.alloc.dupe(u8, session_id);
         artifacts_mod.setSessionId(session_id);
 
-        // Khôi phục session từ file nếu có
+        // Restore session from file if exists
         const session_file_path = try self.resolveSessionFilePath(session_id);
         defer self.alloc.free(session_file_path);
 
@@ -282,7 +282,7 @@ pub const AcpServer = struct {
         if (cwd.openFile(self.io, session_file_path, .{})) |f| {
             f.close(self.io);
             self.agent.history.restoreFromFile(self.io, session_file_path) catch |e| {
-                main.stderrPrint("[acp] Cảnh báo: Lỗi restore session file '{s}': {s}\n", .{ session_file_path, @errorName(e) });
+                main.stderrPrint("[acp] Warning: Failed to restore session file '{s}': {s}\n", .{ session_file_path, @errorName(e) });
             };
         } else |_| {}
 
@@ -303,18 +303,18 @@ pub const AcpServer = struct {
             return;
         }
 
-        // Mở rộng tham chiếu @artifact nếu có
+        // Expand @artifact references if present
         const expanded_prompt = try artifacts_mod.expandArtifactReferences(self.alloc, self.io, prompt_text);
         defer self.alloc.free(expanded_prompt);
 
-        // Kích hoạt active server cho callbacks
+        // Activate active server for callbacks
         g_active_server = self;
         self.is_cancelled = false;
         defer {
             g_active_server = null;
         }
 
-        // Chạy agent loop
+        // Run agent loop
         var stop_reason: []const u8 = "end_turn";
         self.agent.processInput(expanded_prompt, acpTextCallback, acpThinkCallback) catch |e| {
             main.stderrPrint("[acp] Agent error during prompt: {s}\n", .{@errorName(e)});
@@ -329,7 +329,7 @@ pub const AcpServer = struct {
             stop_reason = "cancelled";
         }
 
-        // Tự động sao lưu session history
+        // Automatically back up session history
         if (self.current_session_id) |sid| {
             const session_file_path = try self.resolveSessionFilePath(sid);
             defer self.alloc.free(session_file_path);
@@ -345,7 +345,7 @@ pub const AcpServer = struct {
     fn handleSessionCancel(self: *AcpServer, id_opt: ?JsonId, params_json: ?[]const u8) !void {
         _ = params_json;
         self.is_cancelled = true;
-        main.stderrPrint("[acp] Đã nhận tín hiệu session/cancel.\n", .{});
+        main.stderrPrint("[acp] Received session/cancel signal.\n", .{});
         if (id_opt) |id| {
             try self.sendResult(id, "{}");
         }
@@ -550,7 +550,7 @@ fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Đọc một dòng hoàn chỉnh (cấp phát động) từ File. Trả về null nếu EOF.
+/// Read a complete line (dynamically allocated) from File. Returns null on EOF.
 pub fn readLineAlloc(alloc: Allocator, io: std.Io, file: std.Io.File) !?[]u8 {
     var list = ArrayList(u8).empty;
     errdefer list.deinit(alloc);
@@ -574,7 +574,7 @@ pub fn readLineAlloc(alloc: Allocator, io: std.Io, file: std.Io.File) !?[]u8 {
     return try list.toOwnedSlice(alloc);
 }
 
-/// Phân tích cú pháp cơ bản JSON-RPC 2.0 message.
+/// Basic parsing of JSON-RPC 2.0 message.
 pub fn parseJsonRpcMessage(alloc: Allocator, json_text: []const u8) !JsonRpcMessage {
     const jsonrpc = json_mod.findString(json_text, "jsonrpc") orelse "2.0";
 
@@ -605,7 +605,7 @@ pub fn parseJsonRpcMessage(alloc: Allocator, json_text: []const u8) !JsonRpcMess
     };
 }
 
-/// Tìm giá trị integer theo key trong JSON.
+/// Find integer value by key in JSON.
 pub fn findInteger(json_text: []const u8, key: []const u8) ?i64 {
     var pattern_buf: [256]u8 = undefined;
     if (key.len + 4 > pattern_buf.len) return null;
@@ -626,9 +626,9 @@ pub fn findInteger(json_text: []const u8, key: []const u8) ?i64 {
     return std.fmt.parseInt(i64, json_text[start..i], 10) catch null;
 }
 
-/// Trích xuất text từ prompt trong params (hỗ trợ prompt array, content array, hoặc plain string).
+/// Extract text from prompt in params (supports prompt array, content array, or plain string).
 pub fn extractPromptText(alloc: Allocator, params_json: []const u8) ![]u8 {
-    // 1. Kiểm tra array params.prompt hoặc params.content trước
+    // 1. Check array params.prompt or params.content first
     const arr_json = json_mod.findArray(params_json, "prompt") orelse
         json_mod.findArray(params_json, "content") orelse null;
 
@@ -674,17 +674,17 @@ pub fn extractPromptText(alloc: Allocator, params_json: []const u8) ![]u8 {
         }
     }
 
-    // 2. Kiểm tra nếu có params.prompt string trực tiếp
+    // 2. Check direct params.prompt string
     if (json_mod.findString(params_json, "prompt")) |pr| {
         return try alloc.dupe(u8, pr);
     }
 
-    // 3. Kiểm tra nếu có params.message string trực tiếp
+    // 3. Check direct params.message string
     if (json_mod.findString(params_json, "message")) |msg| {
         return try alloc.dupe(u8, msg);
     }
 
-    // 4. Kiểm tra nếu có params.text string trực tiếp
+    // 4. Check direct params.text string
     if (json_mod.findString(params_json, "text")) |txt| {
         return try alloc.dupe(u8, txt);
     }
@@ -692,7 +692,7 @@ pub fn extractPromptText(alloc: Allocator, params_json: []const u8) ![]u8 {
     return try alloc.dupe(u8, "");
 }
 
-/// Khởi chạy ACP server
+/// Launch ACP server
 pub fn runServer(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, config: *const config_mod.Config) !void {
     var server = AcpServer.init(alloc, io, agent, config);
     defer server.deinit();

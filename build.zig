@@ -1,17 +1,17 @@
-//! build.zig — Build system cho mini-agent.
+//! build.zig — Build system for mini-agent.
 //!
 //! ## Targets
 //!   zig build              → zig-out/bin/mini (native)
-//!   zig build run          → build và chạy interactive REPL
-//!   zig build run -- -e .. → build và chạy single-shot
+//!   zig build run          → build and run interactive REPL
+//!   zig build run -- -e .. → build and run single-shot
 //!
 //! ## Cross-compile
 //!   zig build -Dtarget=x86_64-linux-gnu
 //!   zig build -Dtarget=aarch64-linux-gnu
 //!
 //! ## Dependencies (dynamic linking)
-//!   libcurl  — HTTPS requests đến AI APIs và web search
-//!   libsqlite3 — (reserved cho future history persistence)
+//!   libcurl    — HTTPS requests to AI APIs and web search
+//!   libsqlite3 — (reserved for future history persistence)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,9 +21,9 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // -----------------------------------------------------------------------
-    // Build info: timestamp + metadata, inject vào binary qua options module.
-    // Giá trị đổi theo mỗi lần chạy `zig build` → cache luôn bị invalidate,
-    // binary luôn mang timestamp của lần build gần nhất.
+    // Build info: timestamp + metadata, injected into binary via options module.
+    // Value changes on each `zig build` invocation → cache is invalidated,
+    // and binary always reflects the timestamp of the latest build.
     // -----------------------------------------------------------------------
     const now_ts = std.Io.Timestamp.now(b.graph.io, .real);
     const build_info = b.addOptions();
@@ -92,15 +92,15 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
 
-    const run_step = b.step("run", "Build và chạy mini-agent");
+    const run_step = b.step("run", "Build and run mini-agent");
     run_step.dependOn(&run_cmd.step);
 
     // -----------------------------------------------------------------------
     // Test step: `zig build test` (All-In-One: unit tests + testcases + E2E mock)
     // -----------------------------------------------------------------------
 
-    const skip_e2e = b.option(bool, "skip-e2e", "Bỏ qua E2E tests với mock LLM server") orelse false;
-    const test_port = b.option([]const u8, "test-port", "Port cho mock LLM server (mặc định: 8399)") orelse "8399";
+    const skip_e2e = b.option(bool, "skip-e2e", "Skip E2E tests with mock LLM server") orelse false;
+    const test_port = b.option([]const u8, "test-port", "Port for mock LLM server (default: 8399)") orelse "8399";
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -112,7 +112,7 @@ pub fn build(b: *std.Build) void {
     test_mod.linkLibrary(qjs_lib);
     test_mod.addOptions("build_info", build_info);
 
-    // Module "mini" cho testcases/ import (rooted tại src/main.zig)
+    // "mini" module for testcases/ import (rooted at src/main.zig)
     const testcase_mod = b.createModule(.{
         .root_source_file = b.path("testcases/test_codeact_security.zig"),
         .target = target,
@@ -131,12 +131,12 @@ pub fn build(b: *std.Build) void {
     const testcase_tests = b.addTest(.{ .root_module = testcase_mod });
     const run_testcase_tests = b.addRunArtifact(testcase_tests);
 
-    // Step test-unit: chạy riêng unit tests và testcases
-    const test_unit_step = b.step("test-unit", "Chạy riêng unit tests & testcases (không kèm E2E mock)");
+    // test-unit step: run unit tests and testcases only
+    const test_unit_step = b.step("test-unit", "Run unit tests & testcases only (without E2E mock)");
     test_unit_step.dependOn(&run_tests.step);
     test_unit_step.dependOn(&run_testcase_tests.step);
 
-    // 3. E2E tests với mock LLM server
+    // 3. E2E tests with mock LLM server
     const run_e2e = b.addSystemCommand(&.{
         "bash",
         "scripts/run_tests_with_mock.sh",
@@ -147,21 +147,21 @@ pub fn build(b: *std.Build) void {
     run_e2e.stdio = .inherit;
     run_e2e.step.dependOn(b.getInstallStep());
 
-    // Step test-e2e: chạy riêng E2E tests
-    const test_e2e_step = b.step("test-e2e", "Chạy riêng E2E tests với mock LLM server");
+    // test-e2e step: run E2E tests only
+    const test_e2e_step = b.step("test-e2e", "Run E2E tests only with mock LLM server");
     test_e2e_step.dependOn(&run_e2e.step);
 
-    // Step test chính: ALL-IN-ONE (unit tests -> testcases -> E2E mock LLM)
-    const test_step = b.step("test", "Chạy all-in-one test suite (unit tests + testcases + mock LLM E2E)");
+    // Main test step: ALL-IN-ONE (unit tests -> testcases -> E2E mock LLM)
+    const test_step = b.step("test", "Run all-in-one test suite (unit tests + testcases + mock LLM E2E)");
     test_step.dependOn(test_unit_step);
     if (!skip_e2e) {
-        // Đảm bảo unit tests hoàn thành thành công trước khi chạy E2E
+        // Ensure unit tests finish successfully before running E2E
         run_e2e.step.dependOn(test_unit_step);
         test_step.dependOn(&run_e2e.step);
     }
 }
 
-/// Format Unix timestamp thành "YYYY-MM-DD HH:MM:SS UTC" (không phụ thuộc libc).
+/// Format Unix timestamp to "YYYY-MM-DD HH:MM:SS UTC" (independent of libc).
 fn formatBuildTime(alloc: std.mem.Allocator, ts: i64) []const u8 {
     const epoch: u64 = if (ts > 0) @intCast(ts) else 0;
     const es = std.time.epoch.EpochSeconds{ .secs = epoch };

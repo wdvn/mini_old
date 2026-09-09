@@ -1,29 +1,29 @@
 #!/usr/bin/env node
 /**
  * mock_llm_server.js — Mock LLM server (OpenAI /v1/chat/completions SSE + /v1/responses)
- * Dùng cho test E2E mini-agent. Chọn response theo query param ?case=<tên>
- * hoặc theo body.messages (auto-detect). Chạy: node scripts/mock_llm_server.js [port]
+ * Used for mini-agent E2E tests. Select response via query param ?case=<name>
+ * or via body.messages (auto-detect). Run: node scripts/mock_llm_server.js [port]
  */
 const http = require('http');
 const PORT = parseInt(process.argv[2] || '8399', 10);
 
-// ---- Định nghĩa các case mock ----
+// ---- Mock case definitions ----
 const CASES = {
-  // Case mặc định: trả text đơn giản
+  // Default case: returns simple text
   simple: {
     match: () => true,
     sse: (reqBody) => ({
       id: 'mock-1', object: 'chat.completion.chunk', created: Date.now() / 1000 | 0,
       model: reqBody.model || 'mock-model',
-      choices: [{ index: 0, delta: { role: 'assistant', content: 'Xin chào từ mock LLM!' }, finish_reason: null }],
+      choices: [{ index: 0, delta: { role: 'assistant', content: 'Hello from mock LLM!' }, finish_reason: null }],
     }),
     finish: 'stop',
   },
-  // Case: yêu cầu gọi tool bash
+  // Case: requests calling bash tool
   tool_call: {
     match: (b) => {
       if (!Array.isArray(b.messages)) return false;
-      if (b.messages.some(m => m.role === 'tool')) return false; // đã có tool result → để after_tool xử lý
+      if (b.messages.some(m => m.role === 'tool')) return false; // already has tool result → handled by after_tool
       const lastUser = [...b.messages].reverse().find(m => m.role === 'user');
       return !!lastUser && typeof lastUser.content === 'string' && lastUser.content.toLowerCase().includes('bash');
     },
@@ -38,7 +38,7 @@ const CASES = {
     }),
     finish: 'tool_calls',
   },
-  // Case: nhiều chunk nội dung (kiểm tra stream gom lát)
+  // Case: multiple content chunks (tests streaming chunk merging)
   long_text: {
     match: (b) => {
       if (!Array.isArray(b.messages)) return false;
@@ -52,13 +52,13 @@ const CASES = {
     }),
     finish: 'stop',
   },
-  // Case: tool_call rồi sau tool result trả text (detect theo message role tool)
+  // Case: after tool result, returns text (detected by role === tool)
   after_tool: {
     match: (b) => Array.isArray(b.messages) && b.messages.some(m => m.role === 'tool'),
     sse: (reqBody) => ({
       id: 'mock-4', object: 'chat.completion.chunk', created: Date.now() / 1000 | 0,
       model: reqBody.model || 'mock-model',
-      choices: [{ index: 0, delta: { content: 'Tool đã chạy: ' + (reqBody.messages.filter(m => m.role === 'tool').map(m => String(m.content)).join('|').slice(0, 50)) }, finish_reason: null }],
+      choices: [{ index: 0, delta: { content: 'Tool executed: ' + (reqBody.messages.filter(m => m.role === 'tool').map(m => String(m.content)).join('|').slice(0, 50)) }, finish_reason: null }],
     }),
     finish: 'stop',
   },
@@ -86,7 +86,7 @@ const server = http.createServer((req, res) => {
       }
     }
     if (!chosen) chosen = CASES.simple;
-    // Log để debug
+    // Debug logging
     console.error('[mock] ' + req.method + ' ' + req.url + ' case=' + (chosen && Object.keys(CASES).find(k => CASES[k] === chosen) || 'simple'));
     if (process.env.MOCK_DEBUG) require('fs').writeFileSync('/tmp/mock_last_request.json', body);
 

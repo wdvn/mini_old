@@ -1,6 +1,4 @@
-//! test_ui_chat_stream.zig — Unit tests cho RFC-007 REPL Chat Stream & UI Primitives.
-//!
-//! Kiểm tra các module:
+//! Tests modules:
 //! - ui/terminal.zig
 //! - ui/spinner.zig
 //! - ui/diff_renderer.zig
@@ -62,11 +60,11 @@ test "UI Markdown Highlighter: Inline formatting and code fences" {
     try std.testing.expectEqual(markdown_mod.State.normal, hl.state);
 
     // Stream normal text + bold
-    hl.processChunk(std.testing.io, "Xin chào **bạn**!\n");
+    hl.processChunk(std.testing.io, "Hello **friend**!\n");
     try std.testing.expectEqual(markdown_mod.State.normal, hl.state);
 
     // Stream inline code
-    hl.processChunk(std.testing.io, "Dùng lệnh `zig build test` để kiểm tra.\n");
+    hl.processChunk(std.testing.io, "Use command `zig build test` to test.\n");
     try std.testing.expectEqual(markdown_mod.State.normal, hl.state);
 
     // Stream code block
@@ -85,17 +83,17 @@ test "UI Chat Stream: TurnRenderer complete lifecycle" {
     try std.testing.expect(!renderer.is_thinking);
 
     // 1. Start turn
-    renderer.startTurn("Hãy sửa lỗi trong file main.zig");
+    renderer.startTurn("Please fix the bug in main.zig");
     try std.testing.expect(renderer.turn_start_ms > 0);
 
     // 2. Stream thinking
-    renderer.streamThinking("Đang kiểm tra cú pháp AST...");
+    renderer.streamThinking("Checking AST syntax...");
     try std.testing.expect(renderer.is_thinking);
     renderer.endThinking();
     try std.testing.expect(!renderer.is_thinking);
 
     // 3. Process text chunk containing <think> tags
-    renderer.processTextChunk("<think>Tìm thấy lỗi tại dòng 42</think>Tôi đã tìm ra giải pháp:");
+    renderer.processTextChunk("<think>Found bug at line 42</think>I found the solution:");
     try std.testing.expect(!renderer.is_thinking);
 
     // 4. Tool action
@@ -120,10 +118,10 @@ test "UI Chat Stream: TurnRenderer CodeAct stream in-place" {
     const io = std.testing.io;
 
     var renderer = chat_stream.TurnRenderer.init(alloc, io);
-    renderer.startTurn("Kiểm tra CodeAct in-place streaming");
+    renderer.startTurn("Test CodeAct in-place streaming");
 
     // 1. Process chunk containing inline code and attached ```js ... ```
-    renderer.processTextChunk("Tôi sẽ xóa branch `luynt`.```js\nconst files = mini.glob(\"*.zig\");\nconst result = mini.read(files[0]);\nconsole.log(result);\n```Đã xóa xong.\n");
+    renderer.processTextChunk("I will delete branch `luynt`.```js\nconst files = mini.glob(\"*.zig\");\nconst result = mini.read(files[0]);\nconsole.log(result);\n```Deletion complete.\n");
     try std.testing.expect(!renderer.is_codeact);
     try std.testing.expect(!renderer.in_codeact);
 
@@ -153,8 +151,8 @@ test "UI Chat Stream: startTool and finishTool multi-line detail and snippet" {
     renderer.startTurn("Test tool detail and output snippet");
 
     // 1. invoke_subagent
-    renderer.startTool("invoke_subagent", "{\"task\":\"Khảo sát mã nguồn gateway\"}");
-    renderer.finishTool("invoke_subagent", "Đã phân tích xong 3 files:\n- main.zig\n- openai.zig\n- claude.zig\n- extra.zig", false, 120, null, null);
+    renderer.startTool("invoke_subagent", "{\"task\":\"Inspect gateway source code\"}");
+    renderer.finishTool("invoke_subagent", "Analyzed 3 files successfully:\n- main.zig\n- openai.zig\n- claude.zig\n- extra.zig", false, 120, null, null);
 
     // 2. bash
     renderer.startTool("bash", "{\"cmd\":\"ls -la src/\"}");

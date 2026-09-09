@@ -1,5 +1,5 @@
-//! Scratch test: tái hiện lỗi TlsInitializationFailed/WriteFailed của std.http.Client
-//! qua lib/http_request.zig (postStream) khi gọi OPENAI_COMPAT_URL. Chạy: zig run test_sse_tls.zig
+//! Scratch test: reproduce TlsInitializationFailed/WriteFailed error of std.http.Client
+//! via lib/http_request.zig (postStream) when calling OPENAI_COMPAT_URL. Run: zig run test_sse_tls.zig
 
 const std = @import("std");
 const main_mod = @import("src/main.zig");
@@ -44,7 +44,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .body = body,
     }, onChunk, undefined) catch |e| {
-        std.debug.print("LỖI: {s}\n", .{@errorName(e)});
+        std.debug.print("ERROR: {s}\n", .{@errorName(e)});
         return e;
     };
     std.debug.print("HTTP {d}, bytes={d}\nfirst: {s}\n", .{ code, total, sink_buffer[0..@min(total, 500)] });

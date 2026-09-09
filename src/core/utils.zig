@@ -1,14 +1,14 @@
-//! utils.zig — Các hàm tiện ích dùng chung cho mini-agent.
+//! utils.zig — Shared utility functions for mini-agent.
 //!
-//! Bao gồm các wrapper giúp tương thích với Zig 0.15.2 trong đó
-//! một số API cũ (readAll, deprecatedWriter, ArrayList.writer()) đã bị xóa.
+//! Includes wrappers for Zig 0.16 compatibility where
+//! some older APIs (readAll, deprecatedWriter, ArrayList.writer()) were removed.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
-/// Kiểm tra xem tiến trình hiện tại có phải là subagent (được spawn từ cha) hoặc ở chế độ quiet không
+/// Check whether the current process is a subagent (spawned from parent) or in quiet mode.
 pub fn isSubagent() bool {
     if (getenv("MINI_SUBAGENT_DEPTH")) |ptr| {
         const span = std.mem.span(ptr);
@@ -25,8 +25,8 @@ pub fn isSubagent() bool {
     return false;
 }
 
-/// Đọc toàn bộ nội dung file vào buffer đã cấp phát.
-/// Tương đương File.readAll() đã bị xóa trong Zig 0.15.2.
+/// Read entire file content into allocated buffer.
+/// Equivalent to File.readAll() removed in newer Zig versions.
 pub fn readAll(io: std.Io, file: std.Io.File, buf: []u8) !usize {
     var total: usize = 0;
     while (total < buf.len) {
@@ -37,7 +37,7 @@ pub fn readAll(io: std.Io, file: std.Io.File, buf: []u8) !usize {
     return total;
 }
 
-/// Đọc một dòng byte-by-byte từ File, bỏ '\r'. Trả về null nếu EOF.
+/// Read a line byte-by-byte from File, stripping '\r'. Returns null on EOF.
 pub fn readLine(io: std.Io, file: std.Io.File, buf: []u8) ?[]u8 {
     var i: usize = 0;
     while (i < buf.len) {
@@ -57,11 +57,11 @@ pub fn readLine(io: std.Io, file: std.Io.File, buf: []u8) ?[]u8 {
 }
 
 // ---------------------------------------------------------------------------
-// BufWriter — thay thế ArrayList(u8).writer() đã bị xóa trong Zig 0.15.2
+// BufWriter — replacement for ArrayList(u8).writer() removed in newer Zig
 // ---------------------------------------------------------------------------
 
-/// Growable string buffer với API print/writeAll/writeByte.
-/// Thay thế pattern `buf.writer(alloc)` đã không còn hoạt động.
+/// Growable string buffer with print/writeAll/writeByte API.
+/// Replaces the `buf.writer(alloc)` pattern.
 pub const BufWriter = struct {
     list: std.ArrayList(u8),
     alloc: Allocator,
@@ -89,18 +89,18 @@ pub const BufWriter = struct {
         try self.list.appendSlice(self.alloc, bytes);
     }
 
-    /// Append một byte.
+    /// Append a single byte.
     pub fn writeByte(self: *BufWriter, byte: u8) !void {
         try self.list.append(self.alloc, byte);
     }
 
-    /// Trả về nội dung (owned slice). Caller phải free.
+    /// Return contents (owned slice). Caller must free.
     pub fn toOwnedSlice(self: *BufWriter) ![]u8 {
         return self.list.toOwnedSlice(self.alloc);
     }
 };
 
-/// Drain pipe hoàn toàn vào buffer. Giữ lại tối đa buf.len bytes đầu tiên.
+/// Drain pipe completely into buffer. Keep up to the first buf.len bytes.
 pub fn drainPipe(io: std.Io, pipe: std.Io.File, buf: []u8) usize {
     var stored: usize = 0;
     while (true) {
@@ -117,14 +117,14 @@ pub fn drainPipe(io: std.Io, pipe: std.Io.File, buf: []u8) usize {
     return stored;
 }
 
-/// Lấy epoch timestamp tính theo milliseconds
+/// Get epoch timestamp in milliseconds.
 pub fn milliTimestamp() i64 {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
     return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1000000);
 }
 
-/// Format duration (ms) thành định dạng dễ đọc cho con người (ms, s, m s, h m s).
+/// Format duration (ms) into human-readable format (ms, s, m s, h m s).
 pub fn formatDuration(buf: []u8, duration_ms: u64) []const u8 {
     if (duration_ms < 1000) {
         return std.fmt.bufPrint(buf, "{d}ms", .{duration_ms}) catch "0ms";

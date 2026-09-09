@@ -1,5 +1,5 @@
-//! tokens.zig — TokenEstimator cho MemAct
-//! Ước lượng số token của chuỗi dựa trên heuristic, không cần tokenizer thực.
+//! tokens.zig — TokenEstimator for MemAct
+//! Estimates token count of strings using heuristics, without needing a real tokenizer.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -24,7 +24,7 @@ pub const TokenEstimator = struct {
         self.cache.deinit();
     }
 
-    /// Đếm số ký tự CJK (codepoint > 0x2E80)
+    /// Count CJK characters (codepoint > 0x2E80)
     fn countWideChars(text: []const u8) usize {
         var count: usize = 0;
         var i: usize = 0;
@@ -42,19 +42,19 @@ pub const TokenEstimator = struct {
         return count;
     }
 
-    /// Heuristic: ~4 chars/token cho EN/code, ~1.5 chars/token cho CJK.
+    /// Heuristic: ~4 chars/token for EN/code, ~1.5 chars/token for CJK.
     pub fn estimate(self: *TokenEstimator, text: []const u8) u32 {
         if (text.len == 0) return 0;
         if (self.cache.get(text)) |v| return v;
 
         const n_cjk = countWideChars(text);
-        const n_ascii = text.len - n_cjk; // xấp xỉ
+        const n_ascii = text.len - n_cjk; // approximation
 
         const tokens_ascii = @as(u32, @intFromFloat(@as(f64, @floatFromInt(n_ascii)) / 3.8));
         const tokens_cjk = @as(u32, @intFromFloat(@as(f64, @floatFromInt(n_cjk)) / 1.4));
         const tokens = tokens_ascii + tokens_cjk;
 
-        // Lưu vào cache
+        // Store in cache
         if (self.alloc.dupe(u8, text)) |dup_text| {
             self.cache.put(dup_text, tokens) catch {
                 self.alloc.free(dup_text);
@@ -64,7 +64,7 @@ pub const TokenEstimator = struct {
         return tokens;
     }
 
-    /// Ước lượng cho một Message (cộng thêm overhead cho tool_use/result).
+    /// Estimate for a Message (including overhead for tool_use/result).
     pub fn estimateMessage(self: *TokenEstimator, msg: *const proto.Message) u32 {
         var total: u32 = 0;
         for (msg.content) |block| {
@@ -88,7 +88,7 @@ pub const TokenEstimator = struct {
         return total;
     }
 
-    /// Ước lượng cho một mảng Messages.
+    /// Estimate for an array of Messages.
     pub fn estimateMessages(self: *TokenEstimator, msgs: []const proto.Message) u32 {
         var total: u32 = 0;
         for (msgs) |*msg| {

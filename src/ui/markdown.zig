@@ -1,10 +1,10 @@
-//! markdown.zig — Streaming Markdown & Syntax Highlighter cho terminal mini-agent (RFC-007).
+//! markdown.zig — Streaming Markdown & Syntax Highlighter for terminal mini-agent (RFC-007).
 //!
-//! Phân tích và tô màu văn bản Markdown trực tiếp khi AI đang stream:
+//! Parses and colors Markdown text in real time as the AI streams:
 //! - Headers (#, ##, ###)
 //! - Bold (**text**), Italic (*text*)
 //! - Inline code (`code`)
-//! - Code blocks (```lang ... ```) với viền khung và highlight từ khóa cơ bản (Zig, JS/TS, Python, C/Rust, Shell)
+//! - Code blocks (```lang ... ```) with box borders and basic keyword highlighting (Zig, JS/TS, Python, C/Rust, Shell)
 
 const std = @import("std");
 const term = @import("terminal.zig");
@@ -29,7 +29,7 @@ pub const StreamHighlighter = struct {
         return .{};
     }
 
-    /// Xử lý một chunk text stream từ LLM backend.
+    /// Process a streaming text chunk from LLM backend.
     pub fn processChunk(self: *StreamHighlighter, io: std.Io, chunk: []const u8) void {
         _ = io;
         var i: usize = 0;
@@ -37,7 +37,7 @@ pub const StreamHighlighter = struct {
         while (i < chunk.len) {
             const c = chunk[i];
 
-            // 1. Đang đọc dòng mở code block (ví dụ: ```js\n)
+            // 1. Reading opening code block line (e.g. ```js\n)
             if (self.in_code_header) {
                 if (c == '\n') {
                     self.in_code_header = false;
@@ -65,7 +65,7 @@ pub const StreamHighlighter = struct {
                 continue;
             }
 
-            // 2. Đang đọc dòng đóng code block (bỏ qua các ký tự còn lại của dòng ``` cho tới \n)
+            // 2. Reading closing code block line (skip remaining characters on ``` line until \n)
             if (self.in_closing_fence) {
                 if (c == '\n') {
                     self.in_closing_fence = false;
@@ -83,7 +83,7 @@ pub const StreamHighlighter = struct {
                 continue;
             }
 
-            // 3. Đang trong Code Block
+            // 3. Inside Code Block
             if (self.in_code_block) {
                 if (self.at_line_start) {
                     if (c == '`') {
@@ -131,7 +131,7 @@ pub const StreamHighlighter = struct {
                 continue;
             }
 
-            // 4. Ngoài Code Block (Văn bản thông thường)
+            // 4. Outside Code Block (Regular text)
             if (self.at_line_start) {
                 if (c == '`') {
                     self.fence_backtick_count += 1;
@@ -158,7 +158,7 @@ pub const StreamHighlighter = struct {
                     self.fence_backtick_count = 0;
                 }
 
-                // Xử lý Headers (#, ##, ###) ở đầu dòng
+                // Process Headers (#, ##, ###) at line start
                 if (c == '#') {
                     var h_count: usize = 0;
                     var h_idx = i;
@@ -175,7 +175,7 @@ pub const StreamHighlighter = struct {
                 }
             }
 
-            // Xử lý Inline Code `...`
+            // Process Inline Code `...`
             if (c == '`') {
                 if (self.state == .inline_code) {
                     term.writeStdout("\x1b[0m");
@@ -189,7 +189,7 @@ pub const StreamHighlighter = struct {
                 continue;
             }
 
-            // Xử lý Bold `**`
+            // Process Bold `**`
             if (c == '*' and i + 1 < chunk.len and chunk[i + 1] == '*') {
                 if (self.state == .bold) {
                     term.writeStdout("\x1b[0m");
@@ -221,7 +221,7 @@ pub const StreamHighlighter = struct {
         }
     }
 
-    /// Hoàn tất stream, dọn dẹp state và reset màu.
+    /// Complete stream, clean up state and reset colors.
     pub fn flush(self: *StreamHighlighter, io: std.Io) void {
         _ = io;
         if (self.in_code_block or self.in_code_header or self.in_closing_fence) {
@@ -242,7 +242,7 @@ pub const StreamHighlighter = struct {
     }
 };
 
-/// Danh sách từ khóa code phổ biến cần highlight màu tím/cyan
+/// Common code keywords to highlight in magenta/cyan
 const KEYWORDS = [_][]const u8{
     "fn",       "pub",      "const",   "var",      "return",  "if",       "else",     "while",
     "for",      "switch",   "struct",  "enum",     "union",   "try",      "catch",    "defer",
@@ -254,7 +254,7 @@ const KEYWORDS = [_][]const u8{
 fn scanAndPrintCodeToken(text: []const u8) ?usize {
     if (text.len == 0) return null;
 
-    // Chuỗi string literal "..."
+    // String literal "..."
     if (text[0] == '"') {
         var end: usize = 1;
         while (end < text.len and text[end] != '"') : (end += 1) {
@@ -267,7 +267,7 @@ fn scanAndPrintCodeToken(text: []const u8) ?usize {
         return end;
     }
 
-    // Comment //... hoặc #...
+    // Comment //... or #...
     if ((text.len >= 2 and text[0] == '/' and text[1] == '/') or text[0] == '#') {
         var end: usize = 0;
         while (end < text.len and text[end] != '\n') : (end += 1) {}
@@ -311,6 +311,6 @@ test "StreamHighlighter handles chunked code fences" {
     try std.testing.expect(hl.in_code_block);
     hl.processChunk(undefined, "```\n");
     try std.testing.expect(!hl.in_code_block);
-    hl.processChunk(undefined, "Xin chào!");
+    hl.processChunk(undefined, "Hello world!");
     try std.testing.expect(!hl.in_code_block);
 }

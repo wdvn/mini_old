@@ -1,8 +1,8 @@
-//! history.zig — Persistent prompt input history (RFC-000 nhóm 5).
+//! history.zig — Persistent prompt input history (RFC-000 group 5).
 //!
-//! Ring in-memory (max 500 mục) + lưu JSONL tại <MINI_HOME>/history.jsonl
-//! (mặc định ~/.mini/history.jsonl). Đây là **prompt input history** — những
-//! gì user gõ vào composer, không phải conversation history (RFC-003).
+//! Ring in-memory (max 500 items) + JSONL storage at <MINI_HOME>/history.jsonl
+//! (default ~/.mini/history.jsonl). This is **prompt input history** — what
+//! the user types into the composer, not conversation history (RFC-003).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -23,7 +23,7 @@ pub const PromptHistory = struct {
         self.entries.deinit(self.alloc);
     }
 
-    /// Thêm entry (dedupe với entry liền trước, bỏ empty).
+    /// Add entry (dedupes with immediately preceding entry, skips empty).
     pub fn add(self: *PromptHistory, line: []const u8) !void {
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
         if (trimmed.len == 0) return;
@@ -31,7 +31,7 @@ pub const PromptHistory = struct {
             const last = self.entries.items[self.entries.items.len - 1];
             if (std.mem.eql(u8, last, trimmed)) return;
         }
-        // Dedupe toàn cục: nếu đã có entry giống hệt thì xóa entry cũ, đưa lên cuối
+        // Global dedupe: if identical entry exists, remove old entry and push to end
         var i: usize = 0;
         while (i < self.entries.items.len) : (i += 1) {
             if (std.mem.eql(u8, self.entries.items[i], trimmed)) {
@@ -51,7 +51,7 @@ pub const PromptHistory = struct {
         self.dirty = true;
     }
 
-    /// Load từ file JSONL (mỗi dòng 1 JSON string escaped). Bỏ qua dòng lỗi.
+    /// Load from JSONL file (each line is an escaped JSON string). Skips malformed lines.
     pub fn loadFromFile(self: *PromptHistory, io: std.Io, path: []const u8) !void {
         const cwd = std.Io.Dir.cwd();
         const f = cwd.openFile(io, path, .{}) catch return;
@@ -76,14 +76,14 @@ pub const PromptHistory = struct {
         self.dirty = false;
     }
 
-    /// Append các entry mới vào file JSONL. Chỉ ghi khi dirty.
+    /// Append new entries to JSONL file. Only writes when dirty.
     pub fn saveToFile(self: *PromptHistory, io: std.Io, path: []const u8) !void {
         if (!self.dirty) return;
         const cwd = std.Io.Dir.cwd();
         if (std.fs.path.dirname(path)) |dir| {
             cwd.createDirPath(io, dir) catch {};
         }
-        // Ghi đè toàn bộ (đơn giản, đúng sau dedupe)
+        // Overwrite entirely (simple and correct after deduplication)
         const f = try cwd.createFile(io, path, .{ .truncate = true });
         defer f.close(io);
         var buf: [4096]u8 = undefined;
@@ -122,7 +122,7 @@ pub const PromptHistory = struct {
     }
 };
 
-/// Decode JSON string body (không có quote bao) đơn giản.
+/// Decode simple JSON string body (without enclosing quotes).
 fn decodeJsonString(alloc: Allocator, s: []const u8) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -157,8 +157,8 @@ fn decodeJsonString(alloc: Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
-/// Đường dẫn file history: <MINI_HOME>/history.jsonl (MINI_HOME đã là thư mục .mini),
-/// fallback ~/.mini/history.jsonl — nhất quán với artifacts.zig / main.zig.
+/// Path to history file: <MINI_HOME>/history.jsonl (MINI_HOME is already .mini directory),
+/// fallback ~/.mini/history.jsonl — consistent with artifacts.zig / main.zig.
 pub fn resolveHistoryPath(alloc: Allocator, io: std.Io, env_map: *const std.process.Environ.Map) ![]u8 {
     _ = io;
     if (env_map.get("MINI_HOME")) |mh| {
@@ -186,7 +186,7 @@ test "multiline entry" {
     try std.testing.expectEqualStrings("line1\nline2", h.get(0).?);
 }
 
-test "resolveHistoryPath: MINI_HOME không double-nest" {
+test "resolveHistoryPath: MINI_HOME does not double-nest" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     var env = std.process.Environ.Map.init(alloc);

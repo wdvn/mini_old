@@ -1,6 +1,6 @@
-//! act_logger.zig — Act Debug Logger cho Session Replay & Diagnostics
-//! Lưu trữ chi tiết toàn bộ trạng thái của từng Act trong thư mục ~/.mini/acts/
-//! để phục vụ việc tái hiện, debug và phân tích sự cố.
+//! act_logger.zig — Act debug logger for session replay & diagnostics.
+//! Stores detailed state for each Act in ~/.mini/acts/
+//! to aid in reproduction, debugging, and incident analysis.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -70,7 +70,7 @@ pub const ActLogger = struct {
         const cwd = std.Io.Dir.cwd();
         cwd.createDirPath(io, path_dup) catch {};
 
-        // Prune acts cũ lúc khởi tạo
+        // Prune old acts during initialization
         pruneOldActs(alloc, io, path_dup);
 
         return .{
@@ -83,7 +83,7 @@ pub const ActLogger = struct {
         self.alloc.free(self.acts_dir);
     }
 
-    /// Ghi log chi tiết Act ra file ~/.mini/acts/act_<pid>_<act_id>.json
+    /// Write detailed Act log to file ~/.mini/acts/act_<pid>_<act_id>.json
     pub fn logAct(self: *ActLogger, io: std.Io, data: ActDebugData) !void {
         var file_name_buf: [128]u8 = undefined;
         const file_name = std.fmt.bufPrint(&file_name_buf, "act_{d}_{d}.json", .{ data.session_pid, data.act_id }) catch return;
@@ -107,7 +107,7 @@ pub const ActLogger = struct {
         try file.sync(io);
     }
 
-    /// Prune các file `act_*.json` trong thư mục acts, giữ lại N file mới nhất theo mtime.
+    /// Prune `act_*.json` files in the acts directory, keeping the N newest files by mtime.
     pub fn pruneOldActs(alloc: Allocator, io: std.Io, dir_path: []const u8) void {
         const cwd = std.Io.Dir.cwd();
         var dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch return;
@@ -146,7 +146,7 @@ pub const ActLogger = struct {
 
         if (items.items.len <= max_keep) return;
 
-        // Sort giảm dần theo mtime (mới nhất lên đầu)
+        // Sort descending by mtime (newest first)
         std.mem.sort(Item, items.items, {}, struct {
             fn lt(_: void, a: Item, b: Item) bool {
                 return a.mtime_ns > b.mtime_ns;

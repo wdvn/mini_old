@@ -1,37 +1,38 @@
 # RFC-007: REPL Chat Stream & Turn UI Optimization
 
-- **Tác giả:** mini-agent team
-- **Ngày:** 2026-08- **Trạng thái:** Implemented / Production
-- **Phạm vi:** `src/ui/`, `src/core/agent.zig`, `src/ui/repl.zig`, `src/ui/chat_stream.zig`
+- **Author:** mini-agent team
+- **Date:** 2026-08-25
+- **Status:** Implemented / Production
+- **Scope:** `src/ui/`, `src/core/agent.zig`, `src/ui/repl.zig`, `src/ui/chat_stream.zig`
 
 ---
 
-## 1. Bối cảnh & Mục tiêu
+## 1. Context & Objectives
 
-Trong các AI Coding Agent CLI hiện đại (như Claude Code, Aider, Codex CLI), giao diện terminal không đơn thuần là dòng văn bản in thô (raw stream) hay log `stderr` lộn xộn. Trải nghiệm người dùng trong 1 luồng chat (Single Turn Lifecycle) đóng vai trò quyết định đến cảm giác mượt mà, trực quan và chuyên nghiệp của công cụ.
+In modern AI Coding Agent CLIs (such as Claude Code, Aider, Codex CLI), the terminal interface is not merely raw streaming text or cluttered `stderr` logs. The user experience during a single turn lifecycle decisively determines how smooth, intuitive, and professional the tool feels.
 
-### Tình trạng trước RFC-007 trong `mini`:
-1. **Xung đột luồng đầu ra (`stdout` vs `stderr`)**: Tool logs và agent status ghi vào `stderr`, câu trả lời AI ghi vào `stdout`. Khi flush không đồng bộ, text bị đè và giật.
-2. **"Ô nhiễm" màn hình cuộn (Scrollback pollution)**: Khối reasoning `<think>` và log vòng lặp in thẳng ra màn hình hàng trăm dòng không có viền ngăn cách hay tóm tắt.
-3. **Thiếu phản hồi thị giác khi chạy công cụ**: Khi gọi `file_edit` hoặc `mini.patch()`, user không thấy được Diff trực quan (`+`/`-`); khi chạy `bash` hoặc `codeact`, chỉ có 1 dòng `[ok]`.
-4. **Không có chỉ số Telemetry & Context Window**: User không nắm được số token tiêu thụ, thời gian phản hồi, cũng như % context window còn lại (đặc biệt quan trọng với MemAct - RFC-003).
+### State Prior to RFC-007 in `mini`:
+1. **Output Stream Collisions (`stdout` vs `stderr`)**: Tool logs and agent status wrote to `stderr`, while AI responses wrote to `stdout`. Unsynchronized flushing caused text overwrites and jitter.
+2. **Scrollback Pollution**: `<think>` reasoning blocks and loop iteration logs dumped hundreds of raw lines without bounding boxes or summaries.
+3. **Lack of Visual Tool Feedback**: When calling `file_edit` or `mini.patch()`, users saw no visual Diff (`+`/`-`); `bash` or `codeact` only showed a single `[ok]` line.
+4. **Missing Telemetry & Context Window Metrics**: Users had no visibility into consumed tokens, response latency, or remaining context window percentage (especially critical for MemAct - RFC-003).
 
-### Mục tiêu của RFC-007:
-- Xây dựng hệ thống UI primitives 100% bằng Zig chuẩn (ANSI styling, Box drawing, non-blocking Braille spinner).
-- Phân cấp thị giác rõ ràng cho 1 turn: **User Prompt Card → Reasoning Block → Action Cards & Diff View → Streaming Markdown & Code Highlight → Telemetry Footer**.
-- Đảm bảo hiệu năng cao: Zero heap fragmentation, xử lý streaming mượt mà không nhấp nháy (flicker-free).
+### Objectives of RFC-007:
+- Build UI primitives 100% in standard Zig (ANSI styling, Box drawing, non-blocking Braille spinner).
+- Establish a clear visual hierarchy for each turn: **User Prompt Card → Reasoning Block → Action Cards & Diff View → Streaming Markdown & Code Highlight → Telemetry Footer**.
+- Ensure high performance: zero heap fragmentation, smooth flicker-free streaming.
 
 ---
 
-## 2. Thiết kế phân cấp thị giác (Visual Hierarchy)
+## 2. Visual Hierarchy Design
 
 ```
 ╭─ ❯ You ────────────────────────────────────────────────────────────────────────╮
-│  Refactor hàm readAll trong src/core/utils.zig và kiểm tra lại tests           │
+│  Refactor readAll in src/core/utils.zig and verify tests                       │
 ╰────────────────────────────────────────────────────────────────────────────────╯
 
  💭 Thinking (1.8s)
- │  Model đang phân tích cấu trúc file utils.zig và tìm các test case liên quan...
+ │  Model is analyzing utils.zig structure and identifying related test cases...
 
  ⚡ Action [1/2]  mini.read("src/core/utils.zig")
     ✓ Read 184 lines (6.2 KB) • 12ms
@@ -45,7 +46,7 @@ Trong các AI Coding Agent CLI hiện đại (như Claude Code, Aider, Codex CLI
     ✓ Applied cleanly • CAS hash: a1f8...
 
  🤖 mini-agent
- Đã refactor lại hàm `readAll` để tối ưu bộ nhớ buffer:
+ Refactored the `readAll` function to optimize buffer memory:
 
  ```zig
  // src/core/utils.zig
@@ -58,7 +59,7 @@ Trong các AI Coding Agent CLI hiện đại (như Claude Code, Aider, Codex CLI
 
 ---
 
-## 3. Kiến trúc module UI
+## 3. UI Module Architecture
 
 ```
 src/ui/
@@ -66,56 +67,55 @@ src/ui/
   ├── spinner.zig         — Live non-blocking Braille spinner + stopwatch timer
   ├── diff_renderer.zig   — Unified Diff visualizer (Red/Green syntax, line numbers, CAS hash)
   ├── markdown.zig        — Streaming lightweight Markdown & Syntax highlighter
-  ├── chat_stream.zig     — TurnRenderer orchestrator điều phối toàn bộ lifecycle 1 turn
-  ├── repl.zig            — Kết nối TurnRenderer vào REPL loop
+  ├── chat_stream.zig     — TurnRenderer orchestrator managing the full 1-turn lifecycle
+  ├── repl.zig            — Connects TurnRenderer into REPL loop
   ├── paste.zig           — Incremental bracketed paste state machine
   └── editor.zig          — Single-line composer & input parser
 ```
 
 ### 3.1. `terminal.zig`: ANSI Primitives & Box Characters
-- Cung cấp hằng số ANSI escape codes chuẩn: Bold (`\x1b[1m`), Dim (`\x1b[2m`), Italic (`\x1b[3m`), Reset (`\x1b[0m`).
-- Bảng màu 16 màu và các bộ ký tự UTF-8 box drawing (`╭`, `─`, `╮`, `│`, `╰`, `╯`, `⚡`, `✓`, `✗`, `💭`, `📊`, `🤖`, `❯`).
-- Các hàm điều khiển con trỏ: `clearLine()`, `hideCursor()`, `showCursor()`.
+- Provides standard ANSI escape code constants: Bold (`\x1b[1m`), Dim (`\x1b[2m`), Italic (`\x1b[3m`), Reset (`\x1b[0m`).
+- 16-color palette and UTF-8 box drawing characters (`╭`, `─`, `╮`, `│`, `╰`, `╯`, `⚡`, `✓`, `✗`, `💭`, `📊`, `🤖`, `❯`).
+- Cursor control functions: `clearLine()`, `hideCursor()`, `showCursor()`.
 
 ### 3.2. `spinner.zig`: Non-blocking Braille Spinner
-- Bảng ký tự Braille: `⠋`, `⠙`, `⠹`, `⠸`, `⠼`, `⠴`, `⠦`, `⠧`, `⠇`, `⠏`.
-- Theo dõi thời gian thực hiện (`std.time.milliTimestamp`).
-- Cập nhật dòng trạng thái tại chỗ bằng `\r\x1b[2K` để không làm rối luồng in.
+- Braille character set: `⠋`, `⠙`, `⠹`, `⠸`, `⠼`, `⠴`, `⠦`, `⠧`, `⠇`, `⠏`.
+- Execution stopwatch timer tracking (`std.time.milliTimestamp`).
+- In-place line updates using `\r\x1b[2K` to avoid scrollback noise.
 
 ### 3.3. `diff_renderer.zig`: Unified Diff Visualizer
-- Phân tích nội dung patch / file edit:
-  - Dòng thêm mới (`+`): Xanh lá (`\x1b[32m`).
-  - Dòng bị xóa (`-`): Đỏ (`\x1b[31m`).
-  - Dòng Hunk Header (`@@`): Cyan (`\x1b[36m`).
-  - Tự động đóng khung viền và tóm tắt nếu diff vượt quá số dòng tối đa.
+- Analyzes patch / file edit contents:
+  - Additions (`+`): Green (`\x1b[32m`).
+  - Deletions (`-`): Red (`\x1b[31m`).
+  - Hunk Header (`@@`): Cyan (`\x1b[36m`).
+  - Automatically draws bounding frames and summarizes diffs exceeding maximum lines.
 
 ### 3.4. `markdown.zig`: Streaming Markdown & Code Highlighter
-- Sử dụng state machine siêu nhẹ (Zero-allocation) xử lý từng chunk stream:
-  - Header (`#`, `##`, `###`) → In đậm màu nổi bật.
-  - Inline Code (`` `...` ``) → Màu vàng nền sẫm.
-  - Code Block (````lang ... ````) → Khung viền code block và tô màu từ khóa cơ bản (Zig, JS, Rust, Python, Go, Shell).
-  - Giữ lại bộ đệm nhỏ (lookahead buffer) để không làm vỡ các delimiter khi chunk bị cắt đôi giữa chừng (vd: một nửa `**` ở chunk 1, một nửa ở chunk 2).
+- Ultra-lightweight state machine (Zero-allocation) processing stream chunks:
+  - Headers (`#`, `##`, `###`) → Bold prominent text.
+  - Inline Code (`` `...` ``) → Yellow with dark background.
+  - Code Block (````lang ... ````) → Framed border and syntax highlighted keywords (Zig, JS, Rust, Python, Go, Shell).
+  - Maintains a small lookahead buffer so split delimiters between chunks (e.g., partial `**` across boundaries) do not break parsing.
 
 ### 3.5. `chat_stream.zig`: Turn Orchestrator
-- Struct `TurnRenderer` theo dõi vòng đời hoàn chỉnh của 1 lượt xử lý:
-  - `startTurn(prompt)`: Khởi tạo turn, in header.
-  - `startThinking()` / `streamThinking(text)` / `endThinking()`: Stream suy nghĩ trong khối viền dọc mờ `│` kèm bộ lọc FNV-1a deduplication.
-  - `startTool(name, input_json)`: Hiện Action card với spinner.
-  - `finishTool(name, result, is_error, duration_ms)`: In kết quả action và diff nếu có.
-  - `streamResponse(text)`: Stream câu trả lời qua Markdown highlighter.
-  - `finishTurn(stats)`: In thanh footer telemetry tổng kết tokens, latency, context usage.
+- `TurnRenderer` struct tracking the lifecycle of an interaction turn:
+  - `startTurn(prompt)`: Initializes turn, prints header card.
+  - `startThinking()` / `streamThinking(text)` / `endThinking()`: Streams reasoning inside dim vertical border `│` with FNV-1a deduplication filter.
+  - `startTool(name, input_json)`: Displays Action card with spinner.
+  - `finishTool(name, result, is_error, duration_ms)`: Prints action result and optional diff.
+  - `streamResponse(text)`: Streams response through Markdown highlighter.
+  - `finishTurn(stats)`: Prints telemetry footer summarizing tokens, latency, and context usage.
 
 ### 3.6. Inplace Stream Replacement & Raw Backend Error Formatting
-- **Inplace Overwrite khi Retry**:
-  - Khi gặp lỗi backend có thể phục hồi (HTTP 429 Rate Limit, HTTP 503 Overloaded, Cloudflare 520/522/524), `TurnRenderer` ghi nhận trạng thái dòng retry và dùng chuỗi escape VT100 `\x1b[1A\x1b[2K\r` để đè lại dòng thông báo đếm lùi tại chỗ, triệt tiêu hoàn toàn tình trạng in tràn hàng chục dòng cảnh báo ra terminal.
-- **An toàn hiển thị (Anti-Wrap Truncation)**:
-  - Hàm `visibleWidth` tính toán chính xác độ rộng hiển thị (bỏ qua ANSI escape codes, tính 2 cột cho full-width Unicode tiếng Việt/Đông Á) và dùng `truncateAnsi` cắt chuỗi theo kích thước cửa sổ terminal (`term_cols`), ngăn ngừa hiện tượng tự động xuống dòng làm hỏng phép tính lùi con trỏ `\x1b[1A`.
+- **Inplace Overwrite on Retry**:
+  - Upon encountering recoverable backend errors (HTTP 429 Rate Limit, HTTP 503 Overloaded, Cloudflare 520/522/524), `TurnRenderer` records the retry line and uses VT100 sequence `\x1b[1A\x1b[2K\r` to overwrite countdown messages in place, eliminating terminal spam.
+- **Display Safety (Anti-Wrap Truncation)**:
+  - `visibleWidth` accurately computes terminal visual width (stripping ANSI escape codes, counting 2 columns for full-width East Asian and Vietnamese wide runes) and `truncateAnsi` truncates lines based on window width (`term_cols`), preventing automatic line wrapping from breaking `\x1b[1A` cursor arithmetic.
 - **Formatted Backend Raw Response**:
-  - Khi backend trả về lỗi kèm body chi tiết, `formatRawBackendResponse` bóc tách các trường chuẩn (`error.message`, `error.code`, `metadata.limit_source`, `metadata.remedy_hint`). Nếu payload có format lạ, hệ thống tự động thụt lề định dạng JSON và in trong khung viền cảnh báo rõ ràng để người dùng nắm rõ nguyên nhân mà không bị cắt cụt.
+  - When backend errors include structured bodies, `formatRawBackendResponse` extracts standard fields (`error.message`, `error.code`, `metadata.limit_source`, `metadata.remedy_hint`). For non-standard payloads, it pretty-prints indented JSON in an alert box so users see the exact cause without truncation.
 
 ---
 
-## 4. Tương thích ngược & Chế độ không tương tác
-- Khi chạy single-shot prompt (`mini -e "..."`) hoặc xuất ra pipe/file (`!isatty`), các hiệu ứng spinner động và màu sắc có thể tự động rút gọn hoặc tắt để tránh gây lỗi cho các script tự động hóa.
-- Giữ vững nguyên tắc: Không thêm dependency ngoài, tuân thủ nghiêm ngặt Zig 0.16.0.
-
+## 4. Backward Compatibility & Non-interactive Mode
+- When running single-shot prompts (`mini -e "..."`) or piping to file/command (`!isatty`), dynamic spinners and ANSI styling are simplified or disabled to prevent breaking automated scripts.
+- Adheres strictly to: zero external dependencies, strict Zig 0.16.0 compliance.

@@ -30,10 +30,10 @@ test "unicode: displayWidth skin tone modifier" {
 }
 
 test "unicode: clusterLenAt mid cluster" {
-    // Tại index 1 (byte đầu của combining mark) → cluster bắt đầu ở đó = chính mark (2 byte)
+    // At index 1 (first byte of combining mark) -> cluster starting there = mark itself (2 bytes)
     const s = "a\u{0301}b";
     try std.testing.expectEqual(@as(usize, 2), unicode.clusterLenAt(s, 1));
-    // Tại boundary: cluster "a"+mark = 3 byte
+    // At boundary: cluster "a"+mark = 3 bytes
     try std.testing.expectEqual(@as(usize, 3), unicode.clusterLenAt(s, 0));
     try std.testing.expectEqual(@as(usize, 1), unicode.clusterLenAt(s, 3));
 }
@@ -46,7 +46,7 @@ test "unicode: charClass basics" {
 }
 
 test "unicode: invalid UTF-8 fallback" {
-    // byte không hợp lệ → vẫn iterate không crash, width 1 mỗi cluster
+    // Invalid bytes -> still iterates without crashing, width 1 per cluster
     const s = "\xFF\xFE";
     try std.testing.expectEqual(@as(usize, 2), unicode.displayWidth(s));
 }
@@ -70,7 +70,7 @@ test "history: global dedupe moves to end" {
     try h.add("a");
     try h.add("b");
     try h.add("c");
-    try h.add("a"); // dedupe: xóa a cũ, đưa lên cuối
+    try h.add("a"); // dedupe: removes old "a", moves to end
     try std.testing.expectEqual(@as(usize, 3), h.len());
     try std.testing.expectEqualStrings("a", h.get(2).?);
     try std.testing.expectEqualStrings("b", h.get(0).?);

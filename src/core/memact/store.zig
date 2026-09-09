@@ -1,16 +1,16 @@
-//! store.zig — MemoryStore cho MemAct (RFC-003, M3 §4.4)
-//! Long-term memory dạng append-only event log JSONL tại
+//! store.zig — MemoryStore for MemAct (RFC-003, M3 §4.4)
+//! Long-term memory as an append-only event log JSONL at
 //! `~/.mini/memory/<project_hash>/memory.jsonl`.
 //!
-//! ## Trách nhiệm
-//! - `append`: ghi 1 memory event (1 dòng JSON) — không rewrite dòng cũ.
-//! - `loadIndex`: đọc toàn bộ JSONL rebuild danh sách entries hiện hành;
-//!   entry có `supersedes` sẽ THAY THẾ entry bị supersedes trong index
-//!   (dòng cũ vẫn nằm trong file — giữ audit trail như event-sourcing).
-//! - `touch`: tăng access_count + last_access, rewrite file từ index (v1).
+//! ## Responsibilities
+//! - `append`: write 1 memory event (1 JSON line) — never rewrite old lines.
+//! - `loadIndex`: read entire JSONL and rebuild the list of active entries;
+//!   an entry with `supersedes` will REPLACE the superseded entry in the index
+//!   (old lines remain in the file — preserving an audit trail like event-sourcing).
+//! - `touch`: increment access_count + last_access, rewrite file from index (v1).
 //!
 //! ## Keyword matching
-//! So khớp ASCII case-insensitive.
+//! Matches ASCII case-insensitive.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -20,7 +20,7 @@ const utils = @import("../utils.zig");
 // Keyword matching (ASCII case-insensitive)
 // ---------------------------------------------------------------------------
 
-/// Kiểm tra keyword có xuất hiện trong text (ASCII case-insensitive).
+/// Check if keyword appears in text (ASCII case-insensitive).
 pub fn matchKeyword(keyword: []const u8, text: []const u8) bool {
     if (keyword.len == 0 or keyword.len > text.len) return false;
     var i: usize = 0;
@@ -34,9 +34,9 @@ pub fn matchKeyword(keyword: []const u8, text: []const u8) bool {
 // MemoryEntry
 // ---------------------------------------------------------------------------
 
-/// Một bản ghi memory (1 dòng JSONL). Mọi slice heap-allocated; free bằng `deinit`.
+/// A memory record (1 JSONL line). All slices heap-allocated; freed via `deinit`.
 pub const MemoryEntry = struct {
-    /// ID unique, dạng "mem_<hex ts>_<hex counter>_<hex pid>".
+    /// Unique ID, formatted as "mem_<hex ts>_<hex counter>_<hex pid>".
     id: []u8,
     /// Epoch milliseconds.
     ts: i64,
@@ -46,7 +46,7 @@ pub const MemoryEntry = struct {
     keywords: [][]u8,
     source_session: ?[]u8,
     confidence: f32,
-    /// ID entry mà entry này thay thế (null nếu không supersedes ai).
+    /// ID of the entry that this entry supersedes (null if none).
     supersedes: ?[]u8,
     access_count: u32,
     last_access: i64,
@@ -68,21 +68,21 @@ pub const MemoryEntry = struct {
 
 pub const MemoryStore = struct {
     alloc: Allocator,
-    /// Thư mục `~/.mini/memory/<project_hash>/`.
+    /// Directory `~/.mini/memory/<project_hash>/`.
     dir_path: []const u8,
     /// `<dir_path>/memory.jsonl`.
     file_path: []const u8,
-    /// Counter sinh id unique trong process.
+    /// Counter generating unique IDs within process.
     id_counter: u32 = 0,
 
-    /// Khởi tạo store tại `dir_path` (kiểu `~/.mini/memory/<project_hash>/`).
-    /// Tạo thư mục nếu thiếu. File JSONL tạo lazy ở lần append đầu.
+    /// Initialize store at `dir_path` (e.g. `~/.mini/memory/<project_hash>/`).
+    /// Creates directory if missing. JSONL file is created lazily on first append.
     pub fn init(alloc: Allocator, io: std.Io, dir_path: []const u8) !MemoryStore {
         const dir_dup = try alloc.dupe(u8, dir_path);
         errdefer alloc.free(dir_dup);
 
         const cwd = std.Io.Dir.cwd();
-        cwd.createDirPath(io, dir_dup) catch {}; // bỏ qua lỗi đã tồn tại
+        cwd.createDirPath(io, dir_dup) catch {}; // ignore error if already exists
 
         const file_path = try std.fs.path.join(alloc, &.{ dir_dup, "memory.jsonl" });
         errdefer alloc.free(file_path);
@@ -99,7 +99,7 @@ pub const MemoryStore = struct {
         self.alloc.free(self.dir_path);
     }
 
-    /// Sinh id unique: timestamp hex + counter hex + pid hex.
+    /// Generate unique ID: timestamp hex + counter hex + pid hex.
     fn nextId(self: *MemoryStore) ![]u8 {
         return std.fmt.allocPrint(self.alloc, "mem_{x}_{x}_{x}", .{
             utils.milliTimestamp(),
@@ -108,15 +108,15 @@ pub const MemoryStore = struct {
         });
     }
 
-    /// Append 1 entry vào `memory.jsonl` (1 dòng JSON, append thuần).
-    /// Nếu `entry.id` rỗng → tự sinh id unique và gán lại vào entry.
+    /// Append 1 entry into `memory.jsonl` (1 JSON line, pure append).
+    /// If `entry.id` is empty -> generate unique ID and assign to entry.
     pub fn append(self: *MemoryStore, io: std.Io, entry: *MemoryEntry) !void {
         if (entry.id.len == 0) {
             self.id_counter += 1;
             entry.id = try self.nextId();
         }
 
-        // Serialize entry thành 1 dòng JSON
+        // Serialize entry into 1 JSON line
         var out_buf = std.ArrayList(u8).empty;
         var aw = std.Io.Writer.Allocating.fromArrayList(self.alloc, &out_buf);
 
@@ -126,7 +126,7 @@ pub const MemoryStore = struct {
         out_buf = aw.toArrayList();
         defer out_buf.deinit(self.alloc);
 
-        // Mở read_write để append vào cuối file (pattern journal.zig)
+        // Open read_write to append to end of file (journal.zig pattern)
         const cwd = std.Io.Dir.cwd();
         const file = cwd.openFile(io, self.file_path, .{ .mode = .read_write }) catch |err| blk: {
             if (err == error.FileNotFound) {
@@ -141,10 +141,10 @@ pub const MemoryStore = struct {
         try file.sync(io);
     }
 
-    /// Đọc toàn bộ JSONL, rebuild danh sách entries hiện hành.
-    /// Entry có `supersedes != null` sẽ thay thế (loại khỏi index) entry bị
-    /// trỏ; entry mới nằm cuối danh sách (thứ tự mới nhất).
-    /// Caller sở hữu kết quả — free bằng `freeEntries`.
+    /// Read entire JSONL, rebuild active entries list.
+    /// An entry with `supersedes != null` replaces (removes from index) the target
+    /// entry; new entry is placed at the end (newest order).
+    /// Caller owns the result — free via `freeEntries`.
     pub fn loadIndex(self: *MemoryStore, io: std.Io) ![]MemoryEntry {
         var entries = std.ArrayList(MemoryEntry).empty;
         errdefer freeEntries(self.alloc, entries.items);
@@ -165,14 +165,14 @@ pub const MemoryStore = struct {
         while (it.next()) |line_raw| {
             const line = std.mem.trim(u8, line_raw, " \t\r");
             if (line.len == 0) continue;
-            const entry = parseLine(self.alloc, line) catch continue; // dòng hỏng → bỏ
+            const entry = parseLine(self.alloc, line) catch continue; // corrupted line -> skip
             try self.applySupersedes(&entries, entry);
         }
 
         return entries.toOwnedSlice(self.alloc);
     }
 
-    /// Entry mới supersedes entry đang có → gỡ entry cũ ra khỏi index, append entry mới.
+    /// New entry supersedes existing entry -> remove old entry from index, append new entry.
     fn applySupersedes(self: *MemoryStore, entries: *std.ArrayList(MemoryEntry), entry: MemoryEntry) !void {
         if (entry.supersedes) |target_id| {
             for (entries.items, 0..) |e, i| {
@@ -187,8 +187,8 @@ pub const MemoryStore = struct {
         try entries.append(self.alloc, entry);
     }
 
-    /// Tăng access_count + last_access của entry `id`, rewrite toàn bộ file
-    /// từ index (v1 chấp nhận rewrite toàn file). Trả về false nếu id không có.
+    /// Increment access_count + last_access of entry `id`, rewrite entire file
+    /// from index (v1 allows full file rewrite). Returns false if id is not found.
     pub fn touch(self: *MemoryStore, io: std.Io, id: []const u8) !bool {
         const entries = try self.loadIndex(io);
         defer freeEntries(self.alloc, entries);
@@ -223,13 +223,13 @@ pub const MemoryStore = struct {
         return true;
     }
 
-    /// Giải phóng mảng entries (kèm từng entry bên trong).
+    /// Free entries array (along with each entry inside).
     pub fn freeEntries(alloc: Allocator, entries: []MemoryEntry) void {
         for (entries) |*e| e.deinit(alloc);
         alloc.free(entries);
     }
 
-    /// Ghi entry thành 1 JSON object trên 1 dòng (schema RFC-003 §4.4).
+    /// Write entry as 1 JSON object on 1 line (RFC-003 §4.4 schema).
     fn stringifyEntry(writer: *std.Io.Writer, entry: *const MemoryEntry) !void {
         try writer.writeAll("{\"id\":");
         try std.json.Stringify.value(entry.id, .{}, writer);
@@ -266,7 +266,7 @@ pub const MemoryStore = struct {
     }
 };
 
-/// Parse 1 dòng JSONL thành MemoryEntry (deep-copy, caller sở hữu).
+/// Parse 1 JSONL line into MemoryEntry (deep-copy, owned by caller).
 fn parseLine(alloc: Allocator, line: []const u8) !MemoryEntry {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
     defer parsed.deinit();
@@ -334,7 +334,7 @@ fn parseLine(alloc: Allocator, line: []const u8) !MemoryEntry {
     };
 }
 
-/// Lấy string từ json.Value (trả rỗng nếu không phải string).
+/// Extract string from json.Value (returns empty if not a string).
 fn jsonStr(v: std.json.Value) []const u8 {
     return switch (v) {
         .string => |s| s,
@@ -342,7 +342,7 @@ fn jsonStr(v: std.json.Value) []const u8 {
     };
 }
 
-/// Lấy integer từ json.Value (trả default nếu không phải number).
+/// Extract integer from json.Value (returns default if not a number).
 fn jsonInt(v: std.json.Value, default: i64) i64 {
     return switch (v) {
         .integer => |i| i,
@@ -355,7 +355,7 @@ fn jsonInt(v: std.json.Value, default: i64) i64 {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "append → loadIndex round-trip đủ fields" {
+test "append → loadIndex round-trip with all fields" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
@@ -370,7 +370,7 @@ test "append → loadIndex round-trip đủ fields" {
         .id = &.{},
         .ts = 1700000000000,
         .type = "semantic",
-        .content = @constCast("Project dùng Zig 0.16, test bằng zig build test"),
+        .content = @constCast("Project uses Zig 0.16, test via zig build test"),
         .keywords = @constCast(&[_][]u8{ @constCast("Zig"), @constCast("build") }),
         .source_session = @constCast("sess_test_01"),
         .confidence = 0.9,
@@ -379,7 +379,7 @@ test "append → loadIndex round-trip đủ fields" {
         .last_access = 0,
     };
     try store.append(io, &entry);
-    defer alloc.free(entry.id); // id do store sinh
+    defer alloc.free(entry.id); // id generated by store
 
     const entries = try store.loadIndex(io);
     defer MemoryStore.freeEntries(alloc, entries);
@@ -389,7 +389,7 @@ test "append → loadIndex round-trip đủ fields" {
     try std.testing.expectEqualStrings(entry.id, e.id);
     try std.testing.expectEqual(entry.ts, e.ts);
     try std.testing.expectEqualStrings("semantic", e.type);
-    try std.testing.expectEqualStrings("Project dùng Zig 0.16, test bằng zig build test", e.content);
+    try std.testing.expectEqualStrings("Project uses Zig 0.16, test via zig build test", e.content);
     try std.testing.expectEqual(@as(usize, 2), e.keywords.len);
     try std.testing.expectEqualStrings("Zig", e.keywords[0]);
     try std.testing.expectEqualStrings("build", e.keywords[1]);
@@ -399,7 +399,7 @@ test "append → loadIndex round-trip đủ fields" {
     try std.testing.expectEqual(@as(u32, 0), e.access_count);
 }
 
-test "supersedes thay thế entry cũ trong index, file giữ audit trail" {
+test "supersedes replaces old entry in index, file preserves audit trail" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
@@ -433,7 +433,7 @@ test "supersedes thay thế entry cũ trong index, file giữ audit trail" {
         .keywords = @constCast(&[_][]u8{@constCast("branch")}),
         .source_session = null,
         .confidence = 0.95,
-        .supersedes = e1.id, // thay thế e1
+        .supersedes = e1.id, // replaces e1
         .access_count = 0,
         .last_access = 0,
     };
@@ -443,17 +443,17 @@ test "supersedes thay thế entry cũ trong index, file giữ audit trail" {
     const entries = try store.loadIndex(io);
     defer MemoryStore.freeEntries(alloc, entries);
 
-    // e1 bị loại khỏi index → chỉ còn e2
+    // e1 excluded from index -> only e2 remains
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqualStrings(e2.id, entries[0].id);
     try std.testing.expectEqualStrings("Branch feat/memact", entries[0].content);
     try std.testing.expectEqualStrings(e1.id, entries[0].supersedes.?);
 
-    // File JSONL vẫn đủ 2 dòng (audit trail không mất)
+    // JSONL file still has 2 lines (audit trail preserved)
     try std.testing.expectEqual(@as(usize, 2), try countLines(alloc, io, store.file_path));
 }
 
-test "touch tăng access_count và last_access, id lạ trả false" {
+test "touch increments access_count and last_access, unknown id returns false" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
@@ -468,7 +468,7 @@ test "touch tăng access_count và last_access, id lạ trả false" {
         .id = &.{},
         .ts = 1000,
         .type = "episodic",
-        .content = @constCast("Session fix leak trong ollama streaming"),
+        .content = @constCast("Session fix leak in ollama streaming"),
         .keywords = @constCast(&[_][]u8{@constCast("ollama")}),
         .source_session = @constCast("sess_t"),
         .confidence = 0.7,
@@ -481,7 +481,7 @@ test "touch tăng access_count và last_access, id lạ trả false" {
 
     try std.testing.expect(try store.touch(io, entry.id));
     try std.testing.expect(try store.touch(io, entry.id));
-    try std.testing.expect(!(try store.touch(io, "mem_khong_ton_tai")));
+    try std.testing.expect(!(try store.touch(io, "mem_non_existent")));
 
     const entries = try store.loadIndex(io);
     defer MemoryStore.freeEntries(alloc, entries);
@@ -491,7 +491,7 @@ test "touch tăng access_count và last_access, id lạ trả false" {
     try std.testing.expect(entries[0].last_access > 0);
 }
 
-test "2 append → file JSONL có đúng 2 dòng" {
+test "2 appends → JSONL file has exactly 2 lines" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
@@ -502,7 +502,7 @@ test "2 append → file JSONL có đúng 2 dòng" {
     var store = try MemoryStore.init(alloc, io, dir);
     defer store.deinit();
 
-    const contents = [_][]const u8{ "entry thứ nhất", "entry thứ hai" };
+    const contents = [_][]const u8{ "first entry", "second entry" };
     var owned_ids: [2][]u8 = undefined;
     for (contents, 0..) |c, i| {
         var entry = MemoryEntry{
@@ -527,15 +527,15 @@ test "2 append → file JSONL có đúng 2 dòng" {
 }
 
 test "matchKeyword ASCII case-insensitive" {
-    try std.testing.expect(matchKeyword("zig", "Project dùng Zig build"));
+    try std.testing.expect(matchKeyword("zig", "Project uses Zig build"));
     try std.testing.expect(matchKeyword("ZIG", "project zig 0.16"));
     try std.testing.expect(matchKeyword("Build", "zig BUILD test"));
-    try std.testing.expect(!matchKeyword("rust", "Dùng Zig build"));
+    try std.testing.expect(!matchKeyword("rust", "Uses Zig build"));
     try std.testing.expect(!matchKeyword("", "abc"));
     try std.testing.expect(!matchKeyword("toolong", "abc"));
 }
 
-/// Đếm số dòng không rỗng trong file (helper cho tests).
+/// Count non-empty lines in file (test helper).
 fn countLines(alloc: Allocator, io: std.Io, path: []const u8) !usize {
     const cwd = std.Io.Dir.cwd();
     const file = try cwd.openFile(io, path, .{});

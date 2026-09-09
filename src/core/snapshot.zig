@@ -1,20 +1,20 @@
-//! snapshot.zig — SnapshotTracker: CAS snapshot trước/sau khi file bị thay đổi.
+//! snapshot.zig — SnapshotTracker: CAS snapshot before/after file modifications.
 //!
-//! Mở rộng coverage của RFC-002: mọi đường ghi file (tool file_write/file_edit,
-//! mini.write/mini.patch trong CodeAct, bash command chứa redirect, subagent)
-//! đều lưu nội dung cũ vào CAS (~/.mini/cas) và ghi FileSnapshot vào journal.
+//! Extends coverage of RFC-002: all file-write pathways (tool file_write/file_edit,
+//! mini.write/mini.patch in CodeAct, bash command with redirects, subagents)
+//! save old contents to CAS (~/.mini/cas) and record FileSnapshot to the journal.
 //!
-//! Toàn cục singleton vì js_bindings (CodeAct C-ABI) không giữ con trỏ AgentLoop.
+//! Global singleton because js_bindings (CodeAct C-ABI) does not hold an AgentLoop pointer.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const cas_mod = @import("cas.zig");
 const journal_mod = @import("journal.zig");
 
-/// Tracker toàn cục. Null = no-op (test, chế độ không journal).
+/// Global tracker. Null = no-op (test, non-journal mode).
 var g_tracker: ?*SnapshotTracker = null;
 
-/// Gắn tracker toàn cục (agent.zig gọi lúc init).
+/// Attach global tracker (called by agent.zig during init).
 pub fn setTracker(t: ?*SnapshotTracker) void {
     g_tracker = t;
 }
@@ -23,10 +23,10 @@ pub fn getTracker() ?*SnapshotTracker {
     return g_tracker;
 }
 
-/// 1 file đã được snapshot trong tracker.
+/// A single file snapshot tracked in the tracker.
 pub const TrackedFile = struct {
     path: []const u8,
-    /// Hash nội dung TRƯỚC thay đổi. Null nếu file chưa tồn tại.
+    /// Hash of content BEFORE modification. Null if file did not exist.
     previous_content_hash: ?[]const u8 = null,
 };
 
@@ -34,11 +34,11 @@ pub const SnapshotTracker = struct {
     alloc: Allocator,
     io: std.Io,
     cas: *cas_mod.CAS,
-    /// Journal ghi act_completed + StateDelta. Null = chỉ CAS, không journal.
+    /// Journal recording act_completed + StateDelta. Null = CAS only, no journal.
     journal: ?*journal_mod.ActJournal,
-    /// Danh sách file đang track trong act hiện tại.
+    /// List of files being tracked in the current act.
     tracked: std.ArrayListUnmanaged(TrackedFile),
-    /// Kích thước file tối đa snapshot (32MB).
+    /// Maximum file size to snapshot (32MB).
     max_snapshot_size: usize = 32 * 1024 * 1024,
 
     pub fn init(alloc: Allocator, io: std.Io, cas: *cas_mod.CAS, journal: ?*journal_mod.ActJournal) SnapshotTracker {
@@ -56,7 +56,7 @@ pub const SnapshotTracker = struct {
         self.tracked.deinit(self.alloc);
     }
 
-    /// Xóa danh sách track (cuối act, sau khi đã flush).
+    /// Clear tracked files list (end of act, after flush).
     pub fn reset(self: *SnapshotTracker) void {
         for (self.tracked.items) |tf| {
             self.alloc.free(tf.path);
@@ -72,7 +72,7 @@ pub const SnapshotTracker = struct {
         return null;
     }
 
-    /// Đọc nội dung file hiện tại vào buffer (null nếu không tồn tại / quá lớn).
+    /// Read current file content into buffer (null if non-existent / too large).
     fn readFileContent(self: *SnapshotTracker, path: []const u8) ?[]u8 {
         const cwd = std.Io.Dir.cwd();
         const file = cwd.openFile(self.io, path, .{}) catch return null;
@@ -87,8 +87,8 @@ pub const SnapshotTracker = struct {
         return buf[0..n];
     }
 
-    /// Gọi TRƯỚC khi file sắp bị thay đổi. CAS-store nội dung cũ.
-    /// Idempotent: path đã track thì bỏ qua (giữ hash cũ nhất).
+    /// Called BEFORE file is modified. CAS-stores previous content.
+    /// Idempotent: already tracked paths are ignored (preserving oldest hash).
     pub fn beforeFileWrite(self: *SnapshotTracker, path: []const u8) void {
         if (self.findByPath(path) != null) return;
         var prev_hash: ?[]u8 = null;
@@ -108,16 +108,16 @@ pub const SnapshotTracker = struct {
         };
     }
 
-    /// Gọi SAU khi file đã thay đổi. Flush snapshots đã thu vào journal
-    /// (chỉ những file thực sự đổi hash so với previous). Trả về số snapshot ghi.
+    /// Called AFTER file has been modified. Flush collected snapshots to journal
+    /// (only files that actually changed hash compared to previous). Returns count of written snapshots.
     pub fn afterFileWrite(self: *SnapshotTracker, act_id: usize, path: []const u8) void {
-        // Không flush ngay — agent flush toàn bộ cuối act với act_id thật (tránh event trùng).
+        // Do not flush immediately — agent flushes all at the end of act with the real act_id (avoids duplicate events).
         _ = act_id;
         _ = self;
         _ = path;
     }
 
-    /// Ghi toàn bộ snapshots đang track vào journal (1 event act_completed phụ).
+    /// Flush all tracked snapshots to journal (1 secondary act_completed event).
     pub fn flush(self: *SnapshotTracker, act_id: usize) void {
         const j = self.journal orelse return;
         if (self.tracked.items.len == 0) return;
@@ -139,7 +139,7 @@ pub const SnapshotTracker = struct {
     }
 };
 
-// Helper: đọc toàn bộ file (tránh circular import utils — dùng std trực tiếp).
+// Helper: read entire file (avoids circular import utils — uses std directly).
 fn readAllFile(io: std.Io, file: std.Io.File, buf: []u8) !usize {
     var total: usize = 0;
     while (total < buf.len) {
@@ -154,12 +154,12 @@ fn readAllFile(io: std.Io, file: std.Io.File, buf: []u8) !usize {
 // Bash command path extraction
 // ---------------------------------------------------------------------------
 
-/// Token có vẻ là path không? (chứa '/', hoặc có extension, hoặc tồn tại trên disk).
-/// Heuristic, chỉ dùng để quyết định có đáng snapshot không.
+/// Does token look like a path? (contains '/', has extension, or exists on disk).
+/// Heuristic, used only to decide if worth snapshotting.
 fn looksLikePath(token: []const u8) bool {
     if (token.len == 0 or token.len > 4096) return false;
     if (std.mem.indexOfScalar(u8, token, '/') != null) return true;
-    // file.ext (không phải option/flag)
+    // file.ext (not option/flag)
     if (token[0] == '-') return false;
     if (std.mem.lastIndexOfScalar(u8, token, '.')) |dot| {
         return dot > 0 and dot < token.len - 1;
@@ -167,7 +167,7 @@ fn looksLikePath(token: []const u8) bool {
     return false;
 }
 
-/// Các pattern lệnh ghi file. Token sau pattern là path đích.
+/// Write-command patterns. Token following pattern is target path.
 const WRITE_VERBS = [_][]const u8{
     "sed -i",
     "> ",
@@ -193,14 +193,14 @@ const WRITE_VERBS = [_][]const u8{
     "git stash",
 };
 
-/// Bóc các path có nguy cơ bị bash command thay đổi.
-/// Trả về slice được cấp phát từ arena — caller không cần free riêng từng phần.
+/// Extract paths at risk of being modified by bash command.
+/// Returns slice allocated from arena — caller does not need to free elements individually.
 pub fn extractWritablePaths(arena: std.mem.Allocator, command: []const u8) ![][]const u8 {
     var paths = std.ArrayListUnmanaged([]const u8).empty;
 
     var lines = std.mem.splitScalar(u8, command, '\n');
     while (lines.next()) |line| {
-        // Tách theo '&&', ';', '|'
+        // Split by '&&', ';', '|'
         var segs = std.mem.tokenizeAny(u8, line, "&;|");
         while (segs.next()) |seg_raw| {
             const seg = std.mem.trim(u8, seg_raw, " \t");
@@ -208,7 +208,7 @@ pub fn extractWritablePaths(arena: std.mem.Allocator, command: []const u8) ![][]
 
             // 1. Redirect: > file, >> file, 2> file
             if (std.mem.indexOf(u8, seg, ">")) |gt| {
-                // bỏ qua 2> / &>
+                // Skip 2> / &>
                 var i = gt;
                 while (i < seg.len and seg[i] == '>') i += 1;
                 const rest = std.mem.trim(u8, seg[i..], " \t");
@@ -238,7 +238,7 @@ pub fn extractWritablePaths(arena: std.mem.Allocator, command: []const u8) ![][]
             // 3. Verb + path arguments: mv/cp/rm/touch/sed -i...
             for (WRITE_VERBS) |verb| {
                 if (std.mem.indexOf(u8, seg, verb)) |_| {
-                    // Lấy các token sau verb
+                    // Get tokens after verb
                     const after = seg[std.mem.indexOf(u8, seg, verb).? + verb.len ..];
                     var tok = std.mem.tokenizeAny(u8, after, " \t");
                     var count: usize = 0;
@@ -247,13 +247,13 @@ pub fn extractWritablePaths(arena: std.mem.Allocator, command: []const u8) ![][]
                         if (t.len == 0 or t[0] == '-') continue;
                         const cleaned = stripQuotes(t);
                         if (isDevNull(cleaned)) continue;
-                        // Với mv/cp: bỏ source đầu (count 0 là src), đích là count 1
+                        // For mv/cp: skip first source (count 0 is src), target is count 1
                         if ((std.mem.startsWith(u8, verb, "mv ") or std.mem.startsWith(u8, verb, "cp ")) and count == 0) continue;
                         if (looksLikePath(cleaned) or std.mem.indexOfScalar(u8, cleaned, '/') != null) {
                             try appendUnique(arena, &paths, cleaned);
                         }
                     }
-                    break; // 1 verb match đủ cho segment này
+                    break; // 1 verb match is sufficient for this segment
                 }
             }
         }
@@ -302,7 +302,7 @@ test "extractWritablePaths mv cp rm" {
     try std.testing.expect(found_cp);
 }
 
-test "extractWritablePaths ignores /dev/null và echo" {
+test "extractWritablePaths ignores /dev/null and echo" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const paths = try extractWritablePaths(arena.allocator(), "echo x > /dev/null");

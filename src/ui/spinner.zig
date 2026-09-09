@@ -1,6 +1,6 @@
-//! spinner.zig — Live Non-blocking Braille Spinner & Timer cho mini-agent (RFC-007).
+//! spinner.zig — Live Non-blocking Braille Spinner & Timer for mini-agent (RFC-007).
 //!
-//! Cung cấp spinner động với các frame Braille xoay mượt và đồng hồ đo thời gian thực hiện.
+//! Provides an animated spinner with smooth rotating Braille frames and execution timer.
 
 const std = @import("std");
 const term = @import("terminal.zig");
@@ -12,7 +12,7 @@ pub const Spinner = struct {
     start_ms: i64 = 0,
     is_active: bool = false,
 
-    /// Khởi tạo và bắt đầu đếm giờ spinner.
+    /// Initialize and start the spinner timer.
     pub fn start() Spinner {
         return .{
             .frame_idx = 0,
@@ -21,27 +21,27 @@ pub const Spinner = struct {
         };
     }
 
-    /// Lấy frame hiện tại và nhảy sang frame tiếp theo.
+    /// Get current frame and advance to next frame.
     pub fn nextFrame(self: *Spinner) []const u8 {
         const frame = self.frames[self.frame_idx];
         self.frame_idx = (self.frame_idx + 1) % self.frames.len;
         return frame;
     }
 
-    /// Tính thời gian trôi qua (giây) tính từ lúc start.
+    /// Compute elapsed seconds since start.
     pub fn elapsedSeconds(self: *const Spinner) f64 {
         const now = utils.milliTimestamp();
         const diff = if (now >= self.start_ms) now - self.start_ms else 0;
         return @as(f64, @floatFromInt(diff)) / 1000.0;
     }
 
-    /// Tính thời gian trôi qua (ms).
+    /// Compute elapsed milliseconds since start.
     pub fn elapsedMs(self: *const Spinner) u64 {
         const now = utils.milliTimestamp();
         return if (now >= self.start_ms) @intCast(now - self.start_ms) else 0;
     }
 
-    /// Render một frame spinner lên terminal (tại dòng hiện tại).
+    /// Render one spinner frame to the terminal (at current line).
     pub fn render(self: *Spinner, io: std.Io, msg: []const u8) void {
         _ = io;
         if (!term.isStdoutTty()) return;
@@ -57,7 +57,7 @@ pub const Spinner = struct {
         term.writeStdout(line);
     }
 
-    /// Dừng spinner và xóa dòng trạng thái.
+    /// Stop spinner and clear status line.
     pub fn clear(self: *Spinner, io: std.Io) void {
         _ = io;
         if (!self.is_active) return;
@@ -67,7 +67,7 @@ pub const Spinner = struct {
         }
     }
 
-    /// Dừng spinner và in ra dòng trạng thái cuối cùng (ví dụ: hoàn thành hoặc lỗi).
+    /// Stop spinner and print final status line (e.g., completed or error).
     pub fn finish(self: *Spinner, io: std.Io, glyph: []const u8, glyph_color: []const u8, msg: []const u8) void {
         self.clear(io);
         var buf: [256]u8 = undefined;

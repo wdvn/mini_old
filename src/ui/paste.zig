@@ -1,18 +1,18 @@
-//! paste.zig — Incremental parser cho bracketed paste mode (xterm `?2004`).
+//! paste.zig — Incremental parser for bracketed paste mode (xterm `?2004`).
 //!
-//! Vấn đề với cách đọc byte-cứi-pointer cũ (RFC-000 follow-up):
-//!   - Nội dung paste chứa escape sequence (vd ANSI color `\x1b[31m`) có thể
-//!     trùng prefix với end-marker `\x1b[201~` → byte bị chèn sai, marker thật
-//!     bị nuốt → editor kẹt vĩnh viễn trong paste mode (Enter/Ctrl+C bị nuốt).
-//!   - Terminal không gửi end-marker (tmux cũ, một số terminal) → cùng hang.
+//! Issue with the old end-of-pointer byte read approach (RFC-000 follow-up):
+//!   - Pasted content containing escape sequences (e.g. ANSI color `\x1b[31m`) can
+//!     share prefixes with end-marker `\x1b[201~` → bytes wrongly inserted, real marker
+//!     swallowed → editor permanently trapped in paste mode (Enter/Ctrl+C swallowed).
+//!   - Terminals not sending end-marker (legacy tmux, select terminals) → same hang.
 //!
-//! Giải pháp: state machine incremental — feed từng byte, parser tự nhận diện
-//! đúng end-marker bằng cách so khớp dần và flush phần sai khi biết chuỗi không
-//! thể là marker nữa. Hoàn toàn không I/O → unit test được.
+//! Solution: incremental state machine — feeds byte-by-byte, parser automatically
+//! identifies correct end-markers via progressive matching and flushes failed prefixes
+//! once sequence can no longer match. Completely I/O free → unit testable.
 //!
-//! Đồng thời expose `sanitizeAppend` — chuẩn hoá nội dung paste cho single-line
-//! composer: CRLF/CR/LF → 1 space (không double), strip control chars ngoài TAB,
-//! giữ nguyên UTF-8 (kể cả multibyte tiếng Việt / emoji).
+//! Also exposes `sanitizeAppend` — normalizes pasted content for single-line
+//! composer: CRLF/CR/LF → 1 space (no doubling), strips control chars except TAB,
+//! preserves UTF-8 intact (including multibyte characters / emojis).
 
 const std = @import("std");
 
@@ -21,18 +21,18 @@ pub const END_MARKER = "\x1b[201~";
 
 pub const Marker = enum { start, end };
 
-/// Trạng thái CR đã thấy (đang chờ LF) — dùng cho sanitize CRLF.
+/// Observed CR state (awaiting LF) — used for CRLF sanitization.
 var sanitize_pending_cr: bool = false;
 
-/// Sanitize + append 1 raw byte vào `out` (single-line composer rules).
-/// - '\r\n' / '\r' / '\n' → 1 space (CRLF không thành 2 space).
-/// - TAB giữ nguyên; control char khác bị bỏ.
-/// Trả về true nếu byte được append (caller dùng cho việc redraw hạn chế).
+/// Sanitize + append 1 raw byte into `out` (single-line composer rules).
+/// - '\r\n' / '\r' / '\n' → 1 space (CRLF does not become 2 spaces).
+/// - TAB preserved; other control characters dropped.
+/// Returns true if byte was appended (caller uses for bounded redrawing).
 pub fn sanitizeAppend(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, c: u8) bool {
     switch (c) {
         '\r' => {
             sanitize_pending_cr = true;
-            return false; // chờ LF; nếu không có LF sẽ flush space ở byte kế
+            return false; // awaiting LF; if no LF follows, flush space on next byte
         },
         '\n' => {
             sanitize_pending_cr = false;
@@ -55,23 +55,23 @@ pub fn sanitizeAppend(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator
     }
 }
 
-/// Reset trạng thái sanitize (giữa 2 lần paste).
+/// Reset sanitize state (between paste operations).
 pub fn sanitizeReset() void {
     sanitize_pending_cr = false;
 }
 
-/// Trạng thái CR đang chờ LF cho chế độ multiline (biến riêng, không đụng single-line).
+/// Observed CR state awaiting LF for multiline mode (independent variable, untouched by single-line).
 var multi_pending_cr: bool = false;
 
-/// Sanitize + append 1 byte theo quy tắc MULTILINE (RFC-008 §5A):
-/// - '\r\n' / '\r' / '\n' → đúng 1 '\n' (giữ nguyên cấu trúc dòng).
-/// - TAB giữ nguyên; control char khác bị bỏ; UTF-8 giữ nguyên.
-/// Trả về true nếu byte được append.
+/// Sanitize + append 1 byte according to MULTILINE rules (RFC-008 §5A):
+/// - '\r\n' / '\r' / '\n' → exactly 1 '\n' (preserves line structure).
+/// - TAB preserved; other control characters dropped; UTF-8 preserved.
+/// Returns true if byte was appended.
 pub fn sanitizeAppendMultiline(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, c: u8) bool {
     switch (c) {
         '\r' => {
             multi_pending_cr = true;
-            return false; // chờ LF; nếu không có LF sẽ flush '\n' ở byte kế
+            return false; // awaiting LF; if no LF follows, flush '\n' on next byte
         },
         '\n' => {
             multi_pending_cr = false;
@@ -94,13 +94,13 @@ pub fn sanitizeAppendMultiline(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.
     }
 }
 
-/// Reset trạng thái sanitize multiline (giữa 2 lần paste).
+/// Reset multiline sanitize state (between paste operations).
 pub fn sanitizeMultilineReset() void {
     multi_pending_cr = false;
 }
 
 fn markerCanContinue(cur: []const u8, c: u8) bool {
-    // Hai marker chỉ khác byte index 4 ('0' start / '1' end): ESC [ 2 0|1 ~
+    // Two markers only differ at byte index 4 ('0' start / '1' end): ESC [ 2 0|1 ~
     const common = "\x1b[20";
     const idx = cur.len;
     if (idx < 4) return c == common[idx];
@@ -109,12 +109,12 @@ fn markerCanContinue(cur: []const u8, c: u8) bool {
     return false;
 }
 
-/// Parser bracketed paste: nhận byte tuần tự, tự nhận diện start/end marker
-/// ngay cả khi nội dung paste chứa escape sequence trùng prefix marker.
+/// Bracketed paste parser: receives sequential bytes, identifies start/end markers
+/// accurately even when pasted content contains escape sequences matching marker prefix.
 pub const Parser = struct {
-    /// Số byte candidate-marker đang hold (0 = không hold).
+    /// Number of candidate-marker bytes held (0 = none held).
     matched: usize,
-    /// Kind marker đang hold (chắc chắn sau byte thứ 5; giá trị mặc định vô nghĩa).
+    /// Kind of marker held (determined after 5th byte; default value arbitrary).
     hold_kind: Marker,
     hold_buf: [END_MARKER.len]u8,
 
@@ -126,23 +126,23 @@ pub const Parser = struct {
         self.matched = 0;
     }
 
-    /// Bytes candidate đang hold (chưa biết là marker hay content).
+    /// Candidate bytes currently held (undecided whether marker or content).
     pub fn pending(self: *const Parser) []const u8 {
         return self.hold_buf[0..self.matched];
     }
 
-    /// Copy pending sang buffer caller (an toàn sau khi `feed` trả `.fail`).
+    /// Copy pending to caller buffer (safe after `feed` returns `.fail`).
     pub fn pendingCopy(self: *const Parser, out: *[END_MARKER.len]u8) []const u8 {
         @memcpy(out[0..self.matched], self.hold_buf[0..self.matched]);
         return out[0..self.matched];
     }
 
     /// Feed 1 byte.
-    /// - `.content`  : byte là nội dung paste.
-    /// - `.marker`   : marker hoàn chỉnh vừa khớp (hold đã được tiêu thụ).
-    /// - `.none`     : byte được hold làm candidate (xem `pending`).
-    /// - `.fail`     : hold vừa vỡ — flush `pendingCopy` thành content rồi
-    ///                 feed LẠI byte này (nó chưa được xử lý).
+    /// - `.content`  : byte is paste content.
+    /// - `.marker`   : complete marker matched (held bytes consumed).
+    /// - `.none`     : byte held as candidate (see `pending`).
+    /// - `.fail`     : hold sequence broken — flush `pendingCopy` to content,
+    ///                 then re-feed this byte (it has not been processed).
     pub fn feed(self: *Parser, c: u8) FeedResult {
         if (self.matched == 0) {
             if (c == 0x1b) {
@@ -169,16 +169,16 @@ pub const Parser = struct {
     }
 };
 
-/// Kết quả feed 1 byte.
+/// Result of feeding 1 byte.
 pub const FeedResult = union(enum) {
-    /// Byte thuộc nội dung paste (raw, chưa sanitize).
+    /// Byte belongs to paste content (raw, unsanitized).
     content: u8,
-    /// Marker hoàn chỉnh vừa khớp.
+    /// Complete marker matched.
     marker: Marker,
-    /// Byte được hold làm candidate marker (chưa quyết định).
+    /// Byte held as candidate marker (undecided).
     none: void,
-    /// Chuỗi hold vừa vỡ — caller phải: copy `pendingCopy` TRƯỚC khi feed,
-    /// chèn nó thành content, rồi feed lại byte hiện tại.
+    /// Hold sequence broken — caller must: copy `pendingCopy` BEFORE feed,
+    /// insert as content, then re-feed current byte.
     fail: void,
 };
 
@@ -189,7 +189,7 @@ test "marker prefix match start" {
     }
     const r = p.feed(START_MARKER[START_MARKER.len - 1]);
     try std.testing.expectEqual(FeedResult{ .marker = .start }, r);
-    // Sau marker, feed tiếp byte thường.
+    // After marker, continue feeding normal bytes.
     try std.testing.expectEqual(FeedResult{ .content = 'x' }, p.feed('x'));
 }
 
@@ -202,13 +202,13 @@ test "marker prefix match end" {
     try std.testing.expectEqual(FeedResult{ .marker = .end }, r);
 }
 
-/// Helper: feed toàn bộ chuỗi, gom content sau khi xử lý hold/fail đúng cách.
+/// Helper: feed entire string, collect content after properly handling hold/fail.
 fn feedAll(alloc: std.mem.Allocator, p: *Parser, input: []const u8) !std.ArrayListUnmanaged(u8) {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
     var tmp: [END_MARKER.len]u8 = undefined;
     for (input) |c| {
-        // Copy pending TRƯỚC khi feed (feed có thể reset).
+        // Copy pending BEFORE feed (feed may reset).
         const pre = p.pendingCopy(&tmp);
         const r = p.feed(c);
         switch (r) {
@@ -216,31 +216,31 @@ fn feedAll(alloc: std.mem.Allocator, p: *Parser, input: []const u8) !std.ArrayLi
             .marker, .none => {},
             .fail => {
                 try out.appendSlice(alloc, pre);
-                // Feed lại byte hiện tại (nó chưa được xử lý).
+                // Re-feed current byte (it has not been processed).
                 switch (p.feed(c)) {
                     .content => |b| try out.append(alloc, b),
-                    .none => {}, // byte là ESC → hold lại, ok
+                    .none => {}, // byte is ESC → hold, ok
                     else => unreachable,
                 }
             },
         }
     }
-    // Flush nốt candidate còn hold (không bao giờ khớp marker nữa).
+    // Flush remaining held candidate (will never match a marker again).
     try out.appendSlice(alloc, p.pendingCopy(&tmp));
     return out;
 }
 
-test "escape sequence trong paste không nhầm marker" {
+test "escape sequence in paste does not mistake marker" {
     var p = Parser.init();
     var content = try feedAll(std.testing.allocator, &p, "\x1b[31mred\x1b[0m");
     defer content.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("\x1b[31mred\x1b[0m", content.items);
 }
 
-test "end-marker sau content chứa prefix gần marker" {
+test "end-marker after content containing near-marker prefix" {
     var p = Parser.init();
     var tmp: [END_MARKER.len]u8 = undefined;
-    // Content "abc\x1b[20" rồi END marker thật.
+    // Content "abc\x1b[20" followed by real END marker.
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(std.testing.allocator);
     var got_end = false;
@@ -264,12 +264,12 @@ test "end-marker sau content chứa prefix gần marker" {
         }
     }
     try std.testing.expect(got_end);
-    // Cuối stream còn hold prefix "\x1b[20" → flush thành content.
+    // Stream tail still holds prefix "\x1b[20" → flush as content.
     try out.appendSlice(std.testing.allocator, p.pendingCopy(&tmp));
     try std.testing.expectEqualStrings("abc\x1b[20", out.items);
 }
 
-test "sanitizeAppend: CRLF một space, LF một space, TAB giữ, control bỏ" {
+test "sanitizeAppend: CRLF one space, LF one space, TAB preserved, control dropped" {
     const alloc = std.testing.allocator;
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
@@ -286,7 +286,7 @@ test "sanitizeAppend: CRLF một space, LF một space, TAB giữ, control bỏ"
     _ = sanitizeAppend(&out, alloc, '\n');
     _ = sanitizeAppend(&out, alloc, 'y');
     _ = sanitizeAppend(&out, alloc, '\r');
-    _ = sanitizeAppend(&out, alloc, 'z'); // CR đứng đơn → space rồi 'z'
+    _ = sanitizeAppend(&out, alloc, 'z'); // Standalone CR → space then 'z'
     try std.testing.expectEqualStrings("x y z", out.items);
 
     out.clearRetainingCapacity();
@@ -294,6 +294,6 @@ test "sanitizeAppend: CRLF một space, LF một space, TAB giữ, control bỏ"
     _ = sanitizeAppend(&out, alloc, 'a');
     _ = sanitizeAppend(&out, alloc, '\t');
     _ = sanitizeAppend(&out, alloc, 'b');
-    _ = sanitizeAppend(&out, alloc, 1); // control → bỏ
+    _ = sanitizeAppend(&out, alloc, 1); // control → dropped
     try std.testing.expectEqualStrings("a\tb", out.items);
 }

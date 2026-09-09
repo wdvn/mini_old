@@ -1,19 +1,19 @@
-//! json.zig — Tiện ích parse và build JSON không dùng thư viện ngoài.
+//! json.zig — Lightweight JSON parsing and serialization utilities without external dependencies.
 //!
-//! Vì mini-agent không có dependency JSON lib, module này cung cấp các hàm
-//! scan đơn giản cho JSON responses từ AI backends và tool inputs.
+//! Because mini-agent has no external JSON library dependencies, this module provides
+//! simple scanning functions for JSON responses from AI backends and tool inputs.
 //!
-//! ## Giới hạn
-//!   - Chỉ xử lý JSON flat/single-level đủ dùng cho API responses
-//!   - Không validate JSON đầy đủ
-//!   - Không hỗ trợ unicode escape (\uXXXX) trong chuỗi
+//! ## Limitations
+//!   - Only handles flat/single-level JSON sufficient for API responses
+//!   - Does not perform full JSON validation
+//!   - Does not support unicode escapes (\uXXXX) in strings
 //!
-//! ## Hàm chính
-//!   - `findString`  — tìm giá trị string theo key
-//!   - `findObject`  — tìm giá trị object {} theo key
-//!   - `findArray`   — tìm giá trị array [] theo key
-//!   - `escape`      — escape một chuỗi để nhúng vào JSON string
-//!   - `unescape`    — unescape JSON string sang plain text
+//! ## Key functions
+//!   - `findString`  — find string value by key
+//!   - `findObject`  — find object {} value by key
+//!   - `findArray`   — find array [] value by key
+//!   - `escape`      — escape a string to embed into JSON string
+//!   - `unescape`    — unescape JSON string to plain text
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -22,14 +22,14 @@ const Allocator = std.mem.Allocator;
 // Parsing helpers
 // ---------------------------------------------------------------------------
 
-/// Tìm giá trị string của key trong JSON object.
-/// Trả về slice trỏ vào `json` (không owned, không cần free).
-/// Không xử lý string lồng nhau hoặc key trùng lặp.
+/// Find string value of key in JSON object.
+/// Returns slice pointing into `json` (not owned, no need to free).
+/// Does not handle nested strings or duplicate keys.
 ///
-/// Ví dụ:
+/// Example:
 /// ```
 /// findString(`{"name":"bash","id":"1"}`, "name") == "bash"
-/// findString(`{"x":42}`, "x") == null  // 42 không phải string
+/// findString(`{"x":42}`, "x") == null  // 42 is not a string
 /// ```
 pub fn findString(json: []const u8, key: []const u8) ?[]const u8 {
     var pattern_buf: [256]u8 = undefined;
@@ -39,10 +39,10 @@ pub fn findString(json: []const u8, key: []const u8) ?[]const u8 {
     const start_idx = std.mem.indexOf(u8, json, pattern) orelse return null;
     var val_start = start_idx + pattern.len;
 
-    // Bỏ qua khoảng trắng sau dấu hai chấm
+    // Skip whitespace after colon
     while (val_start < json.len and (json[val_start] == ' ' or json[val_start] == '\t' or json[val_start] == '\n')) : (val_start += 1) {}
     
-    // Phải mở bằng dấu ngoặc kép
+    // Must start with double quote
     if (val_start >= json.len or json[val_start] != '"') return null;
     val_start += 1;
 
@@ -58,12 +58,12 @@ pub fn findString(json: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
-/// findString + unescape kết quả. Trả về bộ nhớ owned (caller phải free).
-/// Fast path: chuỗi không chứa backslash thì chỉ dupe.
-/// Dùng cho mọi tool input chứa nội dung do người dùng/LLM kiểm soát
-/// (command shell, pattern, nội dung file...) — nếu dùng findString thô,
-/// các escape sequence JSON (\" \\n \\t) sẽ leak thành ký tự literal,
-/// làm méo lệnh shell (ví dụ sinh file rác khi redirect 2>&1 bị parse sai).
+/// findString + unescape result. Returns owned memory (caller must free).
+/// Fast path: string containing no backslashes is simply duplicated.
+/// Used for all tool inputs containing user/LLM-controlled content
+/// (shell commands, patterns, file contents...) — if raw findString is used,
+/// JSON escape sequences (\" \\n \\t) would leak as literal characters,
+/// distorting shell commands (e.g., creating stray files when redirect 2>&1 is misparsed).
 pub fn findStringOwned(alloc: Allocator, json: []const u8, key: []const u8) !?[]u8 {
     const raw = findString(json, key) orelse return null;
     if (std.mem.indexOfScalar(u8, raw, '\\') == null) {
@@ -72,8 +72,8 @@ pub fn findStringOwned(alloc: Allocator, json: []const u8, key: []const u8) !?[]
     return try unescape(alloc, raw);
 }
 
-/// Tìm giá trị object {} của key trong JSON.
-/// Trả về slice bao gồm cả dấu `{` và `}`.
+/// Find object {} value of key in JSON.
+/// Returns slice including `{` and `}` braces.
 pub fn findObject(json: []const u8, key: []const u8) ?[]const u8 {
     var pattern_buf: [256]u8 = undefined;
     if (key.len + 4 > pattern_buf.len) return null;
@@ -108,8 +108,8 @@ pub fn findObject(json: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Tìm giá trị array [] của key trong JSON.
-/// Trả về slice bao gồm cả dấu `[` và `]`.
+/// Find array [] value of key in JSON.
+/// Returns slice including `[` and `]` brackets.
 pub fn findArray(json: []const u8, key: []const u8) ?[]const u8 {
     var pattern_buf: [256]u8 = undefined;
     if (key.len + 4 > pattern_buf.len) return null;
@@ -143,14 +143,14 @@ pub fn findArray(json: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Kiểm tra xem JSON có chứa key với giá trị boolean `true` không.
+/// Check whether JSON contains key with boolean value `true`.
 pub fn findBool(json: []const u8, key: []const u8) bool {
     var pattern_buf: [256]u8 = undefined;
     const pattern = std.fmt.bufPrint(&pattern_buf, "\"{s}\":true", .{key}) catch return false;
     return std.mem.indexOf(u8, json, pattern) != null;
 }
 
-/// Tìm giá trị số nguyên của key trong JSON object.
+/// Find integer value of key in JSON object.
 pub fn findInt(json: []const u8, key: []const u8, comptime T: type) ?T {
     var pattern_buf: [256]u8 = undefined;
     if (key.len + 4 > pattern_buf.len) return null;
@@ -172,7 +172,7 @@ pub fn findInt(json: []const u8, key: []const u8, comptime T: type) ?T {
     return std.fmt.parseInt(T, json[val_start..val_end], 10) catch null;
 }
 
-test "findInt parse số nguyên đúng từ JSON" {
+test "findInt correctly parses integers from JSON" {
     const json_str = "{\"id\":123,\"prompt_tokens\":4500,\"negative\":-42,\"not_number\":\"hello\"}";
     try std.testing.expectEqual(@as(?u32, 123), findInt(json_str, "id", u32));
     try std.testing.expectEqual(@as(?u64, 4500), findInt(json_str, "prompt_tokens", u64));
@@ -181,15 +181,15 @@ test "findInt parse số nguyên đúng từ JSON" {
     try std.testing.expectEqual(@as(?u32, null), findInt(json_str, "missing", u32));
 }
 
-test "findStringOwned unescape đúng chuỗi JSON" {
+test "findStringOwned correctly unescapes JSON string" {
     const alloc = std.testing.allocator;
-    // Lệnh shell chứa quote — must survive JSON round-trip nguyên vẹn
+    // Shell command containing quotes — must survive JSON round-trip intact
     const input = "{\"command\":\"grep -A 20 \\\"fail\\\\|error\\\" 2>&1\"}";
     const got = (try findStringOwned(alloc, input, "command")).?;
     defer alloc.free(got);
     try std.testing.expectEqualStrings("grep -A 20 \"fail\\|error\" 2>&1", got);
 
-    // Fast path: không có backslash → chỉ dupe
+    // Fast path: no backslash -> only dupe
     const input2 = "{\"command\":\"ls -la\"}";
     const got2 = (try findStringOwned(alloc, input2, "command")).?;
     defer alloc.free(got2);
@@ -201,7 +201,7 @@ test "findStringOwned unescape đúng chuỗi JSON" {
     defer alloc.free(got3);
     try std.testing.expectEqualStrings("line1\nline2", got3);
 
-    // Key không tồn tại
+    // Key does not exist
     const got4 = try findStringOwned(alloc, input2, "missing");
     try std.testing.expect(got4 == null);
 }
@@ -209,19 +209,19 @@ test "findStringOwned unescape đúng chuỗi JSON" {
 test "Claude partial_json accumulated → unescape → findStringOwned works" {
     const alloc = std.testing.allocator;
 
-    // Claude SSE gửi partial_json chunks. findString trả raw slice (escaped).
-    // Simulated: findString(data, "partial_json") trả từng chunk escaped:
-    //   chunk1: {\"comm       (từ "partial_json":"{\"comm")
-    //   chunk2: and\":\"ls\"}  (từ "partial_json":"and\":\"ls\"}")
+    // Claude SSE sends partial_json chunks. findString returns raw slice (escaped).
+    // Simulated: findString(data, "partial_json") returns each escaped chunk:
+    //   chunk1: {\"comm       (from "partial_json":"{\"comm")
+    //   chunk2: and\":\"ls\"}  (from "partial_json":"and\":\"ls\"}")
     // Accumulated: {\"command\":\"ls\"}
     const accumulated_escaped = "{\\\"command\\\":\\\"ls\\\"}";
 
-    // Sau unescape (tại content_block_stop) → input_json chuẩn
+    // After unescape (at content_block_stop) -> standard input_json
     const input_json = try unescape(alloc, accumulated_escaped);
     defer alloc.free(input_json);
     try std.testing.expectEqualStrings("{\"command\":\"ls\"}", input_json);
 
-    // Verify: findStringOwned trên input_json đã unescape → extract được
+    // Verify: findStringOwned on unescaped input_json -> extracts cleanly
     const cmd = (try findStringOwned(alloc, input_json, "command")).?;
     defer alloc.free(cmd);
     try std.testing.expectEqualStrings("ls", cmd);
@@ -232,18 +232,18 @@ test "Claude partial_json accumulated → unescape → findStringOwned works" {
 // Building helpers
 // ---------------------------------------------------------------------------
 
-/// Re-serialize raw JSON text thành wire-format hợp lệ.
+/// Re-serialize raw JSON text into valid wire-format.
 ///
-/// Khi `input_json` đã bị unescape (do `std.json.parseFromSlice` hoặc
-/// `findStringOwned`), string values bên trong có thể chứa raw control
-/// chars (newline 0x0A, tab 0x09...) làm vỡ JSON wire format.
+/// When `input_json` has been unescaped (by `std.json.parseFromSlice` or
+/// `findStringOwned`), inner string values may contain raw control
+/// chars (newline 0x0A, tab 0x09...) that break JSON wire format.
 ///
-/// Hàm này walk qua JSON, track state in/out string, và:
-///   - Bên ngoài string: giữ nguyên (structural chars `{` `}` `[` `]` `:` `,` `"`)
-///   - Bên trong string: re-escape control chars (`\n` → `\\n`, `\t` → `\\t`...)
-///     nhưng giữ nguyên các escape sequence đã có (ví dụ `\\` `\"`)
+/// This function walks the JSON, tracks in/out string state, and:
+///   - Outside strings: keeps intact (structural chars `{` `}` `[` `]` `:` `,` `"`)
+///   - Inside strings: re-escapes control chars (`\n` → `\\n`, `\t` → `\\t`...)
+///     while preserving existing escape sequences (such as `\\`, `\"`)
 ///
-/// Caller phải free kết quả.
+/// Caller must free result.
 pub fn reserializeJson(alloc: Allocator, raw: []const u8) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
@@ -254,7 +254,7 @@ pub fn reserializeJson(alloc: Allocator, raw: []const u8) ![]u8 {
         const c = raw[i];
         if (in_string) {
             if (c == '\\' and i + 1 < raw.len) {
-                // Escape sequence đã có — giữ nguyên (\\, \", \n, \t, \uXXXX...)
+                // Existing escape sequence — preserve (\\, \", \n, \t, \uXXXX...)
                 try buf.append(alloc, c);
                 i += 1;
                 try buf.append(alloc, raw[i]);
@@ -262,13 +262,13 @@ pub fn reserializeJson(alloc: Allocator, raw: []const u8) ![]u8 {
                 continue;
             }
             if (c == '"') {
-                // Đóng string
+                // Closing string quote
                 try buf.append(alloc, c);
                 in_string = false;
                 i += 1;
                 continue;
             }
-            // Ký tự bên trong string — re-escape control chars
+            // Character inside string — re-escape control chars
             switch (c) {
                 '\n' => try buf.appendSlice(alloc, "\\n"),
                 '\r' => try buf.appendSlice(alloc, "\\r"),
@@ -282,7 +282,7 @@ pub fn reserializeJson(alloc: Allocator, raw: []const u8) ![]u8 {
             }
             i += 1;
         } else {
-            // Ngoài string — giữ nguyên mọi ký tự structural
+            // Outside string — preserve all structural characters
             if (c == '"') {
                 in_string = true;
             }
@@ -296,27 +296,27 @@ pub fn reserializeJson(alloc: Allocator, raw: []const u8) ![]u8 {
 test "reserializeJson: basic" {
     const alloc = std.testing.allocator;
 
-    // JSON object không có control chars — giữ nguyên
+    // JSON object without control chars — preserve unchanged
     const simple = "{\"command\":\"ls\"}";
     const r1 = try reserializeJson(alloc, simple);
     defer alloc.free(r1);
     try std.testing.expectEqualStrings("{\"command\":\"ls\"}", r1);
 }
 
-test "reserializeJson: raw newline trong string value" {
+test "reserializeJson: raw newline in string value" {
     const alloc = std.testing.allocator;
 
-    // Raw newline (0x0A) bên trong string → re-escape thành \\n
+    // Raw newline (0x0A) inside string → re-escape to \\n
     const input = "{\"prompt\":\"Line 1\nLine 2\"}";
     const r = try reserializeJson(alloc, input);
     defer alloc.free(r);
     try std.testing.expectEqualStrings("{\"prompt\":\"Line 1\\nLine 2\"}", r);
 }
 
-test "reserializeJson: giữ nguyên escape sequences đã có" {
+test "reserializeJson: preserve existing escape sequences" {
     const alloc = std.testing.allocator;
 
-    // \\n đã escaped (2 chars: \ + n) → giữ nguyên
+    // \\n already escaped (2 chars: \ + n) → preserve unchanged
     const input = "{\"prompt\":\"hello\\nworld\"}";
     const r = try reserializeJson(alloc, input);
     defer alloc.free(r);
@@ -332,26 +332,26 @@ test "reserializeJson: raw tab + nested object" {
     try std.testing.expectEqualStrings("{\"a\":\"x\\ty\",\"b\":{\"c\":\"ok\"}}", r);
 }
 
-/// Escape một chuỗi để nhúng vào JSON string.
+/// Escape a string to embed into a JSON string.
 ///
-/// Sanitize UTF-8: byte không hợp lệ (sequence cắt cụt, continuation byte
-/// lơ lửng...) được thay bằng U+FFFD (REPLACEMENT CHARACTER) để body gửi
-/// lên backend luôn là JSON/UTF-8 hợp lệ. Không sanitize thì server có thể
-/// từ chối cả request với lỗi gây hiểu lầm (vd "missing model" HTTP 400).
-/// Caller phải free kết quả.
+/// Sanitize UTF-8: invalid bytes (truncated sequences, dangling continuation
+/// bytes...) are replaced with U+FFFD (REPLACEMENT CHARACTER) so the body sent
+/// to backend is always valid JSON/UTF-8. Without sanitization, the server may
+/// reject the request with misleading errors (e.g. "missing model" HTTP 400).
+/// Caller must free result.
 pub fn escape(alloc: Allocator, s: []const u8) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
 
-    // Đường nhanh: chuỗi đã valid UTF-8 thì chỉ cần escape như cũ.
+    // Fast path: valid UTF-8 string only needs normal escaping.
     if (std.unicode.utf8ValidateSlice(s)) {
         try appendEscaped(alloc, &buf, s);
         return buf.toOwnedSlice(alloc);
     }
 
-    // Đường sanitize: decode từng codepoint, byte hỏng → U+FFFD.
+    // Sanitize path: decode each codepoint, invalid bytes → U+FFFD.
     var i: usize = 0;
-    var pending: usize = 0; // số byte ASCII đã scan liên tiếp, chưa flush
+    var pending: usize = 0; // count of consecutive scanned ASCII bytes, unflushed
     while (i < s.len) {
         const b = s[i];
         if (b < 0x80) {
@@ -360,7 +360,7 @@ pub fn escape(alloc: Allocator, s: []const u8) ![]u8 {
             continue;
         }
         const seq_len = std.unicode.utf8ByteSequenceLength(b) catch {
-            // Byte không phải lead hợp lệ — thay 1 U+FFFD, bỏ qua 1 byte.
+            // Invalid lead byte — replace with 1 U+FFFD, skip 1 byte.
             if (pending > 0) {
                 try appendEscaped(alloc, &buf, s[i - pending .. i]);
                 pending = 0;
@@ -369,7 +369,7 @@ pub fn escape(alloc: Allocator, s: []const u8) ![]u8 {
             i += 1;
             continue;
         };
-        // Sequence bị cắt cụt cuối chuỗi (không đủ continuation byte)
+        // Truncated sequence at end of string (missing continuation bytes)
         if (i + seq_len > s.len) {
             if (pending > 0) {
                 try appendEscaped(alloc, &buf, s[i - pending .. i]);
@@ -380,7 +380,7 @@ pub fn escape(alloc: Allocator, s: []const u8) ![]u8 {
             continue;
         }
         if (std.unicode.utf8Decode(s[i .. i + seq_len])) |_| {
-            // Codepoint hợp lệ — giữ nguyên, flush ASCII đứng trước.
+            // Valid codepoint — preserve, flush preceding ASCII.
             if (pending > 0) {
                 try appendEscaped(alloc, &buf, s[i - pending .. i]);
                 pending = 0;
@@ -388,9 +388,9 @@ pub fn escape(alloc: Allocator, s: []const u8) ![]u8 {
             try buf.appendSlice(alloc, s[i .. i + seq_len]);
             i += seq_len;
         } else |_| {
-            // Sequence hỏng (cắt cụt cuối chuỗi, overlong, surrogate...)
-            // — theo chiến lược maximal subpart (khác Python): tiêu thụ cả
-            // đoạn continuation byte liền kề và thay bằng 1 U+FFFD.
+            // Corrupted sequence (truncated, overlong, surrogate...)
+            // — using maximal subpart strategy: consume contiguous
+            // continuation bytes and replace with 1 U+FFFD.
             if (pending > 0) {
                 try appendEscaped(alloc, &buf, s[i - pending .. i]);
                 pending = 0;
@@ -407,7 +407,7 @@ pub fn escape(alloc: Allocator, s: []const u8) ![]u8 {
     return buf.toOwnedSlice(alloc);
 }
 
-/// Escape chuỗi đã được đảm bảo valid UTF-8 (không sanitize gì thêm).
+/// Escape string guaranteed to be valid UTF-8 (no extra sanitization).
 fn appendEscaped(alloc: Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
     for (s) |c| {
         switch (c) {
@@ -426,8 +426,8 @@ fn appendEscaped(alloc: Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const 
     }
 }
 
-/// Unescape một JSON string (phần bên trong dấu ngoặc kép).
-/// Caller phải free kết quả.
+/// Unescape a JSON string (content inside double quotes).
+/// Caller must free result.
 pub fn unescape(alloc: Allocator, s: []const u8) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
@@ -483,45 +483,45 @@ pub fn unescape(alloc: Allocator, s: []const u8) ![]u8 {
     return buf.toOwnedSlice(alloc);
 }
 
-test "escape giữ nguyên chuỗi ASCII/UTF-8 hợp lệ" {
+test "escape preserves valid ASCII/UTF-8 string" {
     const alloc = std.testing.allocator;
     const got = try escape(alloc, "grep -A 20 \"fail\\|error\"\nline2\ttab");
     defer alloc.free(got);
     try std.testing.expectEqualStrings("grep -A 20 \\\"fail\\\\|error\\\"\\nline2\\ttab", got);
 
-    // Tiếng Việt valid UTF-8 — phải giữ nguyên từng byte
+    // Multibyte valid UTF-8 — must preserve each byte
     const got2 = try escape(alloc, "đường dẫn /tmp — ok");
     defer alloc.free(got2);
     try std.testing.expectEqualStrings("đường dẫn /tmp — ok", got2);
 }
 
-test "escape thay byte UTF-8 invalid bằng U+FFFD" {
+test "escape replaces invalid UTF-8 bytes with U+FFFD" {
     const alloc = std.testing.allocator;
 
-    // Sequence 3-byte cắt cụt cuối chuỗi (như output tool bị truncate)
+    // 3-byte sequence truncated at string end (e.g. truncated tool output)
     const trunc = "ok\xe2\x80";
     const got = try escape(alloc, trunc);
     defer alloc.free(got);
     try std.testing.expectEqualStrings("ok\u{FFFD}", got);
 
-    // Continuation byte lơ lửng giữa chuỗi hợp lệ
+    // Dangling continuation byte in the middle of valid string
     const dangling = "a\xc3\xa9\xffb";
     const got2 = try escape(alloc, dangling);
     defer alloc.free(got2);
-    // \xc3\xa9 = 'é' hợp lệ giữ nguyên; \xff hỏng → U+FFFD
+    // \xc3\xa9 = 'é' valid and preserved; \xff corrupted → U+FFFD
     try std.testing.expectEqualStrings("aé\u{FFFD}b", got2);
 
-    // Escape vẫn hoạt động sau khi sanitize: quote đứng trước byte hỏng
+    // Escape still works after sanitize: quote preceding invalid byte
     const mixed = "\"quo\"\x80tail";
     const got3 = try escape(alloc, mixed);
     defer alloc.free(got3);
     try std.testing.expectEqualStrings("\\\"quo\\\"\u{FFFD}tail", got3);
 }
 
-/// Format thụt dòng (pretty-print với 2 khoảng trắng) cho chuỗi JSON.
-/// Hỗ trợ object {}, array [], chuỗi string có escape ký tự đặc biệt.
-/// Trả về chuỗi mới được cấp phát qua `alloc` (caller sở hữu).
-/// Nếu chuỗi không phải JSON (không bắt đầu bằng { hoặc [), trả về bản dupe nguyên bản.
+/// Pretty-print indentation (2 spaces) for JSON string.
+/// Supports object {}, array [], and strings with escaped special characters.
+/// Returns newly allocated string via `alloc` (owned by caller).
+/// If string is not JSON (does not start with { or [), returns unmodified dupe.
 pub fn prettyPrint(alloc: Allocator, raw_json: []const u8) ![]u8 {
     const trimmed = std.mem.trim(u8, raw_json, " \t\r\n");
     if (trimmed.len == 0 or (trimmed[0] != '{' and trimmed[0] != '[')) {
@@ -551,7 +551,7 @@ pub fn prettyPrint(alloc: Allocator, raw_json: []const u8) ![]u8 {
             continue;
         }
 
-        // Bỏ qua khoảng trắng ngoài chuỗi string
+        // Skip whitespace outside string literals
         if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
             continue;
         }
@@ -564,7 +564,7 @@ pub fn prettyPrint(alloc: Allocator, raw_json: []const u8) ![]u8 {
             },
             '{', '[' => {
                 try out.append(alloc, c);
-                // Kiểm tra xem đối tượng có rỗng không: {} hoặc []
+                // Check if object is empty: {} or []
                 var next_idx = i + 1;
                 while (next_idx < trimmed.len and (trimmed[next_idx] == ' ' or trimmed[next_idx] == '\t' or trimmed[next_idx] == '\r' or trimmed[next_idx] == '\n')) : (next_idx += 1) {}
                 const closing_char: u8 = if (c == '{') '}' else ']';
@@ -600,7 +600,7 @@ pub fn prettyPrint(alloc: Allocator, raw_json: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
-test "prettyPrint format đúng JSON object và array" {
+test "prettyPrint formats JSON object and array correctly" {
     const alloc = std.testing.allocator;
     const raw = "{\"error\":{\"code\":429,\"message\":\"Rate limit: try again, please\"},\"tags\":[\"a\",\"b\"],\"empty\":{}}";
     const formatted = try prettyPrint(alloc, raw);

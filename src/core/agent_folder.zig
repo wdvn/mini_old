@@ -1,5 +1,5 @@
-//! agent_folder.zig — Quản lý thư mục `.agent/` trong workspace
-//! Triển khai RFC-005
+//! agent_folder.zig — Manage the `.agent/` directory in the workspace.
+//! Implements RFC-005.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -8,15 +8,15 @@ const main = @import("../main.zig");
 
 pub const AgentFolder = struct {
     alloc: Allocator,
-    path: []const u8, // Đường dẫn tuyệt đối đến thư mục `.agent/`
+    path: []const u8, // Absolute path to `.agent/` directory
 
     pub fn deinit(self: *AgentFolder) void {
         self.alloc.free(self.path);
     }
 };
 
-/// Tìm thư mục `.agent/` từ cwd đi lên dần đến root.
-/// Nếu không thấy, tự động tạo `.agent/` ở cwd và tạo .gitignore mặc định.
+/// Search for the `.agent/` directory upward from cwd to root.
+/// If not found, automatically create `.agent/` in cwd and generate default .gitignore.
 pub fn resolveOrInitAgentFolder(alloc: Allocator, io: std.Io, env_map: *const std.process.Environ.Map) !AgentFolder {
     const cwd_path = env_map.get("PWD") orelse return error.NoPwd;
     var current_dir: []const u8 = cwd_path;
@@ -46,14 +46,14 @@ pub fn resolveOrInitAgentFolder(alloc: Allocator, io: std.Io, env_map: *const st
         current_dir = parent.?;
     }
 
-    // Không tìm thấy thì tạo ở cwd_path
+    // If not found, create at cwd_path
     const agent_path = try std.fmt.allocPrint(alloc, "{s}/.agent", .{cwd_path});
     errdefer alloc.free(agent_path);
 
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, agent_path);
     
-    // Tạo .gitignore
+    // Create .gitignore
     const gitignore_path = try std.fmt.allocPrint(alloc, "{s}/.gitignore", .{agent_path});
     defer alloc.free(gitignore_path);
 
@@ -61,7 +61,7 @@ pub fn resolveOrInitAgentFolder(alloc: Allocator, io: std.Io, env_map: *const st
     defer file.close(io);
     try file.writeStreamingAll(io, "output/\n");
 
-    main.stderrPrint("[agent_folder] Đã tạo thư mục cấu hình {s}\n", .{agent_path});
+    main.stderrPrint("[agent_folder] Created configuration directory {s}\n", .{agent_path});
 
     return AgentFolder{
         .alloc = alloc,

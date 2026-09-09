@@ -7,7 +7,7 @@ const proto = mini.protocol_mod;
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn unsetenv(name: [*:0]const u8) c_int;
 
-test "act_logger: logAct ghi đầy đủ JSON ra file act_<pid>_<act_id>.json" {
+test "act_logger: logAct writes full JSON to act_<pid>_<act_id>.json" {
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -52,7 +52,7 @@ test "act_logger: logAct ghi đầy đủ JSON ra file act_<pid>_<act_id>.json" 
 
     try logger.logAct(io, data);
 
-    // Kiểm tra file được tạo
+    // Verify file was created
     const file_path = "/tmp/test_mini_acts_log/act_99999_1.json";
     const file = try cwd.openFile(io, file_path, .{});
     defer file.close(io);
@@ -71,7 +71,7 @@ test "act_logger: logAct ghi đầy đủ JSON ra file act_<pid>_<act_id>.json" 
     try testing.expect(std.mem.indexOf(u8, buf, "\"stdout\": \"hi\\n\"") != null);
 }
 
-test "act_logger: pruneOldActs giữ lại tối đa N file mới nhất" {
+test "act_logger: pruneOldActs retains at most N newest files" {
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -82,7 +82,7 @@ test "act_logger: pruneOldActs giữ lại tối đa N file mới nhất" {
 
     try cwd.createDirPath(io, test_dir);
 
-    // Tạo 10 file act_0_1.json đến act_0_10.json
+    // Create 10 files act_0_1.json through act_0_10.json
     var i: usize = 1;
     while (i <= 10) : (i += 1) {
         var name_buf: [64]u8 = undefined;
@@ -94,7 +94,7 @@ test "act_logger: pruneOldActs giữ lại tối đa N file mới nhất" {
         try f.writeStreamingAll(io, "{}");
         f.close(io);
 
-        // Sleep 2ms để tạo chênh lệch mtime
+        // Sleep 2ms to create mtime difference
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(2), .awake) catch {};
     }
 
@@ -103,7 +103,7 @@ test "act_logger: pruneOldActs giữ lại tối đa N file mới nhất" {
 
     act_logger.ActLogger.pruneOldActs(alloc, io, test_dir);
 
-    // Kiểm tra số file còn lại
+    // Verify remaining file count
     var dir = try cwd.openDir(io, test_dir, .{ .iterate = true });
     defer dir.close(io);
 

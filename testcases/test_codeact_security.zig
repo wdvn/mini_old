@@ -1,12 +1,11 @@
 //! test_codeact_security.zig — Integration test ISSUE-CODEACT-001 (M10).
 //!
-//! Kiểm tra trong môi trường CodeAct (CodeAct VM):
-//!   1. MINI_TOOL_BLOCKLIST / MINI_TOOL_ALLOWLIST được enforce tại C-bindings mini.* (M2)
-//!   2. Hook Dispatcher phát pre-tool-use / post-tool-use cho mini.*, kể cả khi bị chặn (M3)
-//!   3. Per-Act VM Isolation — biến toàn cục không rò rỉ giữa 2 lượt eval (M1)
+//! Validates inside CodeAct environment (CodeAct VM):
+//!   1. MINI_TOOL_BLOCKLIST / MINI_TOOL_ALLOWLIST enforced at C-bindings mini.* (M2)
+//!   2. Hook Dispatcher fires pre-tool-use / post-tool-use for mini.*, including when blocked (M3)
+//!   3. Per-Act VM Isolation — global variables do not leak across 2 eval turns (M1)
 //!
-//! Chạy qua `zig build test` — import module "mini" (rooted tại src/main.zig)
-//! để tránh escape khỏi module path khi chạy từ testcases/.
+//! Run via `zig build test` — imports "mini" module (rooted at src/main.zig).
 
 const std = @import("std");
 const mini = @import("mini");
@@ -14,7 +13,7 @@ const quickjs = mini.quickjs_engine;
 const registry = mini.tools_mod;
 const hooks = mini.hooks_mod;
 
-// Gộp thêm các testcase CodeAct khác vào cùng binary test
+// Bundle other CodeAct test cases into the same test binary
 test {
     _ = @import("test_codeact_as_tool.zig");
     _ = @import("test_codeact_vm_isolation.zig");
@@ -27,7 +26,7 @@ test {
 }
 
 // ---------------------------------------------------------------------------
-// Hook listener đếm sự kiện in-memory (M3)
+// In-memory event counter hook listener (M3)
 // ---------------------------------------------------------------------------
 const HookCounter = struct {
     var pre_count: usize = 0;
@@ -54,9 +53,9 @@ const HookCounter = struct {
 };
 
 // ---------------------------------------------------------------------------
-// M2: Blocklist — C-bindings mini.* phải enforce policy
+// M2: Blocklist — C-bindings mini.* must enforce policy
 // ---------------------------------------------------------------------------
-test "security: blocklist chan mini.sh (map tool bash)" {
+test "security: blocklist blocks mini.sh (mapped to tool bash)" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
@@ -78,7 +77,7 @@ test "security: blocklist chan mini.sh (map tool bash)" {
     try std.testing.expect(std.mem.indexOf(u8, res.error_message.?, "bash") != null);
 }
 
-test "security: blocklist chan mini.write (map tool file_write) — file khong duoc tao" {
+test "security: blocklist blocks mini.write (mapped to tool file_write) — file not created" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     const target = "/tmp/mini_codeact_sec_blocked.txt";
@@ -99,13 +98,13 @@ test "security: blocklist chan mini.write (map tool file_write) — file khong d
     try std.testing.expect(res.error_message != null);
     try std.testing.expect(std.mem.indexOf(u8, res.error_message.?, "Security Policy Error") != null);
 
-    // File KHÔNG được phép tồn tại sau khi bị chặn
+    // File MUST NOT exist after block
     const cwd = std.Io.Dir.cwd();
     const exists = if (cwd.statFile(io, target, .{})) |_| true else |_| false;
     try std.testing.expect(!exists);
 }
 
-test "security: blocklist chan mini.http (map tool http_request) — khong phat request" {
+test "security: blocklist blocks mini.http (mapped to tool http_request) — no request dispatched" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
@@ -128,9 +127,9 @@ test "security: blocklist chan mini.http (map tool http_request) — khong phat 
 }
 
 // ---------------------------------------------------------------------------
-// M2: Allowlist (ưu tiên cao hơn blocklist)
+// M2: Allowlist (takes precedence over blocklist)
 // ---------------------------------------------------------------------------
-test "security: allowlist chi cho phep tool liet ke — mini.read OK, mini.sh bi chan" {
+test "security: allowlist only permits specified tools — mini.read OK, mini.sh blocked" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
@@ -140,7 +139,7 @@ test "security: allowlist chi cho phep tool liet ke — mini.read OK, mini.sh bi
     var engine = try quickjs.Engine.init(alloc, io);
     defer engine.deinit();
 
-    // file_read nằm trong allowlist → mini.read đọc bình thường
+    // file_read is in allowlist → mini.read succeeds
     var res_ok = try engine.eval(
 \\ const content = mini.read("build.zig");
 \\ console.log("read_len:", content.length > 0);
@@ -150,7 +149,7 @@ test "security: allowlist chi cho phep tool liet ke — mini.read OK, mini.sh bi
     try std.testing.expect(!res_ok.is_error);
     try std.testing.expect(std.mem.indexOf(u8, res_ok.stdout, "read_len: true") != null);
 
-    // bash KHÔNG nằm trong allowlist → mini.sh bị chặn
+    // bash is NOT in allowlist → mini.sh blocked
     var res_blk = try engine.eval(
 \\ const out = mini.sh("echo nope");
 \\ out;
@@ -163,7 +162,7 @@ test "security: allowlist chi cho phep tool liet ke — mini.read OK, mini.sh bi
 // ---------------------------------------------------------------------------
 // M3: Hook Dispatcher
 // ---------------------------------------------------------------------------
-test "security: hook dispatcher phat pre/post-tool-use cho mini.sh thanh cong" {
+test "security: hook dispatcher dispatches pre/post-tool-use for mini.sh successfully" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
@@ -190,7 +189,7 @@ test "security: hook dispatcher phat pre/post-tool-use cho mini.sh thanh cong" {
     try std.testing.expect(HookCounter.post_ok_count >= 1);
 }
 
-test "security: hook dispatcher phat post-tool-use is_error khi mini.sh bi block" {
+test "security: hook dispatcher dispatches post-tool-use is_error when mini.sh is blocked" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
@@ -210,12 +209,12 @@ test "security: hook dispatcher phat post-tool-use is_error khi mini.sh bi block
     defer res.deinit();
 
     try std.testing.expect(res.is_error);
-    // Bị chặn ngay tại policy check → không có pre-hook, chỉ có post-tool-use is_error
+    // Blocked at policy check → no pre-hook, only post-tool-use is_error
     try std.testing.expectEqual(@as(usize, 0), HookCounter.pre_count);
     try std.testing.expectEqual(@as(usize, 1), HookCounter.post_err_count);
 }
 
-test "security: hook dispatcher phat pre/post-tool-use cho mini.write" {
+test "security: hook dispatcher dispatches pre/post-tool-use for mini.write" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     const target = "/tmp/mini_codeact_sec_hook.txt";
@@ -248,9 +247,9 @@ test "security: hook dispatcher phat pre/post-tool-use cho mini.write" {
 }
 
 // ---------------------------------------------------------------------------
-// M1: Per-Act VM Isolation (bổ sung cho test_codeact_vm_isolation.zig)
+// M1: Per-Act VM Isolation (complements test_codeact_vm_isolation.zig)
 // ---------------------------------------------------------------------------
-test "security: per-act VM isolation — bien toan cuc khong ro ri giua 2 luot eval" {
+test "security: per-act VM isolation — global variables do not leak across 2 eval turns" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 

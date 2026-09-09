@@ -1,5 +1,5 @@
-Hãy chạy chẩn đoán toàn diện các session và nhật ký lỗi gần đây của mini-agent:
+Run a comprehensive diagnosis of recent sessions and error journals of mini-agent:
 
-1. Đọc các file journal mới nhất trong thư mục `~/.mini/sessions/journal_*.jsonl`.
-2. Liệt kê các lỗi backend (4xx, 5xx, rate-limit, 529), lỗi parse SSE, hoặc các Act bị gián đoạn/abort.
-3. Tóm tắt nguyên nhân của các lỗi gần nhất và đề xuất cách khắc phục hoặc cấu hình cần điều chỉnh.
+1. Inspect the latest journal files in `~/.mini/sessions/journal_*.jsonl`.
+2. List backend errors (4xx, 5xx, rate-limits, 529), SSE parsing errors, or aborted/interrupted Acts.
+3. Summarize the root causes of recent failures and propose troubleshooting steps or configuration adjustments.

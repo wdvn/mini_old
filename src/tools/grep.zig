@@ -1,7 +1,7 @@
-//! tools/grep.zig — Tool tìm kiếm nội dung trong file.
+//! tools/grep.zig — Content search in files.
 //!
-//! Tìm kiếm pattern trong một file hoặc thư mục (recursive).
-//! Trả về kết quả dạng `path:line_num:nội_dòng`.
+//! Searches for pattern in a file or directory (recursive).
+//! Returns matches in `path:line_num:line_content` format.
 //!
 //! ## Input schema
 //! ```json
@@ -14,10 +14,10 @@
 //! src/agent.zig:10:fn main_loop() void {
 //! ```
 //!
-//! ## Giới hạn
-//!   - Tối đa 200 kết quả
-//!   - Skip file > 1MB
-//!   - Binary files bị bỏ qua tự động
+//! ## Limits
+//!   - Max 200 matches
+//!   - Skip files > 1MB
+//!   - Binary files automatically ignored
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -31,7 +31,7 @@ const MAX_FILE_SIZE = 1024 * 1024;
 /// Input: {"pattern":"...", "path":".", "case_insensitive":"false"}
 pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     const pattern = (try json.findStringOwned(alloc, input_json, "pattern")) orelse
-        return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'pattern'", .{});
+        return std.fmt.allocPrint(alloc, "Error: missing 'pattern' parameter", .{});
     defer alloc.free(pattern);
     const search_path = (try json.findStringOwned(alloc, input_json, "path")) orelse
         try alloc.dupe(u8, ".");
@@ -42,7 +42,7 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     return searchContent(alloc, io, pattern, search_path, case_insensitive);
 }
 
-/// Tìm kiếm pattern trong path (file hoặc thư mục).
+/// Search for pattern in search_path (file or directory).
 pub fn searchContent(alloc: Allocator, io: std.Io, pattern: []const u8, search_path: []const u8, case_insensitive: bool) ![]u8 {
     var result = utils.BufWriter.init(alloc);
     errdefer result.deinit();
@@ -50,16 +50,16 @@ pub fn searchContent(alloc: Allocator, io: std.Io, pattern: []const u8, search_p
 
     const cwd = std.Io.Dir.cwd();
 
-    // Thử mở như file trước
+    // Try statting path first
     const stat = cwd.statFile(io, search_path, .{}) catch |e| {
-        return std.fmt.allocPrint(alloc, "Lỗi truy cập '{s}': {s}", .{ search_path, @errorName(e) });
+        return std.fmt.allocPrint(alloc, "Error accessing '{s}': {s}", .{ search_path, @errorName(e) });
     };
 
     if (stat.kind == .file) {
         try searchFile(alloc, io, &result, &count, pattern, search_path, case_insensitive);
     } else if (stat.kind == .directory) {
         var dir = cwd.openDir(io, search_path, .{ .iterate = true }) catch |e| {
-            return std.fmt.allocPrint(alloc, "Lỗi mở thư mục '{s}': {s}", .{ search_path, @errorName(e) });
+            return std.fmt.allocPrint(alloc, "Error opening directory '{s}': {s}", .{ search_path, @errorName(e) });
         };
         defer dir.close(io);
 
@@ -79,7 +79,7 @@ pub fn searchContent(alloc: Allocator, io: std.Io, pattern: []const u8, search_p
     }
 
     if (count == 0) {
-        return std.fmt.allocPrint(alloc, "Không tìm thấy '{s}' trong '{s}'.", .{ pattern, search_path });
+        return std.fmt.allocPrint(alloc, "No match found for '{s}' in '{s}'.", .{ pattern, search_path });
     }
 
     try result.print("\n{d} match(es) found.", .{count});
@@ -107,7 +107,7 @@ fn searchFile(
     const n = utils.readAll(io, file, buf) catch return;
     const content = buf[0..n];
 
-    // Skip binary: nếu có null bytes trong 512 byte đầu
+    // Skip binary: check for null byte in first 512 bytes
     const check_len = @min(content.len, 512);
     for (content[0..check_len]) |c| {
         if (c == 0) return;
@@ -145,7 +145,7 @@ fn containsCI(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// Kiểm tra extension có khả năng là binary không.
+/// Check if filename extension suggests binary content.
 fn isBinaryName(name: []const u8) bool {
     const binary_exts = [_][]const u8{
         ".o", ".a", ".so", ".dylib", ".dll", ".exe",
@@ -158,4 +158,3 @@ fn isBinaryName(name: []const u8) bool {
     }
     return false;
 }
-

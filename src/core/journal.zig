@@ -1,17 +1,17 @@
 //! journal.zig — Act Journal
-//! Durable Write-Ahead Log (WAL) cho Event-Driven Act Architecture.
+//! Durable Write-Ahead Log (WAL) for Event-Driven Act Architecture.
 //!
-//! Retention: mỗi process sinh 1 file `journal_<pid>.jsonl` trong thư mục
-//! sessions — `init` tự động prune file cũ, chỉ giữ lại `max_journal_files`
-//! file mới nhất (override bằng env `MINI_JOURNAL_KEEP`).
+//! Retention: each process generates 1 `journal_<pid>.jsonl` file in the
+//! sessions directory — `init` automatically prunes old files, retaining only the
+//! `max_journal_files` newest files (override via `MINI_JOURNAL_KEEP` env var).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const utils = @import("utils.zig");
 const json_mod = @import("json.zig");
 
-// Zig 0.16: std.posix.getenv không còn — extern libc getenv (build link libc),
-// cùng pattern với agent.zig / artifacts.zig.
+// Zig 0.16: std.posix.getenv removed — extern libc getenv (build links libc),
+// matching pattern in agent.zig / artifacts.zig.
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn unsetenv(name: [*:0]const u8) c_int;
@@ -35,41 +35,41 @@ pub const ActEventType = enum {
     rollback_completed,
     task_completed,
     task_interrupted,
-    /// RFC-003 §4.6: MemAct compaction hoàn tất (observable & reversible qua Act model).
+    /// RFC-003 §4.6: MemAct compaction completed (observable & reversible via Act model).
     memact_compacted,
 };
 
 pub const FileSnapshot = struct {
     path: []const u8,
-    /// Hash của nội dung cũ trong CAS. Null nếu file chưa tồn tại (mới tạo).
+    /// Hash of previous content in CAS. Null if file did not exist (newly created).
     previous_content_hash: ?[]const u8,
 };
 
-/// Chi tiết lỗi backend (RFC-002): đủ ngữ cảnh để debug sau này từ journal —
-/// backend/model nào, lỗi gì, HTTP code, lần thử thứ mấy, raw body (nếu có).
+/// Backend error details (RFC-002): sufficient context for future debugging from journal —
+/// which backend/model, error details, HTTP code, attempt number, raw body (if any).
 pub const ErrorDetail = struct {
-    /// Tên backend ("openai-compat" / "claude" / "ollama").
+    /// Backend name ("openai-compat" / "claude" / "ollama").
     backend: []const u8,
-    /// Model đang gọi.
+    /// Model invoked.
     model: []const u8,
-    /// Zig error name (ví dụ "LLMRateLimitExceeded").
+    /// Zig error name (e.g. "LLMRateLimitExceeded").
     error_name: []const u8,
-    /// HTTP status code (0 nếu không phải lỗi HTTP).
+    /// HTTP status code (0 if not an HTTP error).
     http_code: u32 = 0,
-    /// Lần thử thứ mấy trong chuỗi retry (bắt đầu từ 1).
+    /// Attempt number in retry sequence (starting at 1).
     attempt: usize = 1,
-    /// Raw body/response từ server, truncate ngắn để journal không phình.
+    /// Raw body/response from server, truncated to avoid bloating journal.
     raw_snippet: ?[]const u8 = null,
-    /// Thông điệp lỗi server trích từ raw_snippet (vd "missing model").
-    /// Giúp phân biệt lỗi thật khi error_name Zig gây hiểu lầm
-    /// (UnknownStopReason nhưng server trả "missing model").
-    /// Null khi không parse được "message" từ raw body.
+    /// Server error message extracted from raw_snippet (e.g. "missing model").
+    /// Helps distinguish real errors when Zig error_name is misleading
+    /// (e.g. UnknownStopReason while server returned "missing model").
+    /// Null when "message" cannot be parsed from raw body.
     server_error: ?[]const u8 = null,
 };
 
 pub const StateDelta = struct {
     act_id: usize,
-    /// File snapshot (để rollback).
+    /// File snapshot (for rollback).
     file_snapshots: []const FileSnapshot,
 };
 
@@ -79,29 +79,29 @@ pub const ActEvent = struct {
     timestamp: i64,
     description: []const u8,
     delta: ?StateDelta = null,
-    /// Chi tiết lỗi backend khi event_type là lỗi LLM/provider.
-    /// Null với các event khác để JSONL không phình.
+    /// Backend error details when event_type is an LLM/provider error.
+    /// Null for other events to keep JSONL compact.
     error_detail: ?ErrorDetail = null,
 };
 
 pub const ActJournal = struct {
     alloc: Allocator,
     file_path: []const u8,
-    /// RFC-002 mở rộng (subagent merge): đường dẫn journal của agent cha đọc từ
-    /// env MINI_PARENT_JOURNAL lúc init. Null nếu không set / rỗng / trùng file_path.
-    /// Event được mirror 1 tầng (ghi trực tiếp, không đệ quy appendEvent).
+    /// RFC-002 extension (subagent merge): parent agent journal path read from
+    /// MINI_PARENT_JOURNAL env at init. Null if not set / empty / identical to file_path.
+    /// Events are mirrored 1-level (direct write, non-recursive appendEvent).
     parent_path: ?[]u8 = null,
 
     pub fn init(alloc: Allocator, io: std.Io, file_path: []const u8) !ActJournal {
         const path_dup = try alloc.dupe(u8, file_path);
         
-        // Đảm bảo thư mục cha tồn tại
+        // Ensure parent directory exists
         if (std.fs.path.dirname(path_dup)) |dir| {
             const cwd = std.Io.Dir.cwd();
             cwd.createDirPath(io, dir) catch {};
         }
 
-        // Tạo file rỗng nếu chưa tồn tại
+        // Create empty file if not yet existing
         const cwd = std.Io.Dir.cwd();
         if (cwd.openFile(io, path_dup, .{})) |file| {
             file.close(io);
@@ -114,13 +114,13 @@ pub const ActJournal = struct {
             }
         }
 
-        // Prune journal cũ ngay sau khi tạo file mới của process này:
-        // mỗi process chạy sinh 1 file journal_<pid>.jsonl → nếu không prune,
-        // thư mục sessions phình nhanh (spam). Giữ lại N file mới nhất.
+        // Prune old journals immediately after creating new file for this process:
+        // each process run generates 1 journal_<pid>.jsonl file -> without pruning,
+        // sessions directory grows rapidly (spam). Keep N newest files.
         pruneOldJournals(alloc, io, path_dup);
 
-        // Cache đường dẫn parent journal (subagent merge). Chỉ mirror khi hợp lệ:
-        // env tồn tại, khác rỗng, và khác chính journal này (tránh self-loop).
+        // Cache parent journal path (subagent merge). Only mirror when valid:
+        // env exists, non-empty, and different from this journal (avoid self-loop).
         var parent_path: ?[]u8 = null;
         if (getEnvVar("MINI_PARENT_JOURNAL")) |pp| {
             if (pp.len > 0 and !std.mem.eql(u8, pp, path_dup)) {
@@ -135,13 +135,13 @@ pub const ActJournal = struct {
         };
     }
 
-    /// Số file journal tối đa giữ lại (mặc định 30, override env MINI_JOURNAL_KEEP).
+    /// Maximum journal files to retain (default 30, overridden by MINI_JOURNAL_KEEP).
     pub const default_max_journal_files: usize = 30;
 
-    /// Prune các file `journal_*.jsonl` CÙNG thư mục với `self_path`,
-    /// giữ lại `max_journal_files` file mới nhất theo mtime.
-    /// File của process hiện tại luôn được giữ (vừa được tạo/ghi).
-    /// Best-effort: mọi lỗi bỏ qua im lặng — prune không được làm hỏng agent.
+    /// Prune `journal_*.jsonl` files in SAME directory as `self_path`,
+    /// keeping the `max_journal_files` newest files by mtime.
+    /// Current process's file is always kept (just created/written).
+    /// Best-effort: silently ignore errors — pruning must never fail the agent.
     pub fn pruneOldJournals(alloc: Allocator, io: std.Io, self_path: []const u8) void {
         const dir_path = std.fs.path.dirname(self_path) orelse ".";
 
@@ -155,7 +155,7 @@ pub const ActJournal = struct {
             break :blk if (v == 0) default_max_journal_files else v;
         };
 
-        // Thu thập {name, mtime} của mọi journal_*.jsonl trong thư mục.
+        // Collect {name, mtime} for all journal_*.jsonl in directory.
         const Item = struct { name: []u8, mtime_ns: i96 };
         var items: std.ArrayList(Item) = .empty;
         defer {
@@ -183,7 +183,7 @@ pub const ActJournal = struct {
 
         if (items.items.len <= max_keep) return;
 
-        // Sort giảm dần theo mtime (mới nhất lên đầu) — giữ `max_keep` đầu.
+        // Sort descending by mtime (newest first) — keep first `max_keep`.
         std.mem.sort(Item, items.items, {}, struct {
             fn lt(_: void, a: Item, b: Item) bool {
                 return a.mtime_ns > b.mtime_ns;
@@ -191,7 +191,7 @@ pub const ActJournal = struct {
         }.lt);
 
         for (items.items[max_keep..]) |old| {
-            // Không bao giờ xóa journal của process hiện tại
+            // Never delete current process journal
             if (std.mem.eql(u8, old.name, std.fs.path.basename(self_path))) continue;
             dir.deleteFile(io, old.name) catch {};
         }
@@ -202,7 +202,7 @@ pub const ActJournal = struct {
         if (self.parent_path) |pp| self.alloc.free(pp);
     }
 
-    /// Ghi sự kiện vào file JSONL và fsync.
+    /// Record event to JSONL file and fsync.
     pub fn recordEvent(self: *ActJournal, io: std.Io, act_id: usize, event_type: ActEventType, desc: []const u8) !void {
         try self.appendEvent(io, .{
             .act_id = act_id,
@@ -212,23 +212,23 @@ pub const ActJournal = struct {
         });
     }
 
-    /// Ghi nhận Act hoàn thành và kèm theo StateDelta.
+    /// Record Act completion accompanied by StateDelta.
     pub fn recordActComplete(self: *ActJournal, io: std.Io, act_id: usize, delta: StateDelta) !void {
         try self.appendEvent(io, .{
             .act_id = act_id,
             .event_type = .act_completed,
             .timestamp = utils.milliTimestamp(),
-            .description = "Hoàn thành Act",
+            .description = "Act completed",
             .delta = delta,
         });
     }
 
-    /// Ghi event lỗi backend với đầy đủ ErrorDetail để debug trong session.
-    /// `desc` mô tả ngắn (hiển thị khi scan journal), chi tiết nằm trong error_detail.
-    /// Raw snippet được truncate tại đây để không phình file JSONL.
-    /// Trích "message" từ raw body lỗi dạng {"error":{"message":"..."}},
-    /// trả về slice trỏ vào raw (không owned — raw_snippet sống cùng event).
-    /// Trả null nếu không tìm thấy cấu trúc này.
+    /// Record backend error event with full ErrorDetail for session debugging.
+    /// `desc` is a short description (shown when scanning journal), details are in error_detail.
+    /// Raw snippet is truncated here to avoid bloating the JSONL file.
+    /// Extracts "message" from raw error body format {"error":{"message":"..."}},
+    /// returning slice pointing into raw (not owned — raw_snippet lifetime matches event).
+    /// Returns null if this structure is not found.
     fn extractServerError(raw: ?[]const u8) ?[]const u8 {
         const r = raw orelse return null;
         const err_obj = json_mod.findObject(r, "error") orelse return json_mod.findString(r, "message");
@@ -249,8 +249,8 @@ pub const ActJournal = struct {
                 detail.raw_snippet = raw[0..max_raw_snippet_len];
             }
         }
-        // Tự trích thông điệp lỗi từ server nếu caller chưa cung cấp,
-        // để error_name Zig (vd UnknownStopReason) không che giấu lỗi thật.
+        // Auto-extract error message from server if caller did not supply one,
+        // so Zig error_name (e.g. UnknownStopReason) does not obscure the real error.
         if (detail.server_error == null) {
             detail.server_error = extractServerError(detail.raw_snippet);
         }
@@ -263,21 +263,21 @@ pub const ActJournal = struct {
         });
     }
 
-    /// Độ dài tối đa raw body lưu trong journal (kích thước bytes).
+    /// Maximum length of raw body stored in journal (byte size).
     const max_raw_snippet_len = 2048;
 
-    /// Ghi 1 dòng (đã kết thúc '\n') vào cuối file JSONL + fsync.
-    /// Tạo file nếu chưa tồn tại (parent journal có thể chưa được init).
-    /// Tách riêng làm helper để test độc lập và tái dùng cho mirror sang parent journal.
+    /// Writes 1 line (ending with '\n') to the end of JSONL file + fsync.
+    /// Creates file if it doesn't exist (parent journal might not be initialized yet).
+    /// Kept separate as a helper for independent testing and reuse for mirroring to parent journal.
     pub fn writeLineTo(alloc: Allocator, io: std.Io, path: []const u8, line: []const u8) !void {
         _ = alloc;
-        // Mở file ở chế độ read_write để append; nếu chưa tồn tại thì tạo mới.
-        // Trên hệ điều hành Unix, ghi vào cuối file có thể được mô phỏng bằng seek.
-        // Dùng `cwd.openFile` thuần cho an toàn vì fsync cũng block thread anyway.
+        // Open file in read_write mode to append; create new if not found.
+        // On Unix operating systems, writing to end of file can be simulated with seek.
+        // Use plain `cwd.openFile` safely since fsync blocks the thread anyway.
         const cwd = std.Io.Dir.cwd();
         const file = cwd.openFile(io, path, .{ .mode = .read_write }) catch |err| blk: {
             if (err != error.FileNotFound) return err;
-            // Tạo thư mục cha nếu cần (parent journal có thể ở thư mục khác)
+            // Create parent directory if needed (parent journal may be in another folder)
             if (std.fs.path.dirname(path)) |dir| {
                 cwd.createDirPath(io, dir) catch {};
             }
@@ -285,11 +285,11 @@ pub const ActJournal = struct {
         };
         defer file.close(io);
 
-        // Zig 0.16: Io.File không còn seek/writeAll trực tiếp.
-        // Lấy offset cuối file rồi ghi positional, đảm bảo append.
+        // Zig 0.16: Io.File no longer has seek/writeAll directly.
+        // Get end offset of file and do positional write to ensure append.
         const end_offset = try file.length(io);
         try file.writePositionalAll(io, line, end_offset);
-        try file.sync(io); // Đảm bảo ghi xuống đĩa (WAL fsync)
+        try file.sync(io); // Ensure flushed to disk (WAL fsync)
         _ = alloc;
     }
 
@@ -303,54 +303,54 @@ pub const ActJournal = struct {
         
         out_buf = aw.toArrayList();
 
-        // Ghi vào journal chính
+        // Write to main journal
         try writeLineTo(self.alloc, io, self.file_path, out_buf.items);
 
-        // RFC-002 mở rộng: mirror 1 tầng sang journal của agent cha (subagent merge).
-        // Ghi trực tiếp cùng dòng JSON — KHÔNG gọi appendEvent đệ quy để tránh
-        // vòng lặp khi parent cũng có MINI_PARENT_JOURNAL set.
+        // RFC-002 extension: 1-tier mirror to parent agent's journal (subagent merge).
+        // Write the same JSON line directly — do NOT recursively call appendEvent to prevent
+        // loops when parent also has MINI_PARENT_JOURNAL set.
         if (self.parent_path) |pp| {
             writeLineTo(self.alloc, io, pp, out_buf.items) catch {};
         }
     }
 };
 
-test "ActEventType stringify chứa memact_compacted" {
-    // Enum mặc định stringify của Zig dùng snake_case tên field — RFC-003 §4.6
+test "ActEventType stringify contains memact_compacted" {
+    // Default enum stringify in Zig uses snake_case field names — RFC-003 §4.6
     try std.testing.expectEqualStrings("memact_compacted", @tagName(ActEventType.memact_compacted));
-    // Stringify JSON của enum cũng dùng tag name
+    // Enum JSON stringify also uses tag name
     var buf: [64]u8 = undefined;
     var sw = std.Io.Writer.fixed(&buf);
     try std.json.Stringify.value(ActEventType.memact_compacted, .{}, &sw);
     try std.testing.expectEqualStrings("\"memact_compacted\"", sw.buffered());
 }
 
-test "appendEvent mirror sang parent journal qua MINI_PARENT_JOURNAL" {
-    // Pattern test của repo: g_io style — dùng std.testing.io cho các thao tác file Io
+test "appendEvent mirrors to parent journal via MINI_PARENT_JOURNAL" {
+    // Repo test pattern: g_io style — use std.testing.io for file Io operations
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
     const main_path = "/tmp/journal_child_test.jsonl";
     const parent_path = "/tmp/journal_parent_test.jsonl";
 
-    // Dọn file cũ từ lần chạy trước
+    // Clean up previous test run files
     std.Io.Dir.deleteFileAbsolute(io, main_path) catch {};
     std.Io.Dir.deleteFileAbsolute(io, parent_path) catch {};
 
-    // Set env trước init — journal cache parent_path lúc init (getenv 1 lần)
+    // Set env before init — journal caches parent_path at init (single getenv)
     _ = setenv("MINI_PARENT_JOURNAL", parent_path, 1);
     defer _ = unsetenv("MINI_PARENT_JOURNAL");
 
     var j = try ActJournal.init(alloc, io, main_path);
     defer j.deinit();
 
-    // init phải cache được parent_path
+    // init must successfully cache parent_path
     try std.testing.expect(j.parent_path != null);
     try std.testing.expectEqualStrings(parent_path, j.parent_path.?);
 
-    try j.recordEvent(io, 1, .act_started, "bắt đầu act test");
+    try j.recordEvent(io, 1, .act_started, "start act test");
 
-    // Cả 2 file phải chứa cùng 1 dòng JSON
+    // Both files must contain the exact same JSON line
     const main_line = try readWholeFile(alloc, io, main_path);
     defer alloc.free(main_line);
     const parent_line = try readWholeFile(alloc, io, parent_path);
@@ -364,8 +364,8 @@ test "appendEvent mirror sang parent journal qua MINI_PARENT_JOURNAL" {
     std.Io.Dir.deleteFileAbsolute(io, parent_path) catch {};
 }
 
-test "recordError ghi đủ ErrorDetail vào journal JSONL" {
-    // Backend lỗi phải log đủ ngữ cảnh trong session để debug sau này
+test "recordError writes full ErrorDetail to journal JSONL" {
+    // Backend errors must log sufficient session context for later debugging
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     const path = "/tmp/journal_recorderror_test.jsonl";
@@ -375,9 +375,9 @@ test "recordError ghi đủ ErrorDetail vào journal JSONL" {
     var j = try ActJournal.init(alloc, io, path);
     defer j.deinit();
 
-    // Raw body dài — recordError phải truncate còn max_raw_snippet_len
+    // Long raw body — recordError must truncate to max_raw_snippet_len
     const long_raw = "x" ** 5000;
-    try j.recordError(io, 3, .llm_provider_error, "Backend lỗi (5xx / provider unavailable)", .{
+    try j.recordError(io, 3, .llm_provider_error, "Backend error (5xx / provider unavailable)", .{
         .backend = "openai-compat",
         .model = "gpt-4o",
         .error_name = "LLMProviderUnavailable",
@@ -386,8 +386,8 @@ test "recordError ghi đủ ErrorDetail vào journal JSONL" {
         .raw_snippet = long_raw,
     });
 
-    // Lỗi HTTP 400 có error body từ server — server_error phải được tự trích
-    try j.recordError(io, 4, .act_failed, "Act lỗi — rollback & retry", .{
+    // HTTP 400 error with server error body — server_error should be auto-extracted
+    try j.recordError(io, 4, .act_failed, "Act error — rollback & retry", .{
         .backend = "openai-compat",
         .model = "deepseek-v4-flash",
         .error_name = "UnknownStopReason",
@@ -399,40 +399,40 @@ test "recordError ghi đủ ErrorDetail vào journal JSONL" {
     const content = try readWholeFile(alloc, io, path);
     defer alloc.free(content);
 
-    // Đủ các trường debug quan trọng trong 1 dòng JSON
+    // Important debug fields present in 1 JSON line
     try std.testing.expect(std.mem.indexOf(u8, content, "\"llm_provider_error\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"openai-compat\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"gpt-4o\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"LLMProviderUnavailable\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"http_code\":503") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"attempt\":2") != null);
-    // JSON mỗi event 1 dòng (2 events) + có raw snippet đã truncate
+    // JSON with 1 event per line (2 events) + truncated raw snippet
     try std.testing.expect(std.mem.count(u8, content, "\n") == 2);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"raw_snippet\"") != null);
     try std.testing.expect(content.len < 5000);
-    // server_error tự trích từ raw body: thấy "missing model" thay vì chỉ UnknownStopReason
+    // server_error auto-extracted from raw body: "missing model" found instead of just UnknownStopReason
     try std.testing.expect(std.mem.indexOf(u8, content, "\"server_error\":\"missing model\"") != null);
 }
 
-test "pruneOldJournals giữ lại N file mới nhất, không xóa file hiện tại" {
+test "pruneOldJournals keeps N newest files, preserves current file" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
-    // Thư mục test riêng — không đụng ~/.mini/sessions thật
+    // Dedicated test directory — do not touch actual ~/.mini/sessions
     var buf: [128]u8 = undefined;
     const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_journal_prune_test_{d}", .{std.os.linux.getpid()});
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, dir);
 
-    // Tạo 5 file journal cũ + 1 file "hiện tại" + 1 file không phải journal
+    // Create 5 old journal files + 1 "current" file + 1 non-journal file
     var i: usize = 0;
     while (i < 5) : (i += 1) {
         var pbuf: [256]u8 = undefined;
         const p = try std.fmt.bufPrint(&pbuf, "{s}/journal_old{s}.jsonl", .{ dir, [_]u8{'0' + @as(u8, @intCast(i))} });
         const f = try cwd.createFile(io, p, .{});
         f.close(io);
-        // mtime phân biệt: file i cũ hơn file i+1 (sleep nhỏ cho chắc chắn khác ns)
+        // Distinguish mtime: file i is older than file i+1 (sleep slightly to ensure different ns)
         std.Io.sleep(io, .{ .nanoseconds = 2 * std.time.ns_per_ms }, .real) catch {};
     }
     var curbuf: [256]u8 = undefined;
@@ -448,13 +448,13 @@ test "pruneOldJournals giữ lại N file mới nhất, không xóa file hiện 
         f.close(io);
     }
 
-    // Env override giữ 3 file
+    // Env override keeps 3 files
     _ = setenv("MINI_JOURNAL_KEEP", "3", 1);
     defer _ = unsetenv("MINI_JOURNAL_KEEP");
 
     ActJournal.pruneOldJournals(alloc, io, cur);
 
-    // Đếm lại journal còn lại trong thư mục
+    // Recount remaining journals in directory
     var d2 = try cwd.openDir(io, dir, .{ .iterate = true });
     defer d2.close(io);
     var n: usize = 0;
@@ -468,20 +468,21 @@ test "pruneOldJournals giữ lại N file mới nhất, không xóa file hiện 
         } else if (std.mem.eql(u8, entry.name, "conv_data.json")) has_other = true;
     }
 
-    // 5 cũ + 1 current = 6 → giữ 3; current luôn sống; file ngoài scope không đụng
+    // 5 old + 1 current = 6 -> keeps 3; current always preserved; out-of-scope files untouched
     try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expect(has_current);
     try std.testing.expect(has_other);
 }
 
-test "writeLineTo append đúng vị trí và tạo nội dung tuần tự" {    const alloc = std.testing.allocator;
+test "writeLineTo appends at correct position and generates sequential content" {
+    const alloc = std.testing.allocator;
     const io = std.testing.io;
     const path = "/tmp/journal_writeline_test.jsonl";
     std.Io.Dir.deleteFileAbsolute(io, path) catch {};
     defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
 
-    // Helper tự tạo file nếu chưa có (init của ActJournal lo phần đó; ở đây
-    // tạo thủ công rồi append 2 dòng kiểm tra offset)
+    // Helper creates file if not present (ActJournal init handles that; here
+    // create manually then append 2 lines to verify offset)
     {
         const cwd = std.Io.Dir.cwd();
         const f = try cwd.createFile(io, path, .{});
@@ -495,7 +496,7 @@ test "writeLineTo append đúng vị trí và tạo nội dung tuần tự" {   
     try std.testing.expectEqualStrings("line1\nline2\n", content);
 }
 
-/// Đọc toàn bộ file vào buffer cấp phát (helper cho test — Zig 0.16 không còn readFileAlloc).
+/// Reads whole file into allocated buffer (test helper — Zig 0.16 no longer has readFileAlloc).
 fn readWholeFile(alloc: Allocator, io: std.Io, path: []const u8) ![]u8 {
     const cwd = std.Io.Dir.cwd();
     const file = try cwd.openFile(io, path, .{});

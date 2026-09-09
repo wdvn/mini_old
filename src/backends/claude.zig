@@ -1,19 +1,19 @@
 //! backend/claude.zig — Anthropic Claude streaming client.
 //!
-//! Giao tiếp với Anthropic Messages API sử dụng SSE theo chuẩn riêng của Claude.
+//! Communicates with the Anthropic Messages API using Claude-specific SSE format.
 //!
 //! ## Endpoint
 //! POST https://api.anthropic.com/v1/messages
 //!
-//! ## SSE events chính
-//!   `content_block_start`  — bắt đầu khối text hoặc tool_use
-//!   `content_block_delta`  — delta của text hoặc input_json
-//!   `content_block_stop`   — kết thúc khối
-//!   `message_delta`        — stop_reason khi kết thúc
-//!   `message_stop`         — toàn bộ message hoàn thành
+//! ## Key SSE events
+//!   `content_block_start`  — starts text or tool_use block
+//!   `content_block_delta`  — delta of text or input_json
+//!   `content_block_stop`   — ends block
+//!   `message_delta`        — stop_reason upon completion
+//!   `message_stop`         — full message complete
 //!
-//! ## Model mặc định
-//! `claude-opus-4-5` — có thể override bằng biến `CLAUDE_MODEL`.
+//! ## Default model
+//! `claude-opus-4-5` — can be overridden via `CLAUDE_MODEL`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -35,15 +35,15 @@ pub const Client = struct {
     api_key: []const u8,
     /// Claude model ID.
     model: []const u8,
-    /// Số token tối đa.
+    /// Maximum tokens.
     max_tokens: u32,
 
-    /// Khởi tạo client.
+    /// Initializes client.
     pub fn init(alloc: Allocator, api_key: []const u8, model: []const u8, max_tokens: u32) Client {
         return .{ .alloc = alloc, .api_key = api_key, .model = model, .max_tokens = max_tokens };
     }
 
-    /// Gửi messages và nhận phản hồi streaming theo SSE của Claude.
+    /// Sends messages and receives streaming response via Claude SSE.
     pub fn sendMessage(
         self: *Client,
         system_prompt: []const u8,
@@ -97,24 +97,23 @@ pub const Client = struct {
 
         ctx.response.http_code = req_http_code;
 
-        // Lưu text còn lại nếu có
+        // Save remaining text if any
         if (ctx.text_accum.items.len > 0) {
             const text = try self.alloc.dupe(u8, ctx.text_accum.items);
-            try ctx.response.content.append(ctx.alloc, .{ .text = text });
+            try ctx.response.content.append(self.alloc, .{ .text = text });
         }
-
-        if ((ctx.response.stop_reason == .unknown or req_http_code >= 400) and ctx.raw_accum_init) {
-            if (ctx.response.raw_debug_info == null) {
-                ctx.response.raw_debug_info = ctx.alloc.dupe(u8, ctx.raw_accum.items) catch null;
-            }
-        }
-        if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
 
         hooks.dispatch(self.alloc, main.g_io, .{
             .event = "message_stop",
+            .role = "assistant",
             .model = self.model,
             .stop_reason = @tagName(ctx.response.stop_reason),
         });
+
+        // If server returned error body
+        if (ctx.raw_accum_init and ctx.raw_accum.items.len > 0) {
+            ctx.response.raw_debug_info = ctx.raw_accum.toOwnedSlice(self.alloc) catch null;
+        }
 
         return ctx.response;
     }
@@ -131,12 +130,12 @@ fn buildRequestBody(
     system_prompt: []const u8,
     msgs: []const proto.Message,
     tools: []const proto.ToolDefinition,
-) ![]u8 {
+) ![]const u8 {
     var buf = utils.BufWriter.init(alloc);
     errdefer buf.deinit();
     const w = &buf;
 
-    // System prompt (với cache_control cho Anthropic Prompt Caching)
+    // System prompt (with cache_control for Anthropic Prompt Caching)
     const escaped_sys = try json.escape(alloc, system_prompt);
     defer alloc.free(escaped_sys);
 
@@ -374,10 +373,10 @@ const StreamCtx = struct {
                 const id = try self.alloc.dupe(u8, self.current_tool_id[0..self.current_tool_id_len]);
                 const name = try self.alloc.dupe(u8, self.current_tool_name[0..self.current_tool_name_len]);
                 const args = if (self.args_accum.items.len > 0) blk: {
-                    // partial_json chunks từ Claude SSE chứa escaped text
-                    // (findString trả raw slice, giữ nguyên \" \\n...).
-                    // Unescape ở đây để input_json nhất quán với OpenAI/Ollama
-                    // (raw JSON object, quotes thật).
+                    // partial_json chunks from Claude SSE contain escaped text
+                    // (findString returns raw slice, retaining \" \\n...).
+                    // Unescape here so input_json is consistent with OpenAI/Ollama
+                    // (raw JSON object, unescaped quotes).
                     break :blk json.unescape(self.alloc, self.args_accum.items) catch
                         try self.alloc.dupe(u8, self.args_accum.items);
                 } else
@@ -438,10 +437,10 @@ test "claude buildRequestBody contains cache_control" {
     const body = try buildRequestBody(alloc, "claude-3-5-sonnet", 1024, "System prompt test", &msgs, &tools);
     defer alloc.free(body);
 
-    // Kiểm tra có cache_control trong system prompt
+    // Verify cache_control exists in system prompt
     try testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
-    // Kiểm tra system prompt formatted như array block
+    // Verify system prompt formatted as array block
     try testing.expect(std.mem.indexOf(u8, body, "\"system\":[{\"type\":\"text\",\"text\":\"System prompt test\",\"cache_control\":{\"type\":\"ephemeral\"}}]") != null);
-    // Kiểm tra tool2 (tool cuối) có cache_control
+    // Verify tool2 (last tool) has cache_control
     try testing.expect(std.mem.indexOf(u8, body, "\"name\":\"tool2\",\"description\":\"desc2\",\"input_schema\":{},\"cache_control\":{\"type\":\"ephemeral\"}") != null);
 }

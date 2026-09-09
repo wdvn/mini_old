@@ -1,10 +1,10 @@
-//! process_manager.zig — Quản lý tiến trình nền (Background Jobs) cho mini-agent.
+//! process_manager.zig — Background job management for mini-agent.
 //!
-//! Cung cấp các nguyên hàm thực thi chạy ngầm theo mô hình OpenHands Pattern:
-//!   - `spawnBackground(alloc, io, command)`: Chạy lệnh ngầm, chuyển hướng stdout/stderr ra log file
-//!   - `getJobStatus(job_id)`: Kiểm tra trạng thái tiến trình (running, exitCode)
-//!   - `readJobLogs(alloc, io, job_id, max_lines)`: Đọc N dòng log gần nhất
-//!   - `killJob(job_id, signal)`: Dừng tiến trình ngầm an toàn (killpg)
+//! Provides background execution primitives following the OpenHands Pattern:
+//!   - `spawnBackground(alloc, io, command)`: run a command in the background, redirecting stdout/stderr to a log file
+//!   - `getJobStatus(job_id)`: check process status (running, exitCode)
+//!   - `readJobLogs(alloc, io, job_id, max_lines)`: read the most recent N log lines
+//!   - `killJob(job_id, signal)`: safely stop a background process (killpg)
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -50,7 +50,7 @@ pub const ProcessManager = struct {
         self.jobs.deinit(self.alloc);
     }
 
-    /// Khởi chạy lệnh chạy ngầm và lưu thông tin job.
+    /// Launch a background command and store job info.
     pub fn spawnBackground(self: *ProcessManager, io: std.Io, command: []const u8) !JobInfo {
         const now = utils.milliTimestamp();
         const job_id = try std.fmt.allocPrint(self.alloc, "job_{d}_{d}", .{ self.next_id, now });
@@ -60,7 +60,7 @@ pub const ProcessManager = struct {
         const log_path = try std.fmt.bufPrint(&path_buf, "/tmp/mini_{s}.log", .{job_id});
         const log_path_owned = try self.alloc.dupe(u8, log_path);
 
-        // Tạo lệnh shell chuyển hướng output ra log file
+        // Build a shell command redirecting output to the log file
         var cmd_buf = utils.BufWriter.init(self.alloc);
         defer cmd_buf.deinit();
 
@@ -89,12 +89,12 @@ pub const ProcessManager = struct {
         return info;
     }
 
-    /// Kiểm tra trạng thái job qua kill(pid, 0)
+    /// Check job status via kill(pid, 0)
     pub fn getJobStatus(self: *ProcessManager, job_id: []const u8) ?JobStatus {
         const info = self.jobs.get(job_id) orelse return null;
         const pid = info.pid;
 
-        // kill(pid, 0) kiểm tra tiến trình có đang sống không
+        // kill(pid, 0) checks whether the process is alive
         const rc = kill(pid, 0);
         if (rc == 0) {
             return .{
@@ -105,20 +105,20 @@ pub const ProcessManager = struct {
         } else {
             return .{
                 .running = false,
-                .exit_code = 0, // Đã kết thúc
+                .exit_code = 0, // Finished
                 .pid = pid,
             };
         }
     }
 
-    /// Đọc tối đa `max_lines` dòng log gần nhất từ log file của job
+    /// Read at most `max_lines` recent log lines from the job's log file
     pub fn readJobLogs(self: *ProcessManager, io: std.Io, job_id: []const u8, max_lines: usize) ![]u8 {
         const info = self.jobs.get(job_id) orelse return error.JobNotFound;
         const cwd = std.Io.Dir.cwd();
 
         const file = cwd.openFile(io, info.log_path, .{}) catch |e| {
             if (e == error.FileNotFound) {
-                return try std.fmt.allocPrint(self.alloc, "(Log file chưa được tạo)", .{});
+                return try std.fmt.allocPrint(self.alloc, "(Log file not created yet)", .{});
             }
             return e;
         };
@@ -127,7 +127,7 @@ pub const ProcessManager = struct {
         const stat = try file.stat(io);
         const file_size: usize = @intCast(stat.size);
         if (file_size == 0) {
-            return try std.fmt.allocPrint(self.alloc, "(Log trống)", .{});
+            return try std.fmt.allocPrint(self.alloc, "(Empty log)", .{});
         }
 
         const buf = try self.alloc.alloc(u8, file_size);
@@ -140,7 +140,7 @@ pub const ProcessManager = struct {
             return try self.alloc.dupe(u8, content);
         }
 
-        // Đếm và lấy N dòng cuối
+        // Count and take the last N lines
         var line_count: usize = 0;
         var i: usize = content.len;
         while (i > 0) {
@@ -156,7 +156,7 @@ pub const ProcessManager = struct {
         return try self.alloc.dupe(u8, content);
     }
 
-    /// Dừng tiến trình ngầm (SIGTERM hoặc SIGKILL)
+    /// Stop a background process (SIGTERM or SIGKILL)
     pub fn killJob(self: *ProcessManager, job_id: []const u8, signal: ?[]const u8) bool {
         const info = self.jobs.get(job_id) orelse return false;
         const sig_num: c_int = if (signal) |s| blk: {
@@ -171,7 +171,7 @@ pub const ProcessManager = struct {
     }
 };
 
-// Singleton process manager cho runtime
+// Singleton process manager for runtime
 var g_pm: ?ProcessManager = null;
 
 pub fn getProcessManager(alloc: Allocator) *ProcessManager {

@@ -1,23 +1,23 @@
-//! tools/subagent.zig — Gọi sub-agent con.
+//! tools/subagent.zig — Subagent invocation tool.
 //!
-//! Spawn `mini -e <task>` với stdout/stderr pipe, đọc song song cả 2 stream
-//! (tránh deadlock khi child ghi nhiều vào 1 pipe) và STREAM từng dòng
-//! output ra stderr của parent kèm prefix `[subagent]` để user thấy được
-//! tiến trình inner đang chạy thay vì tưởng agent bị treo.
-//! Output đầy đủ vẫn được buffer và trả về làm tool result cho LLM.
+//! Spawns `mini -e <task>` with stdout/stderr pipes, reads both streams concurrently
+//! (avoiding pipe deadlocks if child writes extensively) and STREAMS each line
+//! to the parent's stderr prefixed with `[subagent]` so the user observes inner progress
+//! rather than suspecting a hang.
+//! The full output is buffered and returned as the tool result for the LLM.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = @import("../core/json.zig");
 const main = @import("../main.zig");
 
-/// Độ sâu sub-agent mặc định tối đa cho phép để phòng tránh đệ quy vô hạn.
+/// Maximum default subagent depth allowed to prevent infinite recursion.
 pub const DEFAULT_MAX_SUBAGENT_DEPTH: usize = 2;
 
-/// Giới hạn output buffer (byte) giữ lại để trả về tool result.
+/// Maximum output buffer limit (bytes) retained for tool results.
 const MAX_OUTPUT = 128 * 1024;
 
-/// Lấy độ sâu hiện tại của subagent từ biến môi trường.
+/// Retrieve current subagent recursion depth from environment.
 pub fn getCurrentDepth() usize {
     if (main.getEnvironMap()) |em| {
         if (em.get("MINI_SUBAGENT_DEPTH")) |v| {
@@ -27,7 +27,7 @@ pub fn getCurrentDepth() usize {
     return 0;
 }
 
-/// Lấy độ sâu tối đa cho phép từ cấu hình hoặc mặc định.
+/// Retrieve maximum allowed subagent depth from configuration or default.
 pub fn getMaxDepth() usize {
     if (main.getEnvironMap()) |em| {
         if (em.get("MINI_MAX_SUBAGENT_DEPTH")) |v| {
@@ -42,19 +42,18 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     const max_depth = getMaxDepth();
 
     if (current_depth >= max_depth) {
-        return std.fmt.allocPrint(alloc, "Lỗi: Đã đạt giới hạn độ sâu subagent tối đa (depth={d}/{d}). Không thể tạo thêm subagent để phòng tránh đệ quy vô hạn.", .{ current_depth, max_depth });
+        return std.fmt.allocPrint(alloc, "Error: Maximum subagent depth limit reached (depth={d}/{d}). Cannot spawn further subagents.", .{ current_depth, max_depth });
     }
 
     const task = (try json.findStringOwned(alloc, input_json, "task")) orelse
         (try json.findStringOwned(alloc, input_json, "prompt")) orelse
         (try json.findStringOwned(alloc, input_json, "instruction")) orelse
         (try json.findStringOwned(alloc, input_json, "description")) orelse {
-        return std.fmt.allocPrint(alloc, "Lỗi: thiếu tham số 'task'", .{});
+        return std.fmt.allocPrint(alloc, "Error: missing 'task' parameter", .{});
     };
     defer alloc.free(task);
 
-    // Thiết lập độ sâu cho tiến trình con kế thừa (qua environ_map truyền vào spawn,
-    // vì spawn dùng snapshot environ từ lúc start chứ không đọc setenv libc).
+    // Set depth for child process inheritance via environ_map passed into spawn.
     var depth_buf: [16]u8 = undefined;
     const next_depth_str = std.fmt.bufPrintZ(&depth_buf, "{d}", .{current_depth + 1}) catch "1";
     const env_map = main.getEnvironMap();
@@ -64,7 +63,7 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     }
     defer {
         if (env_map) |em| {
-            // Restore giá trị cũ; nếu không có, đặt "0" (tương đương không phải subagent).
+            // Restore previous value; if absent, set "0" (not a subagent).
             const restore = prev_depth orelse "0";
             em.put("MINI_SUBAGENT_DEPTH", restore) catch {};
         }
@@ -81,24 +80,24 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         .environ_map = env_map,
     });
 
-    // Buffer output đầy đủ để trả về agent (giới hạn MAX_OUTPUT, phần dư drain bỏ).
+    // Buffer complete output for the agent (bounded by MAX_OUTPUT, excess drained).
     var stdout_buf = std.ArrayListUnmanaged(u8).empty;
     defer stdout_buf.deinit(alloc);
     var stderr_buf = std.ArrayListUnmanaged(u8).empty;
     defer stderr_buf.deinit(alloc);
 
-    // Thread đọc stderr song song với stdout để tránh deadlock pipe.
+    // Concurrently read stderr alongside stdout to avoid pipe deadlock.
     const stderr_thread = if (child.stderr) |err_pipe|
         std.Thread.spawn(.{}, drainAndStreamStderr, .{ io, err_pipe, &stderr_buf, alloc }) catch null
     else
         null;
 
-    // Main thread đọc + stream stdout.
+    // Main thread reads + streams stdout.
     if (child.stdout) |out_pipe| {
         _ = drainAndStream(io, out_pipe, &stdout_buf, alloc, "subagent");
     }
 
-    // Chờ thread stderr hoàn tất.
+    // Await stderr thread completion.
     if (stderr_thread) |t| {
         t.join();
     } else if (child.stderr) |err_pipe| {
@@ -111,17 +110,17 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         .exited => |code| {
             if (code != 0) {
                 const err_detail = if (stderr_buf.items.len > 0) stderr_buf.items else stdout_buf.items;
-                return std.fmt.allocPrint(alloc, "Sub-agent kết thúc với mã lỗi: {d}. Chi tiết: {s}", .{ code, err_detail });
+                return std.fmt.allocPrint(alloc, "Subagent terminated with error code: {d}. Details: {s}", .{ code, err_detail });
             }
         },
         else => {
             const err_detail = if (stderr_buf.items.len > 0) stderr_buf.items else stdout_buf.items;
-            return std.fmt.allocPrint(alloc, "Sub-agent bị crash hoặc bị kill. Chi tiết: {s}", .{err_detail});
+            return std.fmt.allocPrint(alloc, "Subagent crashed or was killed. Details: {s}", .{err_detail});
         },
     }
 
     if (stdout_buf.items.len == 0) {
-        return std.fmt.allocPrint(alloc, "Sub-agent chạy thành công nhưng không trả về nội dung.", .{});
+        return std.fmt.allocPrint(alloc, "Subagent completed successfully but returned no content.", .{});
     }
 
     return alloc.dupe(u8, stdout_buf.items);
@@ -131,8 +130,8 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
 // Concurrent pipe I/O + real-time streaming
 // ---------------------------------------------------------------------------
 
-/// Đọc pipe song song, append vào buffer (giới hạn MAX_OUTPUT, phần thừa drain bỏ)
-/// và stream từng dòng hoàn chỉnh ra stderr parent với prefix `tag`.
+/// Reads pipe concurrently, appends into buffer (capped at MAX_OUTPUT, excess drained)
+/// and streams completed lines to parent's stderr prefixed with `tag`.
 fn drainAndStream(io: std.Io, pipe: std.Io.File, buf: *std.ArrayListUnmanaged(u8), alloc: Allocator, tag: []const u8) void {
     var line_buf: [4096]u8 = undefined;
     var line_len: usize = 0;
@@ -143,7 +142,7 @@ fn drainAndStream(io: std.Io, pipe: std.Io.File, buf: *std.ArrayListUnmanaged(u8
         const n = pipe.readStreaming(io, &.{&chunk}) catch break;
         if (n == 0) break;
 
-        // Giữ buffer đầy đủ tối đa MAX_OUTPUT; phần còn lại vẫn đọc để không block child.
+        // Keep buffer bounded up to MAX_OUTPUT; remainder still drained so child doesn't block.
         if (stored < MAX_OUTPUT) {
             const room = MAX_OUTPUT - stored;
             const take = @min(room, n);
@@ -151,7 +150,7 @@ fn drainAndStream(io: std.Io, pipe: std.Io.File, buf: *std.ArrayListUnmanaged(u8
             stored += take;
         }
 
-        // Stream real-time: gom chunk thành dòng, in dòng hoàn chỉnh có prefix.
+        // Real-time stream: aggregate chunks into lines, print completed lines with prefix.
         for (chunk[0..n]) |c| {
             if (c == '\n') {
                 emitLine(tag, line_buf[0..line_len]);
@@ -163,18 +162,18 @@ fn drainAndStream(io: std.Io, pipe: std.Io.File, buf: *std.ArrayListUnmanaged(u8
         }
     }
 
-    // Flush dòng cuối nếu chưa có newline.
+    // Flush last line if no trailing newline.
     if (line_len > 0) {
         emitLine(tag, line_buf[0..line_len]);
     }
 }
 
-/// Wrapper cho thread đọc stderr — cùng signature để dùng với Thread.spawn.
+/// Wrapper for stderr reader thread — matching Thread.spawn signature.
 fn drainAndStreamStderr(io: std.Io, pipe: std.Io.File, buf: *std.ArrayListUnmanaged(u8), alloc: Allocator) void {
     drainAndStream(io, pipe, buf, alloc, "subagent:err");
 }
 
-/// In 1 dòng output của subagent ra stderr parent với prefix dim.
+/// Print one subagent output line to parent's stderr with dim prefix.
 fn emitLine(tag: []const u8, line: []const u8) void {
     const trimmed = std.mem.trim(u8, line, " \t\r");
     if (trimmed.len == 0) return;
@@ -219,5 +218,5 @@ test "subagent: depth check logic" {
     const res = try executeTool(testing.allocator, main.getIo(), "{\"task\":\"test infinite loop\"}");
     defer testing.allocator.free(res);
 
-    try testing.expect(std.mem.indexOf(u8, res, "Đã đạt giới hạn độ sâu subagent tối đa") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "Maximum subagent depth limit reached") != null);
 }

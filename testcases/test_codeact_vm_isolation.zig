@@ -1,4 +1,4 @@
-//! Đảm bảo mỗi lần eval() đều có 1 JSContext & JSRuntime mới tinh, không ô nhiễm scope giữa các turn.
+//! Ensure each eval() gets a fresh JSContext & JSRuntime without cross-turn scope pollution.
 
 const std = @import("std");
 const quickjs = @import("mini").quickjs_engine;
@@ -11,7 +11,7 @@ test "codeact: per-act fresh context isolation (const / let re-declaration acros
     var engine = try quickjs.Engine.init(alloc, io);
     defer engine.deinit();
 
-    // Turn 1: Khai báo top-level const 'data' và 'lines'
+    // Turn 1: Declare top-level const 'data' and 'lines'
     var res1 = try engine.eval(
         \\const data = "hello world from turn 1";
         \\const lines = data.split(" ");
@@ -23,7 +23,7 @@ test "codeact: per-act fresh context isolation (const / let re-declaration acros
     try std.testing.expect(!res1.is_error);
     try std.testing.expectEqualStrings("turn1 len: 5\n", res1.stdout);
 
-    // Turn 2: Khai báo CÙNG TÊN top-level const 'data' và 'lines' (Bug cũ ném SyntaxError: Identifier 'data' has already been declared)
+    // Turn 2: Declare SAME top-level const 'data' and 'lines' (Old bug threw SyntaxError: Identifier 'data' has already been declared)
     var res2 = try engine.eval(
         \\const data = "hello again from turn 2";
         \\const lines = data.split(" ");
@@ -43,7 +43,7 @@ test "codeact: global variable state wipeout across turns" {
     var engine = try quickjs.Engine.init(alloc, io);
     defer engine.deinit();
 
-    // Turn 1: Đặt biến var toàn cục
+    // Turn 1: Set global var
     var res1 = try engine.eval(
         \\var secret_token = 12345;
         \\console.log("set secret_token:", secret_token);
@@ -51,7 +51,7 @@ test "codeact: global variable state wipeout across turns" {
     defer res1.deinit();
     try std.testing.expect(!res1.is_error);
 
-    // Turn 2: Kiểm tra secret_token không bị rò rỉ sang turn 2
+    // Turn 2: Verify secret_token does not leak into turn 2
     var res2 = try engine.eval(
         \\console.log("typeof secret_token:", typeof secret_token);
         \\typeof secret_token;
@@ -68,13 +68,13 @@ test "codeact: mini bindings available on fresh context" {
     var engine = try quickjs.Engine.init(alloc, io);
     defer engine.deinit();
 
-    // Turn 1: Gọi mini.exists
+    // Turn 1: Call mini.exists
     var res1 = try engine.eval("const exists = mini.exists('build.zig'); console.log('exists:', exists);", "turn1.js");
     defer res1.deinit();
     try std.testing.expect(!res1.is_error);
     try std.testing.expectEqualStrings("exists: true\n", res1.stdout);
 
-    // Turn 2: Gọi lại mini.exists trên context mới
+    // Turn 2: Call mini.exists again on fresh context
     var res2 = try engine.eval("const exists = mini.exists('build.zig'); console.log('exists again:', exists);", "turn2.js");
     defer res2.deinit();
     try std.testing.expect(!res2.is_error);

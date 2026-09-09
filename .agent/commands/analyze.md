@@ -1,8 +1,8 @@
-Hãy thực hiện phân tích chuyên sâu về vấn đề hoặc thành phần sau: $ARGUMENTS
+Perform an in-depth analysis of the following issue or component: $ARGUMENTS
 
-Thực hiện theo quy trình phân tích và tìm hiểu nguyên nhân gốc rễ (RCA):
-1. **Khảo sát & Định vị**: Tìm kiếm các file, module, hàm liên quan trong codebase `mini` (`src/`).
-2. **Kiểm tra RFC & Spec**: Đối chiếu với các tài liệu thiết kế trong `docs/` nếu có.
-3. **Tracing luồng thực thi**: Mô tả chi tiết luồng dữ liệu (data flow) và trạng thái.
-4. **Xác định điểm nghẽn / Nguyên nhân gốc rễ**: Giải thích rõ ràng vì sao vấn đề xảy ra hoặc cách thức thành phần hoạt động.
-5. **Đề xuất giải pháp / Bước tiếp theo**: Đưa ra hướng xử lý tối ưu, an toàn và tuân thủ chuẩn Zig 0.16.0 của dự án.
+Follow the standard analysis and root cause analysis (RCA) workflow:
+1. **Locate & Investigate**: Search for relevant files, modules, and functions in the `mini` codebase (`src/`).
+2. **Review RFCs & Specs**: Cross-reference against design documents in `docs/` where applicable.
+3. **Execution Flow Tracing**: Detail the data flow and state transitions.
+4. **Identify Bottlenecks / Root Causes**: Explain clearly why the issue occurs or how the component functions.
+5. **Propose Solutions / Next Steps**: Provide optimal, safe remediation steps conforming to the project's Zig 0.16.0 standards.

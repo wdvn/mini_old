@@ -1,25 +1,25 @@
 //! backend/ollama.zig — Ollama local AI client.
 //!
-//! Giao tiếp với Ollama qua API `/api/chat` với NDJSON streaming.
-//! Ollama chạy local, không cần API key, phù hợp để dùng offline.
+//! Communicates with Ollama via `/api/chat` endpoint using NDJSON streaming.
+//! Ollama runs locally without requiring an API key, suitable for offline usage.
 //!
 //! ## Endpoint
 //! POST {ollama_host}/api/chat
 //!
-//! ## Định dạng response (NDJSON)
-//! Mỗi dòng là một JSON object:
+//! ## Response format (NDJSON)
+//! Each line is a JSON object:
 //! ```json
-//! {"message":{"role":"assistant","content":"Xin chào"},"done":false}
+//! {"message":{"role":"assistant","content":"Hello"},"done":false}
 //! {"message":{"role":"assistant","content":"!"},"done":true}
 //! ```
 //!
 //! ## Tool calls
-//! Ollama hỗ trợ tool calls từ phiên bản 0.3.0+.
-//! Format giống OpenAI: `message.tool_calls[0].function.{name,arguments}`.
+//! Ollama supports tool calls starting from version 0.3.0+.
+//! Same format as OpenAI: `message.tool_calls[0].function.{name,arguments}`.
 //!
-//! ## Cấu hình
-//!   `OLLAMA_HOST`   URL base (mặc định: http://localhost:11434)
-//!   `OLLAMA_MODEL`  Tên model (mặc định: llama3)
+//! ## Configuration
+//!   `OLLAMA_HOST`   Base URL (default: http://localhost:11434)
+//!   `OLLAMA_MODEL`  Model name (default: llama3)
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -33,19 +33,19 @@ const utils = @import("../core/utils.zig");
 /// Ollama streaming client.
 pub const Client = struct {
     alloc: Allocator,
-    /// Base URL của Ollama server.
+    /// Ollama server base URL.
     base_url: []const u8,
-    /// Tên model.
+    /// Model name.
     model: []const u8,
-    /// Số token tối đa trong response.
+    /// Maximum tokens in response.
     max_tokens: u32,
 
-    /// Khởi tạo client.
+    /// Initializes client.
     pub fn init(alloc: Allocator, base_url: []const u8, model: []const u8, max_tokens: u32) Client {
         return .{ .alloc = alloc, .base_url = base_url, .model = model, .max_tokens = max_tokens };
     }
 
-    /// Gửi messages và nhận phản hồi NDJSON streaming.
+    /// Sends messages and receives streaming NDJSON response.
     pub fn sendMessage(
         self: *Client,
         system_prompt: []const u8,
@@ -84,7 +84,7 @@ pub const Client = struct {
 
         ctx.response.http_code = req_http_code;
 
-        // Lưu text còn lại
+        // Save remaining text
         if (ctx.text_accum.items.len > 0) {
             const text = try self.alloc.dupe(u8, ctx.text_accum.items);
             try ctx.response.content.append(ctx.alloc, .{ .text = text });
@@ -121,7 +121,7 @@ fn buildRequestBody(
 
     try w.print("{{\"model\":\"{s}\",\"stream\":true", .{model});
 
-    // Tools (Ollama 0.3.0+) đặt trước messages để đảm bảo JSON prefix là tĩnh 100%
+    // Tools (Ollama 0.3.0+) placed before messages to ensure static JSON prefix
     if (tools.len > 0) {
         try w.writeAll(",\"tools\":[");
         for (tools, 0..) |td, ti| {
@@ -143,7 +143,7 @@ fn buildRequestBody(
         if (msgs.len > 0) try w.writeByte(',');
     }
 
-    // Messages (Ollama dùng content string, không phải array)
+    // Messages (Ollama uses content string, not array)
     for (msgs, 0..) |msg, mi| {
         var content_buf = ArrayList(u8).empty;
         defer content_buf.deinit(alloc);
@@ -218,14 +218,14 @@ const StreamCtx = struct {
 
             // Tool calls
             if (json.findArray(msg_obj, "tool_calls")) |tc_arr| {
-                // Lưu text trước khi xử lý tool calls
+                // Save text before handling tool calls
                 if (self.text_accum.items.len > 0) {
                     const text = try self.alloc.dupe(u8, self.text_accum.items);
                     try self.response.content.append(self.alloc, .{ .text = text });
                     self.text_accum.clearRetainingCapacity();
                 }
                 _ = tc_arr;
-                // Parse tool call từ full line
+                // Parse tool call from full line
                 if (json.findString(trimmed, "name")) |name| {
                     const args = json.findObject(trimmed, "arguments") orelse "{}";
                     const id = try std.fmt.allocPrint(self.alloc, "call_{d}", .{self.response.content.items.len});

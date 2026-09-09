@@ -1,16 +1,16 @@
-//! tools/bash.zig — Tool thực thi lệnh shell.
+//! tools/bash.zig — Shell command execution tool.
 //!
-//! Chạy lệnh shell qua `/bin/sh -c` và trả về stdout + stderr.
-//! Có safety check để chặn các lệnh nguy hiểm.
+//! Runs shell commands via `/bin/sh -c` and returns stdout + stderr.
+//! Includes safety checks to block hazardous commands.
 //!
 //! ## Concurrent I/O
-//! Dùng thread riêng để đọc stderr song song với stdout, tránh deadlock
-//! khi child process ghi nhiều data vào cả hai pipe cùng lúc.
-//! Pipe được drain hoàn toàn (data thừa bị bỏ) để child không bị block.
+//! Uses a dedicated thread to read stderr concurrently with stdout, avoiding deadlock
+//! when a child process writes significant data to both pipes simultaneously.
+//! Pipes are drained completely (excess discarded) so the child never blocks.
 //!
 //! ## Safety blocklist
-//! Các pattern sau bị chặn vô điều kiện:
-//!   - `rm -rf /` hoặc `rm -rf ~`
+//! The following patterns are unconditionally blocked:
+//!   - `rm -rf /` or `rm -rf ~`
 //!   - `dd if=`, `mkfs`, `wipefs`
 //!   - `shutdown`, `reboot`, `halt`, `init 0`, `init 6`
 //!   - `git push --force`, `git push -f`
@@ -20,9 +20,9 @@
 //! { "command": "ls -la /tmp" }
 //! ```
 //!
-//! ## Giới hạn
-//!   - Output bị truncate ở 128KB
-//!   - Working directory: CWD của process
+//! ## Limits
+//!   - Output truncated at 128KB
+//!   - Working directory: process CWD
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -30,7 +30,7 @@ const json = @import("../core/json.zig");
 const utils = @import("../core/utils.zig");
 const main = @import("../main.zig");
 
-/// Danh sách pattern lệnh bị chặn.
+/// List of blocked command patterns.
 const BLOCKED_PATTERNS = [_][]const u8{
     "rm -rf /",
     "rm -rf ~",
@@ -48,27 +48,26 @@ const BLOCKED_PATTERNS = [_][]const u8{
     "git clean -f",
 };
 
-/// Giới hạn output (byte). Heap-allocated, không dùng stack.
+/// Output buffer limit (bytes). Heap-allocated.
 const MAX_OUTPUT = 128 * 1024;
 
-/// Thực thi tool bash.
-/// Input: JSON string với trường "command".
-/// Output: stdout/stderr của lệnh, hoặc thông báo lỗi.
+/// Execute the bash tool.
+/// Input: JSON string with "command" field.
+/// Output: stdout/stderr of command, or error message.
 pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
-    // Unescape chuỗi JSON: lệnh chứa \" \\n phải về đúng dạng literal
-    // trước khi đưa vào /bin/sh, nếu không shell sẽ parse sai (quote thành
-    // literal, redirect 2>&1 bị tách token...).
+    // Unescape JSON string: command containing \" \n must become literals
+    // before being passed to /bin/sh.
     const command = (try json.findStringOwned(alloc, input_json, "command")) orelse
         (try json.findStringOwned(alloc, input_json, "cmd")) orelse
         (try json.findStringOwned(alloc, input_json, "script")) orelse
-        return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'command'", .{});
+        return std.fmt.allocPrint(alloc, "Error: missing 'command' parameter", .{});
     defer alloc.free(command);
 
     // Safety check
     for (&BLOCKED_PATTERNS) |pattern| {
         if (std.mem.indexOf(u8, command, pattern) != null) {
             return std.fmt.allocPrint(alloc,
-                "BLOCKED: Lệnh bị chặn bởi safety policy.\nLệnh: {s}\nPattern: {s}",
+                "BLOCKED: Command blocked by safety policy.\nCommand: {s}\nPattern: {s}",
                 .{ command, pattern },
             );
         }
@@ -84,18 +83,18 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
 // Concurrent pipe I/O
 // ---------------------------------------------------------------------------
 
-/// Drain pipe hoàn toàn vào buffer. Giữ lại tối đa buf.len bytes đầu tiên.
-/// Phần data thừa vẫn được đọc hết để child process không bị block trên pipe.
+/// Drain pipe completely into buffer. Retain at most first buf.len bytes.
+/// Excess data is drained so child process does not block on pipe.
 fn drainPipe(io: std.Io, pipe: std.Io.File, buf: []u8) usize {
     var stored: usize = 0;
     while (true) {
         if (stored < buf.len) {
-            // Còn chỗ trong buffer — đọc vào
+            // Buffer has room — read into buffer
             const n = pipe.readStreaming(io, &.{buf[stored..]}) catch break;
             if (n == 0) break;
             stored += n;
         } else {
-            // Buffer đầy — drain phần còn lại để tránh deadlock
+            // Buffer full — drain remainder to prevent deadlock
             var sink: [4096]u8 = undefined;
             const n = pipe.readStreaming(io, &.{&sink}) catch break;
             if (n == 0) break;
@@ -104,7 +103,7 @@ fn drainPipe(io: std.Io, pipe: std.Io.File, buf: []u8) usize {
     return stored;
 }
 
-/// Wrapper cho thread stderr — cùng signature để dùng với Thread.spawn.
+/// Wrapper for stderr thread — matching Thread.spawn signature.
 fn drainStderrThread(io: std.Io, pipe: std.Io.File, buf: []u8, len_out: *usize) void {
     len_out.* = drainPipe(io, pipe, buf);
 }
@@ -113,20 +112,17 @@ fn drainStderrThread(io: std.Io, pipe: std.Io.File, buf: []u8, len_out: *usize) 
 // Command execution
 // ---------------------------------------------------------------------------
 
-test "bash tool: command JSON escape được unescape trước khi chạy" {
+test "bash tool: command JSON escape unescaped before execution" {
     const alloc = std.testing.allocator;
-    // LLM gửi JSON chuẩn: command chứa quote + backslash-pipe + redirect.
-    // Trước fix: findString trả chuỗi chưa unescape → shell thấy echo \"...\"
-    // → in ra kèm quote literal. Sau fix: in đúng hello world.
     const input = "{\"command\":\"echo \\\"hello world\\\"\"}";
     const res = try executeTool(alloc, main.getIo(), input);
     defer alloc.free(res);
     try std.testing.expectEqualStrings("hello world", std.mem.trim(u8, res, " \n\r\t\""));
 }
 
-/// Chạy lệnh shell và thu thập output.
-/// Dùng thread riêng đọc stderr song song với stdout để tránh deadlock pipe.
-/// Buffer được heap-allocate (128KB mỗi stream).
+/// Run shell command and collect output.
+/// Uses separate thread to read stderr concurrently with stdout to avoid pipe deadlock.
+/// Buffers are heap-allocated (128KB per stream).
 fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: ?[]const u8) ![]u8 {
     const argv = [_][]const u8{ "/bin/sh", "-c", command };
     var child = try std.process.spawn(io, .{
@@ -144,7 +140,6 @@ fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: 
         }
     }
 
-
     // Heap-allocate buffers
     const stdout_buf = try alloc.alloc(u8, MAX_OUTPUT);
     defer alloc.free(stdout_buf);
@@ -154,28 +149,28 @@ fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: 
     var stdolen: usize = 0;
     var stdelen: usize = 0;
 
-    // Spawn thread đọc stderr song song
+    // Spawn thread to read stderr concurrently
     const stderr_thread = if (child.stderr) |err_pipe|
         std.Thread.spawn(.{}, drainStderrThread, .{ io, err_pipe, stderr_buf, &stdelen }) catch null
     else
         null;
 
-    // Main thread đọc stdout
+    // Main thread reads stdout
     if (child.stdout) |out_pipe| {
         stdolen = drainPipe(io, out_pipe, stdout_buf);
     }
 
-    // Chờ stderr thread hoàn tất
+    // Await stderr thread completion
     if (stderr_thread) |t| {
         t.join();
     } else if (child.stderr) |err_pipe| {
-        // Fallback sequential nếu spawn thread thất bại
+        // Fallback sequential if thread spawn fails
         stdelen = drainPipe(io, err_pipe, stderr_buf);
     }
 
-    // Chờ child process kết thúc (sau khi đã drain hết pipe)
+    // Await child process termination after draining pipes
     const term = child.wait(io) catch |e| {
-        return std.fmt.allocPrint(alloc, "Lỗi wait: {s}", .{@errorName(e)});
+        return std.fmt.allocPrint(alloc, "Wait error: {s}", .{@errorName(e)});
     };
 
     const exit_code: u8 = switch (term) {
@@ -186,7 +181,7 @@ fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: 
         else => 1,
     };
 
-    // Build kết quả
+    // Build result
     var result = utils.BufWriter.init(alloc);
     errdefer result.deinit();
     const w = &result;

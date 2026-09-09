@@ -1,12 +1,12 @@
-//! unicode.zig — UTF-8 utilities cho UI: display width, grapheme cluster iteration.
+//! unicode.zig — UTF-8 utilities for UI: display width, grapheme cluster iteration.
 //!
-//! Đáp ứng nhóm 1 (RFC-000): tính chiều rộng hiển thị theo East Asian Width,
-//! lặp theo grapheme cluster (base + combining marks + ZWJ sequences + variation
-//! selectors) để cursor không lệch khi gõ tiếng Việt / emoji.
+//! Addresses group 1 (RFC-000): calculates display width according to East Asian Width,
+//! iterates by grapheme cluster (base + combining marks + ZWJ sequences + variation
+//! selectors) to prevent cursor misalignment when typing multibyte languages / emojis.
 
 const std = @import("std");
 
-/// Số byte UTF-8 của codepoint bắt đầu bởi `b` (1..4). Trả 1 nếu byte không hợp lệ.
+/// UTF-8 byte length of codepoint starting with byte `b` (1..4). Returns 1 if byte is invalid.
 pub fn utf8Len(b: u8) usize {
     return switch (b) {
         0b0000_0000...0b0111_1111 => 1,
@@ -17,7 +17,7 @@ pub fn utf8Len(b: u8) usize {
     };
 }
 
-/// Decode 1 codepoint từ đầu slice. Trả (codepoint, số byte đã tiêu thụ).
+/// Decode 1 codepoint from the beginning of slice. Returns (codepoint, consumed byte count).
 fn decodeAt(s: []const u8) struct { cp: u21, len: usize } {
     if (s.len == 0) return .{ .cp = 0, .len = 0 };
     const n = utf8Len(s[0]);
@@ -26,7 +26,7 @@ fn decodeAt(s: []const u8) struct { cp: u21, len: usize } {
     return .{ .cp = cp, .len = n };
 }
 
-/// Kiểm tra codepoint có phải combining mark (Mn/Me/Mf) — zero-width.
+/// Check if codepoint is a combining mark (Mn/Me/Mf) — zero-width.
 fn isCombining(cp: u21) bool {
     return switch (cp) {
         0x0300...0x036F, // Combining Diacritical Marks
@@ -66,7 +66,7 @@ fn isJoinControl(cp: u21) bool {
     return cp == 0x200C or cp == 0x200D;
 }
 
-/// Kiểm tra codepoint thuộc nhóm emoji (presentation rộng, width 2).
+/// Check if codepoint belongs to emoji group (wide presentation, width 2).
 fn isEmojiWide(cp: u21) bool {
     return switch (cp) {
         0x231A...0x231B, // watch, hourglass
@@ -106,7 +106,7 @@ fn isEmojiWide(cp: u21) bool {
         0x1F0CF,
         0x1F18E,
         0x1F191...0x1F19A,
-        0x1F1E6...0x1F1FF, // regional indicators (cờ)
+        0x1F1E6...0x1F1FF, // regional indicators (flags)
         0x1F201...0x1F202,
         0x1F21A,
         0x1F22F,
@@ -167,7 +167,7 @@ fn isEastAsianWide(cp: u21) bool {
         0xFE30...0xFE6F, // CJK Compatibility Forms, Small Form Variants
         0xFF00...0xFF60, // Fullwidth Forms
         0xFFE0...0xFFE6,
-        0x1F300...0x1F64F, // trùng emoji (width 2)
+        0x1F300...0x1F64F, // emoji overlap (width 2)
         0x1F900...0x1F9FF,
         0x20000...0x2FFFD, // CJK Ext B..
         0x30000...0x3FFFD, => true,
@@ -175,20 +175,20 @@ fn isEastAsianWide(cp: u21) bool {
     };
 }
 
-/// Chiều rộng hiển thị của 1 grapheme cluster (tính từ cluster bắt đầu bằng base cp).
+/// Display width of 1 grapheme cluster (computed from cluster starting with base cp).
 pub fn clusterWidth(base_cp: u21) usize {
     if (base_cp == 0) return 0;
     if (isCombining(base_cp)) return 0;
     if (isJoinControl(base_cp)) return 0;
     if (base_cp == 0x200B) return 0; // ZWSP
     if (isEmojiWide(base_cp) or isEastAsianWide(base_cp)) return 2;
-    // Control chars hiển thị dạng ^X → width 2, nhưng hiếm khi tới đây.
+    // Control chars displayed as ^X → width 2, but rarely reached here.
     if (base_cp < 0x20 or base_cp == 0x7F) return 0;
     return 1;
 }
 
-/// Iterator theo grapheme cluster trong 1 UTF-8 slice.
-/// Cluster = base + các combining mark / ZWJ + cp kế tiếp / variation selector.
+/// Iterator by grapheme cluster in a UTF-8 slice.
+/// Cluster = base + combining marks / ZWJ + next cp / variation selector.
 pub const GraphemeIterator = struct {
     s: []const u8,
     i: usize,
@@ -197,14 +197,14 @@ pub const GraphemeIterator = struct {
         return .{ .s = s, .i = 0 };
     }
 
-    /// Trả về cluster kế tiếp, null khi hết.
+    /// Returns next cluster, null when done.
     pub fn next(self: *GraphemeIterator) ?[]const u8 {
         if (self.i >= self.s.len) return null;
         const start = self.i;
         const d = decodeAt(self.s[self.i..]);
         self.i += d.len;
 
-        // Bổ sung: regional indicator pair (cờ) = 2 RI liền nhau
+        // Regional indicator pair (flags) = 2 consecutive RIs
         if (d.cp >= 0x1F1E6 and d.cp <= 0x1F1FF) {
             if (self.i < self.s.len) {
                 const d2 = decodeAt(self.s[self.i..]);
@@ -220,12 +220,12 @@ pub const GraphemeIterator = struct {
                 continue;
             }
             if (isZWJ(peek.cp)) {
-                // ZWJ + grapheme kế tiếp thuộc cùng cluster
+                // ZWJ + next grapheme belongs to same cluster
                 self.i += peek.len;
                 if (self.i < self.s.len) {
                     const after = decodeAt(self.s[self.i..]);
                     self.i += after.len;
-                    // và các combining theo sau nó
+                    // and combining marks following it
                     continue;
                 }
                 break;
@@ -236,31 +236,31 @@ pub const GraphemeIterator = struct {
     }
 };
 
-/// Chiều rộng hiển thị của cả chuỗi.
+/// Display width of entire string.
 pub fn displayWidth(s: []const u8) usize {
     var w: usize = 0;
     var it = GraphemeIterator.init(s);
     while (it.next()) |cluster| {
         const d = decodeAt(cluster);
-        // VS16 (U+FE0F) trong cluster → emoji presentation, nâng width lên 2 (UAX #11)
+        // VS16 (U+FE0F) in cluster → emoji presentation, promote width to 2 (UAX #11)
         if (containsVS16(cluster[d.len..])) {
             w += 2;
         } else {
             w += clusterWidth(d.cp);
         }
-        // ZWJ sequence: cluster chứa nhiều base nhưng chỉ tính width của base đầu
-        // (đã cộng ở trên) — phần sau ZWJ không cộng thêm.
+        // ZWJ sequence: cluster contains multiple bases but only counts width of first base
+        // (already added above) — portion after ZWJ does not add further width.
     }
     return w;
 }
 
-/// Tính chiều rộng hiển thị thực tế trên terminal, tự động bỏ qua ANSI escape sequences (màu sắc, cursor control...).
+/// Calculate actual display width on terminal, automatically ignoring ANSI escape sequences (colors, cursor control...).
 pub fn visibleWidth(s: []const u8) usize {
     var w: usize = 0;
     var i: usize = 0;
     while (i < s.len) {
         if (s[i] == 0x1b) {
-            // Bỏ qua ANSI sequence: \x1b[...]
+            // Skip ANSI sequence: \x1b[...]
             i += 1;
             if (i < s.len and (s[i] == '[' or s[i] == '(' or s[i] == ')')) {
                 i += 1;
@@ -287,29 +287,29 @@ pub fn visibleWidth(s: []const u8) usize {
     return w;
 }
 
-/// Kiểm tra slice chứa U+FE0F (VS16, mã hoá UTF-8: EF B8 8F).
+/// Check if slice contains U+FE0F (VS16, encoded UTF-8: EF B8 8F).
 fn containsVS16(s: []const u8) bool {
     return std.mem.indexOf(u8, s, "\xEF\xB8\x8F") != null;
 }
 
-/// Số byte của grapheme cluster bắt đầu tại `i` (mở rộng qua combining/ZWJ).
+/// Byte count of grapheme cluster starting at `i` (extended across combining/ZWJ).
 pub fn clusterLenAt(s: []const u8, i: usize) usize {
     var it = GraphemeIterator.init(s[i..]);
     const c = it.next() orelse return 1;
     return c.len;
 }
 
-/// Kiểm tra codepoint có thuộc về phần "nối tiếp" của grapheme cluster đứng trước
+/// Check if codepoint belongs to the continuation portion of preceding grapheme cluster
 /// (combining mark, join control ZWJ/ZWNJ, variation selector, skin tone modifier).
-/// Dùng khi lùi cursor qua cluster: gặp cp này phải lùi tiếp về trái.
+/// Used when backspacing cursor across cluster: encountering this cp requires continuing leftward.
 pub fn isContinuationCp(cp: u21) bool {
     if (isCombining(cp)) return true;
     if (isJoinControl(cp)) return true;
-    if (cp == 0x200B) return true; // ZWSP bám cluster trước
+    if (cp == 0x200B) return true; // ZWSP attaches to preceding cluster
     return false;
 }
 
-/// Lớp ký tự dùng cho word motion.
+/// Character class used for word motion.
 pub const CharClass = enum { space, word, punct };
 
 pub fn charClass(cp: u21) CharClass {
@@ -322,7 +322,7 @@ fn isWordChar(cp: u21) bool {
     if (cp < 0x80) {
         return (cp >= 'a' and cp <= 'z') or (cp >= 'A' and cp <= 'Z') or (cp >= '0' and cp <= '9') or cp == '_';
     }
-    // Latin Extended, Greek, Cyrillic, CJK... coi là word
+    // Latin Extended, Greek, Cyrillic, CJK... considered words
     return switch (cp) {
         0xC0...0x24F, // Latin Extended
         0x0370...0x03FF, // Greek
@@ -339,7 +339,7 @@ test "displayWidth ASCII" {
 }
 
 test "displayWidth Vietnamese" {
-    // "tết" = 3 grapheme (t, ế, t), mỗi cái width 1 → 3
+    // "tết" = 3 graphemes (t, ế, t), each with width 1 → 3
     try std.testing.expectEqual(@as(usize, 3), displayWidth("t\u{1EBF}t"));
 }
 
@@ -368,12 +368,12 @@ test "displayWidth flag emoji" {
 }
 
 test "displayWidth emoji ZWJ family" {
-    // family emoji = 4 người nối bằng ZWJ → width 2 (1 cluster)
+    // family emoji = 4 people joined by ZWJ → width 2 (1 cluster)
     try std.testing.expectEqual(@as(usize, 2), displayWidth("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"));
 }
 
 test "grapheme count Vietnamese" {
-    // "tết" — ế có thể là 1 codepoint precomposed hoặc e + marks
+    // "tết" — ế can be 1 precomposed codepoint or e + marks
     const s1 = "t\u{1EBF}t";
     var it1 = GraphemeIterator.init(s1);
     var n: usize = 0;

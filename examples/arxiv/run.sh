@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # run.sh — Arxiv Paper Aggregator Agent
 #
-# Cách dùng:
+# Usage:
 #   ./run.sh
 #   ./run.sh --max-results 30
 #   ./run.sh --output /path/to/file.md
 #
-# Biến môi trường:
+# Environment variables:
 #   OPENAI_COMPAT_URL
 #   MINI_BIN
 
@@ -77,20 +77,20 @@ OUTPUT_PATH="${OUTPUT_PATH:-$SKILL_DIR/arxiv_${DATE}.md}"
 
 TMP_PROMPT=$(mktemp)
 cat << PROMPT > "$TMP_PROMPT"
-Mục tiêu của bạn hôm nay là tạo Bản tin Khoa học Máy tính (Computer Science) Mới nhất từ arXiv.
+Your goal today is to generate the latest Computer Science Research Digest from arXiv.
 
-**Cấu hình thực thi:**
-- Số lượng paper tối đa: ${ARXIV_COUNT}
-- Đường dẫn lưu file: ${OUTPUT_PATH}
+**Execution Configuration:**
+- Maximum papers: ${ARXIV_COUNT}
+- Output file path: ${OUTPUT_PATH}
 
-**Các việc phải làm:**
-1. Lấy thông tin ngày giờ hôm nay.
-2. Từ API của arXiv, fetch ${ARXIV_COUNT} bài báo thuộc mảng Computer Science mới nhất. 
+**Tasks to perform:**
+1. Get today's date and time.
+2. From the arXiv API, fetch the latest ${ARXIV_COUNT} papers in Computer Science.
    URL: http://export.arxiv.org/api/query?search_query=cat:cs.AI+OR+cat:cs.LG+OR+cat:cs.CL+OR+cat:cs.CV&sortBy=submittedDate&sortOrder=descending&max_results=${ARXIV_COUNT}
-3. Dùng Python đọc XML và xuất ra JSON/Text cho Agent nếu dễ xử lý, hoặc bạn có lệnh bash/grep siêu đẳng cũng được. Khuyên dùng Python.
-4. Lựa chọn, phân tích abstract của từng paper và dịch chúng ra ngôn ngữ bình dân cho anh em kỹ sư phần mềm.
-5. Lưu bản tin vào file báo cáo ${OUTPUT_PATH} thông qua công cụ file_write.
-6. Kết thúc với 1 thông báo ngắn gọn chứa file_write là thành công.
+3. Use Python to parse the XML and output JSON/Text for easier agent processing.
+4. Select and analyze the abstract of each paper and summarize them clearly for software engineers.
+5. Save the digest into the report file ${OUTPUT_PATH} using the file_write tool.
+6. Finish with a brief completion message confirming file_write succeeded.
 PROMPT
 
 echo "=========================================="
@@ -109,13 +109,14 @@ STATUS=$?
 echo ""
 if [[ $STATUS -eq 0 ]]; then
     if [[ -f "$OUTPUT_PATH" ]]; then
-        echo "[arxiv] ✓ Hoàn thành! File báo cáo: $OUTPUT_PATH"
+        echo "[arxiv] ✓ Completed! Report file: $OUTPUT_PATH"
     else
-        echo "[arxiv] ✓ Agent xử lý xong nhưng không tìm thấy file."
+        echo "[arxiv] ✓ Agent finished but output file not found."
     fi
 else
-    echo "[arxiv] ✗ Có lỗi xảy ra trong quá trình chạy (exit code $STATUS)." >&2
+    echo "[arxiv] ✗ An error occurred during execution (exit code $STATUS)." >&2
 fi
 
 rm -f "$TMP_PROMPT"
 exit $STATUS
+

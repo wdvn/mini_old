@@ -1,25 +1,25 @@
-//! agent.zig — AgentLoop: vòng lặp chính của mini-agent.
+//! agent.zig — AgentLoop: main loop of mini-agent.
 //!
-//! AgentLoop xử lý một user input qua nhiều iterations cho đến khi
-//! AI trả về `end_turn` (không còn muốn gọi tool).
+//! AgentLoop processes user input across multiple iterations until
+//! the AI returns `end_turn` (no further tool calls requested).
 //!
-//! ## Luồng một iteration
+//! ## Iteration Flow
 //! ```
-//! user_text → history.addUser()
-//!           → sendToBackend(system, history, tools)  ← streaming
-//!           → response.stop_reason == .tool_use?
-//!               YES → executeTools() → history.addToolResults() → tiếp tục
-//!               NO  → kết thúc, trả về
+//! user_text -> history.addUser()
+//!           -> sendToBackend(system, history, tools)  <- streaming
+//!           -> response.stop_reason == .tool_use?
+//!               YES -> executeTools() -> history.addToolResults() -> continue
+//!               NO  -> finish, return
 //! ```
 //!
 //! ## Backends
-//! Agent ưu tiên backend theo thứ tự:
-//!   1. OpenAI-compatible (nếu có OPENAI_COMPAT_URL)
-//!   2. Claude (nếu có ANTHROPIC_API_KEY)
-//!   3. Ollama (fallback local)
+//! Agent prioritizes backends in the following order:
+//!   1. OpenAI-compatible (if OPENAI_COMPAT_URL is set)
+//!   2. Claude (if ANTHROPIC_API_KEY is set)
+//!   3. Ollama (local fallback)
 //!
 //! ## Fallback
-//! Nếu primary backend lỗi, agent thử các backend còn lại.
+//! If primary backend fails, agent attempts remaining backends.
 //!
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -55,24 +55,24 @@ fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
     return null;
 }
 
-/// Số lần retry tối đa khi gặp rate limit.
+/// Maximum retries on rate limit.
 const MAX_RATE_LIMIT_RETRIES = 12;
-/// Thời gian chờ ban đầu khi gặp rate limit (giây).
+/// Initial delay on rate limit (seconds).
 const RATE_LIMIT_BASE_DELAY_S: u64 = 5;
-/// Cap thời gian backoff tối đa khi gặp rate limit (giây).
+/// Maximum backoff cap on rate limit (seconds).
 const RATE_LIMIT_MAX_BACKOFF_S: u64 = 120;
 
 // ---------------------------------------------------------------------------
 // Backend union
 // ---------------------------------------------------------------------------
 
-/// Backend AI đang sử dụng.
+/// Active AI backend.
 pub const Backend = union(enum) {
     openai: openai_mod.Client,
     claude: claude_mod.Client,
     ollama: ollama_mod.Client,
 
-    /// Tên hiển thị của backend.
+    /// Display name of backend.
     pub fn name(self: Backend) []const u8 {
         return switch (self) {
             .openai => "openai-compat",
@@ -81,7 +81,7 @@ pub const Backend = union(enum) {
         };
     }
 
-    /// Tên model đang dùng.
+    /// Model name in use.
     pub fn model(self: Backend) []const u8 {
         return switch (self) {
             .openai => |c| c.model,
@@ -90,18 +90,18 @@ pub const Backend = union(enum) {
         };
     }
 
-    /// Vệ sinh history theo yêu cầu định dạng của backend (dispatch thay vì
-    /// if-else rải rác trong agent loop).
+    /// Sanitizes history according to backend formatting requirements (dispatches instead of
+    /// scattering if-else throughout agent loop).
     fn sanitizeHistory(self: *Backend, hist: *history_mod.History) bool {
         return switch (self.*) {
             .openai => hist.ensureOpenAICompatible(),
             .claude => hist.ensureClaudeCompatible(),
-            // Ollama dùng định dạng OpenAI-compatible.
+            // Ollama uses OpenAI-compatible format.
             .ollama => hist.ensureOpenAICompatible(),
         };
     }
 
-    /// Gửi message đến backend. Trả về Response đầy đủ.
+    /// Sends message to backend. Returns complete Response.
     fn send(
         self: *Backend,
         system_prompt: []const u8,
@@ -122,41 +122,41 @@ pub const Backend = union(enum) {
 // AgentLoop
 // ---------------------------------------------------------------------------
 
-/// Vòng lặp agent chính.
+/// Main agent loop.
 pub const AgentLoop = struct {
     alloc: Allocator,
     io: std.Io,
-    /// Backend đang sử dụng.
+    /// Backend currently in use.
     backend: Backend,
-    /// Lịch sử hội thoại.
+    /// Conversation history.
     history: history_mod.History,
-    /// Config đã load.
+    /// Loaded configuration.
     config: *const config_mod.Config,
     /// CodeAct embedded engine.
     engine: *quickjs.Engine,
-    /// Đếm số lần tự sửa lỗi JavaScript liên tiếp.
+    /// Consecutive JavaScript error self-correction counter.
     js_retry_count: usize = 0,
-    /// Đếm số lần sửa lỗi role/first-message (Claude 400) trong turn.
+    /// Count of role/first-message fix attempts (Claude 400) in current turn.
     role_fix_attempts: usize = 0,
-    /// Đếm số lần liên tiếp response bị cắt do max_tokens trong turn.
+    /// Consecutive response continuations due to max_tokens in current turn.
     max_tokens_continues: usize = 0,
-    /// Trình ước lượng token (MemAct).
+    /// Token estimator (MemAct).
     token_estimator: tokens_mod.TokenEstimator,
     /// Content-Addressed Storage (RFC-002).
     cas: cas_mod.CAS,
-    /// Act Journal (RFC-002). Null nếu chưa processInput.
+    /// Act Journal (RFC-002). Null if processInput has not run.
     journal: ?journal_mod.ActJournal = null,
     /// Act Logger (Session Replay & Diagnostics).
     act_logger: ?act_logger_mod.ActLogger = null,
-    /// Snapshot tracker (RFC-002/ISSUE-CODEACT-001 M4) — track mini.write/patch/sh.
+    /// Snapshot tracker (RFC-002/ISSUE-CODEACT-001 M4) — tracks mini.write/patch/sh.
     snapshot_tracker: ?snapshot_mod.SnapshotTracker = null,
-    /// HTTP code của lỗi backend gần nhất (đưa vào journal ErrorDetail).
+    /// HTTP code of latest backend error (for journal ErrorDetail).
     last_backend_http_code: u32 = 0,
-    /// Raw body lỗi backend gần nhất (bản dupe, agent sở hữu — đưa vào journal).
+    /// Raw body of latest backend error (duped, owned by agent — for journal).
     last_backend_raw_error: ?[]u8 = null,
-    /// Số act đã chạy trong turn gần nhất.
+    /// Number of acts executed in the last turn.
     last_turn_acts: usize = 0,
-    /// Số token completion đã nhận trong turn gần nhất.
+    /// Completion tokens received in the last turn.
     last_turn_completion_tokens: usize = 0,
 
     pub const Error = error{
@@ -170,14 +170,14 @@ pub const AgentLoop = struct {
         UserCancelled,
     };
 
-    /// Khởi tạo AgentLoop từ config.
-    /// Chọn backend dựa trên config theo thứ tự ưu tiên.
+    /// Initializes AgentLoop from config.
+    /// Selects backend based on config priority order.
     pub fn init(alloc: Allocator, io: std.Io, config: *const config_mod.Config) !AgentLoop {
-        // Khởi tạo CodeAct engine (Engine.init tự động gọi registerBindings qua resetContext)
+        // Initialize CodeAct engine (Engine.init automatically registers bindings via resetContext)
         const engine = try quickjs.Engine.init(alloc, io);
         errdefer engine.deinit();
 
-        // Chọn backend theo thứ tự ưu tiên
+        // Select backend in priority order
         const backend: Backend = blk: {
             if (config.openai_compat_url) |url| {
                 if (!utils.isSubagent()) main.stderrPrint("[agent] Backend: OpenAI-compat @ {s} ({s})\n", .{ url, config.openai_compat_model });
@@ -215,7 +215,7 @@ pub const AgentLoop = struct {
             ) };
         };
 
-        // Thiết lập tool policy
+        // Configure tool policy
         tools_mod.setPolicy(config.tool_allowlist, config.tool_blocklist);
 
         var path_buf: [256]u8 = undefined;
@@ -242,7 +242,7 @@ pub const AgentLoop = struct {
         };
     }
 
-    /// Giải phóng bộ nhớ.
+    /// Releases memory.
     pub fn deinit(self: *AgentLoop) void {
         if (self.snapshot_tracker) |*t| {
             snapshot_mod.setTracker(null);
@@ -257,8 +257,8 @@ pub const AgentLoop = struct {
         if (self.last_backend_raw_error) |raw| self.alloc.free(raw);
     }
 
-    /// Lưu ngữ cảnh lỗi backend gần nhất để journal recordError dùng sau đó.
-    /// Dupe raw (response bị deinit trước khi error bubble lên processInput).
+    /// Saves the latest backend error context for subsequent journal recordError.
+    /// Dupes raw response (since response is deinitialized before error bubbles up to processInput).
     fn setLastErrorContext(self: *AgentLoop, http_code: u32, raw: ?[]const u8) void {
         self.last_backend_http_code = http_code;
         if (self.last_backend_raw_error) |old| self.alloc.free(old);
@@ -268,7 +268,7 @@ pub const AgentLoop = struct {
         }
     }
 
-    /// In đầy đủ nội dung raw error response trả về từ AI backend (nếu có) thông qua TurnRenderer.
+    /// Prints full raw error response content from AI backend (if any) via TurnRenderer.
     pub fn printRawBackendResponse(raw_opt: ?[]const u8, http_code: u32) void {
         if (main.ui_repl.current_renderer) |r| {
             r.showBackendError(http_code, raw_opt);
@@ -278,8 +278,8 @@ pub const AgentLoop = struct {
         }
     }
 
-    /// Đếm ngược thời gian chờ retry inplace trên cùng một dòng (kèm Braille spinner) thông qua TurnRenderer.
-    /// Hỗ trợ ngắt ngay lập tức khi nhận Ctrl+C.
+    /// In-place countdown timer for retries on the same line (with Braille spinner) via TurnRenderer.
+    /// Supports immediate interruption upon receiving Ctrl+C.
     pub fn waitWithInplaceCountdown(self: *AgentLoop, backoff_s: u64, attempt: usize, max_attempts: usize) !void {
         if (main.ui_repl.current_renderer) |r| {
             try r.waitRetryCountdown(self.io, backoff_s, attempt, max_attempts);
@@ -367,20 +367,20 @@ pub const AgentLoop = struct {
 
         if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
             if (act_id > 1) {
-                main.stderrPrint("\x1b[90m[agent] --- Vòng lặp {d} ---\x1b[0m\n", .{act_id});
+                main.stderrPrint("\x1b[90m[agent] --- Loop {d} ---\x1b[0m\n", .{act_id});
             } else {
-                main.stderrPrint("\n\x1b[90m[agent] --- Bắt đầu quy trình ---\x1b[0m\n", .{});
+                main.stderrPrint("\n\x1b[90m[agent] --- Starting workflow ---\x1b[0m\n", .{});
             }
-            main.stderrPrint("\x1b[36m[agent]\x1b[0m \x1b[93mĐang suy nghĩ / Phân tích yêu cầu... \x1b[0m\n", .{});
+            main.stderrPrint("\x1b[36m[agent]\x1b[0m \x1b[93mThinking / Analyzing request... \x1b[0m\n", .{});
         }
 
-        // Vệ sinh history theo yêu cầu định dạng của backend.
+        // Sanitize history according to backend formatting requirements.
         _ = self.backend.sanitizeHistory(&self.history);
 
         const input_msgs_count = self.history.len();
         const input_msgs = self.history.messages()[0..input_msgs_count];
 
-        // Gửi lên AI backend (streaming)
+        // Send to AI backend (streaming)
         var response = try self.sendToBackend(
             act_id,
             self.config.system_prompt,
@@ -397,18 +397,18 @@ pub const AgentLoop = struct {
         
         defer response.deinit();
 
-        // Xuống dòng sau khi stream xong
+        // Newline after stream finishes
         if (main.ui_repl.current_renderer == null) {
             try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
         }
 
-        // Thêm response vào history (nếu có nội dung)
+        // Append response to history (if has content)
         _ = try self.history.addAssistantResponse(&response);
 
-        // Lấy lại slice an toàn sau khi history có thể đã reallocate
+        // Retrieve safe slice after history may have reallocated
         const valid_input_msgs = self.history.messages()[0..input_msgs_count];
 
-        // Tích luỹ token completion
+        // Accumulate completion tokens
         for (response.content.items) |block| {
             switch (block) {
                 .text => |t| self.last_turn_completion_tokens += self.token_estimator.estimate(t),
@@ -418,7 +418,7 @@ pub const AgentLoop = struct {
             }
         }
 
-        // 1. Native Tool Calling: nếu model gọi tool qua stop_reason .tool_use hoặc có tool_use blocks
+        // 1. Native Tool Calling: if model calls tool via stop_reason .tool_use or has tool_use blocks
         var has_tool_use_blocks = false;
         for (response.content.items) |block| {
             if (block == .tool_use) {
@@ -434,7 +434,7 @@ pub const AgentLoop = struct {
             return .continue_loop;
         }
 
-        // 2. CodeAct: Kiểm tra có khối mã JavaScript trong response không
+        // 2. CodeAct: Check if JavaScript code block is present in response
         if (self.config.execution_mode != .tools) {
             if (findJsCodeInResponse(self.alloc, &response)) |js_code| {
                 defer self.alloc.free(js_code);
@@ -546,25 +546,25 @@ pub const AgentLoop = struct {
             .end_turn, .stop_sequence => {
                 self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "none" });
                 if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
-                    main.stderrPrint("\n\x1b[92m[agent] ✓ Hoàn thành sau {d} vòng lặp.\x1b[0m\n", .{act_id});
+                    main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
                 }
                 return .exit_loop;
             },
             .max_tokens => {
                 self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "max_tokens" });
-                // Response bị cắt giữa chừng. KHÔNG exit — chèn observation
-                // yêu cầu model tiếp tục đúng từ chỗ dừng (không lặp lại phần đã
-                // viết) để hoàn thành khối đang dở (JS block / tool_use / văn bản).
+                // Response truncated mid-stream. DO NOT exit — insert observation
+                // requesting model to continue EXACTLY from where it stopped (without repeating
+                // already output content) to finish the incomplete block (JS block / tool_use / text).
                 self.max_tokens_continues += 1;
                 if (self.max_tokens_continues > 5) {
-                    main.stderrPrint("\n\x1b[31m[agent] ⛔ Đã tiếp tục max_tokens {d} lần liên tiếp mà chưa hoàn thành. Dừng để tránh lặp vô hạn.\x1b[0m\n", .{self.max_tokens_continues});
+                    main.stderrPrint("\n\x1b[31m[agent] ⛔ Continued max_tokens {d} consecutive times without completion. Stopping to prevent infinite loop.\x1b[0m\n", .{self.max_tokens_continues});
                     return .exit_loop;
                 }
-                main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response bị cắt (max_tokens), yêu cầu tiếp tục (lần {d}/5)...\x1b[0m\n", .{self.max_tokens_continues});
+                main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response truncated (max_tokens), requesting continuation ({d}/5)...\x1b[0m\n", .{self.max_tokens_continues});
                 var buf = utils.BufWriter.init(self.alloc);
                 defer buf.deinit();
                 try buf.print(
-                    "[System] Phản hồi vừa rồi bị cắt do đạt giới hạn max_tokens (lần {d}). Hãy tiếp tục ĐÚNG từ chỗ dừng — không lặp lại phần đã viết, không giới thiệu lại. Nếu khối ```js ... ``` hoặc tool call đang dở dang, viết tiếp phần còn lại để hoàn thành.",
+                    "[System] The previous response was truncated due to reaching the max_tokens limit (attempt {d}). Please continue EXACTLY from where it stopped — do not repeat already written content, do not re-introduce. If a ```js ... ``` block or tool call was in progress, complete the remainder.",
                     .{self.max_tokens_continues},
                 );
                 try self.history.addUser(buf.list.items);
@@ -582,8 +582,8 @@ pub const AgentLoop = struct {
                     .is_error = true,
                     .error_message = response.raw_debug_info,
                 });
-                // Phân loại lỗi HTTP. Capture ngữ cảnh trước để error bubble lên
-                // processInput vẫn ghi đủ journal (response bị deinit trên đường).
+                // Classify HTTP errors. Capture context beforehand so error bubbling up to
+                // processInput still records full journal (response is deinitialized en route).
                 if (response.http_code >= 400) {
                     self.setLastErrorContext(response.http_code, response.raw_debug_info);
                 }
@@ -614,28 +614,28 @@ pub const AgentLoop = struct {
                     if (std.mem.indexOf(u8, raw, "rate_limit") != null) return error.LLMRateLimitExceeded;
                 }
 
-                // Detect lỗi role/first-message: Claude từ chối do thứ tự role
-                // (ví dụ first message không phải user, hoặc role không hợp lệ).
+                // Detect role/first-message error: Claude rejects due to role ordering
+                // (e.g. first message not user, or invalid role).
                 if (response.http_code == 400) {
                     if (response.raw_debug_info) |raw| {
                         const has_first_msg = std.mem.indexOf(u8, raw, "first message") != null;
                         const has_role_and_assistant = std.mem.indexOf(u8, raw, "role") != null and
                             std.mem.indexOf(u8, raw, "assistant") != null;
                         if (has_first_msg or has_role_and_assistant) {
-                            main.stderrPrint("\n\x1b[33m[agent] Claude từ chối do thứ tự role (HTTP 400). Đang sửa history...\x1b[0m\n", .{});
+                            main.stderrPrint("\n\x1b[33m[agent] Claude rejected due to role ordering (HTTP 400). Fixing history...\x1b[0m\n", .{});
                             _ = self.history.ensureClaudeCompatible();
                             if (self.role_fix_attempts < 2) {
                                 self.role_fix_attempts += 1;
-                                // Retry executeStep với history đã sửa, không đi qua nhánh error/retry-truncate
+                                // Retry executeStep with fixed history, bypass error/retry-truncate branch
                                 return .continue_loop;
                             }
-                            // Vượt số lần cho phép — rơi xuống error như cũ
+                            // Exceeded allowed attempts — fall through to standard error
                         }
 
                         const has_orphan_tool = std.mem.indexOf(u8, raw, "No tool call found for function call output") != null or
                             std.mem.indexOf(u8, raw, "tool_call_id") != null;
                         if (has_orphan_tool) {
-                            main.stderrPrint("\n\x1b[33m[agent] OpenAI từ chối do orphan tool_result (HTTP 400). Đang sửa history...\x1b[0m\n", .{});
+                            main.stderrPrint("\n\x1b[33m[agent] OpenAI rejected due to orphan tool_result (HTTP 400). Fixing history...\x1b[0m\n", .{});
                             _ = self.history.ensureOpenAICompatible();
                             if (self.role_fix_attempts < 2) {
                                 self.role_fix_attempts += 1;
@@ -650,9 +650,9 @@ pub const AgentLoop = struct {
                     if (r.is_thinking) r.endThinking();
                     r.ensureNewline();
                 }
-                main.stderrPrint("[agent] Cảnh báo: stop_reason không xác định (HTTP {d})\n", .{response.http_code});
+                main.stderrPrint("[agent] Warning: unknown stop_reason (HTTP {d})\n", .{response.http_code});
                 printRawBackendResponse(response.raw_debug_info, response.http_code);
-                // Đảm bảo ngữ cảnh đã capture (HTTP < 400 nhưng response rác)
+                // Ensure context captured (HTTP < 400 but malformed response)
                 self.setLastErrorContext(response.http_code, response.raw_debug_info);
                 return error.UnknownStopReason;
             },
@@ -660,20 +660,20 @@ pub const AgentLoop = struct {
     }
 
 
-    /// Xử lý input của user qua agentic loop.
-    /// `text_cb`: được gọi với mỗi text chunk khi AI đang stream.
+    /// Processes user input through agentic loop.
+    /// `text_cb`: invoked with each text chunk as AI streams.
     pub fn processInput(
         self: *AgentLoop,
         user_text: []const u8,
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !void {
-        // Cấp phát ArenaAllocator riêng cho từng lượt xử lý (turn-scoped memory)
+        // Allocate turn-scoped ArenaAllocator for memory cleanup
         var turn_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer turn_arena.deinit();
         const turn_alloc = turn_arena.allocator();
 
-        // Phát pre-prompt hook
+        // Dispatch pre-prompt hook
         hooks_mod.dispatch(turn_alloc, self.io, .{
             .event = "pre-prompt",
             .user_prompt = user_text,
@@ -685,21 +685,21 @@ pub const AgentLoop = struct {
             });
         }
 
-        // Thêm user message vào history
+        // Append user message to history
         try self.history.addUser(user_text);
 
         // Reset turn metrics
         self.last_turn_acts = 0;
         self.last_turn_completion_tokens = 0;
 
-        // Reset bộ đếm retry sửa lỗi role cho turn mới
+        // Reset role fix retry counter for new turn
         self.role_fix_attempts = 0;
-        // Reset bộ đếm continue-max_tokens cho turn mới
+        // Reset continue-max_tokens counter for new turn
         self.max_tokens_continues = 0;
 
-        // Lấy danh sách tools phù hợp với user message dựa trên execution_mode
+        // Retrieve relevant tool definitions for user message based on execution_mode
         const tool_defs = switch (self.config.execution_mode) {
-            .codeact => &[_]proto.ToolDefinition{}, // Tắt 100% mảng tools gửi lên API khi ở mode codeact để ép LLM viết JS CodeAct
+            .codeact => &[_]proto.ToolDefinition{}, // Disable 100% of tools sent to API in codeact mode to force LLM to write CodeAct JS
             .tools => blk: {
                 const all_defs = tools_mod.getRelevantDefinitions(turn_alloc, user_text);
                 var list = std.ArrayListUnmanaged(proto.ToolDefinition).empty;
@@ -721,7 +721,7 @@ pub const AgentLoop = struct {
             self.journal = journal_mod.ActJournal.init(self.alloc, self.io, journal_path) catch null;
         }
 
-        // ISSUE-CODEACT-001 M4: snapshot tracker dùng chung CAS, global cho mini.* bindings
+        // ISSUE-CODEACT-001 M4: shared CAS snapshot tracker, global for mini.* bindings
         if (self.snapshot_tracker == null) {
             self.snapshot_tracker = snapshot_mod.SnapshotTracker.init(self.alloc, self.io, &self.cas, if (self.journal != null) &self.journal.? else null);
             snapshot_mod.setTracker(if (self.snapshot_tracker != null) &self.snapshot_tracker.? else null);
@@ -731,13 +731,13 @@ pub const AgentLoop = struct {
         var rate_limit_retries: usize = 0;
         const max_retries = 3;
 
-        // Không giới hạn số act — model tự quyết định khi nào dừng (exit_loop).
+        // Unbounded acts — model decides when to stop (exit_loop).
         while (true) : (act_id += 1) {
             self.last_turn_acts = act_id;
             var try_count: usize = 0;
 
             while (try_count <= max_retries) : (try_count += 1) {
-                if (self.journal) |*j| j.recordEvent(self.io, act_id, .act_started, "Bắt đầu Act") catch {};
+                if (self.journal) |*j| j.recordEvent(self.io, act_id, .act_started, "Act started") catch {};
 
                 const history_len = self.history.messages().len;
 
@@ -749,12 +749,12 @@ pub const AgentLoop = struct {
                                 if (r.is_thinking) r.endThinking();
                                 r.clearInplaceLine();
                                 r.ensureNewline();
-                                r.write(" \x1b[33m[Đã dừng bởi người dùng (Ctrl+C)]\x1b[0m\n");
+                                r.write(" \x1b[33m[Stopped by user (Ctrl+C)]\x1b[0m\n");
                             } else {
-                                main.stderrPrint("\n\x1b[33m[Đã dừng bởi người dùng (Ctrl+C)]\x1b[0m\n", .{});
+                                main.stderrPrint("\n\x1b[33m[Stopped by user (Ctrl+C)]\x1b[0m\n", .{});
                             }
                             if (self.journal) |*j| {
-                                j.recordEvent(self.io, act_id, .task_interrupted, "Người dùng đã dừng tác vụ (Ctrl+C)") catch {};
+                                j.recordEvent(self.io, act_id, .task_interrupted, "Task cancelled by user (Ctrl+C)") catch {};
                             }
                             return;
                         },
@@ -764,8 +764,8 @@ pub const AgentLoop = struct {
                             } else {
                                 printRawBackendResponse(self.last_backend_raw_error, self.last_backend_http_code);
                             }
-                            main.stderrPrint("\n\x1b[31m[agent] ⛔ Lỗi xác thực/quyền truy cập backend (HTTP {d})! Vui lòng kiểm tra API key hoặc tài khoản.\x1b[0m\n", .{self.last_backend_http_code});
-                            if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Lỗi xác thực/quyền backend — abort", .{
+                            main.stderrPrint("\n\x1b[31m[agent] ⛔ Backend authentication/permission error (HTTP {d})! Please check API key or account.\x1b[0m\n", .{self.last_backend_http_code});
+                            if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Backend authentication/permission error — abort", .{
                                 .backend = self.backend.name(),
                                 .model = self.backend.model(),
                                 .error_name = @errorName(e),
@@ -782,17 +782,17 @@ pub const AgentLoop = struct {
                                 printRawBackendResponse(self.last_backend_raw_error, self.last_backend_http_code);
                             }
 
-                            // Journal: đủ ngữ cảnh debug — backend, model, error name,
-                            // HTTP code (classify từ response), lần thử, raw body server.
+                            // Journal: sufficient debug context — backend, model, error name,
+                            // HTTP code (classified from response), attempt, raw server body.
                             if (self.journal) |*j| {
                                 const ev_type: journal_mod.ActEventType = if (e == error.LLMRateLimitExceeded)
                                     .llm_call_throttled
                                 else
                                     .llm_provider_error;
                                 const desc = if (e == error.LLMRateLimitExceeded)
-                                    "Rate limit (429) từ backend"
+                                    "Rate limit (429) from backend"
                                 else
-                                    "Backend lỗi (5xx / provider unavailable)";
+                                    "Backend error (5xx / provider unavailable)";
                                 j.recordError(self.io, act_id, ev_type, desc, .{
                                     .backend = self.backend.name(),
                                     .model = self.backend.model(),
@@ -808,8 +808,8 @@ pub const AgentLoop = struct {
                                 if (main.ui_repl.current_renderer) |r| {
                                     r.clearInplaceLine();
                                 }
-                                main.stderrPrint("\n\x1b[31m[agent] ⛔ Đã thử lại {d} lần nhưng backend vẫn báo lỗi rate limit / 503. Dừng tác vụ.\x1b[0m\n", .{MAX_RATE_LIMIT_RETRIES});
-                                return e; // Giới hạn retry
+                                main.stderrPrint("\n\x1b[31m[agent] ⛔ Retried {d} times but backend still reported rate limit / 503 error. Terminating task.\x1b[0m\n", .{MAX_RATE_LIMIT_RETRIES});
+                                return e; // Retry limit exceeded
                             }
 
                             const raw_backoff: u64 = (@as(u64, 1) << @as(u6, @intCast(rate_limit_retries))) * 2;
@@ -818,7 +818,7 @@ pub const AgentLoop = struct {
                             if (main.ui_repl.current_renderer) |r| {
                                 try r.waitRetryCountdown(self.io, backoff_s, rate_limit_retries, MAX_RATE_LIMIT_RETRIES);
                             } else {
-                                main.stderrPrint("[agent] ⚠ Rate limit / 503 (lần {d}/{d})! Thử lại sau {d}s...\n", .{ rate_limit_retries, MAX_RATE_LIMIT_RETRIES, backoff_s });
+                                main.stderrPrint("[agent] ⚠ Rate limit / 503 (attempt {d}/{d})! Retrying in {d}s...\n", .{ rate_limit_retries, MAX_RATE_LIMIT_RETRIES, backoff_s });
                                 std.Io.sleep(self.io, std.Io.Duration.fromSeconds(@intCast(backoff_s)), .awake) catch {};
                             }
 
@@ -835,8 +835,8 @@ pub const AgentLoop = struct {
                                 printRawBackendResponse(self.last_backend_raw_error, self.last_backend_http_code);
                             }
                             if (try_count >= max_retries) {
-                                main.stderrPrint("\n\x1b[31m[agent] ⛔ Không thể nén ngữ cảnh thêm sau {d} lần thử. Ngắt tiến trình: {s}\x1b[0m\n", .{ max_retries + 1, @errorName(e) });
-                                if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Quá tải context không thể nén thêm — abort", .{
+                                main.stderrPrint("\n\x1b[31m[agent] ⛔ Cannot compact context further after {d} attempts. Terminating process: {s}\x1b[0m\n", .{ max_retries + 1, @errorName(e) });
+                                if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Context overflow cannot be compacted further — abort", .{
                                     .backend = self.backend.name(),
                                     .model = self.backend.model(),
                                     .error_name = @errorName(e),
@@ -847,8 +847,8 @@ pub const AgentLoop = struct {
                                 return e;
                             }
 
-                            main.stderrPrint("\n\x1b[33m[agent] ⚠️ Model báo vượt quá context limit (HTTP 400)! Đang nén MemAct khẩn cấp (lần {d}/{d})...\x1b[0m\n", .{ try_count + 1, max_retries + 1 });
-                            if (self.journal) |*j| j.recordError(self.io, act_id, .llm_context_overflow, "Model báo quá tải context — nén MemAct khẩn cấp", .{
+                            main.stderrPrint("\n\x1b[33m[agent] ⚠️ Model reported exceeding context limit (HTTP 400)! Performing emergency MemAct compaction (attempt {d}/{d})...\x1b[0m\n", .{ try_count + 1, max_retries + 1 });
+                            if (self.journal) |*j| j.recordError(self.io, act_id, .llm_context_overflow, "Model reported context overflow — emergency MemAct compaction", .{
                                 .backend = self.backend.name(),
                                 .model = self.backend.model(),
                                 .error_name = @errorName(e),
@@ -880,8 +880,8 @@ pub const AgentLoop = struct {
                                 r.ensureNewline();
                             }
                             if (try_count == max_retries) {
-                                main.stderrPrint("\n[agent] Act {d} lỗi liên tiếp {d} lần. Ngắt tiến trình: {s}\n", .{ act_id, max_retries + 1, @errorName(e) });
-                                if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Act lỗi terminal — abort", .{
+                                main.stderrPrint("\n[agent] Act {d} failed {d} consecutive times. Terminating process: {s}\n", .{ act_id, max_retries + 1, @errorName(e) });
+                                if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Act terminal error — abort", .{
                                     .backend = self.backend.name(),
                                     .model = self.backend.model(),
                                     .error_name = @errorName(e),
@@ -896,9 +896,9 @@ pub const AgentLoop = struct {
                                 return e;
                             }
 
-                            main.stderrPrint("\n[agent] Act {d} gặp sự cố ({s}). Rollback (lần {d}/{d})...\n", .{ act_id, @errorName(e), try_count + 1, max_retries });
+                            main.stderrPrint("\n[agent] Act {d} encountered an issue ({s}). Rolling back (attempt {d}/{d})...\n", .{ act_id, @errorName(e), try_count + 1, max_retries });
                             
-                            if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Act lỗi — rollback & retry", .{
+                            if (self.journal) |*j| j.recordError(self.io, act_id, .act_failed, "Act error — rollback & retry", .{
                                 .backend = self.backend.name(),
                                 .model = self.backend.model(),
                                 .error_name = @errorName(e),
@@ -912,7 +912,7 @@ pub const AgentLoop = struct {
                                 try self.history.addSystemErrorObservation(@errorName(e));
                                 if (self.journal) |*j| j.recordEvent(self.io, act_id, .rollback_completed, "Rollback state due to error") catch {};
                             } else {
-                                main.stderrPrint("[agent] Không thể rollback vì đã qua mốc nén bộ nhớ.\n", .{});
+                                main.stderrPrint("[agent] Cannot rollback because memory compaction checkpoint has passed.\n", .{});
                                 return e;
                             }
                             continue;
@@ -920,14 +920,14 @@ pub const AgentLoop = struct {
                     }
                 };
 
-                // Reset counter khi act thành công: rate limit rải rác giữa turn
-                // dài không cộng dồn chết tích lũy.
+                // Reset counter when act succeeds: intermittent rate limits across a long turn
+                // do not accumulate fatally.
                 rate_limit_retries = 0;
                 if (main.ui_repl.current_renderer) |r| {
                     r.resetErrorSignature();
                 }
 
-                // Flush toàn bộ snapshot mini.write/patch/sh đã track trong act này (M4)
+                // Flush all mini.write/patch/sh snapshots tracked during this act (M4)
                 var recorded_delta = false;
                 if (self.snapshot_tracker) |*t| {
                     if (t.tracked.items.len > 0) {
@@ -947,30 +947,30 @@ pub const AgentLoop = struct {
                 }
 
                 if (result == .exit_loop) {
-                    if (self.journal) |*j| j.recordEvent(self.io, act_id, .task_completed, "Nhiệm vụ hoàn thành") catch {};
+                    if (self.journal) |*j| j.recordEvent(self.io, act_id, .task_completed, "Task completed") catch {};
                     return;
                 }
                 break; 
             } else {
-                main.stderrPrint("\n\x1b[31m[agent] ⛔ Act {d} thất bại sau {d} lần thử không thể phục hồi. Dừng tác vụ.\x1b[0m\n", .{ act_id, max_retries + 1 });
+                main.stderrPrint("\n\x1b[31m[agent] ⛔ Act {d} failed after {d} unrecoverable attempts. Terminating task.\x1b[0m\n", .{ act_id, max_retries + 1 });
                 return error.ActRetryExhausted;
             }
         }
     }
 
-    /// Xóa lịch sử hội thoại (bắt đầu conversation mới).
+    /// Clears conversation history (starts new conversation).
     pub fn clearHistory(self: *AgentLoop) void {
         self.history.clear();
     }
 
-    /// Đổi backend tại runtime.
+    /// Switches backend at runtime.
     /// name: "openai", "claude", "ollama"
     pub fn switchBackend(self: *AgentLoop, backend_name: []const u8, model_override: ?[]const u8) void {
         const cfg = self.config;
 
         if (std.mem.eql(u8, backend_name, "openai") or std.mem.eql(u8, backend_name, "openai-compat")) {
             const url = cfg.openai_compat_url orelse {
-                main.stderrPrint("[agent] OPENAI_COMPAT_URL chưa được thiết lập\n", .{});
+                main.stderrPrint("[agent] OPENAI_COMPAT_URL is not configured\n", .{});
                 return;
             };
             const proto_mode: openai_mod.ProtocolMode = switch (cfg.openai_protocol) {
@@ -989,7 +989,7 @@ pub const AgentLoop = struct {
             ) };
         } else if (std.mem.eql(u8, backend_name, "claude")) {
             const key = cfg.anthropic_key orelse {
-                main.stderrPrint("[agent] ANTHROPIC_API_KEY chưa được thiết lập\n", .{});
+                main.stderrPrint("[agent] ANTHROPIC_API_KEY is not configured\n", .{});
                 return;
             };
             self.backend = .{ .claude = claude_mod.Client.init(
@@ -1006,7 +1006,7 @@ pub const AgentLoop = struct {
                 cfg.max_tokens,
             ) };
         } else {
-            main.stderrPrint("[agent] Backend không hợp lệ: {s}. Chọn: openai, claude, ollama\n", .{backend_name});
+            main.stderrPrint("[agent] Invalid backend: {s}. Choices: openai, claude, ollama\n", .{backend_name});
             return;
         }
 
@@ -1043,8 +1043,8 @@ pub const AgentLoop = struct {
                 if (r.is_thinking) r.endThinking();
                 r.ensureNewline();
             }
-            // Fallback: thử Ollama nếu primary không phải Ollama
-            main.stderrPrint("\n[agent] {s} lỗi ({s}), thử Ollama...\n", .{ self.backend.name(), @errorName(e) });
+            // Fallback: try Ollama if primary is not Ollama
+            main.stderrPrint("\n[agent] {s} error ({s}), trying Ollama...\n", .{ self.backend.name(), @errorName(e) });
             if (self.backend != .ollama) {
                 if (main.ui_repl.current_renderer) |r| {
                     r.startWaiting();
@@ -1056,12 +1056,12 @@ pub const AgentLoop = struct {
                     self.config.max_tokens,
                 );
                 if (fallback.sendMessage(system_prompt, msgs, tool_defs, text_cb, think_cb)) |resp| {
-                    main.stderrPrint("[agent] Ollama fallback thành công\n", .{});
-                    // Journal: primary lỗi (transport/parse — vd ReadFailed) nhưng
-                    // fallback thành công. Turn vẫn tiếp tục, nhưng phải ghi lại
-                    // lỗi primary để debug từ journal (stderr là ephemeral).
+                    main.stderrPrint("[agent] Ollama fallback succeeded\n", .{});
+                    // Journal: primary error (transport/parse — e.g. ReadFailed) but
+                    // fallback succeeded. Turn continues, but primary error is recorded
+                    // for debugging from journal (stderr is ephemeral).
                     if (self.journal) |*j| {
-                        j.recordError(self.io, act_id, .llm_provider_error, "Primary backend lỗi, fallback Ollama thành công — tiếp tục turn", .{
+                        j.recordError(self.io, act_id, .llm_provider_error, "Primary backend error, fallback Ollama succeeded — continuing turn", .{
                             .backend = self.backend.name(),
                             .model = self.backend.model(),
                             .error_name = @errorName(e),
@@ -1077,14 +1077,14 @@ pub const AgentLoop = struct {
                         if (r.is_thinking) r.endThinking();
                         r.ensureNewline();
                     }
-                    // Journal: fallback cũng thất bại — ghi cả 2 lỗi để debug
-                    // (primary + ollama fallback) trong cùng 1 event.
+                    // Journal: fallback also failed — record both errors for debugging
+                    // (primary + ollama fallback) in the same event.
                     if (self.journal) |*j| {
                         const desc = std.fmt.allocPrint(
                             self.alloc,
-                            "Primary {s} lỗi ({s}), fallback Ollama cũng lỗi ({s})",
+                            "Primary {s} error ({s}), fallback Ollama also failed ({s})",
                             .{ self.backend.name(), @errorName(e), @errorName(fb_err) },
-                        ) catch "Primary + fallback đều lỗi";
+                        ) catch "Primary + fallback both failed";
                         defer self.alloc.free(desc);
                         j.recordError(self.io, act_id, .llm_provider_error, desc, .{
                             .backend = self.backend.name(),
@@ -1100,31 +1100,31 @@ pub const AgentLoop = struct {
         }
     }
 
-    /// Thực hiện nén ngữ cảnh (MemAct compaction) khi model thực sự trả về lỗi quá context limit.
+    /// Performs context compaction (MemAct compaction) when model returns context limit error.
     pub fn compactContext(self: *AgentLoop, act_id: usize) !void {
         if (self.history.messages().len <= 2) {
             self.history.compact();
             return;
         }
 
-        main.stderrPrint("\x1b[33m[agent] Đang tổng hợp tóm tắt ngữ cảnh (MemAct compaction)...\x1b[0m\n", .{});
+        main.stderrPrint("\x1b[33m[agent] Summarizing context (MemAct compaction)...\x1b[0m\n", .{});
 
         if (self.config.memact_enabled) {
             var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
             msg_blocks[0] = .{ .text = try self.alloc.dupe(u8, 
-                "SYSTEM: Bạn là bộ nhớ MemAct. Hãy tóm tắt ngắn gọn phần hội thoại trước thành JSON, tuân thủ đúng stencil:\n" ++
+                "SYSTEM: You are the MemAct memory engine. Concisely summarize the preceding conversation into JSON, strictly adhering to this stencil:\n" ++
                 "{\n" ++
                 "  \"type\": \"context_summary\",\n" ++
                 "  \"iteration_range\": [1, 99],\n" ++
-                "  \"task_state\": \"mô tả tiến độ\",\n" ++
-                "  \"decisions\": [\"quyết định 1\"],\n" ++
+                "  \"task_state\": \"progress description\",\n" ++
+                "  \"decisions\": [\"decision 1\"],\n" ++
                 "  \"open_questions\": [],\n" ++
                 "  \"learned_errors\": [],\n" ++
                 "  \"files_touched\": [],\n" ++
-                "  \"next_step\": \"bước tiếp theo\"\n" ++
+                "  \"next_step\": \"next step\"\n" ++
                 "}\n" ++
-                "Nếu hội thoại đầu vào đã chứa block \"[MemAct Context Summary]\", hãy gộp (merge) nội dung summary cũ vào summary mới, giữ lại các thông tin quan trọng, vẫn theo đúng stencil JSON trên.\n" ++
-                "Chỉ xuất JSON, không có markdown text khác."
+                "If the input conversation already contains a \"[MemAct Context Summary]\" block, merge the previous summary into the new summary, retaining critical details while preserving the JSON stencil above.\n" ++
+                "Output JSON only, with no additional markdown text."
             ) };
             const sys_msg = proto.Message{ .role = .user, .content = msg_blocks };
             defer {
@@ -1149,14 +1149,14 @@ pub const AgentLoop = struct {
                 }
             }
             if (!compacted) {
-                main.stderrPrint("[agent] Cảnh báo: LLM không trả về text summary, fallback.\n", .{});
+                main.stderrPrint("[agent] Warning: LLM did not return text summary, fallback.\n", .{});
                 self.history.compact();
             }
         } else {
-            main.stderrPrint("\n\x1b[33m[agent] Lịch sử quá dài (MemAct tắt), đang nén cũ...\x1b[0m\n", .{});
+            main.stderrPrint("\n\x1b[33m[agent] History too long (MemAct disabled), compacting using legacy method...\x1b[0m\n", .{});
             
             var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
-            msg_blocks[0] = .{ .text = try self.alloc.dupe(u8, "SYSTEM: Lịch sử đã đầy. Hãy tóm tắt trạng thái công việc hiện tại (đã làm gì, kết quả ra sao, cần làm gì tiếp). Không gọi tool, chỉ trả về văn bản tóm tắt.") };
+            msg_blocks[0] = .{ .text = try self.alloc.dupe(u8, "SYSTEM: History is full. Please summarize the current task state (what has been done, results, next steps). Do not call tools, return summary text only.") };
             const sys_msg = proto.Message{ .role = .user, .content = msg_blocks };
             defer {
                 self.alloc.free(sys_msg.content[0].text);
@@ -1185,7 +1185,7 @@ pub const AgentLoop = struct {
         }
     }
 
-    /// Thực thi tất cả tool_use blocks trong response.
+    /// Executes all tool_use blocks in response.
 
     fn executeTools(self: *AgentLoop, act_id: usize, response: *const proto.Response) !void {
         _ = act_id;
@@ -1206,7 +1206,7 @@ pub const AgentLoop = struct {
                     if (main.ui_repl.current_renderer) |r| {
                         r.startTool(tu.name, tu.input_json);
                     } else {
-                        // Hiển thị tên tool và tham số chính (fallback log)
+                        // Display tool name and primary parameters (fallback log)
                         if (std.mem.eql(u8, tu.name, "bash")) {
                             if (json_mod.findString(tu.input_json, "command")) |cmd| {
                                 var cmd_buf: [100]u8 = undefined;
@@ -1228,7 +1228,7 @@ pub const AgentLoop = struct {
                         }
                     }
 
-                    // Phát pre-tool-use hook
+                    // Dispatch pre-tool-use hook
                     hooks_mod.dispatch(self.alloc, self.io, .{
                         .event = "pre-tool-use",
                         .tool_id = tu.id,
@@ -1236,7 +1236,7 @@ pub const AgentLoop = struct {
                         .input_json = tu.input_json,
                     });
 
-                    // Snapshot file nếu là công cụ chỉnh sửa
+                    // Snapshot file if editing tool
                     if (std.mem.eql(u8, tu.name, "file_edit") or std.mem.eql(u8, tu.name, "file_write")) {
                         if (json_mod.findString(tu.input_json, "path")) |path| {
                             if (self.snapshot_tracker) |*t| {
@@ -1248,16 +1248,16 @@ pub const AgentLoop = struct {
                     var is_err = false;
                     const result = tools_mod.executeTool(self.alloc, self.io, tu.name, tu.input_json) catch |e| blk: {
                         is_err = true;
-                        const msg = try std.fmt.allocPrint(self.alloc, "Lỗi tool: {s}", .{@errorName(e)});
+                        const msg = try std.fmt.allocPrint(self.alloc, "Tool error: {s}", .{@errorName(e)});
                         break :blk msg;
                     };
                     try allocated_strings.append(self.alloc, result);
 
-                    // Truncate nếu quá lớn
+                    // Truncate if oversized
                     const max_tool_result = 64 * 1024;
                     const truncated = if (result.len > max_tool_result) result[0..max_tool_result] else result;
 
-                    // Phát post-tool-use hook
+                    // Dispatch post-tool-use hook
                     hooks_mod.dispatch(self.alloc, self.io, .{
                         .event = "post-tool-use",
                         .tool_id = tu.id,
@@ -1286,7 +1286,7 @@ pub const AgentLoop = struct {
                         r.finishTool(tu.name, result, is_err, dur_ms, patch_path, patch_diff);
                     } else {
                         if (is_err) {
-                            main.stderrPrint("\x1b[31m[lỗi]\x1b[0m\n", .{});
+                            main.stderrPrint("\x1b[31m[error]\x1b[0m\n", .{});
                         } else {
                             main.stderrPrint("\x1b[32m[ok]\x1b[0m\n", .{});
                         }
@@ -1302,7 +1302,7 @@ pub const AgentLoop = struct {
     }
 };
 
-/// Bóc tách khối mã JavaScript từ markdown text (```js ... ``` hoặc ```javascript ... ```).
+/// Extracts JavaScript code block from markdown text (```js ... ``` or ```javascript ... ```).
 pub fn extractJsCodeBlock(alloc: Allocator, text: []const u8) ?[]const u8 {
     const markers = [_][]const u8{
         "```javascript\n",
@@ -1344,7 +1344,7 @@ fn extractXmlAttr(tag_str: []const u8, attr_name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Chuyển đổi các thẻ XML giả lập (<file_read>, <glob>, <grep>, <bash>, <file_write>) thành mã JS mini.*
+/// Converts pseudo XML tool tags (<file_read>, <glob>, <grep>, <bash>, <file_write>) into mini.* JS code.
 pub fn convertXmlToolTagsToJs(alloc: Allocator, text: []const u8) ?[]const u8 {
     var js_buf = utils.BufWriter.init(alloc);
     errdefer js_buf.deinit();
@@ -1424,7 +1424,7 @@ pub fn convertXmlToolTagsToJs(alloc: Allocator, text: []const u8) ?[]const u8 {
     return js_buf.toOwnedSlice() catch null;
 }
 
-/// Tìm kiếm khối mã JavaScript trong phản hồi của Assistant
+/// Searches for JavaScript code block in Assistant response
 pub fn findJsCodeInResponse(alloc: Allocator, response: *const proto.Response) ?[]const u8 {
     for (response.content.items) |block| {
         switch (block) {
@@ -1449,13 +1449,13 @@ pub fn findJsCodeInResponse(alloc: Allocator, response: *const proto.Response) ?
 test "agent - extractJsCodeBlock" {
     const alloc = std.testing.allocator;
     const md =
-        \\Dưới đây là đoạn mã thực thi:
+        \\Here is the execution code:
         \\```js
         \\const a = 10;
         \\const b = 20;
         \\console.log(a + b);
         \\```
-        \\Hãy xem kết quả bên trên.
+        \\See the results above.
     ;
 
     const extracted = extractJsCodeBlock(alloc, md);

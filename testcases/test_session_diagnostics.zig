@@ -9,18 +9,18 @@ test "session_diagnostics: listSessions returns non-empty result" {
     defer alloc.free(result);
 
     try testing.expect(result.len > 0);
-    try testing.expect(std.mem.indexOf(u8, result, "Danh sách Sessions") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "Sessions & Subprocesses List") != null);
 }
 
 test "session_diagnostics: executeTool operation=list and invalid op handling" {
     const alloc = testing.allocator;
     const res_list = try session_diag.executeTool(alloc, testing.io, "{\"operation\":\"list\"}");
     defer alloc.free(res_list);
-    try testing.expect(std.mem.indexOf(u8, res_list, "Danh sách Sessions") != null);
+    try testing.expect(std.mem.indexOf(u8, res_list, "Sessions & Subprocesses List") != null);
 
     const res_invalid = try session_diag.executeTool(alloc, testing.io, "{\"operation\":\"unknown_op\"}");
     defer alloc.free(res_invalid);
-    try testing.expect(std.mem.indexOf(u8, res_invalid, "Lỗi: operation không hợp lệ") != null);
+    try testing.expect(std.mem.indexOf(u8, res_invalid, "Error: invalid operation") != null);
 }
 
 test "session_diagnostics: detail of current process" {
@@ -31,7 +31,7 @@ test "session_diagnostics: detail of current process" {
     const res = try session_diag.executeTool(alloc, testing.io, input);
     defer alloc.free(res);
 
-    // Không crash, trả về kết quả
+    // Should not crash, returns non-empty output
     try testing.expect(res.len > 0);
 }
 
@@ -40,8 +40,8 @@ test "session_diagnostics: analyzeJournal parses throttling and errors accuratel
     const test_journal_path = "/tmp/test_session_diag_journal.jsonl";
     const f = try std.Io.Dir.cwd().createFile(testing.io, test_journal_path, .{});
     const sample_content =
-        \\{"act_id":1,"event_type":"act_started","timestamp":1788919924527,"description":"Bắt đầu Act","delta":null,"error_detail":null}
-        \\{"act_id":1,"event_type":"llm_call_throttled","timestamp":1788919925568,"description":"Rate limit (429) từ backend","delta":null,"error_detail":{"backend":"openai-compat","model":"nex-agi/nex-n2.5-mini:free","error_name":"LLMRateLimitExceeded","http_code":429,"attempt":1,"server_error":"Rate limit exceeded: free-models-per-day","remedy_hint":"Wait for the daily reset"}}
+        \\{"act_id":1,"event_type":"act_started","timestamp":1788919924527,"description":"Act started","delta":null,"error_detail":null}
+        \\{"act_id":1,"event_type":"llm_call_throttled","timestamp":1788919925568,"description":"Rate limit (429) from backend","delta":null,"error_detail":{"backend":"openai-compat","model":"nex-agi/nex-n2.5-mini:free","error_name":"LLMRateLimitExceeded","http_code":429,"attempt":1,"server_error":"Rate limit exceeded: free-models-per-day","remedy_hint":"Wait for the daily reset"}}
         \\
     ;
     try f.writeStreamingAll(testing.io, sample_content);
@@ -64,8 +64,7 @@ extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 test "session_diagnostics: detailSession formats a hermetic session cleanly" {
     const alloc = testing.allocator;
 
-    // Hermetic: trỏ MINI_HOME tới thư mục tạm và tự tạo journal cho PID của
-    // chính tiến trình test, không phụ thuộc dữ liệu máy thật.
+    // Hermetic: point MINI_HOME to temporary directory and generate journal for the test process PID
     const saved_mini_home: ?[:0]const u8 = if (getenv("MINI_HOME")) |mh|
         try alloc.dupeZ(u8, std.mem.span(mh))
     else
@@ -88,8 +87,8 @@ test "session_diagnostics: detailSession formats a hermetic session cleanly" {
     const journal_path = try std.fmt.bufPrint(&path_buf, "{s}/sessions/journal_{d}.jsonl", .{ tmp_dir, my_pid });
 
     const sample_content =
-        \\{"act_id":1,"event_type":"act_started","timestamp":1788919924527,"description":"Bắt đầu Act","delta":null,"error_detail":null}
-        \\{"act_id":1,"event_type":"llm_call_throttled","timestamp":1788919925568,"description":"Rate limit (429) từ backend","delta":null,"error_detail":{"backend":"openai-compat","model":"test-model","error_name":"LLMRateLimitExceeded","http_code":429,"attempt":1,"server_error":"Rate limit exceeded","remedy_hint":"Wait"}}
+        \\{"act_id":1,"event_type":"act_started","timestamp":1788919924527,"description":"Act started","delta":null,"error_detail":null}
+        \\{"act_id":1,"event_type":"llm_call_throttled","timestamp":1788919925568,"description":"Rate limit (429) from backend","delta":null,"error_detail":{"backend":"openai-compat","model":"test-model","error_name":"LLMRateLimitExceeded","http_code":429,"attempt":1,"server_error":"Rate limit exceeded","remedy_hint":"Wait"}}
         \\
     ;
     const f = try std.Io.Dir.cwd().createFile(testing.io, journal_path, .{});
@@ -100,11 +99,9 @@ test "session_diagnostics: detailSession formats a hermetic session cleanly" {
     defer alloc.free(report);
 
     try testing.expect(report.len > 0);
-    try testing.expect(std.mem.indexOf(u8, report, "Báo cáo Chẩn đoán Session PID") != null);
+    try testing.expect(std.mem.indexOf(u8, report, "Session Diagnostic Report PID") != null);
     try testing.expect(std.mem.indexOf(u8, report, "throttled") != null or
         std.mem.indexOf(u8, report, "crashed") != null or
         std.mem.indexOf(u8, report, "finished") != null);
     try testing.expect(std.mem.indexOf(u8, report, "HTTP 429") != null);
 }
-
-

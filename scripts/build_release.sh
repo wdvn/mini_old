@@ -1,10 +1,10 @@
 #!/bin/bash
 set -e
 
-# Đảm bảo script được chạy từ thư mục gốc của project
+# Ensure script runs from project root directory
 cd "$(dirname "$0")/.."
 
-echo "Bắt đầu tạo bản build release..."
+echo "Starting release build..."
 mkdir -p releases
 
 TARGETS=(
@@ -19,10 +19,10 @@ for target_info in "${TARGETS[@]}"; do
     TARGET="${target_info%%:*}"
     OUT_NAME="${target_info##*:}"
     
-    echo "Building cho $TARGET..."
+    echo "Building for $TARGET..."
     zig build -Dtarget=$TARGET -Doptimize=ReleaseSafe
     
-    # Copy và đóng gói
+    # Copy and package
     if [[ "$TARGET" == *"windows"* ]]; then
         mv zig-out/bin/mini.exe releases/${OUT_NAME}.exe
         cd releases
@@ -37,7 +37,7 @@ for target_info in "${TARGETS[@]}"; do
         rm ${OUT_NAME}
         cd ..
     fi
-    echo "Đã tạo xong ${OUT_NAME}"
+    echo "Completed ${OUT_NAME}"
 done
 
-echo "Tất cả bản build đã sẵn sàng tại thư mục releases/"
+echo "All release builds ready in releases/ directory."

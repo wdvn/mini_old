@@ -1,84 +1,83 @@
-# RFC-004: Áp dụng chuẩn AGENTS.md cho mini-agent
+# RFC-004: Adopting the AGENTS.md Standard for mini-agent
 
-| Thuộc tính | Giá trị |
+| Attribute | Value |
 |---|---|
 | RFC | 004 |
-| Tên | Áp dụng chuẩn AGENTS.md (open format cho coding agents) |
-| Trạng thái | **Implemented / Production** |
-| Phiên bản | 0.1 |
-| Phụ thuộc | Không phụ thuộc RFC khác (độc lập) |
-| Tham chiếu | [agents.md](https://agents.md) — open format, 60k+ OSS projects |
-| Tác giả | mini-agent |
-| Ngày | 22/08/2026 |
+| Title | Adopting the AGENTS.md Standard (open format for coding agents) |
+| Status | **Implemented / Production** |
+| Version | 0.1 |
+| Dependencies | None (Independent) |
+| References | [agents.md](https://agents.md) — open format, 60k+ OSS projects |
+| Author | mini-agent |
+| Date | 2026-08-22 |
 
 ---
 
-## 1. Vấn đề (Motivation)
+## 1. Motivation
 
-### 1.1. Hiện trạng
+### 1.1. Context
 
-- Repo `mini` có `README.md` hướng dẫn cho **con người**: cài đặt, tính năng, ví dụ.
-- Không có nguồn hướng dẫn **dành riêng cho coding agents** (mini-agent tự chạy trên chính nó, Codex, Jules, Cursor, Claude Code...): lệnh build/test, quy ước code, lưu ý kiến trúc.
-- Agents phải tự đoán hoặc đọc toàn bộ README → tốn context window, dễ bỏ sót quy ước (ví dụ: comment tiếng Việt, không thêm dependency ngoài proposal, file test phải đặt trong `testcases/test_*.zig`).
+- The `mini` repo has a `README.md` intended for **human users**: installation, features, examples.
+- Previously, there was no dedicated guide **specifically for coding agents** (mini-agent self-hosting, Codex, Jules, Cursor, Claude Code, etc.): build/test commands, code conventions, architectural guidelines.
+- Agents had to guess or read the entire README → wasting context window, easily overlooking conventions (e.g. comment conventions, requiring proposals for external dependencies, placing test files in `testcases/test_*.zig`).
 
-### 1.2. Tại sao chọn AGENTS.md
+### 1.2. Why Choose AGENTS.md
 
-| Tiêu chí | AGENTS.md | README.md | `.cursorrules` / CLAUDE.md |
+| Criteria | AGENTS.md | README.md | `.cursorrules` / CLAUDE.md |
 |---|---|---|---|
-| Được nhiều agent hiểu | ✅ Codex, Jules, Cursor, Zed, Warp, VS Code, Devin, Aider, goose... | ⚠️ Agent phải tự đọc | ❌ Chỉ 1 agent |
-| Open format, không proprietary | ✅ | ✅ | ❌ |
-| Tách hướng dẫn agent / người | ✅ "README for agents" | ❌ Trộn lẫn | ✅ |
-| Hỗ trợ nested theo thư mục | ✅ root + subfolder | ✅ | ⚠️ |
-| Không yêu cầu schema | ✅ Markdown tự do | — | — |
+| Understood by many agents | ✅ Codex, Jules, Cursor, Zed, Warp, VS Code, Devin, Aider, goose... | ⚠️ Agent must self-discover | ❌ Single-agent only |
+| Open format, non-proprietary | ✅ | ✅ | ❌ |
+| Separation of human vs agent guidance | ✅ "README for agents" | ❌ Mixed together | ✅ |
+| Directory nesting support | ✅ root + subfolder | ✅ | ⚠️ |
+| No rigid schema required | ✅ Freeform Markdown | — | — |
 
-Chuẩn: đặt file `AGENTS.md` ở root repo. Agent khi làm việc trong thư mục nào sẽ đọc `AGENTS.md` gần nhất (root cho toàn repo, có thể override bằng file trong subfolder). Nội dung nên gồm: **setup commands**, **code style**, **conventions**, **lưu ý kiến trúc**, **testing** — chính xác những gì agent cần và không có trong README.
+Standard practice: place an `AGENTS.md` file in the repository root. When working in any directory, agents read the nearest `AGENTS.md` (root for the whole repo, with subfolder overrides if necessary). Content should include: **setup commands**, **code style**, **conventions**, **architectural notes**, **testing** — exactly what agents need without README fluff.
 
-## 2. Thiết kế
+## 2. Design
 
-### 2.1. File đã tạo
+### 2.1. Created File
 
-`AGENTS.md` ở root (59 dòng), cấu trúc theo khuyến nghị của agents.md:
+`AGENTS.md` at root (59 lines), structured according to agents.md recommendations:
 
 ```markdown
-# mini — Hướng dẫn cho coding agents
-## Tổng quan          → 2 dòng: Zig 0.16 + CodeAct, kiến trúc Code-Centric
+# mini — Guide for coding agents
+## Overview           → 2 lines: Zig 0.16 + CodeAct, Code-Centric architecture
 ## Layout src/        → core, runtime, tools, tooling, ui, backends, acp
 ## Build & Run        → zig build / zig build test / zig build run / scripts/build_release.sh
-## Quy ước code       → comment tiếng Việt, doc-comment //!, không thêm dependency ngoài proposal
-## Lưu ý kiến trúc    → JS VM path, protocol conformance, editor upgrade, SQLite reserve
-## Testing            → zig build test, test UTF-8 thủ công, không gọi API thật
-## PR / Commit        → format `module: mô tả`, không commit scratch/zig-cache/zig-out
+## Code Conventions   → doc-comment //!, no external dependencies without proposal
+## Architectural Notes→ JS VM path, protocol conformance, editor upgrade, SQLite reserve
+## Testing            → zig build test, manual UTF-8 testing, no real API calls
+## PR / Commit        → format `module: description`, do not commit scratch/zig-cache/zig-out
 ```
 
-### 2.2. Quy tắc nội dung
+### 2.2. Content Guidelines
 
-- **Ngắn, chính xác, có thể thực thi**: mỗi mục là lệnh chạy được hoặc quy tắc check được. Không lan man marketing (đó là việc của README).
-- **Không trùng lặp README**: chỉ những gì agent cần — README không nhắc (quy ước comment, file scratch `test*.zig`, đường dẫn proposals).
-- **Tham chiếu chéo docs/**: quy tắc "mở proposal trước khi thêm dependency" trỏ về `docs/*_proposal.md`; mục editor trỏ về `docs/editor_upgrade_proposal.md`.
-- **Ngôn ngữ**: tiếng Việt (đồng nhất toàn repo), tên lệnh/đường dẫn giữ nguyên tiếng Anh.
+- **Concise, accurate, and actionable**: each entry is a runnable command or a verifiable rule. Avoid marketing prose (that belongs in the README).
+- **No redundancy with README**: only include agent-specific requirements omitted from README (comment conventions, test file paths, proposal links).
+- **Cross-reference docs/**: the "open proposal before adding dependency" rule links to `docs/*_proposal.md`; editor sections link to `docs/editor_upgrade_proposal.md`.
+- **Language**: English across the repository, keeping command names and paths intact.
 
-### 2.3. Đồng bộ với hệ thống proposal của repo
+### 2.3. Synchronization with the Proposal System
 
-Quy ước mới được ghi vào AGENTS.md: *"Proposals/design docs đặt ở `docs/`, tên file snake_case: `*_proposal.md`"* — RFC-004 này tuân theo chính quy tắc đó.
+A convention recorded in AGENTS.md: *"Proposals/design docs are located in `docs/`, named in snake_case: `*_proposal.md`"* — RFC-004 follows this exact rule.
 
-## 3. Lộ trình
+## 3. Roadmap
 
-- [x] **Phase 0** — Tạo `AGENTS.md` root (done).
-- [ ] **Phase 1** — Review nội dung bởi maintainer, chốt v0.1.
-- [ ] **Phase 2** (optional) — Nested `AGENTS.md` cho subfolder phức tạp khi chúng to lên (ví dụ `src/runtime/AGENTS.md` mô tả chi tiết JS bindings), chỉ làm khi độ phức tạp thực sự cần.
-- [x] **Phase 3** (optional) — mini-agent tự động đọc `AGENTS.md` của project đích khi chạy trong workspace người dùng (tích hợp vào system prompt / context bootstrapping). Đây là điểm nâng giá trị lớn nhất: mini vừa **tuân thủ** chuẩn (có AGENTS.md riêng), vừa **tiêu thụ** chuẩn khi làm việc trên repo khác. *Ghi chú: nội dung AGENTS.md khi nạp vào system prompt thuộc tier **PINNED** theo mô hình context của RFC-003 (như future work `MINI.md` của RFC-003 đã dự kiến).*
+- [x] **Phase 0** — Create root `AGENTS.md` (done).
+- [ ] **Phase 1** — Maintainer review, finalize v0.1.
+- [ ] **Phase 2** (optional) — Nested `AGENTS.md` for complex subfolders as they grow (e.g. `src/runtime/AGENTS.md` detailing JS bindings), implemented only when complexity strictly demands it.
+- [x] **Phase 3** (optional) — mini-agent automatically reads the target project's `AGENTS.md` when running in a user workspace (integrated into system prompt / context bootstrapping). This delivers significant value: mini both **conforms to** the standard (with its own AGENTS.md) and **consumes** the standard when working on other repositories. *Note: AGENTS.md content loaded into system prompts belongs to the **PINNED** tier per RFC-003 context model (as anticipated in RFC-003's future `MINI.md` work).*
 
-## 4. Rủi ro & lưu ý
+## 4. Risks & Mitigations
 
-| Rủi ro | Giảm thiểu |
+| Risk | Mitigation |
 |---|---|
-| AGENTS.md lỗi thời khi kiến trúc đổi (ví dụ sau editor upgrade Phase 1–3) | Ghi vào checklist mỗi RFC mới: cập nhật AGENTS.md nếu thay đổi build/quy ước |
-| Trùng lặp nội dung với README gây phân kỳ | Nguyên tắc: AGENTS.md không copy README; nếu thấy trùng, rút gọn còn 1 dòng trỏ tham chiếu |
-| File quá dài làm tốn context | Giữ < 100 dòng; chi tiết đẩy về docs/*.md và link |
-| Chuẩn agents.md còn non-formal (Markdown tự do, không schema) | Đây là chủ ý của chuẩn — không cần validate, giữ Markdown đơn giản |
+| AGENTS.md becomes outdated when architecture changes | Add to new RFC checklists: update AGENTS.md if build/conventions change |
+| Content overlap with README causing divergence | Rule: AGENTS.md never duplicates README; if duplicate, reduce to a single reference link |
+| Excessively long file wasting context | Keep < 100 lines; push extensive details to docs/*.md and link |
+| agents.md standard is non-formal (freeform Markdown, no schema) | This is an intentional design choice of the standard — no validation required, keeps Markdown simple |
 
-## 5. Out of scope
+## 5. Out of Scope
 
-- Định nghĩa schema/validator cho AGENTS.md — chuẩn cố ý không có.
-- Tích hợp nhiều file config theo agent (.cursorrules, CLAUDE.md...) — chỉ giữ 1 nguồn sự thật là AGENTS.md.
-- Đa ngôn ngữ (EN bản sao) — không cần ở giai đoạn này.
+- Defining a schema/validator for AGENTS.md — intentionally omitted by the standard.
+- Integrating multiple vendor config files (.cursorrules, CLAUDE.md...) — maintain a single source of truth in AGENTS.md.

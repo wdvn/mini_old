@@ -1,73 +1,73 @@
-//! lib/http_request.zig — HTTP client tập trung cho toàn bộ mini-agent.
+//! lib/http_request.zig — Centralized HTTP client for the entire mini-agent.
 //!
-//! Mọi phần cần gửi HTTP request (tools/http.zig, backends AI, ...)
-//! đều gọi qua module này thay vì tự dựng std.http.Client.
+//! All components needing to send HTTP requests (tools/http.zig, AI backends, ...)
+//! call through this module instead of setting up std.http.Client independently.
 //!
-//! ## API chính
+//! ## Main API
 //!   - `fetch(alloc, io, .{...})` → `Response { status, headers, body, truncated }`
 //!   - `postStream(alloc, io, .{...}, on_chunk, userdata)` → status u32 —
-//!     streaming từng chunk cho SSE/NDJSON (thay thế backends/sse.zig cũ).
+//!     streams chunk-by-chunk for SSE/NDJSON (replaces legacy backends/sse.zig).
 //!   - `parseMethod`, `parseHeadersJson`, `parseHeadersKv`, `formatResponseText`
-//!     — helpers dùng chung.
+//!     — shared helpers.
 //!
-//! ## Thiết kế
-//!   - Dùng std.http.Client của Zig std, không dependency ngoài.
-//!   - Response body đọc tối đa `max_body_size` (mặc định 30KB) — tránh overflow
-//!     context window của AI; phần vượt bị bỏ và ghi nhận vào `truncated`.
-//!   - Status, headers, body tách bạch trong struct `Response` để caller
-//!     (JS binding `mini.http`) trả JSON object đúng semantic, không lẫn
-//!     headers vào body như bản cũ.
-//!   - Headers response giữ dạng raw lines (đã trim) — đủ cho tool protocol.
+//! ## Design
+//!   - Uses Zig std's std.http.Client, zero external dependencies.
+//!   - Response body reads at most `max_body_size` (default 30KB) — prevents overflowing
+//!     AI context window; truncated portion is dropped and flagged in `truncated`.
+//!   - Status, headers, and body are clearly separated in `Response` struct so caller
+//!     (JS binding `mini.http`) returns JSON object with proper semantics, avoiding
+//!     leaking headers into body like the old version.
+//!   - Response headers maintain raw trimmed lines — sufficient for tool protocol.
 //!
-//! ## Test
-//!   - `zig build test` chạy integration test với local HTTP server lập từ
-//!     std.Io.net (không cần mạng ngoài, không flaky).
+//! ## Testing
+//!   - `zig build test` runs integration tests with local HTTP server built from
+//!     std.Io.net (no external network required, deterministic and non-flaky).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const signals = @import("../core/signals.zig");
 
-/// Giới hạn body mặc định: 30KB — nhất quán với tool protocol cũ.
+/// Default body limit: 30KB — consistent with legacy tool protocol.
 pub const DEFAULT_MAX_BODY_SIZE: usize = 30 * 1024;
 
-/// Timeout mặc định cho toàn bộ request (connect + transfer): 60s.
+/// Default timeout for full request (connect + transfer): 60s.
 pub const DEFAULT_TIMEOUT_S: u32 = 60;
 
 // ---------------------------------------------------------------------------
 // Request / Response
 // ---------------------------------------------------------------------------
 
-/// Tham số cho `fetch`. Tất cả field đều optional trừ `url`.
+/// Parameters for `fetch`. All fields are optional except `url`.
 pub const Options = struct {
     url: []const u8,
     method: []const u8 = "GET",
     body: ?[]const u8 = null,
-    /// JSON object string dạng `{"Key":"Value",...}` — parse bằng `parseHeadersJson`.
+    /// JSON object string like `{"Key":"Value",...}` — parsed with `parseHeadersJson`.
     headers_json: ?[]const u8 = null,
-    /// Giới hạn body đọc về. Mặc định DEFAULT_MAX_BODY_SIZE.
+    /// Limit of response body to read. Default DEFAULT_MAX_BODY_SIZE.
     max_body_size: usize = DEFAULT_MAX_BODY_SIZE,
-    /// Timeout toàn request (giây). Mặc định DEFAULT_TIMEOUT_S.
+    /// Overall request timeout (seconds). Default DEFAULT_TIMEOUT_S.
     timeout_s: u32 = DEFAULT_TIMEOUT_S,
 };
 
-/// Kết quả HTTP request có cấu trúc.
-/// Toàn bộ slice đều thuộc về `alloc` của caller — giải phóng bằng `deinit`.
+/// Structured HTTP request result.
+/// All slices belong to caller's `alloc` — freed via `deinit`.
 pub const Response = struct {
     status: u16,
-    /// Status reason phrase (vd "OK", "Not Found"). Có thể rỗng.
+    /// Status reason phrase (e.g. "OK", "Not Found"). May be empty.
     reason: []const u8,
-    /// Raw header lines đã trim, dạng "Name: Value" (không kèm status line).
+    /// Raw trimmed header lines in "Name: Value" format (excluding status line).
     headers: []const Header,
-    /// Body (đã truncate ở max_body_size nếu vượt).
+    /// Body (truncated at max_body_size if exceeded).
     body: []u8,
-    /// Số byte body thực nhận được từ server (kể cả phần bị bỏ).
+    /// Actual bytes of body received from server (including discarded portion).
     total_body_bytes: usize,
-    /// true nếu body bị cắt vì vượt max_body_size.
+    /// true if body was truncated due to exceeding max_body_size.
     truncated: bool,
-    /// Con trỏ vùng nhớ gốc do fetch cấp — deinit free vùng này (headers_out
-    /// cũng được merge về đây, xem fetch).
+    /// Base memory pointer allocated by fetch — deinit frees this buffer (headers_out
+    /// is also merged here, see fetch).
     intern_base: ?[]u8 = null,
-    /// Allocation riêng cho mảng Header (trỏ vào intern_base).
+    /// Dedicated allocation for Header array (pointing into intern_base).
     intern_headers: ?[]Response.Header = null,
 
     pub const Header = struct {
@@ -75,7 +75,7 @@ pub const Response = struct {
         value: []const u8,
     };
 
-    /// Tìm header theo tên (case-insensitive). Trả value hoặc null.
+    /// Find header by name (case-insensitive). Returns value or null.
     pub fn getHeader(self: *const Response, name: []const u8) ?[]const u8 {
         for (self.headers) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
@@ -83,7 +83,7 @@ pub const Response = struct {
         return null;
     }
 
-    /// Giải phóng toàn bộ bộ nhớ thuộc Response.
+    /// Free all memory belonging to Response.
     pub fn deinit(self: *Response, alloc: Allocator) void {
         if (self.intern_headers) |h| alloc.free(h);
         if (self.intern_base) |p| alloc.free(p);
@@ -92,11 +92,11 @@ pub const Response = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Helpers dùng chung
+// Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Parse chuỗi method → std.http.Method. Case-insensitive.
-/// Trả error.InvalidMethod nếu không nhận dạng được.
+/// Parse method string → std.http.Method. Case-insensitive.
+/// Returns error.InvalidMethod if unrecognized.
 pub fn parseMethod(method: []const u8) !std.http.Method {
     var buf: [16]u8 = undefined;
     if (method.len > buf.len) return error.InvalidMethod;
@@ -104,21 +104,21 @@ pub fn parseMethod(method: []const u8) !std.http.Method {
     return std.meta.stringToEnum(std.http.Method, upper) orelse error.InvalidMethod;
 }
 
-/// Parse JSON object string `{"K":"V",...}` thành list Header.
-/// Đây là parser đơn giản: key/value phải là string, không escape phức tạp
-/// (tool input từ LLM luôn ở dạng này). Trả lỗi nếu JSON malformed.
+/// Parse JSON object string `{"K":"V",...}` into Header list.
+/// This is a simple parser: key/value must be strings without complex nesting
+/// (tool input from LLM is always in this shape). Returns error if JSON is malformed.
 pub fn parseHeadersJson(alloc: Allocator, headers_json: []const u8) ![]std.http.Header {
     var list = std.ArrayList(std.http.Header).empty;
     errdefer list.deinit(alloc);
 
     var i: usize = 0;
-    // Bỏ qua whitespace leading
+    // Skip leading whitespace
     while (i < headers_json.len and std.ascii.isWhitespace(headers_json[i])) : (i += 1) {}
     if (i >= headers_json.len or headers_json[i] != '{') return error.InvalidHeadersJson;
     i += 1;
 
     while (i < headers_json.len) {
-        // skip whitespace và dấu phẩy
+        // Skip whitespace and comma
         while (i < headers_json.len and (std.ascii.isWhitespace(headers_json[i]) or headers_json[i] == ',')) : (i += 1) {}
         if (i >= headers_json.len) break;
         if (headers_json[i] == '}') break;
@@ -139,8 +139,8 @@ pub fn parseHeadersJson(alloc: Allocator, headers_json: []const u8) ![]std.http.
     return list.toOwnedSlice(alloc);
 }
 
-/// Đọc JSON string bắt đầu tại s[i] == '"'. Nâng i qua closing quote.
-/// Hỗ trợ escape: \" \\ \/ \b \f \n \r \t \uXXXX.
+/// Read JSON string starting at s[i] == '"'. Advance i past closing quote.
+/// Supports escapes: \" \\ \/ \b \f \n \r \t \uXXXX.
 fn parseJsonString(alloc: Allocator, s: []const u8, i: *usize) ![]u8 {
     std.debug.assert(s[i.*] == '"');
     i.* += 1;
@@ -182,11 +182,11 @@ fn parseJsonString(alloc: Allocator, s: []const u8, i: *usize) ![]u8 {
             i.* += 1;
         }
     }
-    return error.InvalidHeadersJson; // thiếu closing quote
+    return error.InvalidHeadersJson; // missing closing quote
 }
 
-/// Format Response thành text cho tool protocol (status, headers, blank, body).
-/// Dùng cho executeTool của http_request và các tool muốn output plain text.
+/// Format Response as text for tool protocol (status, headers, blank, body).
+/// Used by executeTool in http_request and tools needing plain text output.
 pub fn formatResponseText(alloc: Allocator, res: *const Response) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(alloc);
@@ -224,10 +224,10 @@ pub fn formatResponseText(alloc: Allocator, res: *const Response) ![]u8 {
 // Fetch — core
 // ---------------------------------------------------------------------------
 
-/// Gửi HTTP request và trả Response có cấu trúc.
+/// Send HTTP request and return structured Response.
 ///
-/// Lưu ý memory: toàn bộ Response nằm trong MỘT allocation duy nhất
-/// (arena nội bộ) → caller chỉ cần `res.deinit(alloc)`.
+/// Memory note: entire Response is housed in ONE single allocation
+/// (internal arena) → caller only needs to call `res.deinit(alloc)`.
 pub fn fetch(alloc: Allocator, io: std.Io, opts: Options) !Response {
     var client = std.http.Client{
         .allocator = alloc,
@@ -235,31 +235,31 @@ pub fn fetch(alloc: Allocator, io: std.Io, opts: Options) !Response {
     };
     defer client.deinit();
 
-    // Pre-warm TLS state đúng cách std làm cho https trực tiếp: rescan CA
-    // bundle + set `now`. Không có bước này, request http bị redirect 301 →
-    // https sẽ panic "attempt to use null value" trong Tls.create (unwrap
-    // `client.now.?` khi connect).
+    // Pre-warm TLS state the way std does for direct https: rescan CA
+    // bundle + set `now`. Without this, http requests redirected 301 →
+    // https will panic "attempt to use null value" in Tls.create (unwrapping
+    // `client.now.?` on connect).
     initTlsState(&client, io);
 
     return fetchWithClient(alloc, &client, opts);
 }
 
-/// Khởi tạo `now` + `ca_bundle` cho client (mirror logic tls: block trong
-/// std.http.Client.connect — std chỉ chạy nhánh này khi URL gốc là https).
+/// Initialize `now` + `ca_bundle` for client (mirroring tls: logic in
+/// std.http.Client.connect — std only runs this branch when root URL is https).
 fn initTlsState(client: *std.http.Client, io: std.Io) void {
     if (std.http.Client.disable_tls) return;
     client.now = std.Io.Clock.real.now(io);
     var bundle: std.crypto.Certificate.Bundle = .empty;
     defer bundle.deinit(client.allocator);
     bundle.rescan(client.allocator, io, client.now.?) catch {
-        // Load CA thất bại → bỏ trống, TLS sẽ trả CertificateBundleLoadFailure
-        // thay vì crash; các connection http vẫn hoạt động bình thường.
+        // Failed to load CA → leave empty, TLS will return CertificateBundleLoadFailure
+        // instead of crashing; http connections will still work normally.
         return;
     };
     std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
 }
 
-/// Như `fetch` nhưng dùng client có sẵn (reuse connection pool, caller quản deinit).
+/// Like `fetch` but uses existing client (reuses connection pool, caller manages deinit).
 pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options) !Response {
     const http_method = try parseMethod(opts.method);
 
@@ -287,7 +287,7 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
     });
     defer req.deinit();
 
-    // --- Gửi request body ---
+    // --- Send request body ---
     if (opts.body) |b| {
         if (b.len > 0) {
             req.transfer_encoding = .{ .content_length = b.len };
@@ -302,14 +302,14 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
         try req.sendBodiless();
     }
 
-    // --- Nhận response head ---
+    // --- Receive response head ---
     var redirect_buffer: [4096]u8 = undefined;
     var response = try req.receiveHead(&redirect_buffer);
 
     const status: u16 = @intFromEnum(response.head.status);
     const reason: []const u8 = response.head.reason;
 
-    // --- Thu thập headers bằng HeaderIterator chuẩn của std ---
+    // --- Collect headers using std HeaderIterator ---
     var header_list = std.ArrayList(Response.Header).empty;
     defer header_list.deinit(alloc);
     if (response.head.bytes.len > 0) {
@@ -322,7 +322,7 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
         }
     }
 
-    // --- Đọc body có giới hạn ---
+    // --- Read body with limit ---
     var resp_body = std.ArrayList(u8).empty;
     defer resp_body.deinit(alloc);
 
@@ -334,7 +334,7 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
     while (true) {
         if (signals.isInterrupted()) return error.Interrupted;
         const n = r.readSliceShort(&chunk_buf) catch |e| {
-            // Đã đọc được một phần → coi như đủ, không fail cả request
+            // Already read a portion → consider sufficient, don't fail whole request
             if (resp_body.items.len > 0) break;
             return e;
         };
@@ -347,8 +347,8 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
         }
     }
 
-    // --- Đóng gói vào một allocation duy nhất để deinit đơn giản ---
-    // Layout: reason | header names+values | body  (không padding, cộng dồn offset)
+    // --- Pack into a single allocation for simple deinit ---
+    // Layout: reason | header names+values | body  (no padding, cumulative offsets)
     const reason_len = reason.len;
     var headers_flat_len: usize = 0;
     for (header_list.items) |h| {
@@ -359,7 +359,7 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
     const base = try alloc.alloc(u8, total_len);
     errdefer alloc.free(base);
 
-    // Copy xong sẽ free các bản dupe tạm trong header_list (tránh leak).
+    // Once copied, free temporary duplicates in header_list (avoid leaks).
     defer for (header_list.items) |h| {
         alloc.free(h.name);
         alloc.free(h.value);
@@ -371,7 +371,7 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
     const reason_out = base[off .. off + reason.len];
     off += reason.len;
 
-    // headers: mảng Header trỏ vào base
+    // headers: Header array pointing into base
     const headers_out = try alloc.alloc(Response.Header, header_list.items.len);
     errdefer alloc.free(headers_out);
     for (header_list.items, 0..) |h, idx| {
@@ -404,24 +404,24 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
 // postStream — streaming cho SSE / NDJSON (backends AI)
 // ---------------------------------------------------------------------------
 
-/// Callback nhận từng chunk dữ liệu từ HTTP response (streaming).
-/// `chunk` là slice tạm thời — phải copy nếu cần giữ lại.
-/// `userdata` là con trỏ tới context struct của caller.
+/// Callback receiving each data chunk from HTTP response (streaming).
+/// `chunk` is a temporary slice — must be copied if retained.
+/// `userdata` is a pointer to caller's context struct.
 pub const StreamChunkFn = *const fn (chunk: []const u8, userdata: *anyopaque) void;
 
-/// Tùy chọn cho streaming POST (tương tự sse.post cũ).
+/// Options for streaming POST (similar to legacy sse.post).
 pub const StreamOptions = struct {
-    /// URL đầy đủ (http:// hoặc https://).
+    /// Full URL (http:// or https://).
     url: []const u8,
-    /// Headers dạng "Key: Value".
+    /// Headers in "Key: Value" format.
     headers: []const []const u8 = &.{},
-    /// Body POST (JSON string).
+    /// POST body (JSON string).
     body: []const u8 = "",
-    /// Timeout tổng (giây). Mặc định: 120.
+    /// Total timeout (seconds). Default: 120.
     timeout_secs: u32 = 120,
 };
 
-/// Parse list headers dạng "Key: Value" → []std.http.Header (đã dupe).
+/// Parse list of headers in "Key: Value" format → []std.http.Header (duplicated).
 pub fn parseHeadersKv(alloc: Allocator, headers: []const []const u8) ![]std.http.Header {
     var list = std.ArrayList(std.http.Header).empty;
     errdefer list.deinit(alloc);
@@ -447,8 +447,8 @@ fn freeHeadersKv(alloc: Allocator, headers: []std.http.Header) void {
     alloc.free(headers);
 }
 
-/// Gửi HTTP POST và stream response qua `on_chunk` callback từng chunk.
-/// Trả về HTTP status code. Dùng cho SSE/NDJSON của các AI backend.
+/// Send HTTP POST and stream response chunk-by-chunk via `on_chunk` callback.
+/// Returns HTTP status code. Used for SSE/NDJSON across AI backends.
 pub fn postStream(
     alloc: Allocator,
     io: std.Io,
@@ -462,7 +462,7 @@ pub fn postStream(
     };
     defer client.deinit();
 
-    // Xem fetch(): redirect http → https cần TLS state được pre-warm.
+    // See fetch(): redirect http → https requires pre-warmed TLS state.
     initTlsState(&client, io);
 
     const extra_headers = try parseHeadersKv(alloc, opts.headers);
@@ -478,9 +478,9 @@ pub fn postStream(
     });
     defer req.deinit();
 
-    // Gửi body
-    // POST luôn phải có body (sendBodiless assert !method.requestHasBody()
-    // → panic với POST/PUT). Gửi content_length = 0 khi body rỗng.
+    // Send body
+    // POST must always have a body (sendBodiless asserts !method.requestHasBody()
+    // → panics with POST/PUT). Send content_length = 0 when body is empty.
     req.transfer_encoding = .{ .content_length = opts.body.len };
     var req_body = try req.sendBodyUnflushed(&.{});
     if (opts.body.len > 0) {
@@ -492,7 +492,7 @@ pub fn postStream(
     var redirect_buffer: [4096]u8 = undefined;
     var response = try req.receiveHead(&redirect_buffer);
 
-    // Đọc streaming từng chunk
+    // Read streaming chunks
     var transfer_buf: [4096]u8 = undefined;
     const r = response.reader(&transfer_buf);
 
@@ -509,27 +509,27 @@ pub fn postStream(
 }
 
 // ---------------------------------------------------------------------------
-// Tests — unit + integration với local HTTP server (std.Io.net)
+// Tests — unit + integration with local HTTP server (std.Io.net)
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
-/// Context cho test server chạy trên thread riêng: đọc 1 request, ghi 1 response.
+/// Context for test server running on separate thread: reads 1 request, writes 1 response.
 const TestServerCtx = struct {
     io: std.Io,
     port: u16,
-    /// Response bytes server sẽ gửi (raw HTTP/1.1, KHÔNG chunked).
+    /// Response bytes server will send (raw HTTP/1.1, NOT chunked).
     response: []const u8,
-    /// Số request phục vụ trước khi thoát.
+    /// Number of requests to serve before exiting.
     max_requests: u32,
-    /// Raw request nhận được (để assert method/path/body).
+    /// Raw request received (to assert method/path/body).
     received: std.ArrayList(u8),
     received_mutex: std.Io.Mutex = .init,
     done: std.Io.Event = .unset,
 
     fn run(self: *TestServerCtx) void {
         self.serve() catch |e| {
-            std.debug.print("[test-server] lỗi: {s}\n", .{@errorName(e)});
+            std.debug.print("[test-server] error: {s}\n", .{@errorName(e)});
         };
         self.done.set(self.io);
     }
@@ -549,7 +549,7 @@ const TestServerCtx = struct {
             var write_buf: [16384]u8 = undefined;
             var s_writer = stream.writer(self.io, &write_buf);
 
-            // Đọc request: head + body tới đủ content-length.
+            // Read request: head + body until full content-length.
             const head = s_reader.interface.peekGreedy(1) catch break;
             const content_len: usize = blk: {
                 if (std.mem.indexOf(u8, head, "content-length:")) |p| {
@@ -581,7 +581,7 @@ const TestServerCtx = struct {
     }
 };
 
-/// Helper: bind ephemeral port, trả về port thật (unbind ngay để tái sử dụng).
+/// Helper: bind ephemeral port, return actual port (immediately unbind for reuse).
 fn ephemeralPort(io: std.Io) !u16 {
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var s = try addr.listen(io, .{ .reuse_address = true });
@@ -589,7 +589,7 @@ fn ephemeralPort(io: std.Io) !u16 {
     return s.socket.address.getPort();
 }
 
-/// Chạy fetch với test server. Xử lý lifecycle thread + cleanup.
+/// Run fetch with test server. Manages thread lifecycle + cleanup.
 const FetchHarness = struct {
     ctx: TestServerCtx,
     thread: ?std.Thread,
@@ -628,7 +628,7 @@ const FetchHarness = struct {
 // Unit tests: parseMethod
 // -------------------------------------------------------------------------
 
-test "parseMethod: hợp lệ + case-insensitive" {
+test "parseMethod: valid + case-insensitive" {
     try testing.expectEqual(std.http.Method.GET, try parseMethod("GET"));
     try testing.expectEqual(std.http.Method.GET, try parseMethod("get"));
     try testing.expectEqual(std.http.Method.POST, try parseMethod("post"));
@@ -639,7 +639,7 @@ test "parseMethod: hợp lệ + case-insensitive" {
     try testing.expectEqual(std.http.Method.PUT, try parseMethod("PUT"));
 }
 
-test "parseMethod: sai định dạng" {
+test "parseMethod: invalid format" {
     try testing.expectError(error.InvalidMethod, parseMethod("BREW"));
     try testing.expectError(error.InvalidMethod, parseMethod(""));
     try testing.expectError(error.InvalidMethod, parseMethod("TOOLONGMETHODXX"));
@@ -657,7 +657,7 @@ fn freeHeaders(alloc: Allocator, headers: []std.http.Header) void {
     alloc.free(headers);
 }
 
-test "parseHeadersJson: object đơn giản" {
+test "parseHeadersJson: simple object" {
     const alloc = testing.allocator;
     const headers = try parseHeadersJson(alloc, "{\"User-Agent\":\"test\",\"Accept\":\"text/html\"}");
     defer freeHeaders(alloc, headers);
@@ -668,7 +668,7 @@ test "parseHeadersJson: object đơn giản" {
     try testing.expectEqualStrings("text/html", headers[1].value);
 }
 
-test "parseHeadersJson: whitespace linh hoạt + object rỗng" {
+test "parseHeadersJson: flexible whitespace + empty object" {
     const alloc = testing.allocator;
     const h1 = try parseHeadersJson(alloc, "  { \"X-A\" : \"1\" }  ");
     defer freeHeaders(alloc, h1);
@@ -694,14 +694,14 @@ test "parseHeadersJson: escape sequences" {
     try testing.expectEqualStrings("Aầ", headers[4].value);
 }
 
-test "parseHeadersJson: UTF-8 giữ nguyên" {
+test "parseHeadersJson: UTF-8 preserved" {
     const alloc = testing.allocator;
     const headers = try parseHeadersJson(alloc, "{\"X-Custom\":\"tiếng Việt 🇻🇳\"}");
     defer freeHeaders(alloc, headers);
     try testing.expectEqualStrings("tiếng Việt 🇻🇳", headers[0].value);
 }
 
-test "parseHeadersJson: input sai" {
+test "parseHeadersJson: invalid input" {
     const alloc = testing.allocator;
     try testing.expectError(error.InvalidHeadersJson, parseHeadersJson(alloc, "not json"));
     try testing.expectError(error.InvalidHeadersJson, parseHeadersJson(alloc, "[1,2]"));
@@ -719,7 +719,7 @@ test "formatResponseText: status + headers + body + truncate note" {
         .status = 404,
         .reason = "Not Found",
         .headers = &.{.{ .name = "content-type", .value = "text/plain" }},
-        .body = @constCast("không có gì"), // 14 bytes UTF-8
+        .body = @constCast("nothing here"), // 12 bytes
         .total_body_bytes = 100,
         .truncated = true,
     };
@@ -730,12 +730,12 @@ test "formatResponseText: status + headers + body + truncate note" {
 
     try testing.expect(std.mem.startsWith(u8, text, "HTTP 404 Not Found\n"));
     try testing.expect(std.mem.indexOf(u8, text, "content-type: text/plain\n") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "\n\nkhông có gì") != null);
-    // omitted = total_body_bytes - body.len = 100 - 14 = 86
-    try testing.expect(std.mem.indexOf(u8, text, "... [truncated 86 bytes]") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\n\nnothing here") != null);
+    // omitted = total_body_bytes - body.len = 100 - 12 = 88
+    try testing.expect(std.mem.indexOf(u8, text, "... [truncated 88 bytes]") != null);
 }
 
-test "formatResponseText: 200 không truncate" {
+test "formatResponseText: 200 without truncation" {
     const alloc = testing.allocator;
     var res = Response{
         .status = 200,
@@ -773,10 +773,10 @@ test "Response.getHeader: case-insensitive" {
 }
 
 // -------------------------------------------------------------------------
-// Integration tests: fetch với local HTTP server
+// Integration tests: fetch with local HTTP server
 // -------------------------------------------------------------------------
 
-test "fetch GET: status/headers/body tách bạch — regression bug body lẫn headers" {
+test "fetch GET: separated status/headers/body — regression bug body mixed with headers" {
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -805,13 +805,13 @@ test "fetch GET: status/headers/body tách bạch — regression bug body lẫn 
     try testing.expectEqualStrings("OK", res.reason);
     try testing.expectEqualStrings("application/json", res.getHeader("Content-Type").?);
     try testing.expectEqualStrings("hello", res.getHeader("X-Custom").?);
-    // Body phải CHỈ là body — bug cũ trả cả status line + headers trong body
+    // Body must ONLY be body — old bug returned status line + headers inside body
     try testing.expectEqualStrings("{\"msg\":\"xin chào 🇻🇳\"}", res.body);
     try testing.expect(!res.truncated);
     try testing.expectEqual(@as(usize, 28), res.total_body_bytes);
 }
 
-test "fetch POST: gửi body + custom headers, server nhận đủ" {
+test "fetch POST: send body + custom headers, server receives complete" {
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -843,7 +843,7 @@ test "fetch POST: gửi body + custom headers, server nhận đủ" {
     try testing.expectEqual(@as(u16, 201), res.status);
     try testing.expectEqualStrings("created", res.body);
 
-    // Assert request server nhận được
+    // Assert request received by server
     try h.ctx.received_mutex.lock(h.io);
     defer h.ctx.received_mutex.unlock(h.io);
     const req = h.ctx.received.items;
@@ -855,7 +855,7 @@ test "fetch POST: gửi body + custom headers, server nhận đủ" {
     try testing.expect(std.mem.endsWith(u8, req, "{\"name\":\"test item\",\"qty\":3}"));
 }
 
-test "fetch GET 404: status đúng, body error vẫn đọc được" {
+test "fetch GET 404: correct status, error body still readable" {
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -883,7 +883,7 @@ test "fetch GET 404: status đúng, body error vẫn đọc được" {
     try testing.expectEqualStrings("not found", res.body);
 }
 
-test "fetch: body rỗng (content-length 0)" {
+test "fetch: empty body (content-length 0)" {
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -910,11 +910,11 @@ test "fetch: body rỗng (content-length 0)" {
     try testing.expect(!res.truncated);
 }
 
-test "fetch: truncation khi body vượt max_body_size" {
+test "fetch: truncation when body exceeds max_body_size" {
     const alloc = testing.allocator;
     const io = testing.io;
 
-    // Body 100 bytes 'a', max_body_size = 10 → chỉ giữ 10
+    // Body 100 bytes 'a', max_body_size = 10 → retain only 10
     var body: [100]u8 = undefined;
     @memset(&body, 'a');
 
@@ -940,12 +940,12 @@ test "fetch: truncation khi body vượt max_body_size" {
     try testing.expectEqual(@as(usize, 100), res.total_body_bytes);
 }
 
-test "fetch: URL sai scheme/host trả lỗi" {
+test "fetch: invalid scheme/host URL returns error" {
     const alloc = testing.allocator;
     const io = testing.io;
-    // URL malformed → error từ Uri.parse
+    // Malformed URL → error from Uri.parse
     try testing.expectError(error.InvalidFormat, fetch(alloc, io, .{ .url = "not a url" }));
-    // Host không tồn tại → connection error
+    // Non-existent host → connection error
     const r = fetch(alloc, io, .{ .url = "http://127.0.0.1:1/", .timeout_s = 5 });
     try testing.expectError(error.ConnectionRefused, r);
 }
@@ -965,7 +965,7 @@ const StreamAccumCtx = struct {
     }
 };
 
-test "postStream: SSE stream nhận đủ chunks + status" {
+test "postStream: SSE stream receives all chunks + status" {
     const alloc = testing.allocator;
     const io = testing.io;
 

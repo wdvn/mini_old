@@ -1,10 +1,10 @@
-//! artifacts.zig — Hệ thống quản lý Artifacts & Artifact References cho mini-agent.
+//! artifacts.zig — Artifacts & Artifact References management system for mini-agent.
 //!
-//! Cung cấp:
-//! 1. Quản lý lưu trữ tệp artifacts theo session: ~/.mini/artifacts/<session_id>/
-//! 2. Quản lý metadata danh mục artifacts (metadata.json)
-//! 3. Bắn event hooks thời gian thực (artifact_saved, artifact_updated) cho external UI/Preview
-//! 4. Hỗ trợ cú pháp tham chiếu 2 chiều @artifact:<name> trong chat / prompt.
+//! Provides:
+//! 1. Session-based artifact file storage: ~/.mini/artifacts/<session_id>/
+//! 2. Artifact catalog metadata management (metadata.json)
+//! 3. Real-time event hooks dispatching (artifact_saved, artifact_updated) for external UI/Preview
+//! 4. Bidirectional reference syntax support @artifact:<name> in chat / prompt.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -24,12 +24,12 @@ fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
 
 var g_session_id: ?[]const u8 = null;
 
-/// Thiết lập Session ID hiện tại.
+/// Set the current Session ID.
 pub fn setSessionId(id: ?[]const u8) void {
     g_session_id = id;
 }
 
-/// Lấy Session ID hiện tại (mặc định "default").
+/// Get the current Session ID (defaults to "default").
 pub fn getSessionId() []const u8 {
     if (g_session_id) |sid| {
         if (sid.len > 0) return sid;
@@ -37,7 +37,7 @@ pub fn getSessionId() []const u8 {
     return "default";
 }
 
-/// Xác định đường dẫn thư mục artifacts cho session hiện tại.
+/// Resolve artifacts directory path for current session.
 pub fn resolveArtifactsDir(alloc: Allocator, io: std.Io) ![]u8 {
     const sid = getSessionId();
 
@@ -52,7 +52,7 @@ pub fn resolveArtifactsDir(alloc: Allocator, io: std.Io) ![]u8 {
         dir_path = try defaultArtifactsDir(alloc, sid);
     }
 
-    // Tạo thư mục nếu chưa tồn tại
+    // Create directory if it does not exist
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, dir_path) catch {};
 
@@ -69,8 +69,8 @@ fn defaultArtifactsDir(alloc: Allocator, sid: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "./.mini/artifacts/{s}", .{sid});
 }
 
-/// Ghi một artifact mới hoặc cập nhật artifact cũ.
-/// Trả về đường dẫn tuyệt đối (hoặc chuẩn) tới tệp artifact.
+/// Write a new artifact or update an existing one.
+/// Returns absolute (or canonical) path to the artifact file.
 pub fn writeArtifact(
     alloc: Allocator,
     io: std.Io,
@@ -84,7 +84,7 @@ pub fn writeArtifact(
     const art_dir = try resolveArtifactsDir(alloc, io);
     defer alloc.free(art_dir);
 
-    // Chuẩn hóa tên file: loại bỏ các ký tự nguy hiểm dẫn ra ngoài thư mục
+    // Sanitize filename: strip dangerous leading characters leading outside directory
     var safe_name = name;
     while (std.mem.startsWith(u8, safe_name, "/") or std.mem.startsWith(u8, safe_name, "./")) {
         if (std.mem.startsWith(u8, safe_name, "/")) safe_name = safe_name[1..];
@@ -95,24 +95,24 @@ pub fn writeArtifact(
     const file_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ art_dir, safe_name });
     errdefer alloc.free(file_path);
 
-    // Tạo thư mục cha nếu safe_name có chứa subpath (ví dụ: scratch/test.py)
+    // Create parent directory if safe_name contains subpath (e.g. scratch/test.py)
     if (std.fs.path.dirname(file_path)) |pdir| {
         std.Io.Dir.cwd().createDirPath(io, pdir) catch {};
     }
 
-    // Ghi file nội dung artifact
+    // Write artifact file content
     const cwd = std.Io.Dir.cwd();
     const file = try cwd.createFile(io, file_path, .{ .truncate = true });
     defer file.close(io);
     try file.writeStreamingAll(io, content);
 
-    // Cập nhật metadata.json
+    // Update metadata.json
     updateMetadata(alloc, io, art_dir, safe_name, title, artifact_type, summary, user_facing, file_path) catch {};
 
     return file_path;
 }
 
-/// Đọc nội dung một artifact theo tên hoặc đường dẫn.
+/// Read content of an artifact by name or path.
 pub fn readArtifact(alloc: Allocator, io: std.Io, name: []const u8) ![]u8 {
     const art_dir = try resolveArtifactsDir(alloc, io);
     defer alloc.free(art_dir);
@@ -125,7 +125,7 @@ pub fn readArtifact(alloc: Allocator, io: std.Io, name: []const u8) ![]u8 {
 
     const cwd = std.Io.Dir.cwd();
     const file = cwd.openFile(io, file_path, .{}) catch |e| {
-        return std.fmt.allocPrint(alloc, "Lỗi: Không tìm thấy artifact '{s}' ({s})", .{ name, @errorName(e) });
+        return std.fmt.allocPrint(alloc, "Error: Artifact '{s}' not found ({s})", .{ name, @errorName(e) });
     };
     defer file.close(io);
 
@@ -139,7 +139,7 @@ pub fn readArtifact(alloc: Allocator, io: std.Io, name: []const u8) ![]u8 {
     return buf[0..n];
 }
 
-/// Liệt kê danh sách tất cả artifacts hiện có trong session.
+/// List all artifacts currently present in session.
 pub fn listArtifacts(alloc: Allocator, io: std.Io) ![]u8 {
     const art_dir = try resolveArtifactsDir(alloc, io);
     defer alloc.free(art_dir);
@@ -149,22 +149,22 @@ pub fn listArtifacts(alloc: Allocator, io: std.Io) ![]u8 {
 
     const cwd = std.Io.Dir.cwd();
     const meta_file = cwd.openFile(io, meta_path, .{}) catch {
-        return std.fmt.allocPrint(alloc, "Chưa có artifact nào trong session '{s}'. Thư mục: {s}", .{ getSessionId(), art_dir });
+        return std.fmt.allocPrint(alloc, "No artifacts found in session '{s}'. Directory: {s}", .{ getSessionId(), art_dir });
     };
     defer meta_file.close(io);
 
-    const stat = meta_file.stat(io) catch return std.fmt.allocPrint(alloc, "Lỗi đọc metadata.", .{});
+    const stat = meta_file.stat(io) catch return std.fmt.allocPrint(alloc, "Error reading metadata.", .{});
     const buf = try alloc.alloc(u8, @intCast(stat.size));
     defer alloc.free(buf);
     const n = try utils.readAll(io, meta_file, buf);
     const meta_content = buf[0..n];
 
-    return std.fmt.allocPrint(alloc, "Danh sách Artifacts (Session: {s}):\nThư mục: {s}\n\n{s}", .{
+    return std.fmt.allocPrint(alloc, "Artifacts List (Session: {s}):\nDirectory: {s}\n\n{s}", .{
         getSessionId(), art_dir, meta_content,
     });
 }
 
-/// Tự động quét và mở rộng cú pháp tham chiếu `@artifact:<name>` trong user prompt.
+/// Scan and expand `@artifact:<name>` reference syntax in user prompt.
 pub fn expandArtifactReferences(alloc: Allocator, io: std.Io, prompt: []const u8) ![]u8 {
     const prefix = "@artifact:";
     if (std.mem.indexOf(u8, prompt, prefix) == null) {
@@ -189,7 +189,7 @@ pub fn expandArtifactReferences(alloc: Allocator, io: std.Io, prompt: []const u8
                 if (content) |c| {
                     try result.print("\n\n--- [Artifact: {s}] ---\n{s}\n--- [End of Artifact: {s}] ---\n\n", .{ art_name, c, art_name });
                 } else {
-                    try result.print("@artifact:{s} (không tìm thấy)", .{art_name});
+                    try result.print("@artifact:{s} (not found)", .{art_name});
                 }
             } else {
                 try result.writeAll(prefix);
@@ -222,7 +222,7 @@ fn updateMetadata(
     _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
     const now = ts.sec;
 
-    // Đọc metadata hiện có nếu có
+    // Read existing metadata if present
     const cwd = std.Io.Dir.cwd();
     var existing_content: ?[]u8 = null;
     if (cwd.openFile(io, meta_path, .{})) |mf| {
@@ -257,7 +257,7 @@ fn updateMetadata(
     const esc_path = try json.escape(alloc, path);
     defer alloc.free(esc_path);
 
-    // Ghi cấu trúc JSON danh sách
+    // Write JSON array structure
     if (existing_content) |ec| {
         const trimmed = std.mem.trim(u8, ec, " \t\r\n");
         if (trimmed.len >= 2 and trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']') {
@@ -295,10 +295,10 @@ test "artifacts write, read and reference expansion" {
         alloc,
         main.getIo(),
         "test_plan.md",
-        "Kế hoạch thử nghiệm",
-        "# Kế hoạch\nNội dung artifact kiểm thử",
+        "Test Plan",
+        "# Plan\nTest artifact content",
         "markdown",
-        "Tóm tắt kiểm thử",
+        "Test summary",
         true,
     );
     defer alloc.free(path);
@@ -306,14 +306,14 @@ test "artifacts write, read and reference expansion" {
     // Read artifact
     const read_back = try readArtifact(alloc, main.getIo(), "test_plan.md");
     defer alloc.free(read_back);
-    try std.testing.expect(std.mem.indexOf(u8, read_back, "Nội dung artifact kiểm thử") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_back, "Test artifact content") != null);
 
     // Test expandArtifactReferences
-    const prompt = "Hãy xem @artifact:test_plan.md và tiếp tục";
+    const prompt = "Please review @artifact:test_plan.md and continue";
     const expanded = try expandArtifactReferences(alloc, main.getIo(), prompt);
     defer alloc.free(expanded);
     try std.testing.expect(std.mem.indexOf(u8, expanded, "--- [Artifact: test_plan.md] ---") != null);
-    try std.testing.expect(std.mem.indexOf(u8, expanded, "Nội dung artifact kiểm thử") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "Test artifact content") != null);
 }
 
 

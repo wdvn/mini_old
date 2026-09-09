@@ -1,11 +1,11 @@
 //! mcp.zig — Model Context Protocol (MCP) client.
 //!
-//! Kết nối với các MCP server bên ngoài qua stdio JSON-RPC 2.0.
-//! Mỗi server được spawn như một child process, giao tiếp qua
-//! stdin/stdout theo giao thức MCP.
+//! Connects to external MCP servers via stdio JSON-RPC 2.0.
+//! Each server is spawned as a child process communicating over
+//! stdin/stdout following the MCP protocol specification.
 //!
-//! ## Cấu hình
-//! File `~/.mini/mcp.json` (hoặc `$MINI_MCP_CONFIG`):
+//! ## Configuration
+//! File `~/.mini/mcp.json` (or `$MINI_MCP_CONFIG`):
 //! ```json
 //! {
 //!   "servers": {
@@ -22,15 +22,15 @@
 //! ```
 //!
 //! ## Tool naming
-//! Tên tool có prefix server: `filesystem__read_file`, `database__query`.
+//! Tool names carry a server prefix: `filesystem__read_file`, `database__query`.
 //!
-//! ## Giao thức MCP (JSON-RPC 2.0 over stdio)
+//! ## MCP Protocol (JSON-RPC 2.0 over stdio)
 //! 1. Spawn process
-//! 2. Gửi `initialize` request
-//! 3. Nhận response
-//! 4. Gửi `notifications/initialized`
-//! 5. Gửi `tools/list` → nhận danh sách tool
-//! 6. Gửi `tools/call` khi AI muốn dùng tool
+//! 2. Send `initialize` request
+//! 3. Receive response
+//! 4. Send `notifications/initialized`
+//! 5. Send `tools/list` → receive tool list
+//! 6. Send `tools/call` when AI executes tool
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -46,7 +46,7 @@ const hooks = @import("../core/hooks.zig");
 // I/O helper
 // ---------------------------------------------------------------------------
 
-/// Đọc một dòng byte-by-byte từ File, bỏ '\r'. Trả về null nếu EOF.
+/// Read a line byte-by-byte from File, stripping '\r'. Returns null on EOF.
 fn readLineFrom(file: std.Io.File, buf: []u8) ?[]u8 {
     var i: usize = 0;
     while (i < buf.len) {
@@ -69,17 +69,17 @@ fn readLineFrom(file: std.Io.File, buf: []u8) ?[]u8 {
 // Remote tool
 // ---------------------------------------------------------------------------
 
-/// Một tool được discover từ MCP server bên ngoài.
+/// A tool discovered from an external MCP server.
 pub const RemoteTool = struct {
-    /// Tên server (dùng làm prefix).
+    /// Server name (used as prefix).
     server_name: []const u8,
-    /// Tên gốc của tool (không có prefix).
+    /// Original tool name (without prefix).
     tool_name: []const u8,
-    /// Tên có prefix: `"server__tool"`.
+    /// Prefixed name: `"server__tool"`.
     prefixed_name: []const u8,
-    /// Mô tả ngắn.
+    /// Short description.
     description: []const u8,
-    /// JSON Schema của input.
+    /// JSON Schema of input parameters.
     input_schema_json: []const u8,
 };
 
@@ -87,24 +87,24 @@ pub const RemoteTool = struct {
 // MCP Server
 // ---------------------------------------------------------------------------
 
-/// Một MCP server đang kết kết nối, giao tiếp qua child process stdio.
+/// A connected MCP server communicating via child process stdio.
 pub const McpServer = struct {
     alloc: Allocator,
-    /// Tên server (từ config).
+    /// Server name (from config).
     name: []const u8,
     child: Child,
     stdin_file: std.Io.File,
     stdout_file: std.Io.File,
-    /// Danh sách tool discover được.
+    /// List of discovered tools.
     tools: ArrayList(RemoteTool),
     next_id: i64 = 1,
-    /// Argv slice (owned) cần free khi shutdown.
+    /// Argv slice (owned) to be freed upon shutdown.
     argv_owned: []const []const u8 = &.{},
-    /// Stream buffer cho line reader.
+    /// Stream buffer for line reader.
     recv_buf: ArrayList(u8) = .empty,
 
-    /// Đọc 1 dòng từ stdout_file (bất kể độ dài), tự động buffer chunk 8KB.
-    /// Trả về slice do caller owned (cần free qua self.alloc) hoặc error.McpEof khi EOF.
+    /// Read 1 line from stdout_file (regardless of length), buffering 8KB chunks.
+    /// Returns slice owned by caller (must free via self.alloc) or error.McpEof on EOF.
     fn readLine(self: *McpServer) ![]u8 {
         while (true) {
             if (std.mem.indexOfScalar(u8, self.recv_buf.items, '\n')) |idx| {
@@ -141,8 +141,8 @@ pub const McpServer = struct {
         }
     }
 
-    /// Gửi JSON-RPC request và đọc response đồng bộ.
-    /// Trả về JSON response string (owned).
+    /// Send JSON-RPC request and synchronously read response.
+    /// Returns JSON response string (owned).
     fn call(self: *McpServer, method: []const u8, params_json: ?[]const u8) ![]u8 {
         hooks.dispatch(self.alloc, main.g_io, .{
             .event = "OnRequest",
@@ -196,7 +196,7 @@ pub const McpServer = struct {
         return try self.alloc.dupe(u8, std.mem.trim(u8, line, " \t\r"));
     }
 
-    /// Gửi notification (không chờ response).
+    /// Send notification (without awaiting response).
     fn notify(self: *McpServer, method: []const u8) !void {
         hooks.dispatch(self.alloc, main.g_io, .{
             .event = "OnNotification",
@@ -212,7 +212,7 @@ pub const McpServer = struct {
         try self.stdin_file.writeStreamingAll(main.g_io, "\n");
     }
 
-    /// Thực hiện MCP handshake: initialize → initialized notification.
+    /// Perform MCP handshake: initialize → initialized notification.
     pub fn handshake(self: *McpServer) !void {
         const params =
             \\{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mini-agent","version":"1.0.0"}}
@@ -224,12 +224,12 @@ pub const McpServer = struct {
         try self.notify("notifications/initialized");
     }
 
-    /// Discover tools từ server bằng tools/list.
+    /// Discover tools from server via tools/list.
     pub fn discoverTools(self: *McpServer) !void {
         const resp = try self.call("tools/list", "{}");
         defer self.alloc.free(resp);
 
-        // Parse tools array từ result.tools
+        // Parse tools array from result.tools
         const result_obj = json.findObject(resp, "result") orelse return;
         const tools_arr = json.findArray(result_obj, "tools") orelse return;
 
@@ -240,7 +240,7 @@ pub const McpServer = struct {
                 continue;
             }
 
-            // Tìm object end
+            // Find object end
             var depth: i32 = 0;
             const obj_start = i;
             while (i < tools_arr.len) : (i += 1) {
@@ -285,21 +285,11 @@ pub const McpServer = struct {
         main.stderrPrint("[mcp] {s}: {d} tools discovered\n", .{ self.name, self.tools.items.len });
     }
 
-    /// Gọi tool theo tên gốc (không prefix). Trả về kết quả (owned).
-    ///
-    /// LƯU Ý: `arguments_json` là chuỗi JSON object đã được unescape ở lớp
-    /// findStringOwned (có thể chứa newline/quote thật từ nội dung tool, VD
-    /// `{"prompt":"Dòng 1\nDòng 2"}`). Nhét thẳng vào JSON-RPC sẽ làm vỡ wire
-    /// format. Ta parse thành `std.json.Value` rồi stringify lại để chuẩn
-    /// hoá escape, giữ `arguments` là một object (đúng MCP spec).
+    /// Call tool by raw name (without prefix). Returns owned result.
     pub fn callTool(self: *McpServer, tool_name: []const u8, arguments_json: []const u8) ![]u8 {
         const esc_tool = try json.escape(self.alloc, tool_name);
         defer self.alloc.free(esc_tool);
 
-        // Ưu tiên: parse JSON rồi stringify lại (chuẩn hoá mọi escape).
-        // Nếu parse fail (ví dụ raw newline trong string → invalid JSON),
-        // fallback sang reserializeJson (chỉ re-escape control chars trong
-        // string values, giữ nguyên JSON structure).
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, arguments_json, .{ .ignore_unknown_fields = true }) catch null;
         var args_buf: ?[]u8 = null;
         if (parsed) |*p| {
@@ -320,17 +310,17 @@ pub const McpServer = struct {
         const resp = try self.call("tools/call", params);
         defer self.alloc.free(resp);
 
-        // Trích xuất text từ result.content[0].text
+        // Extract text from result.content[0].text
         if (json.findObject(resp, "result")) |result_obj| {
             if (json.findString(result_obj, "text")) |text| {
                 return self.alloc.dupe(u8, text);
             }
             return self.alloc.dupe(u8, result_obj);
         }
-        return self.alloc.dupe(u8, "MCP: Không có kết quả");
+        return self.alloc.dupe(u8, "MCP: No result");
     }
 
-    /// Tắt server và giải phóng tài nguyên.
+    /// Shut down server and release resources.
     pub fn shutdown(self: *McpServer) void {
         for (self.tools.items) |t| {
             self.alloc.free(t.tool_name);
@@ -340,15 +330,14 @@ pub const McpServer = struct {
         }
         self.tools.deinit(self.alloc);
 
-        // Đóng stdin/stdout pipe, sau đó null-out handle trên child
-        // để child.wait() → cleanupStreams() không cố close lại (EBADF).
+        // Close pipes then null-out handle on child
         self.stdin_file.close(main.g_io);
         self.stdout_file.close(main.g_io);
         self.child.stdin = null;
         self.child.stdout = null;
         _ = self.child.wait(main.g_io) catch {};
 
-        // Giải phóng argv items + slice, recv_buf, và server name.
+        // Free argv items, recv_buf, and server name.
         self.recv_buf.deinit(self.alloc);
         for (self.argv_owned) |arg| self.alloc.free(arg);
         if (self.argv_owned.len > 0) self.alloc.free(self.argv_owned);
@@ -360,13 +349,13 @@ pub const McpServer = struct {
 // MCP Client Manager
 // ---------------------------------------------------------------------------
 
-/// Quản lý nhiều MCP server, cung cấp unified interface cho tool dispatch.
+/// Manages multiple MCP servers, providing unified interface for tool dispatch.
 pub const McpClientManager = struct {
     alloc: Allocator,
-    /// Danh sách server đang kết nối.
+    /// List of connected servers.
     servers: ArrayList(McpServer),
 
-    /// Khởi tạo manager rỗng.
+    /// Initialize empty manager.
     pub fn init(alloc: Allocator) McpClientManager {
         return .{
             .alloc = alloc,
@@ -374,8 +363,7 @@ pub const McpClientManager = struct {
         };
     }
 
-    /// Load và kết nối tất cả server từ file cấu hình.
-    /// Không báo lỗi nếu file không tồn tại (chỉ log).
+    /// Load and connect all servers from configuration file.
     pub fn loadFromConfig(self: *McpClientManager, env_map: *const std.process.Environ.Map, io: std.Io, config_path_override: ?[]const u8) void {
         var path_buf: [512]u8 = undefined;
         const config_path = config_path_override orelse blk: {
@@ -389,7 +377,7 @@ pub const McpClientManager = struct {
         const cwd = std.Io.Dir.cwd();
         const file = cwd.openFile(io, config_path, .{}) catch |e| {
             if (e != error.FileNotFound) {
-                main.stderrPrint("[mcp] Lỗi đọc {s}: {s}\n", .{ config_path, @errorName(e) });
+                main.stderrPrint("[mcp] Error reading {s}: {s}\n", .{ config_path, @errorName(e) });
             }
             return;
         };
@@ -455,7 +443,7 @@ pub const McpClientManager = struct {
 
             const command = json.findString(server_cfg, "command") orelse continue;
             self.spawnServer(server_name, command, server_cfg) catch |e| {
-                main.stderrPrint("[mcp] Lỗi spawn {s}: {s}\n", .{ server_name, @errorName(e) });
+                main.stderrPrint("[mcp] Error spawning {s}: {s}\n", .{ server_name, @errorName(e) });
             };
         }
     }
@@ -505,7 +493,7 @@ pub const McpClientManager = struct {
         };
 
         server.handshake() catch |e| {
-            main.stderrPrint("[mcp] {s}: handshake thất bại ({s}), bỏ qua.\n", .{ name, @errorName(e) });
+            main.stderrPrint("[mcp] {s}: handshake failed ({s}), skipping.\n", .{ name, @errorName(e) });
             server.shutdown();
             return;
         };
@@ -514,7 +502,7 @@ pub const McpClientManager = struct {
         try self.servers.append(self.alloc, server);
     }
 
-    /// Tìm và gọi tool theo prefixed name. Trả về null nếu không tìm thấy.
+    /// Find and invoke tool by prefixed name. Returns null if not found.
     pub fn callTool(self: *McpClientManager, prefixed_name: []const u8, arguments_json: []const u8) ?[]u8 {
         for (self.servers.items) |*server| {
             for (server.tools.items) |tool| {
@@ -526,8 +514,8 @@ pub const McpClientManager = struct {
         return null;
     }
 
-    /// Lấy danh sách tất cả remote tools dạng ToolDefinition để gửi lên API.
-    /// Kết quả cần được free bởi caller.
+    /// Get list of all remote tools as ToolDefinition to send to API.
+    /// Result must be freed by caller.
     pub fn getToolDefinitions(self: *const McpClientManager, alloc: Allocator) []proto.ToolDefinition {
         var total: usize = 0;
         for (self.servers.items) |s| total += s.tools.items.len;
@@ -548,14 +536,14 @@ pub const McpClientManager = struct {
         return defs;
     }
 
-    /// Tổng số tool MCP đang có.
+    /// Total count of available MCP tools.
     pub fn toolCount(self: *const McpClientManager) usize {
         var n: usize = 0;
         for (self.servers.items) |s| n += s.tools.items.len;
         return n;
     }
 
-    /// Tắt tất cả server và giải phóng bộ nhớ.
+    /// Terminate all servers and free memory.
     pub fn deinit(self: *McpClientManager) void {
         for (self.servers.items) |*s| s.shutdown();
         self.servers.deinit(self.alloc);

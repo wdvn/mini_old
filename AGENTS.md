@@ -1,11 +1,11 @@
 # AGENTS.md
 
-Hướng dẫn cho AI coding agents làm việc trên repo **mini-agent**. Đọc file này trước khi sửa code.
+Instructions for AI coding agents working on the **mini-agent** repository. Read this file before making any code changes.
 
-## Tổng quan project
+## Project Overview
 
-- **Ngôn ngữ**: Zig 0.16.0, thư viện chuẩn only (ngoại lệ: libcurl dynamic link, CodeAct static link).
-- **Loại**: AI agent chạy terminal, kiến trúc Code-Centric (agent viết JS chạy trong CodeAct VM nhúng, gọi tool qua object `mini.*`).
+- **Language**: Zig 0.16.0, standard library only (exceptions: libcurl dynamic link, QuickJS/CodeAct static link).
+- **Type**: Terminal-based AI agent with a Code-Centric architecture (agent writes JS running inside an embedded CodeAct VM, calling tools via the `mini.*` object).
 - **Layout**:
 
 ```
@@ -18,60 +18,60 @@ src/
   ui/                 — terminal UI: editor.zig (line editor), repl.zig
   backends/           — AI providers: openai.zig, claude.zig, ollama.zig, sse.zig
   acp/                — ACP server
-docs/                 — proposals, technical docs (tiếng Việt)
+docs/                 — proposals, technical documentation (English)
 scripts/build_release.sh
-scripts/setup_home_mini.sh — Khởi tạo & sync skills/config cho ~/.mini
-testcases/            — tất cả các file test (standalone, integration, benchmarks, ...)
+scripts/setup_home_mini.sh — Initialize & sync skills/config for ~/.mini
+testcases/            — all test files (standalone, integration, benchmarks, ...)
 ```
 
 ## Build & Run
 
 - `zig build` → binary `zig-out/bin/mini`.
-- `zig build run` → build + chạy interactive REPL.
+- `zig build run` → build + run interactive REPL.
 - `zig build run -- -e "..."` → single-shot mode.
 - `zig build test` → All-In-One test suite (Unit tests + Testcases + Mock LLM E2E).
-- `zig build test-unit` → Chạy riêng unit tests & testcases (không cần Node.js/mock server).
-- `zig build test-e2e` → Chạy riêng E2E tests với mock LLM server.
-- `zig build test -Dskip-e2e=true` → Chạy test bỏ qua tầng E2E mock.
-- `zig build test -Dtest-port=<port>` → Đổi port cho mock server (mặc định: 8399).
-- Setup môi trường user: `scripts/setup_home_mini.sh` (tạo/sync `~/.mini/`).
+- `zig build test-unit` → Run unit tests & testcases only (no Node.js/mock server required).
+- `zig build test-e2e` → Run E2E tests only with mock LLM server.
+- `zig build test -Dskip-e2e=true` → Run tests skipping the E2E mock layer.
+- `zig build test -Dtest-port=<port>` → Change port for mock server (default: 8399).
+- Setup user environment: `scripts/setup_home_mini.sh` (create/sync `~/.mini/`).
 - Release: `scripts/build_release.sh`.
-- Cross-compile: `zig build -Dtarget=x86_64-linux-gnu` (hoặc `aarch64-linux-gnu`).
+- Cross-compile: `zig build -Dtarget=x86_64-linux-gnu` (or `aarch64-linux-gnu`).
 
-## Quy ước code
+## Code Conventions
 
-- Comment tiếng Việt, giữ style hiện có trong file đang sửa.
-- Mỗi module `.zig` có doc-comment `//!` mô tả trách nhiệm ở đầu file.
-- Không thêm dependency ngoài nếu chưa được thảo luận trong proposal — nếu cần, mở proposal trước.
-- Tất cả các file test (scratch experiments, standalone test, benchmarks...) đều được đặt trong thư mục `testcases/` và phải có tên dạng `test_*.zig` (không để file test ở thư mục root).
-- Proposals/design docs đặt ở `docs/`, format: `rfc_NNN_<tên>_proposal.md` (RFC đánh số tăng dần, snake_case; ví dụ `rfc_005_agent_folder_proposal.md`). Doc tham khảo/thuần kiến thức (không phải proposal) giữ tên snake_case thường.
+- **Primary language**: English. Code, comments, docstrings, user-facing output, and documentation must be in English.
+- Every `.zig` module must have a top-level doc-comment `//!` describing its responsibilities.
+- Do not add external dependencies unless discussed in a proposal — open a proposal first if necessary.
+- All test files (scratch experiments, standalone tests, benchmarks...) must be placed in `testcases/` and named `test_*.zig` (do not leave test files in the root directory).
+- Proposals/design docs belong in `docs/`, format: `rfc_NNN_<name>_proposal.md` (RFCs sequentially numbered, snake_case; e.g. `rfc_005_agent_folder_proposal.md`). Reference docs retain standard snake_case naming.
 
-## Lưu ý kiến trúc
+## Architecture Notes
 
-- Tool calls ưu tiên đi qua JS VM (`runtime/js_bindings.zig`) thay vì thêm path JSON tool-calling mới.
-- **Per-Act VM Isolation**: Mỗi Act khởi tạo một `JSContext` độc lập để triệt tiêu ô nhiễm scope biến toàn cục (`const`/`let`) giữa các turns.
-- **MemAct Reactive Compaction**: Nén ngữ cảnh dạng reactive-only (chỉ kích hoạt khi backend trả lỗi vượt context limit, drop-all + dồn summary tại index 1, bảo tồn prompt gốc index 0).
-- **Dual-Protocol Auto-Negotiation**: Tự động chuyển đổi và nhớ protocol giữa Chat Completions API và Responses API cho OpenAI-compatible endpoints.
-- **Execution & Stopping Rules**: Agent tuân thủ 4 quy tắc dừng (Stop on Completion, Confirm Before Mutation, Avoid Action Loops, Progress Checkpoint).
-- Backends đều conform `core/protocol.zig`; không gọi HTTP trực tiếp trong agent loop.
-- Editor (`ui/editor.zig`) hỗ trợ incremental bracketed paste parser (`ui/paste.zig`), UTF-8 width, single-line byte-based (lộ trình FSM multiline composer tại `docs/rfc_008_user_input_state_machine_proposal.md`).
-- History persistence dự kiến dùng SQLite (libsqlite3 đã reserve trong build.zig).
+- Tool calls preferentially pass through the JS VM (`runtime/js_bindings.zig`) rather than introducing new JSON tool-calling paths.
+- **Per-Act VM Isolation**: Each Act initializes an independent `JSContext` to eliminate global variable scope pollution (`const`/`let`) across turns.
+- **MemAct Reactive Compaction**: Reactive-only context compression (triggers only when backend returns context limit error, drops-all and inserts summary at index 1, preserving original prompt at index 0).
+- **Dual-Protocol Auto-Negotiation**: Automatically switch and remember protocol between Chat Completions API and Responses API for OpenAI-compatible endpoints.
+- **Execution & Stopping Rules**: The agent strictly follows 4 stopping rules (Stop on Completion, Confirm Before Mutation, Avoid Action Loops, Progress Checkpoint).
+- Backends conform to `core/protocol.zig`; do not make direct HTTP calls in the agent loop.
+- Editor (`ui/editor.zig`) supports incremental bracketed paste parser (`ui/paste.zig`), UTF-8 width, single-line byte-based editing (multiline composer FSM roadmap at `docs/rfc_008_user_input_state_machine_proposal.md`).
+- History persistence is planned using SQLite (libsqlite3 reserved in `build.zig`).
 
 ## Testing
 
-- **Lệnh chuẩn trước khi commit**: Chạy `zig build test` (hoặc `zig build test --summary all`), phải pass toàn bộ 13/13 steps (159 tests passed, 4 skipped).
-- **Cơ chế All-In-One**:
-  1. *Tầng 1 (Unit tests)*: Test toàn bộ module trong `src/main.zig` (118 tests: 114 passed, 4 skipped).
-  2. *Tầng 2 (Integration testcases)*: Test CodeAct VM isolation, security blocklist/allowlist, hooks, CAS file snapshot (`testcases/test_codeact_security.zig` — 45 tests).
-  3. *Tầng 3 (E2E Mock LLM)*: Tự build binary `mini`, khởi chạy `node scripts/mock_llm_server.js` độc lập trên port 8399 và test 3 flow hoàn chỉnh (`simple text`, `long text streaming`, `tool call bash multi-turn`).
-- **Tùy chọn linh hoạt**:
-  - Khi môi trường thiếu Node.js hoặc chỉ muốn test nhanh: `zig build test-unit` hoặc `zig build test -Dskip-e2e=true`.
-  - Khi chỉ muốn test riêng E2E: `zig build test-e2e`.
-  - Đổi port mock server khi xung đột: `zig build test -Dtest-port=8400`.
-- **UI/editor**: Test thủ công qua `zig build run`, kiểm tra gõ UTF-8 (tiếng Việt), bracketed paste, Ctrl+A/E/U, ↑/↓ history.
-- **Backends**: Không gọi API thật khi test; kiểm tra logic parse SSE bằng unit test và mock server nội bộ.
+- **Standard pre-commit command**: Run `zig build test` (or `zig build test --summary all`), all 13/13 steps must pass.
+- **All-In-One Architecture**:
+  1. *Tier 1 (Unit tests)*: Test all modules in `src/main.zig`.
+  2. *Tier 2 (Integration testcases)*: Test CodeAct VM isolation, security blocklist/allowlist, hooks, CAS file snapshots (`testcases/test_codeact_security.zig`).
+  3. *Tier 3 (E2E Mock LLM)*: Builds `mini` binary, spawns `node scripts/mock_llm_server.js` independently on port 8399 and tests 3 complete flows (`simple text`, `long text streaming`, `tool call bash multi-turn`).
+- **Flexible Options**:
+  - When Node.js is unavailable or for faster iterations: `zig build test-unit` or `zig build test -Dskip-e2e=true`.
+  - When running E2E tests only: `zig build test-e2e`.
+  - In case of port collision: `zig build test -Dtest-port=8400`.
+- **UI/editor**: Manual testing via `zig build run`, verify UTF-8 input, bracketed paste, Ctrl+A/E/U, ↑/↓ history.
+- **Backends**: Never call real APIs during automated testing; verify SSE parsing via unit tests and the internal mock server.
 
 ## PR / Commit
 
-- Commit message tiếng Anh hoặc tiếng Việt, format: `module: mô tả ngắn` (ví dụ `editor: add word motion keybindings`).
-- Không commit file scratch test ngoài các file test trong `testcases/` đã có, không commit `zig-cache/`, `zig-out/`.
+- Commit messages must be in English, format: `module: short description` (e.g. `editor: add word motion keybindings`).
+- Do not commit scratch test files outside of `testcases/`, do not commit `zig-cache/`, `zig-out/`.

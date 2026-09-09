@@ -1,5 +1,5 @@
 //! cas.zig — Content-Addressed Storage
-//! Lưu trữ nội dung file theo SHA-256 hash để phục vụ snapshot và rollback.
+//! Stores file contents indexed by SHA-256 hash for snapshot and rollback.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -10,12 +10,12 @@ pub const CAS = struct {
     alloc: Allocator,
     dir_path: []const u8,
 
-    /// Khởi tạo CAS tại đường dẫn chỉ định (vd: ~/.mini/cas)
+    /// Initialize CAS at the specified directory path (e.g., ~/.mini/cas)
     pub fn init(alloc: Allocator, io: std.Io, dir_path: []const u8) !CAS {
         const path_dup = try alloc.dupe(u8, dir_path);
-        // Tạo thư mục nếu chưa có
+        // Create directory if it does not exist
         const cwd = std.Io.Dir.cwd();
-        cwd.createDirPath(io, path_dup) catch {}; // Ignore error nếu đã tồn tại
+        cwd.createDirPath(io, path_dup) catch {}; // Ignore error if already exists
         return .{
             .alloc = alloc,
             .dir_path = path_dup,
@@ -26,13 +26,13 @@ pub const CAS = struct {
         self.alloc.free(self.dir_path);
     }
 
-    /// Lưu dữ liệu vào CAS. Trả về mã hash SHA-256 (64 ký tự hex).
-    /// Caller có trách nhiệm `free` chuỗi trả về.
+    /// Store data into CAS. Returns SHA-256 hash (64 hex characters).
+    /// Caller owns the returned slice and must free it.
     pub fn store(self: *CAS, io: std.Io, content: []const u8) ![]u8 {
         var hash_bin: [crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         crypto.hash.sha2.Sha256.hash(content, &hash_bin, .{});
 
-        // Zig 0.16: fmtSliceHexLower đã bị xóa, dùng bytesToHex.
+        // Zig 0.16: fmtSliceHexLower was removed, use bytesToHex.
         const hash_hex = try self.alloc.dupe(u8, &std.fmt.bytesToHex(hash_bin, .lower));
         errdefer self.alloc.free(hash_hex);
 
@@ -41,7 +41,7 @@ pub const CAS = struct {
 
         const cwd = std.Io.Dir.cwd();
 
-        // Kiểm tra xem đã có chưa
+        // Check if already exists
         if (cwd.openFile(io, file_path, .{})) |file| {
             file.close(io);
             return hash_hex;
@@ -54,8 +54,8 @@ pub const CAS = struct {
         return hash_hex;
     }
 
-    /// Đọc dữ liệu từ CAS bằng hash.
-    /// Trả về slice do caller sở hữu.
+    /// Read data from CAS by hash.
+    /// Returns slice owned by the caller.
     pub fn retrieve(self: *CAS, io: std.Io, hash_hex: []const u8) ![]u8 {
         const file_path = try std.fs.path.join(self.alloc, &.{ self.dir_path, hash_hex });
         defer self.alloc.free(file_path);

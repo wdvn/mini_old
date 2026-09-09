@@ -1,18 +1,18 @@
-//! tools/glob.zig — Tool tìm file theo wildcard pattern.
+//! tools/glob.zig — File wildcard search tool.
 //!
-//! Hỗ trợ các wildcard cơ bản:
-//!   `*`   — khớp bất kỳ chuỗi nào (không kể path separator)
-//!   `**`  — khớp bất kỳ chuỗi kể cả path separator (recursive)
-//!   `?`   — khớp đúng 1 ký tự bất kỳ
+//! Supports basic wildcards:
+//!   `*`   — matches any characters within a path component
+//!   `**`  — matches any characters across path separators (recursive)
+//!   `?`   — matches exactly 1 character
 //!
 //! ## Input schema
 //! ```json
 //! { "pattern": "**/*.zig", "path": "./src" }
 //! ```
-//! `path` là thư mục gốc để tìm kiếm (mặc định: ".").
+//! `path` is the search base directory (default: ".").
 //!
 //! ## Output
-//! Danh sách đường dẫn, mỗi file một dòng, tối đa 500 kết quả.
+//! List of file paths, one per line, up to 500 results.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -25,7 +25,7 @@ const MAX_RESULTS = 500;
 /// Input: {"pattern":"**/*.zig", "path":"./src"}
 pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     const pattern = (try json.findStringOwned(alloc, input_json, "pattern")) orelse
-        return std.fmt.allocPrint(alloc, "Lỗi: thiếu trường 'pattern'", .{});
+        return std.fmt.allocPrint(alloc, "Error: missing 'pattern' parameter", .{});
     defer alloc.free(pattern);
     const base_path = (try json.findStringOwned(alloc, input_json, "path")) orelse
         try alloc.dupe(u8, ".");
@@ -34,14 +34,14 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     return searchGlob(alloc, io, pattern, base_path);
 }
 
-/// Tìm file theo glob pattern trong thư mục base_path.
+/// Find files matching glob pattern inside base_path.
 pub fn searchGlob(alloc: Allocator, io: std.Io, pattern: []const u8, base_path: []const u8) ![]u8 {
     var result = utils.BufWriter.init(alloc);
     errdefer result.deinit();
 
     const cwd = std.Io.Dir.cwd();
     var dir = cwd.openDir(io, base_path, .{ .iterate = true }) catch |e| {
-        return std.fmt.allocPrint(alloc, "Lỗi mở thư mục '{s}': {s}", .{ base_path, @errorName(e) });
+        return std.fmt.allocPrint(alloc, "Error opening directory '{s}': {s}", .{ base_path, @errorName(e) });
     };
     defer dir.close(io);
 
@@ -52,7 +52,7 @@ pub fn searchGlob(alloc: Allocator, io: std.Io, pattern: []const u8, base_path: 
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (count >= MAX_RESULTS) {
-            try result.print("... (giới hạn {d} kết quả)\n", .{MAX_RESULTS});
+            try result.print("... (limited to {d} results)\n", .{MAX_RESULTS});
             break;
         }
 
@@ -66,10 +66,10 @@ pub fn searchGlob(alloc: Allocator, io: std.Io, pattern: []const u8, base_path: 
     }
 
     if (count == 0) {
-        return std.fmt.allocPrint(alloc, "Không tìm thấy file khớp với pattern '{s}' trong '{s}'.", .{ pattern, base_path });
+        return std.fmt.allocPrint(alloc, "No files matching pattern '{s}' found in '{s}'.", .{ pattern, base_path });
     }
 
-    // Thêm summary
+    // Append summary
     try result.print("\n{d} file(s) found.", .{count});
     return result.toOwnedSlice();
 }
@@ -78,8 +78,8 @@ pub fn searchGlob(alloc: Allocator, io: std.Io, pattern: []const u8, base_path: 
 // Glob matching
 // ---------------------------------------------------------------------------
 
-/// Khớp path với pattern glob.
-/// Hỗ trợ `*` (không qua /), `**` (qua /), `?` (1 ký tự).
+/// Match path against glob pattern.
+/// Supports `*` (within component), `**` (across /), `?` (single char).
 fn globMatch(pattern: []const u8, path: []const u8) bool {
     return matchInner(pattern, path);
 }
@@ -90,18 +90,18 @@ fn matchInner(pat: []const u8, str: []const u8) bool {
 
     while (pi < pat.len) {
         if (pat[pi] == '*') {
-            // Double star: khớp bất kỳ (kể cả /)
+            // Double star: match across /
             if (pi + 1 < pat.len and pat[pi + 1] == '*') {
                 pi += 2;
                 if (pi < pat.len and pat[pi] == '/') pi += 1;
-                // Thử khớp từ mỗi vị trí trong str
+                // Try matching from each position in str
                 var i: usize = si;
                 while (i <= str.len) : (i += 1) {
                     if (matchInner(pat[pi..], str[i..])) return true;
                 }
                 return false;
             } else {
-                // Single star: không qua /
+                // Single star: does not cross /
                 pi += 1;
                 var i: usize = si;
                 while (i <= str.len) : (i += 1) {

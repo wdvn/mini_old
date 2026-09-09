@@ -1,10 +1,10 @@
-//! quickjs_engine.zig — Embedded Runtime Engine cho mini-agent.
+//! quickjs_engine.zig — Embedded Runtime Engine for mini-agent.
 //!
-//! Quản lý máy ảo JavaScript nhúng (In-Process CodeAct VM):
+//! Manages in-process CodeAct JavaScript virtual machine:
 //!   - Sandbox Isolation & Resource Limits (128MB RAM, 1MB Stack)
-//!   - Heartbeat Activity Watchdog (bắt CPU Infinite Loops > 5s burst time, tự động gia hạn khi có I/O)
-//!   - Output Buffer Capture (console.log redirect vào buffer 64KB kèm head-truncation)
-//!   - Stack Trace & Detailed Error Extraction phục vụ Self-Correction Loop
+//!   - Heartbeat Activity Watchdog (catches CPU Infinite Loops > 5s burst time, automatically extended on I/O)
+//!   - Output Buffer Capture (console.log redirected to 64KB buffer with head-truncation)
+//!   - Stack Trace & Detailed Error Extraction for Self-Correction Loops
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -75,13 +75,13 @@ pub const Engine = struct {
             .max_cpu_burst_ms = 5000,
         };
 
-        // Khởi tạo runtime & context sạch ban đầu
+        // Initialize fresh runtime & context initially
         try self.resetContext();
 
         return self;
     }
 
-    /// Khởi tạo mới JSRuntime & JSContext sạch trước mỗi lượt eval để đảm bảo cô lập 100% (Per-Act VM Isolation)
+    /// Initialize fresh JSRuntime & JSContext before each eval for complete isolation (Per-Act VM Isolation)
     pub fn resetContext(self: *Engine) !void {
         if (self.ctx) |ctx| {
             c.JS_FreeContext(ctx);
@@ -124,32 +124,32 @@ pub const Engine = struct {
         self.alloc.destroy(self);
     }
 
-    /// Gia hạn watchdog khi có I/O hoặc Output
+    /// Extend watchdog on I/O or output activity
     pub fn renewActivity(self: *Engine) void {
         self.last_activity_time = utils.milliTimestamp();
     }
 
-    /// Tạm dừng watchdog khi chờ prompt tương tác người dùng
+    /// Pause watchdog while awaiting interactive user prompt
     pub fn pauseWatchdog(self: *Engine) void {
         self.is_paused = true;
     }
 
-    /// Tiếp tục watchdog sau khi người dùng nhập xong
+    /// Resume watchdog after user completes input
     pub fn resumeWatchdog(self: *Engine) void {
         self.renewActivity();
         self.is_paused = false;
     }
 
-    /// Đánh dấu ngắt thực thi (Ctrl+C / SIGINT)
+    /// Flag execution interrupt (Ctrl+C / SIGINT)
     pub fn requestInterrupt(self: *Engine) void {
         self.is_interrupted = true;
     }
 
-    /// Ghi nội dung vào output buffer (có giới hạn 64KB + head truncation)
+    /// Append content to output buffer (bounded at 64KB with head truncation)
     pub fn appendOutput(self: *Engine, text: []const u8) void {
         self.renewActivity();
         if (self.output_buf.items.len + text.len > MAX_OUTPUT_BUFFER) {
-            // Cắt bớt phần đầu nếu vượt quá 64KB
+            // Truncate head if exceeding 64KB
             const excess = (self.output_buf.items.len + text.len) - MAX_OUTPUT_BUFFER;
             const drop = @min(excess + 1024, self.output_buf.items.len);
             if (drop > 0) {
@@ -169,7 +169,7 @@ pub const Engine = struct {
 
         const now = utils.milliTimestamp();
         if (now - self.last_activity_time > self.max_cpu_burst_ms) {
-            return 1; // Ngắt CPU Starvation
+            return 1; // Interrupt CPU Starvation
         }
         return 0;
     }
@@ -198,7 +198,7 @@ pub const Engine = struct {
         const global_obj = c.JS_GetGlobalObject(ctx);
         defer c.JS_FreeValue(ctx, global_obj);
 
-        // Tạo console object
+        // Create console object
         const console_obj = c.JS_NewObject(ctx);
         const log_func = c.JS_NewCFunction(ctx, jsConsoleLog, "log", 1);
         const error_func = c.JS_NewCFunction(ctx, jsConsoleLog, "error", 1);
@@ -212,12 +212,12 @@ pub const Engine = struct {
 
         _ = c.JS_SetPropertyStr(ctx, global_obj, "console", console_obj);
 
-        // Đăng ký hàm print toàn cục
+        // Register global print function
         const print_func = c.JS_NewCFunction(ctx, jsConsoleLog, "print", 1);
         _ = c.JS_SetPropertyStr(ctx, global_obj, "print", print_func);
     }
 
-    /// Thực thi đoạn mã JavaScript trong engine
+    /// Execute JavaScript code snippet in engine
     pub fn eval(self: *Engine, code: []const u8, filename: []const u8) !ExecutionResult {
         try self.resetContext();
         const ctx = self.ctx.?;
@@ -239,13 +239,13 @@ pub const Engine = struct {
             c.JS_EVAL_TYPE_GLOBAL,
         );
 
-        // Chạy các Promise pending jobs nếu có
+        // Execute pending Promise jobs if present
         var pctx: ?*c.JSContext = null;
         while (true) {
             const err = c.JS_ExecutePendingJob(self.rt, &pctx);
             if (err <= 0) {
                 if (err < 0) {
-                    // Lỗi trong async job
+                    // Error in async job
                 }
                 break;
             }
@@ -260,14 +260,14 @@ pub const Engine = struct {
             var err_msg: ?[]u8 = null;
             var stack_trace: ?[]u8 = null;
 
-            // Lấy message / toString của exception
+            // Extract exception message / toString
             const exc_str = c.JS_ToCString(ctx, exc);
             if (exc_str != null) {
                 defer c.JS_FreeCString(ctx, exc_str);
                 err_msg = try self.alloc.dupe(u8, std.mem.span(exc_str));
             }
 
-            // Lấy stack trace nếu có
+            // Extract stack trace if present
             const stack_val = c.JS_GetPropertyStr(ctx, exc, "stack");
             defer c.JS_FreeValue(ctx, stack_val);
             if (c.JS_IsUndefined(stack_val) == 0 and c.JS_IsNull(stack_val) == 0) {
@@ -291,7 +291,7 @@ pub const Engine = struct {
 
         defer c.JS_FreeValue(ctx, val);
 
-        // Format return value thành JSON nếu không phải undefined
+        // Format return value to JSON if not undefined
         var return_json: ?[]u8 = null;
         if (c.JS_IsUndefined(val) == 0) {
             const json_val = c.JS_JSONStringify(ctx, val, JS_UNDEFINED, JS_UNDEFINED);
@@ -402,7 +402,7 @@ test "quickjs_engine - background job management" {
 }
 
 
-// --- Test helper: HTTP server 1-request chạy trên thread riêng cho mini.http ---
+// --- Test helper: Single-request HTTP server running on a separate thread for mini.http ---
 
 const HttpTestServer = struct {
     io: std.Io,
@@ -434,14 +434,14 @@ const HttpTestServer = struct {
     }
 };
 
-test "quickjs_engine - mini.http trả status/headers/body qua lib" {
+test "quickjs_engine - mini.http returns status/headers/body via lib" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     const js_bindings = @import("js_bindings.zig");
     const http_lib = @import("../lib/http_request.zig");
-    _ = http_lib; // đảm bảo lib được link vào test root
+    _ = http_lib; // ensure lib is linked into test root
 
-    // Bind ephemeral port rồi đóng để tái sử dụng
+    // Bind ephemeral port then close to reuse
     const probe_addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
     var probe = probe_addr.listen(io, .{ .reuse_address = true }) catch unreachable;
     const port = probe.socket.address.getPort();
@@ -487,13 +487,13 @@ test "quickjs_engine - per-act fresh context isolation (no top-level const colli
     var engine = try Engine.init(alloc, io);
     defer engine.deinit();
 
-    // Turn 1: Khai báo const ở top-level
+    // Turn 1: Declare top-level const
     var res1 = try engine.eval("const data = 'turn 1'; console.log(data);", "turn1.js");
     defer res1.deinit();
     try std.testing.expect(!res1.is_error);
     try std.testing.expectEqualStrings("turn 1\n", res1.stdout);
 
-    // Turn 2: Khai báo const CÙNG TÊN 'data' ở top-level (không bị trùng scope nhờ resetContext)
+    // Turn 2: Declare SAME-NAMED top-level const 'data' (no scope collision due to resetContext)
     var res2 = try engine.eval("const data = 'turn 2'; console.log(data);", "turn2.js");
     defer res2.deinit();
     try std.testing.expect(!res2.is_error);

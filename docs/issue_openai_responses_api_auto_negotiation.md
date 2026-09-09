@@ -1,46 +1,46 @@
 # Issue & Design Proposal: OpenAI Responses API Integration & Dual-Protocol Auto-Negotiation
 
-| Thuộc tính | Giá trị |
+| Attribute | Value |
 |---|---|
-| Mã Issue | **ISSUE-BACKEND-001** |
-| Tên | Tự động đàm phán và chuyển đổi giữa Chat Completions API và Responses API (Dual-Protocol Auto-Negotiation & Adaptive Fallback) |
-| Trạng thái | **Resolved / Implemented** (Đã hoàn thành cơ chế 3-tier auto-negotiation, request translation và protocol session cache) |
-| Phạm vi | `src/backends/openai.zig`, `src/core/config.zig`, `src/core/protocol.zig` |
-| Ngày | 26/08/2026 |
+| Issue Code | **ISSUE-BACKEND-001** |
+| Title | Automatic negotiation and switching between Chat Completions API and Responses API (Dual-Protocol Auto-Negotiation & Adaptive Fallback) |
+| Status | **Resolved / Implemented** (Completed 3-tier auto-negotiation, request translation, and protocol session cache) |
+| Scope | `src/backends/openai.zig`, `src/core/config.zig`, `src/core/protocol.zig` |
+| Date | 2026-08-26 |
 
 ---
 
-## 1. Tổng quan vấn đề (Problem Statement)
+## 1. Problem Statement
 
-Hiện nay, `src/backends/openai.zig` giao tiếp với toàn bộ hệ sinh thái OpenAI-compatible thông qua endpoint truyền thống:
+Currently, `src/backends/openai.zig` communicates with the entire OpenAI-compatible ecosystem through the traditional endpoint:
 `POST {base_url}/chat/completions` (Chat Completions API).
 
-Tuy nhiên, hệ sinh thái AI đang bước vào giai đoạn chuyển giao kiến trúc lớn:
-1. **Dòng model thế hệ mới (OpenAI GPT-5.6 Sol / Terra / Luna, o3-pro)** ưu tiên hoặc bắt buộc sử dụng **Responses API** (`POST {base_url}/responses`) khi thực hiện các tác vụ kết hợp giữa **Reasoning (suy luận sâu)** và **Tool Calling (gọi công cụ)**.
-2. Trên endpoint Chat Completions cũ, khi gửi request kèm `tools` và `reasoning_effort`, một số model GPT-5.6 trả về lỗi `HTTP 400 Bad Request` (từ chối kết hợp reasoning effort với function tools trên giao thức cũ).
-3. **Trải nghiệm người dùng bị phân mảnh**: Người dùng thường chỉ cấu hình 1 biến môi trường duy nhất là `OPENAI_COMPAT_URL` (ví dụ `https://api.openai.com/v1` hoặc `https://api.openai.com/v1/chat/completions`). Người dùng không muốn phải cấu hình thủ công xem model nào dùng `/chat/completions`, model nào dùng `/responses`.
+However, the AI ecosystem is entering a major architectural transition:
+1. **Next-generation model families (OpenAI GPT-5.6 Sol / Terra / Luna, o3-pro)** prioritize or require the **Responses API** (`POST {base_url}/responses`) when combining **Reasoning** and **Tool Calling**.
+2. On legacy Chat Completions endpoints, sending requests with both `tools` and `reasoning_effort` causes some GPT-5.6 models to return `HTTP 400 Bad Request` (rejecting reasoning effort combined with function tools on the old protocol).
+3. **Fragmented user experience**: Users typically configure only a single environment variable, `OPENAI_COMPAT_URL` (e.g. `https://api.openai.com/v1` or `https://api.openai.com/v1/chat/completions`). Users should not have to manually configure which models use `/chat/completions` and which use `/responses`.
 
 ---
 
-## 2. Mục tiêu kỹ thuật (Objectives)
+## 2. Objectives
 
-1. **Đơn điểm cấu hình (Single Endpoint Configuration)**:
-   - Người dùng chỉ cần cấu hình `OPENAI_COMPAT_URL` (hoặc `config.json`).
-   - `mini` tự động trích xuất Base URL gốc và route đến đúng endpoint cần thiết (`/chat/completions` hoặc `/responses`).
+1. **Single Endpoint Configuration**:
+   - Users only need to configure `OPENAI_COMPAT_URL` (or `config.json`).
+   - `mini` automatically extracts the root Base URL and routes to the correct target endpoint (`/chat/completions` or `/responses`).
 
-2. **Tự động chuyển đổi giao thức 3 tầng (3-Tier Auto-Negotiation & Adaptive Fallback)**:
-   - **Tier 1 (Model-Aware Pre-routing)**: Nhận diện tiền tố model (ví dụ `gpt-5.6*`, `o3-pro*`) để chủ động dùng Responses API.
-   - **Tier 2 (Adaptive Error Fallback)**: Khi gặp HTTP 400 (báo lỗi không hỗ trợ trên Chat Completions), tự động dịch payload sang format Responses API và retry ngay lập tức. Ngược lại, nếu gặp HTTP 404 trên server proxy/local cũ, tự động fallback về Chat Completions.
-   - **Tier 3 (Protocol Memory Caching)**: Ghi nhớ endpoint thành công cho từng model trong suốt phiên làm việc (session cache) để triệt tiêu độ trễ probe ở các turn tiếp theo.
+2. **3-Tier Auto-Negotiation & Adaptive Fallback**:
+   - **Tier 1 (Model-Aware Pre-routing)**: Recognize model prefixes (e.g. `gpt-5.6*`, `o3-pro*`) to proactively use the Responses API.
+   - **Tier 2 (Adaptive Error Fallback)**: When encountering HTTP 400 (indicating unsupported feature combinations on Chat Completions), automatically translate payload to Responses API format and retry immediately. Conversely, if HTTP 404 occurs on older local/proxy servers, automatically fall back to Chat Completions.
+   - **Tier 3 (Protocol Memory Caching)**: Remember successful endpoints per model throughout the session (session cache) to eliminate probe latency in subsequent turns.
 
-3. **Adapter Transformer 2 chiều**:
-   - Dịch chuyển trong suốt giữa `Message` / `ToolDefinition` (trong `core/protocol.zig`) sang định dạng request/response của cả 2 API mà không làm thay đổi Agent Loop.
+3. **Bidirectional Adapter Transformer**:
+   - Seamlessly translate between `Message` / `ToolDefinition` (in `core/protocol.zig`) and both API request/response formats without modifying the Agent Loop.
 
 ---
 
-## 3. Kiến trúc thiết kế chi tiết (Detailed Design)
+## 3. Detailed Design
 
-### 3.1. Luồng thực thi & Auto-Negotiation
+### 3.1. Execution Flow & Auto-Negotiation
 
 ```
                    [ Agent Loop: sendMessage ]
@@ -62,18 +62,18 @@ Tuy nhiên, hệ sinh thái AI đang bước vào giai đoạn chuyển giao ki�
           [ Chat Completions ]     [ Responses API ]
           POST /chat/completions   POST /responses
                        │                │
-               Gặp HTTP 400?       Gặp HTTP 404?
-          (unsupported/tools+cot)  (server chưa hỗ trợ)
+               Encounter 400?       Encounter 404?
+          (unsupported/tools+cot)  (server unsupported)
                        │                │
                        ▼                ▼
             ┌──────────────────────────────────────┐
             │ 3. Adaptive Cross-Protocol Fallback  │
-            │    - Convert Payload sang chuẩn kia  │
+            │    - Convert Payload to other format │
             │    - Retry Request & Cache Protocol  │
             └──────────────────────────────────────┘
 ```
 
-### 3.2. Chuẩn hóa Base URL
+### 3.2. Base URL Normalization
 
 ```zig
 fn getRootApiUrl(base_url: []const u8) []const u8 {
@@ -88,9 +88,9 @@ fn getRootApiUrl(base_url: []const u8) []const u8 {
 }
 ```
 
-### 3.3. So sánh Định dạng Payload & Streaming Events
+### 3.3. Payload Format & Streaming Events Comparison
 
-| Hạng mục | Chat Completions API | Responses API |
+| Category | Chat Completions API | Responses API |
 |---|---|---|
 | **Endpoint** | `POST {base}/chat/completions` | `POST {base}/responses` |
 | **Input Payload** | `{"messages": [{"role":"user","content":"..."}]}` | `{"input": [{"role":"user","content":"..."}]}` |
@@ -102,18 +102,18 @@ fn getRootApiUrl(base_url: []const u8) []const u8 {
 
 ---
 
-## 4. Kế hoạch triển khai (Implementation Plan)
+## 4. Implementation Plan
 
-1. **Giai đoạn 1 (Protocol Struct & Enum)**:
-   - Thêm `ProtocolMode` (`auto`, `chat_completions`, `responses`) vào `Config` và `Client`.
-   - Bổ sung logic chuẩn hóa URL gốc `getRootApiUrl()`.
+1. **Phase 1 (Protocol Struct & Enum)**:
+   - Add `ProtocolMode` (`auto`, `chat_completions`, `responses`) to `Config` and `Client`.
+   - Implement root URL normalization via `getRootApiUrl()`.
 
-2. **Giai đoạn 2 (Responses API Streaming Parser)**:
-   - Xây dựng parser SSE cho các event chuẩn của Responses API (`response.output_text.delta`, `response.reasoning_text.delta`, `response.tool_call.delta`).
+2. **Phase 2 (Responses API Streaming Parser)**:
+   - Build SSE parser for standard Responses API events (`response.output_text.delta`, `response.reasoning_text.delta`, `response.tool_call.delta`).
 
-3. **Giai đoạn 3 (Adaptive Fallback & Caching)**:
-   - Tích hợp phát hiện lỗi 400/404 và tự động retry chéo giữa 2 protocol.
-   - Cache protocol đã đàm phán thành công theo tên model.
+3. **Phase 3 (Adaptive Fallback & Caching)**:
+   - Detect 400/404 errors and automatically retry across protocols.
+   - Cache successfully negotiated protocol keyed by model name.
 
-4. **Giai đoạn 4 (Testing & Fixtures)**:
-   - Viết unit tests giả lập SSE stream từ cả 2 chuẩn API trong `testcases/`.
+4. **Phase 4 (Testing & Fixtures)**:
+   - Write unit tests simulating SSE streams for both API standards in `testcases/`.

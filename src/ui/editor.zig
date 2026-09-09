@@ -1,15 +1,15 @@
-//! editor.zig — Line editor cho REPL (RFC-000 Phase 0).
+//! editor.zig — Line editor for REPL (RFC-000 Phase 0).
 //!
-//! Đáp ứng các issue editor:
-//!   - Buffer động `ArrayListUnmanaged(u8)` (input limit 64KB, reject thay vì truncate)
-//!   - UTF-8 aware qua `unicode.zig`: cursor move theo grapheme cluster,
-//!     redraw theo displayWidth và multiline wrapping (gõ tiếng Việt / emoji / paste dài không lặp prompt)
-//!   - Word motion: Alt+B/F di chuyển theo từ, Alt+D / Alt+Backspace xóa từ
-//!   - Undo/Redo: Ctrl+Z / Ctrl+Y (ring 16 snapshot, cap 4KB/snapshot)
-//!   - Kill ring: Ctrl+W cut từ trái, Ctrl+K cut tới cuối dòng, Ctrl+Y yank (ring 5)
+//! Addresses editor features:
+//!   - Dynamic buffer `ArrayListUnmanaged(u8)` (input limit 64KB, reject instead of truncate)
+//!   - UTF-8 aware via `unicode.zig`: cursor moves by grapheme cluster,
+//!     redraw according to displayWidth and multiline wrapping (typing multibyte UTF-8 / emoji / long paste without prompt repeating)
+//!   - Word motion: Alt+B/F move by word, Alt+D / Alt+Backspace delete word
+//!   - Undo/Redo: Ctrl+Z / Ctrl+Y (16-snapshot ring, 4KB/snapshot cap)
+//!   - Kill ring: Ctrl+W cut left word, Ctrl+K cut to end of line, Ctrl+Y yank (5-slot ring)
 //!   - Ctrl+A/E/U/L, Home/End, ↑/↓ history, bracketed paste
 //!
-//! Vẫn là single-line composer (multiline là Phase 1 — RFC-000).
+//! Still a single-line composer (multiline is Phase 1 — RFC-000).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -19,11 +19,11 @@ const paste_mod = @import("paste.zig");
 const term = @import("terminal.zig");
 const utils = @import("../core/utils.zig");
 
-/// Input limit (byte). Vượt → hiện lỗi, không nhận thêm.
+/// Input limit (bytes). Exceeding -> show error, reject additional input.
 pub const MAX_INPUT_BYTES = 64 * 1024;
-/// Số snapshot undo/redo tối đa.
+/// Maximum undo/redo snapshots.
 const UNDO_DEPTH = 16;
-/// Kích thước tối đa mỗi snapshot (buffer lớn hơn → không undo).
+/// Maximum snapshot size (larger buffer -> no undo).
 const UNDO_SNAPSHOT_CAP = 4 * 1024;
 /// Kill ring depth.
 const KILL_RING_DEPTH = 5;
@@ -33,12 +33,12 @@ pub const LineEditor = struct {
     /// Prompt input history persistent (JSONL).
     prompt_history: history_mod.PromptHistory,
     history_index: usize,
-    /// Backup nội dung đang soạn khi đi lên history.
+    /// Backup of draft content when navigating up in history.
     draft: std.ArrayListUnmanaged(u8),
 
-    // --- Buffer động ---
+    // --- Dynamic buffer ---
     buf: std.ArrayListUnmanaged(u8),
-    /// Vị trí cursor (byte offset, luôn đứng ở biên grapheme).
+    /// Cursor position (byte offset, always at grapheme boundary).
     pos: usize,
 
     // --- Multiline / Wrapping redraw tracking ---
@@ -49,7 +49,7 @@ pub const LineEditor = struct {
     undo_stack: [UNDO_DEPTH][]u8,
     undo_pos_stack: [UNDO_DEPTH]usize,
     undo_len: usize,
-    undo_head: usize, // index phần tử kế tiếp được ghi
+    undo_head: usize, // next slot index to write
     redo_stack: [UNDO_DEPTH][]u8,
     redo_pos_stack: [UNDO_DEPTH]usize,
     redo_len: usize,
@@ -60,20 +60,20 @@ pub const LineEditor = struct {
     kill_len: usize,
     kill_head: usize,
 
-    /// Hiển thị thông báo lỗi input-limit cho redraw kế tiếp.
+    /// Display input limit error message on next redraw.
     limit_msg: bool,
 
-    /// Parser bracketed paste (state machine — xem paste.zig).
+    /// Bracketed paste parser (state machine — see paste.zig).
     paste_parser: paste_mod.Parser,
-    /// Đang trong paste mode (giữa START và END marker).
+    /// Currently in paste mode (between START and END markers).
     pasting: bool,
-    /// Đã push undo cho đợt paste hiện tại (1 undo cho cả đợt).
+    /// Undo pushed for current paste operation (1 undo per paste batch).
     paste_undo_pushed: bool,
-    /// Buffer tích luỹ nội dung paste trước khi flush vào buffer chính.
+    /// Buffer accumulating paste content before flushing to main buffer.
     paste_buf: std.ArrayListUnmanaged(u8),
-    /// Test-only: bỏ qua ghi stdout trong redraw (không có std.Io hợp lệ).
+    /// Test-only: suppress writing stdout during redraw (no valid std.Io).
     suppress_redraw: bool,
-    /// Timestamp lần nhấn Ctrl+C gần nhất (ms).
+    /// Timestamp of the most recent Ctrl+C press (ms).
     last_ctrl_c_ms: i64,
 
     pub fn init(alloc: Allocator) LineEditor {
@@ -125,7 +125,7 @@ pub const LineEditor = struct {
         if (self.buf.items.len > UNDO_SNAPSHOT_CAP) return;
         const snap = self.alloc.dupe(u8, self.buf.items) catch return;
         if (self.undo_len == UNDO_DEPTH) {
-            // Ring đầy: ghi đè cũ nhất (undo_head luôn trỏ slot kế tiếp).
+            // Ring full: overwrite oldest (undo_head always points to next slot).
             self.alloc.free(self.undo_stack[self.undo_head]);
         } else {
             self.undo_len += 1;
@@ -133,7 +133,7 @@ pub const LineEditor = struct {
         self.undo_stack[self.undo_head] = snap;
         self.undo_pos_stack[self.undo_head] = self.pos;
         self.undo_head = (self.undo_head + 1) % UNDO_DEPTH;
-        // Mutation mới vô hiệu redo.
+        // New mutation invalidates redo.
         self.clearRedo();
     }
 
@@ -179,7 +179,7 @@ pub const LineEditor = struct {
         self.redo_len -= 1;
         const snap = self.redo_stack[self.redo_head];
         defer self.alloc.free(snap);
-        // Lưu trạng thái hiện tại vào undo để undo lần nữa quay lại.
+        // Save current state into undo so that another undo returns to it.
         const cur = self.alloc.dupe(u8, self.buf.items) catch return false;
         if (self.undo_len == UNDO_DEPTH) {
             self.alloc.free(self.undo_stack[self.undo_head]);
@@ -221,18 +221,18 @@ pub const LineEditor = struct {
     // Buffer primitives (UTF-8 grapheme aware)
     // -----------------------------------------------------------------------
 
-    /// Số byte của grapheme cluster bắt đầu tại byte `i`.
+    /// Number of bytes of grapheme cluster starting at byte `i`.
     fn clusterLenAt(self: *LineEditor, i: usize) usize {
         return unicode.clusterLenAt(self.buf.items, i);
     }
 
-    /// Kích thước grapheme cluster đứng TRƯỚC byte `i`.
+    /// Size of grapheme cluster preceding byte `i`.
     fn clusterLenBefore(self: *LineEditor, i: usize) usize {
         if (i == 0) return 0;
         var j = i - 1;
-        // Lùi qua các continuation byte (10xxxxxx) để tìm byte đầu cluster.
+        // Step back through continuation bytes (10xxxxxx) to find cluster start byte.
         while (j > 0 and (self.buf.items[j] & 0xC0) == 0x80) j -= 1;
-        // Lùi tiếp qua combining marks / ZWJ nối với cluster trước đó.
+        // Continue stepping back across combining marks / ZWJ joined to preceding cluster.
         while (j > 0) {
             var k = j - 1;
             while (k > 0 and (self.buf.items[k] & 0xC0) == 0x80) k -= 1;
@@ -270,7 +270,7 @@ pub const LineEditor = struct {
         return true;
     }
 
-    /// Chèn '\n' tại vị trí cursor (xuống dòng thủ công, RFC-008 §5B).
+    /// Insert '\n' at cursor position (manual newline, RFC-008 §5B).
     fn insertNewlineAtCursor(self: *LineEditor, io: std.Io, prompt: []const u8) void {
         if (self.buf.items.len + 1 > MAX_INPUT_BYTES) {
             self.limit_msg = true;
@@ -282,7 +282,7 @@ pub const LineEditor = struct {
         self.redraw(io, prompt);
     }
 
-    /// Xóa range [start, end). Trả về text đã xóa (caller free) hoặc null.
+    /// Delete range [start, end). Returns removed text (caller frees) or null.
     fn deleteRange(self: *LineEditor, start: usize, end: usize) ?[]u8 {
         if (start >= end or end > self.buf.items.len) return null;
         const removed = self.alloc.dupe(u8, self.buf.items[start..end]) catch return null;
@@ -318,10 +318,10 @@ pub const LineEditor = struct {
         return .{ .cp = cp, .len = n };
     }
 
-    /// Vị trí bắt đầu từ phía trái cursor (space-punct-word theo unicode.CharClass).
+    /// Start position to the left of cursor (space-punct-word per unicode.CharClass).
     fn wordLeft(self: *LineEditor) usize {
         var i = self.pos;
-        // Bỏ qua space về trái.
+        // Skip spaces to the left.
         while (i > 0) {
             const cp = self.cpBefore(i) orelse break;
             if (unicode.charClass(cp) == .space) {
@@ -333,7 +333,7 @@ pub const LineEditor = struct {
                 }
             } else break;
         }
-        // Ăn theo class của ký tự tại vị trí mới.
+        // Match character class of character at new position.
         var target_class: ?unicode.CharClass = null;
         while (i > 0) {
             const cp = self.cpBefore(i) orelse break;
@@ -347,7 +347,7 @@ pub const LineEditor = struct {
         return i;
     }
 
-    /// Vị trí kết thúc từ phía phải cursor.
+    /// End position to the right of cursor.
     fn wordRight(self: *LineEditor) usize {
         var i = self.pos;
         var target_class: ?unicode.CharClass = null;
@@ -382,7 +382,7 @@ pub const LineEditor = struct {
             }
         };
 
-        // Lưu draft khi rời vị trí cuối.
+        // Save draft when leaving last position.
         if (cur == self.prompt_history.entries.items.len) {
             self.draft.clearRetainingCapacity();
             self.draft.appendSlice(self.alloc, self.buf.items) catch {};
@@ -407,19 +407,19 @@ pub const LineEditor = struct {
         var out_buf: [8192]u8 = undefined;
         var w = std.Io.Writer.fixed(&out_buf);
 
-        // 1. Lùi cursor về dòng đầu tiên của prompt nếu lần render trước bị wrap xuống các dòng dưới
+        // 1. Move cursor back to the first line of prompt if previous render wrapped to lines below
         if (self.cursor_row > 0) {
             w.print("\x1b[{d}A", .{self.cursor_row}) catch return;
         }
-        // 2. Về đầu dòng và xóa toàn bộ vùng hiển thị từ cursor xuống dưới màn hình
+        // 2. Return to line start and clear entire visible region from cursor downwards
         w.writeAll("\r\x1b[J") catch return;
 
         if (self.limit_msg) {
-            w.writeAll("\x1b[33m[input limit 64KB — từ chối]\x1b[0m\r\n\x1b[J") catch return;
+            w.writeAll("\x1b[33m[input limit 64KB — rejected]\x1b[0m\r\n\x1b[J") catch return;
         }
 
-        // 3. In prompt + buffer theo dòng logic: \n thật → \r\n + thụt lề
-        //    bằng độ rộng prompt (raw mode: \n không tự về cột 0, phải dùng \r\n).
+        // 3. Print prompt + buffer by logical line: actual \n -> \r\n + indent
+        //    matching prompt width (raw mode: \n does not return to column 0, must use \r\n).
         const term_size = term.getTerminalSize();
         const cols: usize = if (term_size.cols > 0) term_size.cols else 80;
 
@@ -429,7 +429,7 @@ pub const LineEditor = struct {
         @memset(indent_buf[0..indent_len], ' ');
         const indent = indent_buf[0..indent_len];
 
-        var total_rows: usize = 0; // số hàng thêm so với hàng đầu tiên
+        var total_rows: usize = 0; // extra rows relative to first row
         var cur_row: usize = 0;
         var cur_col: usize = 0;
         var cursor_placed = false;
@@ -441,7 +441,7 @@ pub const LineEditor = struct {
             const at_end = k == self.buf.items.len;
             if (!at_end and self.buf.items[k] != '\n') continue;
 
-            // Dòng logic [line_start..k)
+            // Logical line [line_start..k)
             const line = self.buf.items[line_start..k];
             const prefix_w: usize = if (line_idx == 0) prompt_w else indent_len;
             const lw = prefix_w + unicode.displayWidth(line);
@@ -454,7 +454,7 @@ pub const LineEditor = struct {
             }
             w.writeAll(line) catch return;
 
-            // Cursor thuộc dòng này?
+            // Does cursor belong to this line?
             if (!cursor_placed and self.pos <= k) {
                 const in_w = unicode.displayWidth(self.buf.items[line_start..@min(self.pos, k)]);
                 const coff = prefix_w + in_w;
@@ -463,7 +463,7 @@ pub const LineEditor = struct {
                 cursor_placed = true;
             }
 
-            // Hàng thêm: dòng đầu chỉ tính wrap, dòng sau tính cả lần xuống dòng
+            // Extra rows: first line only counts wrapping, subsequent lines count newlines as well
             if (line_idx == 0) {
                 total_rows += lw / cols;
             } else {
@@ -475,7 +475,7 @@ pub const LineEditor = struct {
             line_idx += 1;
         }
 
-        // 4. Di chuyển con trỏ terminal về (cur_row, cur_col)
+        // 4. Move terminal cursor to (cur_row, cur_col)
         if (total_rows > cur_row) {
             w.print("\x1b[{d}A", .{total_rows - cur_row}) catch return;
         }
@@ -504,13 +504,13 @@ pub const LineEditor = struct {
         var raw = orig_termios;
         raw.lflag.ECHO = false;
         raw.lflag.ICANON = false;
-        raw.lflag.ISIG = false; // Nhận byte Ctrl+C (0x03) trực tiếp để editor xử lý hủy dòng / thoát 2 lần
-        // Tắt(input) CR/NL translation: paste CRLF phải đến nguyên vẹn
-        // (\r\n → 1 space khi sanitize), Enter đến như '\r' (13).
+        raw.lflag.ISIG = false; // Receive Ctrl+C byte (0x03) directly for editor to handle line cancel / exit on double-press
+        // Disable (input) CR/NL translation: pasted CRLF must arrive intact
+        // (\r\n -> 1 space when sanitized), Enter arrives as '\r' (13).
         raw.iflag.ICRNL = false;
         raw.iflag.INLCR = false;
         raw.iflag.IGNCR = false;
-        raw.iflag.IXON = false; // Ctrl+S/Q đến editor, không bị kernel bắt
+        raw.iflag.IXON = false; // Ctrl+S/Q pass to editor, not caught by kernel
         raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
         raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
 
@@ -557,10 +557,10 @@ pub const LineEditor = struct {
             };
             if (n == 0) return null;
 
-            // Đang trong paste mode: đưa toàn bộ chunk vào paste parser.
-            // pasteFeed trả về offset ngay SAU END marker nếu paste kết thúc
-            // GIỮA chunk — phần còn lại phải xử lý tiếp như input thường
-            // (RCA-001: mất bytes sau END marker).
+            // In paste mode: feed entire chunk to paste parser.
+            // pasteFeed returns offset immediately AFTER END marker if paste finishes
+            // MID-chunk — remainder must continue processing as regular input
+            // (RCA-001: lost bytes after END marker).
             var i: usize = 0;
             if (self.pasting) {
                 const consumed = self.pasteFeed(io, prompt, read_buf[0..n]);
@@ -574,27 +574,27 @@ pub const LineEditor = struct {
             }
 
             while (i < n) {
-                // START marker vừa hoàn tất TRONG chunk này (case 27 gọi
-                // beginPaste): phần còn lại là NỘI DUNG paste, tuyệt đối không
-                // đi qua đường thường — byte '\r' sẽ rơi vào case 13 và submit
-                // nhầm giữa chừng (root cause paste multi-line bị cắt).
+                // START marker just completed WITHIN this chunk (case 27 called
+                // beginPaste): remainder is PASTE CONTENT, must not go through
+                // normal path — '\r' byte would hit case 13 and prematurely submit
+                // (root cause of multi-line paste being truncated).
                 if (self.pasting) {
                     const consumed = self.pasteFeed(io, prompt, read_buf[i..n]);
                     if (!self.pasting) {
-                        i += consumed; // END marker giữa chunk → xử lý nốt phần sau
+                        i += consumed; // END marker mid-chunk -> process remainder
                         continue;
                     }
                     if (self.pasteIdleTimedOut(io, stdin_file)) {
                         self.endPaste(io, prompt);
                     }
-                    break; // vẫn pasting → về vòng read chính
+                    break; // still pasting -> return to main read loop
                 }
                 const c = read_buf[i];
                 if (c != 3) {
                     self.last_ctrl_c_ms = 0;
                 }
                 switch (c) {
-                    3 => { // Ctrl+C: Hủy dòng đang nhập hoặc thoát REPL nếu nhấn 2 lần liên tiếp
+                    3 => { // Ctrl+C: Cancel current line or exit REPL on double-press
                         const now_ms = utils.milliTimestamp();
                         if (self.rendered_rows > self.cursor_row) {
                             var move_down_buf: [32]u8 = undefined;
@@ -627,7 +627,7 @@ pub const LineEditor = struct {
                             }
                         }
                     },
-                    4 => { // Ctrl+D: EOF khi buffer rỗng → thoát REPL
+                    4 => { // Ctrl+D: EOF when buffer empty -> exit REPL
                         if (self.buf.items.len == 0) {
                             stdout_file.writeStreamingAll(io, "\r\n") catch {};
                             return null;
@@ -640,7 +640,7 @@ pub const LineEditor = struct {
                         }
                         i += 1;
                     },
-                    13 => { // Enter → submit (toàn bộ buffer, kể cả multiline)
+                    13 => { // Enter -> submit (entire buffer, including multiline)
                         if (self.rendered_rows > self.cursor_row) {
                             var move_down_buf: [32]u8 = undefined;
                             const seq = std.fmt.bufPrint(&move_down_buf, "\x1b[{d}B", .{self.rendered_rows - self.cursor_row}) catch "";
@@ -649,7 +649,7 @@ pub const LineEditor = struct {
                         stdout_file.writeStreamingAll(io, "\r\n") catch {};
                         return try self.alloc.dupe(u8, self.buf.items);
                     },
-                    10 => { // Ctrl+J → chèn newline thủ công (RFC-008 §5B)
+                    10 => { // Ctrl+J -> manually insert newline (RFC-008 §5B)
                         self.insertNewlineAtCursor(io, prompt);
                         i += 1;
                     },
@@ -679,7 +679,7 @@ pub const LineEditor = struct {
                         self.redraw(io, prompt);
                         i += 1;
                     },
-                    21 => { // Ctrl+U — xóa tới đầu dòng
+                    21 => { // Ctrl+U — delete to start of line
                         if (self.pos > 0) {
                             self.pushUndo();
                             if (self.deleteRange(0, self.pos)) |rem| self.alloc.free(rem);
@@ -687,7 +687,7 @@ pub const LineEditor = struct {
                         }
                         i += 1;
                     },
-                    23 => { // Ctrl+W — kill word trái
+                    23 => { // Ctrl+W — kill word to the left
                         const start = self.wordLeft();
                         if (start < self.pos) {
                             self.pushUndo();
@@ -699,7 +699,7 @@ pub const LineEditor = struct {
                         }
                         i += 1;
                     },
-                    11 => { // Ctrl+K — kill tới cuối dòng
+                    11 => { // Ctrl+K — kill to end of line
                         if (self.pos < self.buf.items.len) {
                             self.pushUndo();
                             if (self.deleteRange(self.pos, self.buf.items.len)) |rem| {
@@ -760,7 +760,7 @@ pub const LineEditor = struct {
                                 }
                                 i += 1;
                             } else {
-                                // Batch insert cho text nhanh / dán ngoài paste mode
+                                // Batch insert for fast text / paste outside paste mode
                                 self.pushUndo();
                                 if (self.insertBytes(read_buf[i..end])) {
                                     self.redraw(io, prompt);
@@ -779,7 +779,7 @@ pub const LineEditor = struct {
         }
     }
 
-    /// Xử lý escape sequence: mũi tên, Alt+key, Home/End, Delete, bracketed paste.
+    /// Handle escape sequences: arrow keys, Alt+key, Home/End, Delete, bracketed paste.
     fn handleEscapeSlice(self: *LineEditor, io: std.Io, stdin_file: std.Io.File, prompt: []const u8, slice: []const u8) usize {
         var seq_buf: [8]u8 = undefined;
         var seq_len: usize = 0;
@@ -829,7 +829,7 @@ pub const LineEditor = struct {
                     self.redraw(io, prompt);
                     return @min(3, slice.len);
                 },
-                '1' => { // ESC [ 1 ~ hoặc ESC [ 1 ; 3 C (Alt+→)
+                '1' => { // ESC [ 1 ~ or ESC [ 1 ; 3 C (Alt+→)
                     if (seq_len >= 4 and seq_buf[3] == '~') {
                         self.pos = 0;
                         self.redraw(io, prompt);
@@ -848,7 +848,7 @@ pub const LineEditor = struct {
                     self.consumeTildeOrModifier(io, stdin_file, prompt);
                     return @min(3, slice.len);
                 },
-                '2' => { // Bracketed paste bắt đầu: ESC [ 2 0 0 ~
+                '2' => { // Bracketed paste start: ESC [ 2 0 0 ~
                     if (seq_len >= 6 and std.mem.eql(u8, seq_buf[0..6], "\x1b[200~")) {
                         self.beginPaste();
                         return @min(6, slice.len);
@@ -939,7 +939,7 @@ pub const LineEditor = struct {
         return @max(1, @min(seq_len, slice.len));
     }
 
-    /// ESC [ 1 ... — đọc nốt tới '~' (Home variant) hoặc ';<mod><key>' (modifier combo).
+    /// ESC [ 1 ... — consume up to '~' (Home variant) or ';<mod><key>' (modifier combo).
     fn consumeTildeOrModifier(self: *LineEditor, io: std.Io, stdin_file: std.Io.File, prompt: []const u8) void {
         var extra: [8]u8 = undefined;
         var got: usize = 0;
@@ -976,7 +976,7 @@ pub const LineEditor = struct {
         }
     }
 
-    /// Bắt đầu paste mode (đã nhận START marker).
+    /// Begin paste mode (START marker received).
     fn beginPaste(self: *LineEditor) void {
         self.pasting = true;
         self.paste_undo_pushed = false;
@@ -986,7 +986,7 @@ pub const LineEditor = struct {
         paste_mod.sanitizeMultilineReset();
     }
 
-    /// Kết thúc paste mode: flush nốt candidate còn hold thành content và chèn vào buffer.
+    /// End paste mode: flush remaining held candidate as content and insert into buffer.
     fn endPaste(self: *LineEditor, io: std.Io, prompt: []const u8) void {
         if (!self.pasting) return;
         self.pasting = false;
@@ -1005,9 +1005,9 @@ pub const LineEditor = struct {
         self.redraw(io, prompt);
     }
 
-    /// Feed các bytes trong paste mode qua state machine (xem paste.zig).
-    /// Trả về offset trong `bytes` NGAY SAU END marker nếu paste kết thúc giữa
-    /// chunk; trả về `bytes.len` nếu hết chunk mà vẫn đang pasting.
+    /// Feed bytes in paste mode through state machine (see paste.zig).
+    /// Returns offset in `bytes` IMMEDIATELY AFTER END marker if paste ended mid-chunk;
+    /// returns `bytes.len` if chunk ended while still pasting.
     fn pasteFeed(self: *LineEditor, io: std.Io, prompt: []const u8, bytes: []const u8) usize {
         var tmp: [paste_mod.END_MARKER.len]u8 = undefined;
         var idx: usize = 0;
@@ -1021,9 +1021,9 @@ pub const LineEditor = struct {
                 .marker => |m| {
                     if (m == .end) {
                         self.endPaste(io, prompt);
-                        // RCA-001: trả về offset byte SAU end-marker. Caller
-                        // dùng để xử lý tiếp phần còn lại của chunk như input
-                        // thường (bytes sau END marker không được nuốt).
+                        // RCA-001: return byte offset AFTER end-marker. Caller
+                        // uses it to continue processing remainder of chunk as
+                        // normal input (bytes after END marker must not be swallowed).
                         return idx + 1;
                     }
                 },
@@ -1041,17 +1041,17 @@ pub const LineEditor = struct {
         return bytes.len;
     }
 
-    /// Trong paste mode: poll stdin 100ms — hết thời gian mà không có byte
-    /// coi như terminal sẽ không gửi END marker → caller tự thoát paste mode.
-    /// (100ms: đủ rộng cho paste lớn qua SSH/mạng lag, nhỏ hơn TTL luồng
-    /// dummy byte của render khi tab qua lại nên không gây redraw dính — RCA-001.)
+    /// In paste mode: poll stdin for 100ms — if time expires without bytes,
+    /// assume terminal will not send END marker -> caller exits paste mode automatically.
+    /// (100ms: wide enough for large pastes over SSH/laggy networks, smaller than
+    /// dummy byte thread TTL during tab switching to avoid stuck redraw — RCA-001.)
     fn pasteIdleTimedOut(_: *LineEditor, _: std.Io, _: std.Io.File) bool {
         var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
         const ready = std.posix.poll(&fds, 100) catch return true;
         return ready == 0;
     }
 
-    /// Sanitize (newline→space, bỏ control) rồi insert vào buffer + redraw.
+    /// Sanitize (newline->space, strip control) then insert into buffer + redraw.
     fn insertPastedSanitized(self: *LineEditor, io: std.Io, prompt: []const u8, bytes: []const u8) void {
         if (bytes.len == 0) return;
         if (!self.paste_undo_pushed) {
@@ -1067,24 +1067,24 @@ pub const LineEditor = struct {
         }
     }
 
-    /// Thêm vào prompt history (gọi khi submit).
+    /// Add to prompt history (called on submit).
     pub fn addHistory(self: *LineEditor, line: []const u8) !void {
         try self.prompt_history.add(line);
     }
 
-    /// Load persistent history từ disk.
+    /// Load persistent history from disk.
     pub fn loadHistoryFile(self: *LineEditor, io: std.Io, path: []const u8) !void {
         try self.prompt_history.loadFromFile(io, path);
     }
 
-    /// Flush persistent history ra disk nếu dirty.
+    /// Flush persistent history to disk if dirty.
     pub fn saveHistoryFile(self: *LineEditor, io: std.Io, path: []const u8) !void {
         try self.prompt_history.saveToFile(io, path);
     }
 };
 
 // ---------------------------------------------------------------------------
-// Tests — logic thuần không cần terminal
+// Tests — pure logic without terminal
 // ---------------------------------------------------------------------------
 
 const Testing = struct {
@@ -1101,46 +1101,46 @@ test "wordLeft / wordRight ASCII" {
     var e = try Testing.makeEditor(alloc);
     defer e.deinit();
 
-    e.pos = e.buf.items.len; // sau "foo"
-    try std.testing.expectEqual(@as(usize, 12), e.wordLeft()); // trước "foo"
+    e.pos = e.buf.items.len; // after "foo"
+    try std.testing.expectEqual(@as(usize, 12), e.wordLeft()); // before "foo"
     e.pos = 12;
-    try std.testing.expectEqual(@as(usize, 6), e.wordLeft()); // trước "world"
+    try std.testing.expectEqual(@as(usize, 6), e.wordLeft()); // before "world"
     e.pos = 6;
-    try std.testing.expectEqual(@as(usize, 0), e.wordLeft()); // trước "hello"
+    try std.testing.expectEqual(@as(usize, 0), e.wordLeft()); // before "hello"
 
     e.pos = 0;
-    try std.testing.expectEqual(@as(usize, 5), e.wordRight()); // sau "hello"
+    try std.testing.expectEqual(@as(usize, 5), e.wordRight()); // after "hello"
     e.pos = 5;
-    try std.testing.expectEqual(@as(usize, 11), e.wordRight()); // sau "world"
+    try std.testing.expectEqual(@as(usize, 11), e.wordRight()); // after "world"
 }
 
-test "word motion qua punct" {
+test "word motion across punct" {
     const alloc = std.testing.allocator;
     var e = LineEditor.init(alloc);
     defer e.deinit();
     try e.buf.appendSlice(alloc, "foo.bar baz");
     e.pos = e.buf.items.len;
-    try std.testing.expectEqual(@as(usize, 8), e.wordLeft()); // trước "baz"
+    try std.testing.expectEqual(@as(usize, 8), e.wordLeft()); // before "baz"
     e.pos = 8;
-    try std.testing.expectEqual(@as(usize, 4), e.wordLeft()); // trước "bar" ("." là cluster punct riêng)
+    try std.testing.expectEqual(@as(usize, 4), e.wordLeft()); // before "bar" ("." is separate punct cluster)
     e.pos = 4;
-    try std.testing.expectEqual(@as(usize, 3), e.wordLeft()); // trước "." ("foo" là 1 word)
+    try std.testing.expectEqual(@as(usize, 3), e.wordLeft()); // before "." ("foo" is 1 word)
 }
 
-test "word motion tiếng Việt" {
+test "word motion multibyte UTF-8" {
     const alloc = std.testing.allocator;
     var e = LineEditor.init(alloc);
     defer e.deinit();
     try e.buf.appendSlice(alloc, "tết đến rồi");
     e.pos = e.buf.items.len;
-    const w1 = e.wordLeft(); // trước "rồi"
+    const w1 = e.wordLeft(); // before "rồi"
     try std.testing.expectEqualStrings("rồi", e.buf.items[w1..]);
     e.pos = w1;
-    const w2 = e.wordLeft(); // trước "đến"
+    const w2 = e.wordLeft(); // before "đến"
     try std.testing.expectEqualStrings("đến rồi", e.buf.items[w2..]);
 }
 
-test "undo redo cơ bản" {
+test "undo redo basic" {
     const alloc = std.testing.allocator;
     var e = LineEditor.init(alloc);
     defer e.deinit();
@@ -1172,7 +1172,7 @@ test "undo ring depth cap" {
     try std.testing.expectEqual(@as(usize, UNDO_DEPTH), e.undo_len);
 }
 
-test "kill ring push/yank và depth cap" {
+test "kill ring push/yank and depth cap" {
     const alloc = std.testing.allocator;
     var e = LineEditor.init(alloc);
     defer e.deinit();
@@ -1186,7 +1186,7 @@ test "kill ring push/yank và depth cap" {
     try std.testing.expectEqual(@as(usize, KILL_RING_DEPTH), e.kill_len);
 }
 
-test "insertBytes reject khi vượt limit" {
+test "insertBytes reject when exceeding limit" {
     const alloc = std.testing.allocator;
     var e = LineEditor.init(alloc);
     defer e.deinit();
@@ -1194,10 +1194,10 @@ test "insertBytes reject khi vượt limit" {
     e.pos = e.buf.items.len;
     try std.testing.expect(!e.insertBytes("xyz"));
     try std.testing.expect(e.limit_msg);
-    try std.testing.expect(e.insertBytes("ab")); // vừa đủ
+    try std.testing.expect(e.insertBytes("ab")); // exact fit
 }
 
-test "deleteRange cập nhật pos đúng" {
+test "deleteRange updates pos correctly" {
     const alloc = std.testing.allocator;
     var e = LineEditor.init(alloc);
     defer e.deinit();
@@ -1210,27 +1210,27 @@ test "deleteRange cập nhật pos đúng" {
     try std.testing.expectEqual(@as(usize, 5), e.pos);
 }
 
-test "clusterLenBefore với emoji và tiếng Việt" {
+test "clusterLenBefore with emoji and multibyte UTF-8" {
     const alloc = std.testing.allocator;
     var e = LineEditor.init(alloc);
     defer e.deinit();
     // "a" + "ế" (3 bytes) + 👍 (4 bytes)
     try e.buf.appendSlice(alloc, "a\u{1EBF}\u{1F44D}");
     e.pos = e.buf.items.len;
-    e.moveLeft(); // qua 👍 (4 bytes)
+    e.moveLeft(); // past 👍 (4 bytes)
     try std.testing.expectEqual(@as(usize, 4), e.pos);
-    e.moveLeft(); // qua ế (3 bytes)
+    e.moveLeft(); // past ế (3 bytes)
     try std.testing.expectEqual(@as(usize, 1), e.pos);
-    e.moveLeft(); // qua a
+    e.moveLeft(); // past a
     try std.testing.expectEqual(@as(usize, 0), e.pos);
 }
 
 // ---------------------------------------------------------------------------
-// Paste mode — tái hiện & fix bug kẹt paste (xem paste.zig)
+// Paste mode — repro & fix for stuck paste bug (see paste.zig)
 // ---------------------------------------------------------------------------
 
-/// Mô phỏng feed 1 stream bytes vào editor đang trong paste mode.
-/// Trả về buffer sau khi stream kết thúc (không có timeout — dùng parser trực tiếp).
+/// Simulate feeding a stream of bytes into editor in paste mode.
+/// Returns buffer after stream completes (no timeout — uses parser directly).
 fn simulatePaste(alloc: Allocator, input: []const u8) ![]u8 {
     var e = LineEditor.init(alloc);
     defer e.deinit();
@@ -1241,29 +1241,29 @@ fn simulatePaste(alloc: Allocator, input: []const u8) ![]u8 {
     return alloc.dupe(u8, e.buf.items);
 }
 
-test "paste thường: content nằm giữa start/end marker" {
+test "normal paste: content between start/end marker" {
     const alloc = std.testing.allocator;
     const out = try simulatePaste(alloc, "hello pasted" ++ paste_mod.END_MARKER);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("hello pasted", out);
 }
 
-test "paste multiline: giữ nguyên newline (RFC-008 §5A)" {
+test "multiline paste: preserves newlines (RFC-008 §5A)" {
     const alloc = std.testing.allocator;
     const out = try simulatePaste(alloc, "line1\r\nline2\nline3" ++ paste_mod.END_MARKER);
     defer alloc.free(out);
-    // CRLF → 1 \n (không double), \n đơn giữ nguyên.
+    // CRLF -> 1 \n (no double), single \n preserved.
     try std.testing.expectEqualStrings("line1\nline2\nline3", out);
 }
 
-test "paste multiline giữ indent (tab + space)" {
+test "multiline paste preserves indent (tab + space)" {
     const alloc = std.testing.allocator;
     const out = try simulatePaste(alloc, "fn x() {\n\treturn 1;\n}" ++ paste_mod.END_MARKER);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("fn x() {\n\treturn 1;\n}", out);
 }
 
-test "insertNewlineAtCursor: chèn \\n giữa buffer, pos đúng" {
+test "insertNewlineAtCursor: inserts \\n in middle of buffer, pos correct" {
     const alloc = std.testing.allocator;
     var e = LineEditor.init(alloc);
     defer e.deinit();
@@ -1275,7 +1275,7 @@ test "insertNewlineAtCursor: chèn \\n giữa buffer, pos đúng" {
     try std.testing.expectEqual(@as(usize, 2), e.pos);
 }
 
-test "paste chứa ANSI escape không nhầm end-marker" {
+test "paste containing ANSI escape does not mistake end-marker" {
     const alloc = std.testing.allocator;
     const input = "\x1b[31mred\x1b[0m end" ++ paste_mod.END_MARKER;
     const out = try simulatePaste(alloc, input);
@@ -1283,7 +1283,7 @@ test "paste chứa ANSI escape không nhầm end-marker" {
     try std.testing.expectEqualStrings("[31mred[0m end", out);
 }
 
-test "paste chứa prefix gần end-marker vẫn nhận đúng marker thật" {
+test "paste containing prefix near end-marker still detects real marker" {
     const alloc = std.testing.allocator;
     const input = "abc\x1b[20" ++ paste_mod.END_MARKER;
     const out = try simulatePaste(alloc, input);
@@ -1291,7 +1291,7 @@ test "paste chứa prefix gần end-marker vẫn nhận đúng marker thật" {
     try std.testing.expectEqualStrings("abc[20", out);
 }
 
-test "paste không có end-marker: flush pending, editor không kẹt" {
+test "paste without end-marker: flushes pending, editor does not hang" {
     const alloc = std.testing.allocator;
     var e = LineEditor.init(alloc);
     defer e.deinit();
@@ -1299,20 +1299,20 @@ test "paste không có end-marker: flush pending, editor không kẹt" {
     e.beginPaste();
     const consumed = e.pasteFeed(undefined, "", "dangling\x1b[2");
     _ = consumed;
-    // Idle timeout path: gọi endPaste như editor sẽ làm.
+    // Idle timeout path: call endPaste as editor would.
     e.endPaste(undefined, "");
     try std.testing.expect(!e.pasting);
     try std.testing.expectEqualStrings("dangling[2", e.buf.items);
 }
 
-test "paste UTF-8 tiếng Việt + emoji giữ nguyên" {
+test "paste UTF-8 multibyte + emoji preserved" {
     const alloc = std.testing.allocator;
     const out = try simulatePaste(alloc, "xin chào thế giới 👍" ++ paste_mod.END_MARKER);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("xin chào thế giới 👍", out);
 }
 
-test "paste đoạn dài không bị lặp redraw hay tràn dòng" {
+test "long paste chunk does not repeat redraw or overflow line" {
     const alloc = std.testing.allocator;
     var e = LineEditor.init(alloc);
     defer e.deinit();
@@ -1324,33 +1324,33 @@ test "paste đoạn dài không bị lặp redraw hay tràn dòng" {
     try std.testing.expect(e.buf.items.len > 500);
 }
 
-// RCA-001: START marker nằm GIỮA chunk — phần sau marker là nội dung paste,
-// không được đi qua đường thường (Enter nhầm → submit giữa chừng).
-test "paste bắt đầu giữa chunk: phần sau START marker vào paste mode" {
+// RCA-001: START marker located MID-chunk — content after marker is paste content,
+// must not go through normal path (accidental Enter -> premature submit).
+test "paste starting mid-chunk: portion after START marker enters paste mode" {
     const alloc = std.testing.allocator;
     var e = LineEditor.init(alloc);
     defer e.deinit();
     e.suppress_redraw = true;
 
-    // Mô phỏng main loop nhận 1 chunk: prompt-echo + Enter + START + "l1\r\nl2"
+    // Simulate main loop receiving 1 chunk: prompt-echo + Enter + START + "l1\r\nl2"
     const chunk = "abc\r\x1b[200~l1\r\nl2";
-    // Đi qua đường thường tới khi gặp ESC[200~: mô phỏng bằng cách tự feed
-    // phần đầu như main loop (3 ký tự + Enter), sau đó phần còn lại chunk.
+    // Go through normal path until reaching ESC[200~: simulate by feeding
+    // initial portion as main loop (3 chars + Enter), then remaining chunk.
     for ("abc") |ch| _ = e.insertBytes(&.{ch});
     e.pos = e.buf.items.len;
     _ = e.handleEscapeSlice(undefined, undefined, "", chunk[4..]);
-    try std.testing.expect(e.pasting); // START marker đã bật paste mode
+    try std.testing.expect(e.pasting); // START marker enabled paste mode
 
-    // Phần còn lại của chunk ("l1\r\nl2") PHẢI được pasteFeed xử lý:
+    // Remainder of chunk ("l1\r\nl2") MUST be handled by pasteFeed:
     const consumed = e.pasteFeed(undefined, "", chunk[10..]);
     try std.testing.expectEqual(@as(usize, chunk.len - 10), consumed);
     e.endPaste(undefined, "");
     try std.testing.expectEqualStrings("abcl1\nl2", e.buf.items);
 }
 
-// RCA-001: END marker nằm giữa chunk — bytes sau marker là input thường
-// (Enter ngay sau paste → submit, không bị nuốt).
-test "paste kết thúc giữa chunk: bytes sau END marker không bị nuốt" {
+// RCA-001: END marker located mid-chunk — bytes after marker are normal input
+// (Enter immediately after paste -> submit, not swallowed).
+test "paste ending mid-chunk: bytes after END marker are not swallowed" {
     const alloc = std.testing.allocator;
     var e = LineEditor.init(alloc);
     defer e.deinit();
@@ -1362,5 +1362,5 @@ test "paste kết thúc giữa chunk: bytes sau END marker không bị nuốt" {
     try std.testing.expectEqual(@as(usize, 3 + paste_mod.END_MARKER.len), consumed);
     e.endPaste(undefined, "");
     try std.testing.expectEqualStrings("abc", e.buf.items);
-    // "xyz" (offset trả về) phải còn lại để caller xử lý như input thường.
+    // "xyz" (returned offset) must remain for caller to process as regular input.
 }

@@ -1,9 +1,9 @@
-//! tools/session_diagnostics.zig — Công cụ chẩn đoán tiến trình & telemetry phiên làm việc.
+//! tools/session_diagnostics.zig — Process diagnostics & session telemetry tool.
 //!
-//! Cung cấp khả năng tự truy xuất thông tin hệ thống cho LLM:
-//!   - operation="list": Liệt kê các session/subagent, PID, trạng thái sống/chết, mode (REPL vs Subagent), state.
-//!   - operation="detail": Xem chi tiết journal, số act đã chạy, trạng thái hiện tại, lịch sử lỗi.
-//!   - operation="kill": Dừng an toàn hoặc cưỡng bức tiến trình bị treo.
+//! Provides system inspection capabilities for LLMs:
+//!   - operation="list": List sessions/subagents, PID, alive status, mode (REPL vs Subagent), state.
+//!   - operation="detail": Inspect journal details, executed acts, current state, error history.
+//!   - operation="kill": Safely or forcefully terminate a hanging process.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -135,11 +135,11 @@ pub fn analyzeJournal(alloc: Allocator, io: std.Io, file_path: []const u8, pid: 
 
     if (file_size == 0) {
         summary.state = if (is_alive) .executing_act else .finished;
-        summary.description = if (is_alive) "Tiến trình đang khởi động..." else "File log trống.";
+        summary.description = if (is_alive) "Process is starting up..." else "Empty log file.";
         return summary;
     }
 
-    // Đọc toàn bộ nội dung journal (tối đa 512KB)
+    // Read entire journal content (up to 512KB)
     const read_size = @min(file_size, 512 * 1024);
     const buf = try alloc.alloc(u8, read_size);
     defer alloc.free(buf);
@@ -175,7 +175,7 @@ pub fn analyzeJournal(alloc: Allocator, io: std.Io, file_path: []const u8, pid: 
         }
     }
 
-    // Trích xuất chi tiết lỗi gần nhất nếu có
+    // Extract recent error details if present
     if (last_error_line) |err_line| {
         if (json.findInt(err_line, "http_code", u32)) |code| {
             summary.last_error_code = code;
@@ -192,73 +192,73 @@ pub fn analyzeJournal(alloc: Allocator, io: std.Io, file_path: []const u8, pid: 
         }
     }
 
-    // Xác định trạng thái nghiệp vụ chuẩn xác
+    // Determine operational state
     const last_ev = summary.lastEvent();
     if (is_alive) {
         if (std.mem.eql(u8, last_ev, "task_completed")) {
             if (summary.mode == .repl) {
                 summary.state = .idle_waiting_input;
-                summary.description = "Phiên REPL rảnh, nằm chờ nhập lệnh tại You >";
+                summary.description = "REPL session idle, waiting for command at You >";
             } else {
                 summary.state = .completed;
-                summary.description = "Nhiệm vụ đã hoàn tất thành công.";
+                summary.description = "Task completed successfully.";
             }
         } else if (std.mem.eql(u8, last_ev, "task_interrupted")) {
             summary.state = .cancelled;
-            summary.description = "Tác vụ đã bị người dùng ngắt (Ctrl+C).";
+            summary.description = "Task interrupted by user (Ctrl+C).";
         } else if (std.mem.eql(u8, last_ev, "llm_call_throttled")) {
             summary.state = .throttled;
-            summary.description = "Backend đang bị Rate Limit (429/503), chờ thử lại";
+            summary.description = "Backend rate limited (429/503), waiting for retry";
         } else if (std.mem.eql(u8, last_ev, "llm_context_overflow")) {
             summary.state = .context_overflow;
-            summary.description = "Vượt giới hạn context, đang nén ngữ cảnh MemAct";
+            summary.description = "Context limit exceeded, compressing context via MemAct";
         } else if (std.mem.eql(u8, last_ev, "act_started")) {
             summary.state = .executing_act;
-            summary.description = "Đang thực thi Act (chờ LLM stream phản hồi hoặc chạy Tool)";
+            summary.description = "Executing Act (waiting for LLM stream or tool execution)";
         } else if (std.mem.eql(u8, last_ev, "act_completed")) {
             summary.state = .between_acts;
-            summary.description = "Đã hoàn thành Act gần nhất, đang chuẩn bị cho Act tiếp theo";
+            summary.description = "Latest Act completed, preparing for next Act";
         } else if (std.mem.eql(u8, last_ev, "act_failed")) {
             summary.state = .crashed;
-            summary.description = "Act gặp sự cố lỗi";
+            summary.description = "Act encountered an error";
         } else {
             summary.state = .executing_act;
-            summary.description = "Đang hoạt động bình thường";
+            summary.description = "Operating normally";
         }
     } else {
         if (std.mem.eql(u8, last_ev, "task_completed")) {
             summary.state = .completed;
-            summary.description = "Tiến trình đã hoàn thành và thoát bình thường.";
+            summary.description = "Process completed and exited normally.";
         } else if (std.mem.eql(u8, last_ev, "task_interrupted")) {
             summary.state = .cancelled;
-            summary.description = "Tiến trình đã dừng do người dùng ngắt (Ctrl+C).";
+            summary.description = "Process stopped due to user interruption (Ctrl+C).";
         } else if (std.mem.eql(u8, last_ev, "act_failed") or std.mem.eql(u8, last_ev, "llm_call_throttled")) {
             summary.state = .crashed;
-            summary.description = "Tiến trình đã dừng do lỗi backend / chạm trần retry.";
+            summary.description = "Process stopped due to backend error / retry limit reached.";
         } else {
             summary.state = .finished;
-            summary.description = "Tiến trình đã kết thúc/dừng.";
+            summary.description = "Process finished / stopped.";
         }
     }
 
     return summary;
 }
 
-/// Liệt kê tất cả các sessions gần nhất
+/// List all recent sessions
 pub fn listSessions(alloc: Allocator, io: std.Io) ![]u8 {
     const sessions_dir = try getSessionsDir(alloc);
     defer alloc.free(sessions_dir);
 
     var dir = std.Io.Dir.cwd().openDir(io, sessions_dir, .{ .iterate = true }) catch |e| {
-        return std.fmt.allocPrint(alloc, "Không thể mở thư mục sessions: {s} ({s})", .{ sessions_dir, @errorName(e) });
+        return std.fmt.allocPrint(alloc, "Could not open sessions directory: {s} ({s})", .{ sessions_dir, @errorName(e) });
     };
     defer dir.close(io);
 
     var w = utils.BufWriter.init(alloc);
     defer w.deinit();
 
-    try w.print("## Danh sách Sessions & Subprocesses (~/.mini/sessions)\n\n", .{});
-    try w.print("| PID | Sống | Mode | State | Last Act | Lỗi | Chi tiết |\n", .{});
+    try w.print("## Sessions & Subprocesses List (~/.mini/sessions)\n\n", .{});
+    try w.print("| PID | Alive | Mode | State | Last Act | Errors | Details |\n", .{});
     try w.print("|---|---|---|---|---|---|---|\n", .{});
 
     var count: usize = 0;
@@ -314,13 +314,13 @@ pub fn listSessions(alloc: Allocator, io: std.Io) ![]u8 {
     }
 
     if (count == 0) {
-        try w.writeAll("\n*(Không tìm thấy session journal nào trong thư mục)*\n");
+        try w.writeAll("\n*(No session journals found in directory)*\n");
     }
 
     return alloc.dupe(u8, w.list.items);
 }
 
-/// Xem chi tiết một session theo PID
+/// Inspect detailed session state by PID
 pub fn detailSession(alloc: Allocator, io: std.Io, pid: i32) ![]u8 {
     const sessions_dir = try getSessionsDir(alloc);
     defer alloc.free(sessions_dir);
@@ -329,31 +329,31 @@ pub fn detailSession(alloc: Allocator, io: std.Io, pid: i32) ![]u8 {
     const full_path = std.fmt.bufPrint(&path_buf, "{s}/journal_{d}.jsonl", .{ sessions_dir, pid }) catch return error.BufferTooSmall;
 
     const summary = analyzeJournal(alloc, io, full_path, pid) catch |e| {
-        return std.fmt.allocPrint(alloc, "Không tìm thấy session cho PID {d} (lỗi: {s}) tại {s}", .{ pid, @errorName(e), full_path });
+        return std.fmt.allocPrint(alloc, "Session not found for PID {d} (error: {s}) at {s}", .{ pid, @errorName(e), full_path });
     };
 
     var w = utils.BufWriter.init(alloc);
     defer w.deinit();
 
-    try w.print("## Báo cáo Chẩn đoán Session PID `{d}`\n\n", .{pid});
-    try w.print("- **Trạng thái tiến trình**: {s}\n", .{if (summary.is_alive) "🟢 Đang chạy (ALIVE)" else "⚪ Đã thoát (EXITED)"});
-    try w.print("- **Chế độ thực thi**: `{s}`\n", .{@tagName(summary.mode)});
-    try w.print("- **Trạng thái nghiệp vụ**: `{s}`\n", .{@tagName(summary.state)});
-    try w.print("- **Đánh giá bản chất**: **{s}**\n", .{summary.description});
-    try w.print("- **Act mới nhất**: `{d}` (Event: `{s}`)\n", .{ summary.last_act_id, summary.lastEvent() });
-    try w.print("- **Tổng số sự kiện**: `{d}` (Lỗi ghi nhận: `{d}`)\n", .{ summary.total_events, summary.error_count });
+    try w.print("## Session Diagnostic Report PID `{d}`\n\n", .{pid});
+    try w.print("- **Process status**: {s}\n", .{if (summary.is_alive) "🟢 Running (ALIVE)" else "⚪ Exited (EXITED)"});
+    try w.print("- **Execution mode**: `{s}`\n", .{@tagName(summary.mode)});
+    try w.print("- **Operational state**: `{s}`\n", .{@tagName(summary.state)});
+    try w.print("- **Assessment**: **{s}**\n", .{summary.description});
+    try w.print("- **Latest Act**: `{d}` (Event: `{s}`)\n", .{ summary.last_act_id, summary.lastEvent() });
+    try w.print("- **Total events**: `{d}` (Recorded errors: `{d}`)\n", .{ summary.total_events, summary.error_count });
 
     if (summary.last_error_code > 0 or summary.lastErrorName().len > 0 or summary.lastErrorMessage().len > 0) {
-        try w.print("- **Lỗi gần nhất**: `HTTP {d}` [{s}]: {s}\n", .{
+        try w.print("- **Most recent error**: `HTTP {d}` [{s}]: {s}\n", .{
             summary.last_error_code,
             if (summary.lastErrorName().len > 0) summary.lastErrorName() else "Error",
-            if (summary.lastErrorMessage().len > 0) summary.lastErrorMessage() else "Không có chi tiết lỗi",
+            if (summary.lastErrorMessage().len > 0) summary.lastErrorMessage() else "No error details",
         });
     }
-    try w.print("- **Đường dẫn Journal**: `{s}`\n\n", .{full_path});
+    try w.print("- **Journal path**: `{s}`\n\n", .{full_path});
 
-    // Trích xuất 10 events gần nhất
-    try w.print("### Các sự kiện gần nhất (Journal Tail):\n\n", .{});
+    // Extract 10 most recent events
+    try w.print("### Recent Events (Journal Tail):\n\n", .{});
     const file = std.Io.Dir.cwd().openFile(io, full_path, .{}) catch null;
     if (file) |f| {
         defer f.close(io);
@@ -408,27 +408,27 @@ pub fn detailSession(alloc: Allocator, io: std.Io, pid: i32) ![]u8 {
     return alloc.dupe(u8, w.list.items);
 }
 
-/// Dừng một session / tiến trình theo PID
+/// Terminate a session / process by PID
 pub fn killSession(alloc: Allocator, pid: i32, signal: ?[]const u8) ![]u8 {
     if (pid <= 0) {
-        return std.fmt.allocPrint(alloc, "PID không hợp lệ: {d}", .{pid});
+        return std.fmt.allocPrint(alloc, "Invalid PID: {d}", .{pid});
     }
 
     if (!checkIsAlive(pid)) {
-        return std.fmt.allocPrint(alloc, "Tiến trình PID {d} đã kết thúc từ trước (không còn hoạt động).", .{pid});
+        return std.fmt.allocPrint(alloc, "Process PID {d} already terminated (no longer active).", .{pid});
     }
 
     const sig_num: c_int = if (signal) |s| blk: {
         if (std.mem.eql(u8, s, "SIGKILL") or std.mem.eql(u8, s, "9")) break :blk 9;
         if (std.mem.eql(u8, s, "SIGINT") or std.mem.eql(u8, s, "2")) break :blk 2;
-        break :blk 15; // SIGTERM
+        break :blk 15; // SIGTERM default
     } else 15;
 
     const rc = kill(pid, sig_num);
     if (rc == 0) {
-        return std.fmt.allocPrint(alloc, "Đã gửi tín hiệu dừng (signal {d}) tới PID {d} thành công.", .{ sig_num, pid });
+        return std.fmt.allocPrint(alloc, "Successfully sent termination signal (signal {d}) to PID {d}.", .{ sig_num, pid });
     } else {
-        return std.fmt.allocPrint(alloc, "Không thể dừng PID {d} (mã lỗi errno: {d}).", .{ pid, rc });
+        return std.fmt.allocPrint(alloc, "Failed to stop PID {d} (errno: {d}).", .{ pid, rc });
     }
 }
 
@@ -440,14 +440,14 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         return listSessions(alloc, io);
     } else if (std.mem.eql(u8, op, "detail")) {
         const pid = json.findInt(input_json, "pid", i32) orelse
-            return std.fmt.allocPrint(alloc, "Lỗi: operation='detail' yêu cầu tham số 'pid' kiểu số nguyên.", .{});
+            return std.fmt.allocPrint(alloc, "Error: operation='detail' requires integer 'pid' parameter.", .{});
         return detailSession(alloc, io, pid);
     } else if (std.mem.eql(u8, op, "kill") or std.mem.eql(u8, op, "stop")) {
         const pid = json.findInt(input_json, "pid", i32) orelse
-            return std.fmt.allocPrint(alloc, "Lỗi: operation='kill' yêu cầu tham số 'pid' kiểu số nguyên.", .{});
+            return std.fmt.allocPrint(alloc, "Error: operation='kill' requires integer 'pid' parameter.", .{});
         const sig = json.findString(input_json, "signal");
         return killSession(alloc, pid, sig);
     }
 
-    return std.fmt.allocPrint(alloc, "Lỗi: operation không hợp lệ '{s}'. Các giá trị hợp lệ: list, detail, kill.", .{op});
+    return std.fmt.allocPrint(alloc, "Error: invalid operation '{s}'. Valid values: list, detail, kill.", .{op});
 }

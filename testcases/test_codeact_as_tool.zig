@@ -1,4 +1,4 @@
-//! Kiểm tra `executeTool` thực thi `codeact` tool call từ JSON payload thành công.
+//! Verify that executeTool runs codeact tool calls from JSON payload successfully.
 
 const std = @import("std");
 const registry = @import("mini").tools_mod;

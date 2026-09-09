@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # run_bfcl_benchmark.sh
-# Kịch bản chạy bộ test BFCL (Javascript Subset) cho mini
+# BFCL Benchmark Runner Script (Javascript Subset) for mini
 
 MINI_BIN="./zig-out/bin/mini"
 TEST_FILE="testcases/bfcl_javascript_subset.json"
@@ -12,17 +12,17 @@ SUMMARY_FILE="$REPORT_DIR/summary_$(date +%Y%m%d_%H%M%S).json"
 mkdir -p "$REPORT_DIR"
 
 if [ ! -f "$MINI_BIN" ]; then
-    echo "Không tìm thấy $MINI_BIN. Vui lòng build mini trước bằng 'zig build'."
+    echo "$MINI_BIN not found. Please build mini first with 'zig build'."
     exit 1
 fi
 
 if [ ! -f "$TEST_FILE" ]; then
-    echo "Không tìm thấy file dataset: $TEST_FILE"
+    echo "Dataset file not found: $TEST_FILE"
     exit 1
 fi
 
 echo "==========================================="
-echo "Bắt đầu chạy benchmark BFCL cho mini"
+echo "Starting BFCL benchmark for mini"
 echo "Dataset: $TEST_FILE"
 echo "Report: $REPORT_FILE"
 echo "===========================================" | tee -a "$REPORT_FILE"
@@ -31,65 +31,65 @@ total=0
 success=0
 failed=0
 
-# Xóa file summary cũ (nếu có) và khởi tạo mảng JSON
+# Remove old summary file (if any) and initialize JSON array
 echo "[" > "$SUMMARY_FILE"
 first_entry=true
 
-# Đọc từng dòng (JSONL)
+# Read line by line (JSONL)
 while IFS= read -r line || [ -n "$line" ]; do
     if [ -z "$line" ]; then
         continue
     fi
 
-    # Phân tích cú pháp bằng jq
+    # Parse using jq
     test_id=$(echo "$line" | jq -r '.id')
     
-    # BFCL v3 thường có cấu trúc question: [[{"role": "user", "content": "..."}]]
+    # BFCL v3 usually has question structure: [[{"role": "user", "content": "..."}]]
     question=$(echo "$line" | jq -r '.question[0][0].content')
     
-    # Lấy schema của các tool
+    # Get tools schema
     tools_schema=$(echo "$line" | jq -c '.function')
 
-    echo "▶ Đang chạy Test ID: $test_id" | tee -a "$REPORT_FILE"
+    echo "▶ Running Test ID: $test_id" | tee -a "$REPORT_FILE"
     echo "  Prompt: $question" | tee -a "$REPORT_FILE"
 
-    # Xây dựng câu lệnh yêu cầu LLM gọi tool dựa trên schema
-    # (Vì đây là bài test gọi hàm, ta yêu cầu LLM trả về JSON gọi hàm)
-    full_prompt="Bạn là một trợ lý thông minh. Dưới đây là các công cụ (tools) bạn có thể sử dụng (dạng JSON schema):
+    # Build prompt requesting LLM to call tool based on schema
+    # (Since this is a function calling benchmark, we request LLM to return JSON function call)
+    full_prompt="You are a helpful assistant. Below are the tools you can use (JSON schema):
 $tools_schema
 
-Yêu cầu của người dùng:
+User request:
 \"$question\"
 
-Hãy gọi công cụ phù hợp nhất và chỉ in ra kết quả dưới dạng JSON object mô tả việc gọi tool (không giải thích thêm). Ví dụ: {\"name\": \"tên_hàm\", \"arguments\": {\"param\": \"value\"}}"
+Please call the most appropriate tool and output ONLY the result as a JSON object describing the tool call (no additional explanation). Example: {\"name\": \"function_name\", \"arguments\": {\"param\": \"value\"}}"
 
-    # Chạy mini (single-shot execution)
+    # Run mini (single-shot execution)
     start_time=$(date +%s%3N)
     output=$($MINI_BIN -e "$full_prompt" 2>&1)
     end_time=$(date +%s%3N)
     duration=$((end_time - start_time))
 
     echo "  Output: $output" | tee -a "$REPORT_FILE"
-    echo "  Thời gian: ${duration}ms" | tee -a "$REPORT_FILE"
+    echo "  Duration: ${duration}ms" | tee -a "$REPORT_FILE"
     echo "-------------------------------------------" | tee -a "$REPORT_FILE"
 
-    # Trích xuất JSON sạch từ output
-    # Loại bỏ mã màu ANSI và tìm dòng JSON (bắt đầu bằng { và kết thúc bằng })
+    # Extract clean JSON from output
+    # Strip ANSI escape sequences and find JSON line (starts with { and ends with })
     clean_json=$(echo "$output" | sed -r "s/\x1B\[([0-9]{1,3}(;[0-9]{1,2})?)?[mGK]//g" | grep -E "^\{.*\}$" | head -n 1)
     
-    # Nếu LLM không trả về JSON hợp lệ, fallback về mảng rỗng
+    # If LLM did not return valid JSON, fallback to empty object
     if [ -z "$clean_json" ]; then
         clean_json="{}"
     fi
 
-    # Log kết quả ra file tổng hợp JSON
+    # Log result to summary JSON file
     if [ "$first_entry" = true ]; then
         first_entry=false
     else
         echo "," >> "$SUMMARY_FILE"
     fi
     
-    # Lưu log cho từng case vào summary
+    # Save per-case log into summary
     jq -n \
         --arg id "$test_id" \
         --arg q "$question" \
@@ -105,8 +105,8 @@ done < "$TEST_FILE"
 echo "]" >> "$SUMMARY_FILE"
 
 echo "===========================================" | tee -a "$REPORT_FILE"
-echo "Hoàn thành benchmark!" | tee -a "$REPORT_FILE"
-echo "Tổng số test: $total" | tee -a "$REPORT_FILE"
-echo "Chi tiết xem tại:"
+echo "Benchmark completed!" | tee -a "$REPORT_FILE"
+echo "Total tests: $total" | tee -a "$REPORT_FILE"
+echo "Details available at:"
 echo "  - $REPORT_FILE"
 echo "  - $SUMMARY_FILE"

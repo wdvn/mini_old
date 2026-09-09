@@ -1,21 +1,21 @@
-//! history.zig — Lịch sử hội thoại in-memory.
+//! history.zig — In-memory conversation history.
 //!
-//! Quản lý danh sách các `Message` trong một phiên hội thoại.
-//! Tự động compact khi số lượng tin nhắn vượt ngưỡng để tránh
-//! overflow context window của AI model.
+//! Manages the list of `Message`s in a conversation session.
+//! Automatically compacts when message count exceeds threshold to prevent
+//! overflowing the AI model's context window.
 //!
-//! ## Cách dùng
+//! ## Usage
 //! ```zig
 //! var h = History.init(alloc);
 //! defer h.deinit();
-//! try h.addUser("Xin chào!");
-//! try h.addAssistant("Chào bạn!");
-//! const msgs = h.messages();  // gửi lên API
+//! try h.addUser("Hello!");
+//! try h.addAssistant("Hi there!");
+//! const msgs = h.messages();  // send to API
 //! ```
 //!
 //! ## Compact
-//! Khi `messages.len > max_messages`, gọi `compact()` để giữ lại
-//! chỉ một nửa số tin nhắn gần nhất (tính theo cặp user/assistant).
+//! When `messages.len > max_messages`, call `compact()` to retain
+//! only the most recent half of the messages (counted by user/assistant pairs).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -26,19 +26,19 @@ const utils = @import("utils.zig");
 
 
 
-/// Số tin nhắn tối đa trước khi tự động compact.
+/// Maximum messages before auto-compaction.
 const DEFAULT_MAX_MESSAGES = 40;
 
-/// Lịch sử hội thoại cho một phiên làm việc.
+/// Conversation history for a session.
 pub const History = struct {
     alloc: Allocator,
     msgs: ArrayList(proto.Message),
-    /// Ngưỡng tự động compact.
+    /// Auto-compaction threshold.
     max_messages: usize,
-    /// ID của Act tại lần compact gần nhất (để block rollback vượt quá mốc này).
+    /// Act ID at last compaction (to block rollbacks beyond this checkpoint).
     last_compaction_act_id: usize,
 
-    /// Khởi tạo History rỗng.
+    /// Initializes an empty History.
     pub fn init(alloc: Allocator) History {
         return .{
             .alloc = alloc,
@@ -70,7 +70,7 @@ pub const History = struct {
         alloc.free(blocks);
     }
 
-    /// Giải phóng tất cả bộ nhớ.
+    /// Releases all memory.
     pub fn deinit(self: *History) void {
         for (self.msgs.items) |msg| {
             freeContentBlocks(self.alloc, msg.content);
@@ -78,7 +78,7 @@ pub const History = struct {
         self.msgs.deinit(self.alloc);
     }
 
-    /// Backup lịch sử ra file JSON.
+    /// Backs up history to a JSON file.
     pub fn backupToFile(self: *const History, io: std.Io, path: []const u8) !void {
         const cwd = std.Io.Dir.cwd();
         const file = try cwd.createFile(io, path, .{ .truncate = true });
@@ -93,7 +93,7 @@ pub const History = struct {
         try file.writeStreamingAll(io, out_buf.items);
     }
 
-    /// Khôi phục lịch sử từ file JSON.
+    /// Restores history from a JSON file.
     pub fn restoreFromFile(self: *History, io: std.Io, path: []const u8) !void {
         const cwd = std.Io.Dir.cwd();
         const file = try cwd.openFile(io, path, .{});
@@ -143,8 +143,8 @@ pub const History = struct {
     }
 
 
-    /// Thêm tin nhắn của user.
-    /// `text` được copy vào bộ nhớ sở hữu bởi History.
+    /// Appends user message.
+    /// `text` is copied into memory owned by History.
     pub fn addUser(self: *History, text: []const u8) !void {
         const text_copy = try self.alloc.dupe(u8, text);
         const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
@@ -152,7 +152,7 @@ pub const History = struct {
         try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks, .tier = .recent });
     }
 
-    /// Thêm tin nhắn của assistant (text response).
+    /// Appends assistant message (text response).
     pub fn addAssistantText(self: *History, text: []const u8) !void {
         const text_copy = try self.alloc.dupe(u8, text);
         const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
@@ -160,8 +160,8 @@ pub const History = struct {
         try self.msgs.append(self.alloc, .{ .role = .assistant, .content = blocks, .tier = .recent });
     }
 
-    /// Thêm phản hồi đầy đủ từ AI (có thể chứa text + tool_use).
-    /// Content blocks được copy sâu vào History. Trả về true nếu tin nhắn được thêm.
+    /// Appends full AI response (may contain text + tool_use).
+    /// Content blocks are deeply copied into History. Returns true if message was added.
     pub fn addAssistantResponse(self: *History, response: *const proto.Response) !bool {
         if (response.content.items.len == 0) return false;
         const blocks = try self.alloc.alloc(proto.ContentBlock, response.content.items.len);
@@ -188,7 +188,7 @@ pub const History = struct {
         return true;
     }
 
-    /// Thêm kết quả tool execution vào lịch sử (dạng user message với tool_result blocks).
+    /// Appends tool execution results to history (as user message with tool_result blocks).
     pub fn addToolResults(self: *History, results: []const proto.ToolResult) !void {
         if (results.len == 0) return;
         const blocks = try self.alloc.alloc(proto.ContentBlock, results.len);
@@ -202,23 +202,23 @@ pub const History = struct {
         try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks, .tier = .recent });
     }
 
-    /// Trả về slice tin nhắn hiện tại (không owned).
+    /// Returns slice of current messages (unowned).
     pub fn messages(self: *const History) []const proto.Message {
         return self.msgs.items;
     }
 
-    /// Số tin nhắn hiện tại.
+    /// Current message count.
     pub fn len(self: *const History) usize {
         return self.msgs.items.len;
     }
 
-    /// Xóa toàn bộ lịch sử.
+    /// Clears entire history.
     pub fn clear(self: *History) void {
         for (self.msgs.items) |msg| freeContentBlocks(self.alloc, msg.content);
         self.msgs.clearRetainingCapacity();
     }
 
-    /// Xóa tin nhắn cuối cùng khỏi lịch sử.
+    /// Removes the last message from history.
     pub fn popLast(self: *History) void {
         if (self.msgs.items.len == 0) return;
         const last = self.msgs.items[self.msgs.items.len - 1];
@@ -226,7 +226,7 @@ pub const History = struct {
         self.msgs.items.len -= 1;
     }
 
-    /// Xóa các tin nhắn từ index được chỉ định trở đi (Rollback)
+    /// Truncates messages starting from the specified index (Rollback).
     pub fn truncate(self: *History, target_len: usize) void {
         if (target_len >= self.msgs.items.len) return;
         for (self.msgs.items[target_len..]) |msg| {
@@ -235,45 +235,45 @@ pub const History = struct {
         self.msgs.items.len = target_len;
     }
 
-    /// Thêm thông báo lỗi hệ thống từ Agent
+    /// Appends a system error observation from Agent.
     pub fn addSystemErrorObservation(self: *History, err_msg: []const u8) !void {
         const text_copy = try self.alloc.dupe(u8, err_msg);
         const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
         blocks[0] = .{ .text = text_copy };
-        // Phải là .user để LLM có thể đọc như một observation
+        // Must be .user so LLM can read as an observation
         try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks, .tier = .recent });
     }
 
-    /// Compact: giữ lại chỉ một nửa các tin nhắn gần nhất.
-    /// Luôn giữ theo cặp chẵn (user + assistant) để không phá vỡ cấu trúc.
+    /// Compact: retains only the recent half of messages.
+    /// Always keeps an even pair (user + assistant) to maintain conversation structure.
     pub fn compact(self: *History) void {
         const n = self.msgs.items.len;
         if (n <= 2) return;
 
-        // Giữ lại nửa sau, tính theo bội số 2
-        const keep = (n / 2) & ~@as(usize, 1); // làm tròn xuống số chẵn
+        // Keep latter half, rounded down to even count
+        const keep = (n / 2) & ~@as(usize, 1);
         const drop = n - keep;
 
-        // Free các message bị bỏ
+        // Free discarded messages
         for (self.msgs.items[0..drop]) |msg| freeContentBlocks(self.alloc, msg.content);
 
         // Shift left
         std.mem.copyForwards(proto.Message, self.msgs.items[0..keep], self.msgs.items[drop..]);
         self.msgs.items.len = keep;
 
-        if (!utils.isSubagent()) main.stderrPrint("[history] Compacted: giữ {d}/{d} messages\n", .{ keep, n });
+        if (!utils.isSubagent()) main.stderrPrint("[history] Compacted: kept {d}/{d} messages\n", .{ keep, n });
     }
 
-    /// Kiểm tra xem lịch sử có vượt quá ngưỡng hay không
+    /// Checks whether history has exceeded the compaction threshold.
     pub fn needsCompaction(self: *const History) bool {
         return self.msgs.items.len > self.max_messages;
     }
 
-    /// Reset lịch sử: giữ lại tin nhắn đầu tiên và chèn summary
+    /// Resets history: retains first message and inserts summary.
     pub fn compactWithSummary(self: *History, summary: []const u8) !void {
         if (self.msgs.items.len <= 1) return;
 
-        // Free các tin nhắn từ index 1 trở đi
+        // Free messages from index 1 onwards
         for (self.msgs.items[1..]) |msg| {
             freeContentBlocks(self.alloc, msg.content);
         }
@@ -285,36 +285,36 @@ pub const History = struct {
         blocks[0] = .{ .text = summary_copy };
         try self.msgs.append(self.alloc, .{ .role = .assistant, .content = blocks, .tier = .summarized });
 
-        if (!utils.isSubagent()) main.stderrPrint("\n[history] Đã dọn dẹp bộ nhớ và lưu tóm tắt ngữ cảnh.\n", .{});
+        if (!utils.isSubagent()) main.stderrPrint("\n[history] Memory cleaned and context summary saved.\n", .{});
     }
 
-    /// Compact theo logic MemAct (bản mới): GIỮ NGUYÊN msgs.items[0] (user prompt gốc),
-    /// đặt summary message tại index 1, DROP toàn bộ phần còn lại.
+    /// Compact according to MemAct logic: PRESERVES msgs.items[0] (original user prompt),
+    /// places summary message at index 1, and DROPS the rest.
     ///
-    /// Không còn giữ N messages gần nhất: với window lớn, phần giữ lại (~60% window)
-    /// vẫn vượt ngưỡng compact → mỗi vòng lặp lại nén (tốn LLM call, history không
-    /// bao giờ xuống dưới ngưỡng). Trạng thái "đang ở bước nào" được đưa vào
-    /// summary (task_state/next_step) nên model vẫn tiếp tục đúng chỗ.
+    /// Does not keep N recent messages: with large windows, keeping (~60% window)
+    /// still exceeds compaction threshold -> compacts every turn (wasting LLM calls,
+    /// history never drops below threshold). State of "current step" is preserved in
+    /// summary (task_state/next_step) so the model continues properly.
     ///
-    /// Nếu msgs.items[1] đã là summary từ lần compact trước (tier .summarized)
-    /// thì summary cũ bị thay thế bởi summary mới (dồn tích lũy).
+    /// If msgs.items[1] is already a summary from previous compaction (.summarized tier),
+    /// the old summary is replaced by the new cumulative summary.
     pub fn compactMemAct(self: *History, act_id: usize, summary: []const u8) !void {
-        // No-op: không có gì để nén (chưa qua prompt gốc)
+        // No-op: nothing to compact (haven't progressed past original prompt)
         if (self.msgs.items.len <= 1) return;
 
-        // Cập nhật mốc compact
+        // Update compaction act mark
         self.last_compaction_act_id = act_id;
 
-        // Nếu msgs[1] là summary từ lần compact trước → thay thế; ngược lại → chèn mới.
+        // If msgs[1] is summary from previous compaction -> replace; otherwise -> insert new.
         const replace_old_summary = self.msgs.items[1].tier == .summarized;
 
-        // Free toàn bộ messages từ index 1 trở đi (không đụng tới msgs[0] — prompt gốc)
+        // Free all messages from index 1 onwards (do not touch msgs[0] — original prompt)
         const dropped = self.msgs.items.len - 1;
         for (self.msgs.items[1..]) |msg| freeContentBlocks(self.alloc, msg.content);
         self.msgs.items.len = 1;
 
-        // Tạo summary message. Role phải là .user để Claude API không từ chối
-        // với lỗi 400 "first message must be user" (session cũ compact kiểu cũ).
+        // Create summary message. Role must be .user so Claude API does not reject
+        // with 400 "first message must be user" (old session legacy compaction format).
         const summary_text = try std.fmt.allocPrint(self.alloc, "[MemAct Context Summary]\n{s}", .{summary});
         errdefer self.alloc.free(summary_text);
         const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
@@ -323,12 +323,12 @@ pub const History = struct {
         const summary_msg = proto.Message{ .role = .user, .content = blocks, .tier = .summarized };
         try self.msgs.append(self.alloc, summary_msg);
 
-        if (!utils.isSubagent()) main.stderrPrint("\n[history] Đã nén ngữ cảnh (MemAct): giữ prompt gốc (index 0), {s} summary tại index 1, drop {d} messages.\n", .{ if (replace_old_summary) "thay thế" else "chèn mới", dropped });
+        if (!utils.isSubagent()) main.stderrPrint("\n[history] Context compacted (MemAct): preserved original prompt (index 0), {s} summary at index 1, dropped {d} messages.\n", .{ if (replace_old_summary) "replaced" else "inserted", dropped });
     }
 
-    /// Đảm bảo history tương thích Claude API (message đầu tiên phải có role .user).
-    /// Session cũ compact kiểu cũ có thể có msgs[0].role == .assistant → đổi thành .user.
-    /// KHÔNG đụng vào content. Trả về true nếu đã sửa, false nếu không cần.
+    /// Ensures history compatibility with Claude API (first message must have .user role).
+    /// Old sessions compacted using legacy method might have msgs[0].role == .assistant -> convert to .user.
+    /// Does NOT touch content. Returns true if modified, false otherwise.
     pub fn ensureClaudeCompatible(self: *History) bool {
         if (self.msgs.items.len > 0 and self.msgs.items[0].role == .assistant) {
             self.msgs.items[0].role = .user;
@@ -337,11 +337,11 @@ pub const History = struct {
         return false;
     }
 
-    /// Đảm bảo history tương thích OpenAI API:
-    /// 1. Loại bỏ/chuyển đổi các block tool_result mồ côi (không có assistant message mang tool_use tương ứng đi trước).
-    ///    Tránh lỗi OpenAI 400: "No tool call found for function call output with call_id ...".
-    /// 2. Loại bỏ/chuyển đổi các block tool_use mồ côi (không có user message mang tool_result tương ứng đi sau).
-    ///    Tránh lỗi OpenAI 400: "No tool output found for function call ...".
+    /// Ensures history compatibility with OpenAI API:
+    /// 1. Strips/converts orphan tool_result blocks (without preceding assistant message holding corresponding tool_use).
+    ///    Prevents OpenAI 400 error: "No tool call found for function call output with call_id ...".
+    /// 2. Strips/converts orphan tool_use blocks (without succeeding user message holding corresponding tool_result).
+    ///    Prevents OpenAI 400 error: "No tool output found for function call ...".
     pub fn ensureOpenAICompatible(self: *History) bool {
         var modified = false;
         var valid_tool_ids = std.StringHashMap(void).init(self.alloc);
@@ -365,7 +365,7 @@ pub const History = struct {
             }
         }
 
-        // Pass 1: Xử lý assistant messages chứa tool_use không có tool_result đi sau
+        // Pass 1: Handle assistant messages containing tool_use without succeeding tool_result
         for (self.msgs.items) |*msg| {
             if (msg.role == .assistant) {
                 var has_orphan_call = false;
@@ -399,7 +399,7 @@ pub const History = struct {
             }
         }
 
-        // Pass 2: Xử lý user messages chứa tool_result không có tool_use đi trước
+        // Pass 2: Handle user messages containing tool_result without preceding tool_use
         for (self.msgs.items) |*msg| {
             if (msg.role != .assistant) {
                 var has_orphan_res = false;
@@ -440,65 +440,65 @@ pub const History = struct {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "compactMemAct giữ msgs[0], summary .user/.summarized ở index 1, drop toàn bộ phần sau" {
-    // compactMemAct log qua main.stderrPrint dùng g_io — trong test mode g_io
-    // chưa được init (chỉ set trong main()) → gán std.testing.io cho an toàn.
+test "compactMemAct preserves msgs[0], puts .user/.summarized summary at index 1, drops all following" {
+    // compactMemAct logs via main.stderrPrint using g_io — in test mode g_io
+    // is uninitialized (only set in main()) -> assign std.testing.io for safety.
     main.g_io = std.testing.io;
     const alloc = std.testing.allocator;
     var h = History.init(alloc);
     defer h.deinit();
 
-    try h.addUser("prompt gốc");
-    try h.addAssistantText("trả lời 1");
-    try h.addUser("câu hỏi 2");
-    try h.addAssistantText("trả lời 2");
-    try h.addUser("câu hỏi 3");
-    try h.addAssistantText("trả lời 3");
+    try h.addUser("original prompt");
+    try h.addAssistantText("reply 1");
+    try h.addUser("question 2");
+    try h.addAssistantText("reply 2");
+    try h.addUser("question 3");
+    try h.addAssistantText("reply 3");
 
-    try h.compactMemAct(7, "tóm tắt ngữ cảnh");
+    try h.compactMemAct(7, "context summary");
 
-    // Chỉ còn prompt gốc + summary
+    // Only original prompt + summary remain
     try std.testing.expectEqual(@as(usize, 2), h.msgs.items.len);
 
-    // msgs[0] nguyên vẹn: role .user, text prompt gốc
+    // msgs[0] intact: role .user, text original prompt
     try std.testing.expect(h.msgs.items[0].role == .user);
-    try std.testing.expectEqualStrings("prompt gốc", h.msgs.items[0].content[0].text);
+    try std.testing.expectEqualStrings("original prompt", h.msgs.items[0].content[0].text);
 
-    // Summary tại index 1: role .user (Claude-compatible), tier .summarized, có prefix
+    // Summary at index 1: role .user (Claude-compatible), tier .summarized, prefixed
     try std.testing.expect(h.msgs.items[1].role == .user);
     try std.testing.expect(h.msgs.items[1].tier == .summarized);
-    try std.testing.expectEqualStrings("[MemAct Context Summary]\ntóm tắt ngữ cảnh", h.msgs.items[1].content[0].text);
+    try std.testing.expectEqualStrings("[MemAct Context Summary]\ncontext summary", h.msgs.items[1].content[0].text);
 
     try std.testing.expect(h.last_compaction_act_id == 7);
 }
 
-test "compactMemAct lần 2 dồn tích lũy: thay summary cũ, msgs[0] vẫn nguyên, không leak" {
-    main.g_io = std.testing.io; // xem comment test phía trên
+test "second compactMemAct cumulatively aggregates: replaces old summary, msgs[0] intact, no leak" {
+    main.g_io = std.testing.io;
     const alloc = std.testing.allocator;
     var h = History.init(alloc);
-    defer h.deinit(); // std.testing.allocator bắt leak nếu compact xử lý bộ nhớ sai
+    defer h.deinit();
 
-    try h.addUser("prompt gốc");
-    try h.addAssistantText("trả lời 1");
-    try h.addUser("câu hỏi 2");
-    try h.addAssistantText("trả lời 2");
+    try h.addUser("original prompt");
+    try h.addAssistantText("reply 1");
+    try h.addUser("question 2");
+    try h.addAssistantText("reply 2");
 
-    // Compact lần 1: còn [prompt gốc, summary v1]
+    // Compact 1: remaining [original prompt, summary v1]
     try h.compactMemAct(3, "summary v1");
     try std.testing.expectEqual(@as(usize, 2), h.msgs.items.len);
 
-    // Thêm hội thoại mới rồi compact lần 2: summary cũ bị thay thế
-    try h.addUser("câu hỏi 3");
-    try h.addAssistantText("trả lời 3");
+    // Add new turns and compact 2nd time: old summary is replaced
+    try h.addUser("question 3");
+    try h.addAssistantText("reply 3");
     try h.compactMemAct(9, "summary v2 merged");
 
     try std.testing.expectEqual(@as(usize, 2), h.msgs.items.len);
 
-    // msgs[0] vẫn nguyên vẹn qua cả 2 lần compact
+    // msgs[0] remains intact across both compactions
     try std.testing.expect(h.msgs.items[0].role == .user);
-    try std.testing.expectEqualStrings("prompt gốc", h.msgs.items[0].content[0].text);
+    try std.testing.expectEqualStrings("original prompt", h.msgs.items[0].content[0].text);
 
-    // msgs[1] là summary MỚI (thay thế summary cũ đã được free đúng)
+    // msgs[1] is NEW summary (replaces old summary which was properly freed)
     try std.testing.expect(h.msgs.items[1].role == .user);
     try std.testing.expect(h.msgs.items[1].tier == .summarized);
     try std.testing.expectEqualStrings("[MemAct Context Summary]\nsummary v2 merged", h.msgs.items[1].content[0].text);
@@ -506,7 +506,7 @@ test "compactMemAct lần 2 dồn tích lũy: thay summary cũ, msgs[0] vẫn ng
     try std.testing.expect(h.last_compaction_act_id == 9);
 }
 
-test "compactMemAct no-op khi history quá ngắn (chỉ prompt gốc hoặc rỗng)" {
+test "compactMemAct no-op when history is too short (original prompt only or empty)" {
     const alloc = std.testing.allocator;
     var h = History.init(alloc);
     defer h.deinit();
@@ -515,9 +515,9 @@ test "compactMemAct no-op khi history quá ngắn (chỉ prompt gốc hoặc r�
     try h.compactMemAct(5, "sum");
     try std.testing.expectEqual(@as(usize, 1), h.msgs.items.len);
     try std.testing.expectEqualStrings("a", h.msgs.items[0].content[0].text);
-    try std.testing.expect(h.last_compaction_act_id == 0); // không cập nhật mốc
+    try std.testing.expect(h.last_compaction_act_id == 0); // checkpoint not updated
 
-    // History rỗng → no-op
+    // Empty history -> no-op
     var h2 = History.init(alloc);
     defer h2.deinit();
     try h2.compactMemAct(2, "sum");
@@ -525,35 +525,35 @@ test "compactMemAct no-op khi history quá ngắn (chỉ prompt gốc hoặc r�
     try std.testing.expect(h2.last_compaction_act_id == 0);
 }
 
-test "ensureClaudeCompatible đổi role assistant đầu tiên và trả đúng bool" {
+test "ensureClaudeCompatible changes role of first assistant message and returns correct bool" {
     const alloc = std.testing.allocator;
     var h = History.init(alloc);
     defer h.deinit();
 
-    // Trường hợp không cần sửa: history rỗng
+    // No fix needed: empty history
     try std.testing.expect(h.ensureClaudeCompatible() == false);
 
-    // Session cũ compact kiểu cũ: msgs[0].role == .assistant
-    try h.addAssistantText("summary cũ assistant-first");
-    try h.addUser("câu hỏi mới");
+    // Old session legacy compacted: msgs[0].role == .assistant
+    try h.addAssistantText("old summary assistant-first");
+    try h.addUser("new question");
 
     try std.testing.expect(h.ensureClaudeCompatible() == true);
     try std.testing.expect(h.msgs.items[0].role == .user);
-    // Content không bị đụng tới
-    try std.testing.expectEqualStrings("summary cũ assistant-first", h.msgs.items[0].content[0].text);
+    // Content untouched
+    try std.testing.expectEqualStrings("old summary assistant-first", h.msgs.items[0].content[0].text);
     try std.testing.expect(h.msgs.items[1].role == .user);
 
-    // Lần gọi thứ hai: msgs[0] đã là .user → không sửa, trả false
+    // Second call: msgs[0] is already .user -> no fix, returns false
     try std.testing.expect(h.ensureClaudeCompatible() == false);
     try std.testing.expect(h.msgs.items[0].role == .user);
 }
 
-test "ensureOpenAICompatible chuyển đổi orphan tool_result thành text an toàn" {
+test "ensureOpenAICompatible safely converts orphan tool_result to text" {
     const alloc = std.testing.allocator;
     var h = History.init(alloc);
     defer h.deinit();
 
-    // Thêm 1 tool_result mồ côi (không có assistant tool_use trước đó)
+    // Add 1 orphan tool_result (without preceding assistant tool_use)
     const blocks = try alloc.alloc(proto.ContentBlock, 1);
     blocks[0] = .{ .tool_result = .{
         .tool_use_id = try alloc.dupe(u8, "call_orphan_123"),
@@ -566,16 +566,16 @@ test "ensureOpenAICompatible chuyển đổi orphan tool_result thành text an t
     try std.testing.expect(h.msgs.items[0].content[0] == .text);
     try std.testing.expect(std.mem.indexOf(u8, h.msgs.items[0].content[0].text, "output of orphan tool") != null);
 
-    // Lần 2: Đã là text, không sửa nữa
+    // Run 2: already text, no modification
     try std.testing.expect(h.ensureOpenAICompatible() == false);
 }
 
-test "ensureOpenAICompatible chuyển đổi orphan tool_use thành text an toàn" {
+test "ensureOpenAICompatible safely converts orphan tool_use to text" {
     const alloc = std.testing.allocator;
     var h = History.init(alloc);
     defer h.deinit();
 
-    // Thêm 1 tool_use mồ côi (không có user tool_result theo sau)
+    // Add 1 orphan tool_use (without succeeding user tool_result)
     const blocks = try alloc.alloc(proto.ContentBlock, 1);
     blocks[0] = .{ .tool_use = .{
         .id = try alloc.dupe(u8, "call_orphan_456"),
@@ -588,6 +588,6 @@ test "ensureOpenAICompatible chuyển đổi orphan tool_use thành text an toà
     try std.testing.expect(h.msgs.items[0].content[0] == .text);
     try std.testing.expect(std.mem.indexOf(u8, h.msgs.items[0].content[0].text, "[Tool Call: bash({\"cmd\":\"ls\"})]") != null);
 
-    // Lần 2: Đã là text, không sửa nữa
+    // Run 2: already text, no modification
     try std.testing.expect(h.ensureOpenAICompatible() == false);
 }

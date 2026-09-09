@@ -1,10 +1,10 @@
-//! main.zig — Composition Root của mini-agent.
+//! main.zig — Composition Root of mini-agent.
 //!
-//! Khởi tạo DI, phân tích tham số CLI, nạp cấu hình và điều phối chế độ thực thi:
-//! - `--acp`: Chế độ ACP Server (Agent Client Protocol qua JSON-RPC 2.0)
-//! - `--install-cron`: Chế độ tạo cronjob tự động trên Linux
-//! - `-e` / `--single`: Chế độ chạy single-shot prompt
-//! - Mặc định: Chế độ REPL tương tác dòng lệnh qua `ui/repl.zig`
+//! Initializes DI, parses CLI arguments, loads configuration, and coordinates execution modes:
+//! - `--acp`: ACP Server Mode (Agent Client Protocol via JSON-RPC 2.0)
+//! - `--install-cron`: Linux cronjob installation mode
+//! - `-e` / `--single`: Single-shot prompt mode
+//! - Default: Interactive REPL terminal mode via `ui/repl.zig`
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -44,8 +44,8 @@ pub const process_manager = @import("runtime/process_manager.zig");
 
 pub const VERSION = "1.0.0";
 
-/// Build info được inject lúc build (build.zig → options module `build_info`).
-/// Đổi theo mỗi lần `zig build`, giúp nhận diện binary đang chạy là bản build nào.
+/// Build info injected at build time (build.zig → options module `build_info`).
+/// Changes on each `zig build`, identifying the binary build version.
 pub const build_info = @import("build_info");
 pub const BUILD_TIME = build_info.build_time;
 pub const BUILD_OPTIMIZE = build_info.optimize_mode;
@@ -55,13 +55,13 @@ pub const ZIG_VERSION = build_info.zig_version;
 pub var g_io: std.Io = undefined;
 pub var g_environ_map: ?*std.process.Environ.Map = null;
 
-/// Lấy environ map của process (snapshot lúc start + biến đã put thêm, vd .env).
-/// Dùng để spawn child với đúng environment hiện tại.
+/// Get process environ map (startup snapshot + added variables e.g. from .env).
+/// Used to spawn children with the accurate current environment.
 pub fn getEnvironMap() ?*std.process.Environ.Map {
     return g_environ_map;
 }
 
-/// Lấy Io instance: tự động dùng std.testing.io khi chạy test (comptime), hoặc g_io khi runtime.
+/// Get Io instance: automatically uses std.testing.io when running tests (comptime), or g_io at runtime.
 pub fn getIo() std.Io {
     if (comptime builtin.is_test) {
         return std.testing.io;
@@ -120,25 +120,25 @@ pub fn main(init: std.process.Init) !void {
         agent_folder_opt = folder;
         init.environ_map.put("MINI_AGENT_FOLDER", folder.path) catch {};
     } else |err| {
-        stderrPrint("[main] Lỗi khi tìm .agent: {any}\n", .{err});
+        stderrPrint("[main] Error finding .agent: {any}\n", .{err});
     }
     defer if (agent_folder_opt) |*f| f.deinit();
 
-    // Nạp biến môi trường từ .env và config.json
+    // Load environment variables from .env and config.json
     config_mod.loadDotEnv(alloc, init.environ_map, init.io);
 
-    // Nạp Config
+    // Load Config
     var cfg = config_mod.Config.load(alloc, init.environ_map, init.io) catch |e| {
-        stderrPrint("Lỗi load config: {s}\n", .{@errorName(e)});
+        stderrPrint("Error loading config: {s}\n", .{@errorName(e)});
         std.process.exit(1);
     };
     defer cfg.deinit(alloc);
 
-    // Override system prompt từ CLI
+    // Override system prompt from CLI
     if (args.system_file) |sfile| {
         const cwd = std.Io.Dir.cwd();
         const file = cwd.openFile(init.io, sfile, .{}) catch |e| {
-            stderrPrint("Không mở được system file '{s}': {s}\n", .{ sfile, @errorName(e) });
+            stderrPrint("Cannot open system file '{s}': {s}\n", .{ sfile, @errorName(e) });
             std.process.exit(1);
         };
         defer file.close(init.io);
@@ -150,7 +150,7 @@ pub fn main(init: std.process.Init) !void {
         cfg.system_prompt = buf[0..n];
     }
 
-    // Override execution mode từ CLI
+    // Override execution mode from CLI
     if (args.mode) |m| cfg.execution_mode = config_mod.ExecutionMode.fromString(m);
 
     // Hooks setup
@@ -167,24 +167,24 @@ pub fn main(init: std.process.Init) !void {
         mcp.loadFromConfig(init.environ_map, init.io, args.mcp_config orelse cfg.mcp_config_path);
         tools_mod.setMcpManager(&mcp);
         if (mcp.toolCount() > 0) {
-            stderrPrint("[main] MCP: {d} tools từ {d} server(s)\n", .{ mcp.toolCount(), mcp.servers.items.len });
+            stderrPrint("[main] MCP: {d} tools from {d} server(s)\n", .{ mcp.toolCount(), mcp.servers.items.len });
         }
     }
 
-    // Khởi tạo AgentLoop
+    // Initialize AgentLoop
     var agent = agent_mod.AgentLoop.init(alloc, init.io, &cfg) catch |e| {
-        stderrPrint("Lỗi init agent: {s}\n", .{@errorName(e)});
+        stderrPrint("Error initializing agent: {s}\n", .{@errorName(e)});
         std.process.exit(1);
     };
     defer agent.deinit();
 
-    // Override backend từ CLI
+    // Override backend from CLI
     if (args.backend) |b| agent.switchBackend(b, null);
 
-    // Cài đặt cronjob
+    // Install cronjob
     if (args.cron) |cron_expr| {
         if (args.prompt == null) {
-            stderrPrint("Lỗi: --install-cron yêu cầu phải có -e <prompt>\n", .{});
+            stderrPrint("Error: --install-cron requires -e <prompt>\n", .{});
             std.process.exit(1);
         }
         
@@ -193,14 +193,14 @@ pub fn main(init: std.process.Init) !void {
         
         cron_mod.installCronjob(alloc, init.io, cron_expr, exe_path, args.prompt.?) catch |e| {
             if (e == error.AlreadyExists) {
-                stdoutPrint("Cronjob này đã tồn tại trong hệ thống!\n", .{});
+                stdoutPrint("This cronjob already exists on the system!\n", .{});
             } else {
-                stderrPrint("Lỗi khi cài đặt cronjob: {s}\n", .{@errorName(e)});
+                stderrPrint("Error installing cronjob: {s}\n", .{@errorName(e)});
                 std.process.exit(1);
             }
             return;
         };
-        stdoutPrint("Đã cài đặt cronjob thành công: {s}\n", .{cron_expr});
+        stdoutPrint("Cronjob installed successfully: {s}\n", .{cron_expr});
         return;
     }
 
@@ -217,16 +217,16 @@ pub fn main(init: std.process.Init) !void {
         if (cwd.openFile(init.io, spath, .{})) |f| {
             f.close(init.io);
             agent.history.restoreFromFile(init.io, spath) catch |e| {
-                stderrPrint("[main] Cảnh báo: Lỗi nạp session file '{s}': {s}, tạo session mới.\n", .{ spath, @errorName(e) });
+                stderrPrint("[main] Warning: Error loading session file '{s}': {s}, creating new session.\n", .{ spath, @errorName(e) });
             };
         } else |_| {}
     }
 
-    // Tự động lưu session khi thoát
+    // Automatically save session on exit
     defer {
         if (session_path) |spath| {
             agent.history.backupToFile(init.io, spath) catch |e| {
-                stderrPrint("[main] Cảnh báo: Không thể lưu session file: {s}\n", .{@errorName(e)});
+                stderrPrint("[main] Warning: Unable to save session file: {s}\n", .{@errorName(e)});
             };
         }
     }
@@ -275,7 +275,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.single) |prompt_file| {
         const cwd = std.Io.Dir.cwd();
         const file = cwd.openFile(init.io, prompt_file, .{}) catch |e| {
-            stderrPrint("Không mở được prompt file '{s}': {s}\n", .{ prompt_file, @errorName(e) });
+            stderrPrint("Cannot open prompt file '{s}': {s}\n", .{ prompt_file, @errorName(e) });
             std.process.exit(1);
         };
         defer file.close(init.io);
@@ -455,49 +455,49 @@ fn getAbsoluteExePath(alloc: Allocator, io: std.Io, arg0: []const u8) ![]u8 {
 
 fn printHelp() void {
     std.Io.File.stdout().writeStreamingAll(g_io,
-        \\mini-agent — AI agent trên terminal
+        \\mini-agent — Terminal AI agent
         \\
-        \\CÁCH DÙNG:
+        \\USAGE:
         \\  mini-agent [options]
         \\
         \\OPTIONS:
-        \\  -e, --exec <prompt>    Chạy single-shot và thoát
-        \\  --system <file>        Dùng file làm system prompt
-        \\  -m, --mode <mode>      Chế độ thực thi: codeact (CodeAct JS engine), tools (JSON), auto
-        \\  --session <id>         Tự động nạp/lưu session tại ~/.mini/sessions/<id>.json
-        \\  --session-file <path>  Chỉ định đường dẫn file session JSON trực tiếp
-        \\  --acp                  Chạy chế độ ACP server (Agent Client Protocol qua stdin/stdout)
-        \\  --install-cron <expr>  Tạo cronjob Linux chạy tự động (cần dùng chung với -e)
-        \\  --model <backend>      Chọn backend: openai, claude, ollama
-        \\  --hook-command <cmd>   Lệnh prehook / monitoring hook chạy trước/sau các hành động
-        \\  --no-mcp               Không kết nối MCP servers
-        \\  --mcp-config <path>     Đường dẫn file mcp.json (override MINI_MCP_CONFIG)
-        \\  --version, -v          In phiên bản
-        \\  --help, -h             In hướng dẫn này
+        \\  -e, --exec <prompt>    Run single-shot and exit
+        \\  --system <file>        Use file as system prompt
+        \\  -m, --mode <mode>      Execution mode: codeact (CodeAct JS engine), tools (JSON), auto
+        \\  --session <id>         Auto load/save session at ~/.mini/sessions/<id>.json
+        \\  --session-file <path>  Specify direct JSON session file path
+        \\  --acp                  Run in ACP server mode (Agent Client Protocol over stdin/stdout)
+        \\  --install-cron <expr>  Create automated Linux cronjob (requires -e)
+        \\  --model <backend>      Select backend: openai, claude, ollama
+        \\  --hook-command <cmd>   Prehook / monitoring hook command executed before/after actions
+        \\  --no-mcp               Do not connect to MCP servers
+        \\  --mcp-config <path>    Path to mcp.json file (overrides MINI_MCP_CONFIG)
+        \\  --version, -v          Print version
+        \\  --help, -h             Print this help guide
         \\
-        \\VÍ DỤ:
-        \\  mini-agent -e "Tóm tắt README.md"
-        \\  mini-agent --session test-sess -e "Tên tôi là An."
-        \\  mini-agent --session test-sess -e "Tên tôi là gì?"
+        \\EXAMPLES:
+        \\  mini-agent -e "Summarize README.md"
+        \\  mini-agent --session test-sess -e "My name is Alice."
+        \\  mini-agent --session test-sess -e "What is my name?"
         \\  mini-agent --system prompt.md
         \\  mini-agent --model claude
         \\  mini-agent --hook-command 'echo "[HOOK] $MINI_HOOK_EVENT tool=$MINI_TOOL_NAME"'
         \\  MINI_TOOL_BLOCKLIST=bash mini-agent
         \\
-        \\CẤU HÌNH (.env hoặc biến môi trường):
-        \\  MINI_HOME              Thư mục gốc lưu trữ cấu hình & session (mặc định: ~/.mini)
-        \\  OPENAI_COMPAT_URL      URL OpenAI-compatible
-        \\  OPENAI_COMPAT_MODEL    Tên model
-        \\  OPENAI_COMPAT_API_HEADER Header tên (mặc định: Authorization)
+        \\CONFIGURATION (.env or environment variables):
+        \\  MINI_HOME              Root directory for config & sessions (default: ~/.mini)
+        \\  OPENAI_COMPAT_URL      OpenAI-compatible URL
+        \\  OPENAI_COMPAT_MODEL    Model name
+        \\  OPENAI_COMPAT_API_HEADER Header name (default: Authorization)
         \\  ANTHROPIC_API_KEY      Claude API key
-        \\  OLLAMA_HOST            Ollama URL (mặc định: localhost:11434)
+        \\  OLLAMA_HOST            Ollama URL (default: localhost:11434)
         \\  MINI_SYSTEM_FILE       System prompt file
-        \\  MINI_SESSION            Session ID (lưu tại <MINI_HOME>/sessions/<id>.json)
-        \\  MINI_SESSION_FILE       Đường dẫn file session JSON
-        \\  MINI_HOOK_COMMAND      Lệnh hook giám sát toàn cục (pre-tool-use, pre-prompt, MCP...)
-        \\  MINI_TOOL_ALLOWLIST    Chỉ cho phép tools này (comma-separated)
-        \\  MINI_TOOL_BLOCKLIST    Chặn tools này (comma-separated)
-        \\  MINI_MCP_CONFIG        Đường dẫn mcp.json (mặc định: <MINI_HOME>/mcp.json)
+        \\  MINI_SESSION           Session ID (stored at <MINI_HOME>/sessions/<id>.json)
+        \\  MINI_SESSION_FILE      Path to session JSON file
+        \\  MINI_HOOK_COMMAND      Global monitoring hook command (pre-tool-use, pre-prompt, MCP...)
+        \\  MINI_TOOL_ALLOWLIST    Allow only these tools (comma-separated)
+        \\  MINI_TOOL_BLOCKLIST    Block these tools (comma-separated)
+        \\  MINI_MCP_CONFIG        Path to mcp.json (default: <MINI_HOME>/mcp.json)
         \\
     ) catch {};
 }

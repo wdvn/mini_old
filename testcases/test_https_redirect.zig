@@ -1,5 +1,5 @@
-//! Scratch test: redirect http → https qua lib/http_request.zig — reproduce bug
-//! panic "attempt to use null value" (arxiv 301 http→https). Chạy: zig run test_https_redirect.zig
+//! Scratch test: redirect http -> https via lib/http_request.zig — reproduce bug
+//! panic "attempt to use null value" (arxiv 301 http->https). Run: zig run test_https_redirect.zig
 
 const std = @import("std");
 const http_lib = @import("src/lib/http_request.zig");

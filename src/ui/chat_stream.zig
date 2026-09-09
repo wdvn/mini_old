@@ -1,6 +1,6 @@
-//! chat_stream.zig — Turn Renderer & Unified Stream Event Lifecycle cho mini-agent (RFC-007).
+//! chat_stream.zig — Turn Renderer & Unified Stream Event Lifecycle for mini-agent (RFC-007).
 //!
-//! Kiến trúc luồng sự kiện (Stream Event Lifecycle Pipeline):
+//! Stream Event Lifecycle Pipeline architecture:
 //!
 //!   AI Backend (SSE / Chunks)
 //!             │
@@ -29,8 +29,8 @@ const utils = @import("../core/utils.zig");
 const signals = @import("../core/signals.zig");
 const main = @import("../main.zig");
 
-/// Tính toán độ dài visual (số cột hiển thị thực tế trên terminal) của một chuỗi,
-/// bỏ qua toàn bộ ANSI escape sequences (dạng `\x1b[...m`, `\x1b[...K`, v.v.).
+/// Calculate visual display length (number of visible columns on terminal) of a string,
+/// ignoring all ANSI escape sequences (e.g. `\x1b[...m`, `\x1b[...K`, etc.).
 pub fn visibleWidth(str: []const u8) usize {
     var width: usize = 0;
     var i: usize = 0;
@@ -54,8 +54,8 @@ pub fn visibleWidth(str: []const u8) usize {
     return width;
 }
 
-/// Cắt ngắn chuỗi có ANSI color sao cho visual width <= max_cols.
-/// Tự động đóng lại mã màu ANSI với `\x1b[0m` ở cuối nếu bị cắt ngắn.
+/// Truncate ANSI-colored string so visual width <= max_cols.
+/// Automatically closes ANSI escape sequence with `\x1b[0m` at the end if truncated.
 pub fn truncateAnsi(buf: []u8, str: []const u8, max_cols: usize) []const u8 {
     if (visibleWidth(str) <= max_cols) return str;
     if (max_cols <= 3) return "";
@@ -100,7 +100,7 @@ pub const TurnStats = struct {
     files_modified: usize = 0,
 };
 
-/// Các sự kiện vòng đời phát sinh từ luồng streaming của LLM
+/// Lifecycle events emitted from LLM streaming
 pub const StreamEvent = union(enum) {
     think_start,
     think_chunk: []const u8,
@@ -115,7 +115,7 @@ pub const StreamEvent = union(enum) {
     text_end,
 };
 
-/// Finite State Machine phân tích cú pháp stream và phát sinh typed StreamEvents
+/// Finite State Machine parsing stream chunks and emitting typed StreamEvents
 pub const StreamEventParser = struct {
     pub const ParseState = enum {
         idle,
@@ -155,7 +155,7 @@ pub const StreamEventParser = struct {
         while (i < chunk.len) {
             const c = chunk[i];
 
-            // 1. Phân tích cú pháp <think>...</think>
+            // 1. Parse <think>...</think>
             if (self.state == .in_think) {
                 const expected = "</think>";
                 if (c == '<' or self.tag_len > 0) {
@@ -180,7 +180,7 @@ pub const StreamEventParser = struct {
                 continue;
             }
 
-            // 2. Phân tích cú pháp trong khối CodeAct (```js ... ```)
+            // 2. Parse inside CodeAct block (```js ... ```)
             if (self.state == .in_codeact) {
                 if (c == '`') {
                     self.closing_backticks += 1;
@@ -207,7 +207,7 @@ pub const StreamEventParser = struct {
                 }
             }
 
-            // 3. Phân tích mở thẻ Code Fence ```
+            // 3. Parse opening Code Fence ```
             if (self.in_fence_check) {
                 if (self.fence_len < 3 and c != '`') {
                     self.in_fence_check = false;
@@ -268,7 +268,7 @@ pub const StreamEventParser = struct {
                 }
             }
 
-            // 4. Kiểm tra mở thẻ <think>
+            // 4. Check opening <think> tag
             const think_expected = "<think>";
             if (c == '<' or self.tag_len > 0) {
                 self.tag_buf[self.tag_len] = c;
@@ -296,7 +296,7 @@ pub const StreamEventParser = struct {
                 continue;
             }
 
-            // 5. Kiểm tra bắt đầu code fence ```
+            // 5. Check start of code fence ```
             if (c == '`') {
                 self.in_fence_check = true;
                 self.fence_buf[0] = '`';
@@ -305,7 +305,7 @@ pub const StreamEventParser = struct {
                 continue;
             }
 
-            // 6. Text chunk thông thường
+            // 6. Regular text chunk
             if (self.state != .in_text) {
                 self.state = .in_text;
                 emitFn(context, .text_start);
@@ -316,7 +316,7 @@ pub const StreamEventParser = struct {
     }
 };
 
-/// UI Presentation Layer điều phối rendering các trạng thái của 1 Turn
+/// UI Presentation Layer coordinating rendering states of a Turn
 pub const TurnRenderer = struct {
     pub const UIState = enum {
         idle,
@@ -406,7 +406,7 @@ pub const TurnRenderer = struct {
     // In-place Terminal Rendering Primitives (Anti-wrap & ANSI safe)
     // -----------------------------------------------------------------------
 
-    /// Ghi đè dòng in-place hiện tại an toàn, chống tràn cột (anti line-wrap).
+    /// Safely overwrite current line in-place, preventing column overflow (anti line-wrap).
     pub fn renderInplaceLine(self: *TurnRenderer, text: []const u8) void {
         _ = self;
         if (comptime builtin.is_test) return;
@@ -422,7 +422,7 @@ pub const TurnRenderer = struct {
         term.writeStdout(safe_text);
     }
 
-    /// Xóa dòng in-place hiện tại và đưa con trỏ về đầu dòng.
+    /// Clear current line in-place and return cursor to column 0.
     pub fn clearInplaceLine(self: *TurnRenderer) void {
         _ = self;
         if (comptime builtin.is_test) return;
@@ -430,13 +430,13 @@ pub const TurnRenderer = struct {
         term.writeStdout("\r\x1b[2K");
     }
 
-    /// Reset signature lỗi khi act thành công hoặc kết thúc turn.
+    /// Reset error signature on successful act or turn completion.
     pub fn resetErrorSignature(self: *TurnRenderer) void {
         self.last_error_signature = 0;
         self.clearInplaceLine();
     }
 
-    /// Băm 64-bit FNV-1a error signature kết hợp giữa HTTP code và raw response body.
+    /// Compute 64-bit FNV-1a error signature combining HTTP code and raw response body.
     pub fn computeErrorSignature(http_code: u32, raw_opt: ?[]const u8) u64 {
         var hash: u64 = 0xcbf29ce484222325 ^ @as(u64, http_code);
         hash *%= 0x100000001b3;
@@ -450,7 +450,7 @@ pub const TurnRenderer = struct {
         return hash;
     }
 
-    /// Hiển thị khối lỗi backend tổng quát (generic), không phụ thuộc vào schema hay format cụ thể của bất kỳ provider nào.
+    /// Display generic backend error block, independent of provider-specific error schema or format.
     pub fn showBackendError(self: *TurnRenderer, http_code: u32, raw_opt: ?[]const u8) void {
         self.stopWaiting();
         if (self.ui_state == .thinking or self.is_thinking) {
@@ -460,15 +460,15 @@ pub const TurnRenderer = struct {
         self.ensureNewline();
 
         if (http_code > 0) {
-            main.stderrPrint("\n\x1b[1;31m[agent] ⛔ Lỗi từ backend (HTTP {d})\x1b[0m\n", .{http_code});
+            main.stderrPrint("\n\x1b[1;31m[agent] ⛔ Backend error (HTTP {d})\x1b[0m\n", .{http_code});
         } else {
-            main.stderrPrint("\n\x1b[1;31m[agent] ⛔ Lỗi kết nối backend\x1b[0m\n", .{});
+            main.stderrPrint("\n\x1b[1;31m[agent] ⛔ Backend connection error\x1b[0m\n", .{});
         }
 
         if (raw_opt) |raw| {
             const trimmed = std.mem.trim(u8, raw, " \t\r\n");
             if (trimmed.len > 0) {
-                // Tự động format thụt lề nếu là JSON hợp lệ; nếu là HTML/text thuần thì giữ nguyên bản
+                // Automatically pretty-print if valid JSON; keep raw if HTML/plain text
                 const pretty = json_mod.prettyPrint(std.heap.page_allocator, trimmed) catch null;
                 defer if (pretty) |p| std.heap.page_allocator.free(p);
                 const to_print = if (pretty) |p| p else trimmed;
@@ -482,11 +482,11 @@ pub const TurnRenderer = struct {
             }
         }
         if (http_code >= 400) {
-            main.stderrPrint("\x1b[90m--- RAW BACKEND RESPONSE (HTTP {d}) ---\x1b[0m\n(Không có nội dung trả về từ server)\n\x1b[90m---------------------------------------\x1b[0m\n", .{http_code});
+            main.stderrPrint("\x1b[90m--- RAW BACKEND RESPONSE (HTTP {d}) ---\x1b[0m\n(No content returned from server)\n\x1b[90m---------------------------------------\x1b[0m\n", .{http_code});
         }
     }
 
-    /// Xử lý hiển thị lỗi Throttled (Rate limit 429 / 503) kèm cơ chế deduplication tự động.
+    /// Handle throttled backend error (Rate limit 429 / 503) with automatic deduplication.
     pub fn showBackendThrottled(self: *TurnRenderer, http_code: u32, raw_opt: ?[]const u8) void {
         self.stopWaiting();
         if (self.is_thinking) self.endThinking();
@@ -502,11 +502,11 @@ pub const TurnRenderer = struct {
         }
     }
 
-    /// Thực hiện đếm ngược inplace mượt mà trên đúng 1 dòng (với Braille spinner và realtime countdown).
-    /// Hỗ trợ kiểm tra signals.isInterrupted() để thoát ngay lập tức khi nhận Ctrl+C.
+    /// Perform smooth in-place countdown on a single line (with Braille spinner and realtime countdown).
+    /// Checks signals.isInterrupted() to exit immediately on Ctrl+C.
     pub fn waitRetryCountdown(self: *TurnRenderer, io: std.Io, backoff_s: u64, attempt: usize, max_attempts: usize) !void {
         if (!term.isStdoutTty()) {
-            main.stderrPrint("[agent] ⚠ Rate limit / 503 (lần {d}/{d})! Thử lại sau {d}s...\n", .{ attempt, max_attempts, backoff_s });
+            main.stderrPrint("[agent] ⚠ Rate limit / 503 (attempt {d}/{d})! Retrying in {d}s...\n", .{ attempt, max_attempts, backoff_s });
             std.Io.sleep(io, std.Io.Duration.fromSeconds(@intCast(backoff_s)), .awake) catch {};
             return;
         }
@@ -529,7 +529,7 @@ pub const TurnRenderer = struct {
 
             const frame = s.nextFrame();
             var buf: [256]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, " \x1b[33m{s}\x1b[0m \x1b[1;33m[agent]\x1b[0m \x1b[33m⚠ Rate limit / 503 (lần {d}/{d})! Thử lại sau {d}s... \x1b[90m(Ctrl+C để hủy)\x1b[0m", .{
+            const line = std.fmt.bufPrint(&buf, " \x1b[33m{s}\x1b[0m \x1b[1;33m[agent]\x1b[0m \x1b[33m⚠ Rate limit / 503 (attempt {d}/{d})! Retrying in {d}s... \x1b[90m(Ctrl+C to cancel)\x1b[0m", .{
                 frame, attempt, max_attempts, remaining_s,
             }) catch "";
             if (line.len > 0) self.renderInplaceLine(line);
@@ -538,13 +538,13 @@ pub const TurnRenderer = struct {
         }
 
         var retry_buf: [256]u8 = undefined;
-        const retry_line = std.fmt.bufPrint(&retry_buf, " \x1b[36m{s}\x1b[0m \x1b[90m[agent] Đang thử lại kết nối backend (lần {d}/{d})...\x1b[0m", .{
+        const retry_line = std.fmt.bufPrint(&retry_buf, " \x1b[36m{s}\x1b[0m \x1b[90m[agent] Retrying backend connection (attempt {d}/{d})...\x1b[0m", .{
             s.nextFrame(), attempt + 1, max_attempts,
         }) catch "";
         if (retry_line.len > 0) self.renderInplaceLine(retry_line);
     }
 
-    /// Ghi chuỗi ra terminal và cập nhật trạng thái dòng / newlines liên tiếp.
+    /// Write string to terminal and update newline state.
     pub fn write(self: *TurnRenderer, bytes: []const u8) void {
         if (bytes.len == 0) return;
         term.writeStdout(bytes);
@@ -557,14 +557,14 @@ pub const TurnRenderer = struct {
         }
     }
 
-    /// Đảm bảo con trỏ đang ở đầu một dòng mới (ít nhất 1 ký tự \n).
+    /// Ensure cursor is at the beginning of a new line (at least 1 newline).
     pub fn ensureNewline(self: *TurnRenderer) void {
         if (self.consecutive_newlines == 0) {
             self.write("\n");
         }
     }
 
-    /// Đảm bảo có đúng 1 dòng trống phân cách đoạn (ít nhất 2 ký tự \n).
+    /// Ensure exactly 1 blank line separating paragraphs (at least 2 newlines).
     pub fn ensureBlankLine(self: *TurnRenderer) void {
         if (self.consecutive_newlines == 0) {
             self.write("\n\n");
@@ -573,7 +573,7 @@ pub const TurnRenderer = struct {
         }
     }
 
-    /// Bắt đầu một Turn mới từ input của User.
+    /// Start a new Turn from user input.
     pub fn startTurn(self: *TurnRenderer, prompt: []const u8) void {
         _ = prompt;
         self.turn_start_ms = utils.milliTimestamp();
@@ -596,11 +596,11 @@ pub const TurnRenderer = struct {
         self.parser.resetAct();
         self.resetErrorSignature();
 
-        // Bật ngay live spinner trong khi chờ backend phản hồi TTFT
+        // Start live spinner while waiting for backend TTFT
         self.startWaiting();
     }
 
-    /// Bắt đầu spinner chờ phản hồi đầu tiên từ AI backend (TTFT).
+    /// Start spinner waiting for first response from AI backend (TTFT).
     pub fn startWaiting(self: *TurnRenderer) void {
         if (self.waiting_active.load(.acquire)) return;
         if (comptime builtin.is_test) return;
@@ -627,7 +627,7 @@ pub const TurnRenderer = struct {
         }
     }
 
-    /// Dừng spinner chờ phản hồi và dọn dẹp dòng hiển thị.
+    /// Stop waiting spinner and clean up line.
     pub fn stopWaiting(self: *TurnRenderer) void {
         if (!self.waiting_active.load(.acquire)) return;
         self.waiting_active.store(false, .release);
@@ -638,7 +638,7 @@ pub const TurnRenderer = struct {
         self.clearInplaceLine();
     }
 
-    /// Xử lý stream event typed từ Parser
+    /// Handle typed stream event from Parser
     pub fn onStreamEvent(self: *TurnRenderer, event: StreamEvent) void {
         switch (event) {
             .think_start => self.startThinking(),
@@ -659,7 +659,7 @@ pub const TurnRenderer = struct {
         self.onStreamEvent(event);
     }
 
-    /// Xử lý text chunk từ LLM backend
+    /// Process text chunk from LLM backend
     pub fn processTextChunk(self: *TurnRenderer, text: []const u8) void {
         self.parser.feed(text, self, dispatchParserEvent);
     }
@@ -854,32 +854,32 @@ pub const TurnRenderer = struct {
             }
         }
 
-        // Di chuyển con trỏ lên vị trí dòng đầu tiên đã render trước đó
+        // Move cursor up to first previously rendered line
         if (self.codeact_rendered_lines > 1) {
             for (0..self.codeact_rendered_lines - 1) |_| {
                 term.writeStdout("\x1b[1A");
             }
         }
 
-        // Render Dòng 1 (Header)
+        // Render Line 1 (Header)
         term.writeStdout("\r\x1b[2K");
         term.writeStdout(header_line);
 
-        // Render Dòng 2
+        // Render Line 2
         if (line2_opt) |l2| {
             var l2_buf: [256]u8 = undefined;
             const l2_str = std.fmt.bufPrint(&l2_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m \x1b[2;37m{s}\x1b[0m", .{l2}) catch "";
             term.writeStdout(l2_str);
         }
 
-        // Render Dòng 3
+        // Render Line 3
         if (line3_opt) |l3| {
             var l3_buf: [256]u8 = undefined;
             const l3_str = std.fmt.bufPrint(&l3_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m \x1b[37m{s}\x1b[0m", .{l3}) catch "";
             term.writeStdout(l3_str);
         }
 
-        // Xóa dòng thừa nếu số dòng render lần này ít hơn lần trước
+        // Clear excess lines if this render has fewer lines than before
         if (self.codeact_rendered_lines > num_lines) {
             const excess = self.codeact_rendered_lines - num_lines;
             for (0..excess) |_| {
@@ -978,7 +978,7 @@ pub const TurnRenderer = struct {
         }
     }
 
-    /// Stream câu trả lời của AI ra stdout (hàm tương thích ngược).
+    /// Stream AI response to stdout (backwards-compatible function).
     pub fn streamResponse(self: *TurnRenderer, text: []const u8) void {
         self.streamTextResponse(text);
     }
@@ -987,7 +987,7 @@ pub const TurnRenderer = struct {
     // Tool Execution Lifecycle Handlers
     // -----------------------------------------------------------------------
 
-    /// Bắt đầu thực thi một Tool Action.
+    /// Start executing a Tool Action.
     pub fn startTool(self: *TurnRenderer, name: []const u8, input_json: []const u8) void {
         self.stopWaiting();
         if (self.ui_state == .thinking or self.is_thinking) {
@@ -1062,7 +1062,7 @@ pub const TurnRenderer = struct {
         self.ui_state = .tool_executing;
     }
 
-    /// Hoàn thành một Tool Action và hiển thị output snippet (tối đa 3 dòng).
+    /// Finish a Tool Action and display output snippet (up to 3 lines).
     pub fn finishTool(self: *TurnRenderer, name: []const u8, result: []const u8, is_error: bool, duration_ms: u64, patch_path: ?[]const u8, patch_diff: ?[]const u8) void {
         if (patch_path) |path| {
             if (patch_diff) |diff| {
@@ -1077,19 +1077,19 @@ pub const TurnRenderer = struct {
 
         var status_buf: [256]u8 = undefined;
         if (is_error) {
-            const status_line = std.fmt.bufPrint(&status_buf, "    \x1b[31m{s} Lỗi sau {s}:\x1b[0m {s}\n", .{
+            const status_line = std.fmt.bufPrint(&status_buf, "    \x1b[31m{s} Error after {s}:\x1b[0m {s}\n", .{
                 term.GLYPH_CROSS, dur_str, if (result.len > 120) result[0..120] else result,
             }) catch return;
             self.write(status_line);
         } else {
             _ = name;
-            const status_line = std.fmt.bufPrint(&status_buf, "    \x1b[32m{s} Hoàn thành ({s})\x1b[0m\n", .{
+            const status_line = std.fmt.bufPrint(&status_buf, "    \x1b[32m{s} Completed ({s})\x1b[0m\n", .{
                 term.GLYPH_CHECK, dur_str,
             }) catch return;
             self.write(status_line);
         }
 
-        // Render tối đa 3 dòng kết quả / output snippet (stream inplace detail)
+        // Render up to 3 lines of output snippet (stream inplace detail)
         if (patch_diff == null or patch_diff.?.len == 0) {
             const trimmed_res = std.mem.trim(u8, result, " \r\n\t");
             if (trimmed_res.len > 0) {
@@ -1119,7 +1119,7 @@ pub const TurnRenderer = struct {
     // Turn Finalization
     // -----------------------------------------------------------------------
 
-    /// Hoàn thành toàn bộ Turn và in Telemetry Status Footer.
+    /// Finish entire Turn and print Telemetry Status Footer.
     pub fn finishTurn(self: *TurnRenderer, stats: TurnStats) void {
         self.stopWaiting();
         if (self.ui_state == .thinking or self.is_thinking) {

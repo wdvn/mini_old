@@ -1,47 +1,47 @@
-//! config.zig — Tải cấu hình từ biến môi trường và file .env.
+//! config.zig — Load configuration from environment variables and .env files.
 //!
-//! ## Thứ tự tìm file .env (ưu tiên từ cao xuống thấp)
-//!   1. `$MINI_ENV_FILE`      — đường dẫn chỉ định rõ
-//!   2. `./.env`              — thư mục làm việc hiện tại (project-level)
+//! ## .env file search order (highest to lowest priority)
+//!   1. `$MINI_ENV_FILE`      — explicitly specified path
+//!   2. `./.env`              — current working directory (project-level)
 //!   3. `~/.mini/.env`        — user-level config
 //!
-//! Shell environment variables luôn CÓ ƯU TIÊN CAO HƠN giá trị trong file .env
-//! (dùng `setenv` với overwrite=0).
+//! Shell environment variables always TAKE HIGHER PRECEDENCE over values in .env files
+//! (using `setenv` with overwrite=0).
 //!
-//! ## Biến môi trường được hỗ trợ
+//! ## Supported environment variables
 //!
-//! ### Backend AI
-//!   `OPENAI_COMPAT_URL`     URL OpenAI-compatible (ưu tiên cao nhất)
-//!   `OPENAI_COMPAT_MODEL`   Tên model (mặc định: gpt-4o-mini)
-//!   `OPENAI_COMPAT_API_KEY` API key (tuỳ chọn, một số endpoint không cần)
-//!   `OPENAI_COMPAT_API_HEADER` Header tên (mặc định: Authorization)
+//! ### AI Backend
+//!   `OPENAI_COMPAT_URL`     OpenAI-compatible URL (highest priority)
+//!   `OPENAI_COMPAT_MODEL`   Model name (default: gpt-4o-mini)
+//!   `OPENAI_COMPAT_API_KEY` API key (optional, some endpoints do not require one)
+//!   `OPENAI_COMPAT_API_HEADER` Header name (default: Authorization)
 //!   `ANTHROPIC_API_KEY`     Claude API key
-//!   `OLLAMA_HOST`           Ollama base URL (mặc định: http://localhost:11434)
-//!   `OLLAMA_MODEL`          Ollama model (mặc định: llama3)
+//!   `OLLAMA_HOST`           Ollama base URL (default: http://localhost:11434)
+//!   `OLLAMA_MODEL`          Ollama model (default: llama3)
 //!
 //! ### Agent
-//!   `MINI_MAX_TOKENS`       Giới hạn token response (mặc định: 8192)
-//!   `MINI_SYSTEM_FILE`      Đường dẫn file system prompt (.md)
-//!   `MINI_NO_HISTORY`       "1" để tắt lưu lịch sử in-memory
+//!   `MINI_MAX_TOKENS`       Response token limit (default: 8192)
+//!   `MINI_SYSTEM_FILE`      Path to system prompt file (.md)
+//!   `MINI_NO_HISTORY`       "1" to disable in-memory history saving
 //!
 //! ### MemAct (RFC-003)
-//!   `MINI_MEMACT_ENABLED`       "0" để tắt MemAct (mặc định: bật)
-//!   `MINI_CONTEXT_WINDOW`       Context window tokens; nếu không set sẽ
-//!                               auto-detect theo backend (openai-compat 128000,
+//!   `MINI_MEMACT_ENABLED`       "0" to disable MemAct (default: enabled)
+//!   `MINI_CONTEXT_WINDOW`       Context window tokens; if unset,
+//!                               auto-detects based on backend (openai-compat 128000,
 //!                               anthropic 200000, ollama 8192)
-//!   `MINI_CTX_SAFETY_MARGIN`    Hệ số biên an toàn (mặc định: 0.15)
-//!   `MINI_CTX_COMPACT_THRESHOLD` Ngưỡng nén lịch sử (mặc định: 0.85)
-//!   `MINI_MEMACT_TOP_K`         Số memory item tối đa inject (mặc định: 8)
-//!   `MINI_MEMACT_MEMORY_BUDGET` Ngân sách token cho memory block (mặc định: 2000)
-//!   `MINI_MEMACT_EXTRACT`       Chế độ extract memory: async|sync|off (mặc định: async)
-//!   `MINI_MEMORY_DIR`           Thư mục memory (mặc định: ~/.mini/memory)
+//!   `MINI_CTX_SAFETY_MARGIN`    Safety margin ratio (default: 0.15)
+//!   `MINI_CTX_COMPACT_THRESHOLD` History compaction threshold (default: 0.85)
+//!   `MINI_MEMACT_TOP_K`         Maximum injected memory items (default: 8)
+//!   `MINI_MEMACT_MEMORY_BUDGET` Token budget for memory block (default: 2000)
+//!   `MINI_MEMACT_EXTRACT`       Memory extraction mode: async|sync|off (default: async)
+//!   `MINI_MEMORY_DIR`           Memory directory (default: ~/.mini/memory)
 //!
 //! ### Tools
-//!   `MINI_TOOL_ALLOWLIST`   Chỉ cho phép các tool này (comma-separated)
-//!   `MINI_TOOL_BLOCKLIST`   Chặn các tool này (comma-separated)
+//!   `MINI_TOOL_ALLOWLIST`   Only allow these tools (comma-separated)
+//!   `MINI_TOOL_BLOCKLIST`   Block these tools (comma-separated)
 //!
 //! ### MCP
-//!   `MINI_MCP_CONFIG`       Đường dẫn file mcp.json (mặc định: ~/.mini/mcp.json)
+//!   `MINI_MCP_CONFIG`       Path to mcp.json file (default: ~/.mini/mcp.json)
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -66,7 +66,7 @@ pub const ExecutionMode = enum {
     }
 };
 
-/// Giao thức OpenAI-compatible (ISSUE-BACKEND-001).
+/// OpenAI-compatible protocol (ISSUE-BACKEND-001).
 pub const OpenAiProtocol = enum {
     auto,
     chat_completions,
@@ -79,24 +79,24 @@ pub const OpenAiProtocol = enum {
     }
 };
 
-/// Cấu hình đầy đủ của mini-agent, đọc từ biến môi trường.
+/// Complete configuration of mini-agent, loaded from environment variables.
 pub const Config = struct {
     // Mode
     execution_mode: ExecutionMode = .auto,
     // Backend
-    /// Giao thức OpenAI-compatible (mặc định: auto).
+    /// OpenAI-compatible protocol (default: auto).
     openai_protocol: OpenAiProtocol = .auto,
-    /// URL OpenAI-compatible (ưu tiên cao nhất). Null = không cấu hình.
+    /// OpenAI-compatible URL (highest priority). Null = unconfigured.
     openai_compat_url: ?[]const u8,
-    /// API key cho OpenAI-compatible endpoint. Null = không cần key.
+    /// API key for OpenAI-compatible endpoint. Null = key not required.
     openai_compat_key: ?[]const u8,
-    /// Header tên chứa API key (mặc định: Authorization).
+    /// Header name holding API key (default: Authorization).
     openai_compat_api_header: []const u8,
-    /// Model cho OpenAI-compatible endpoint.
+    /// Model for OpenAI-compatible endpoint.
     openai_compat_model: []const u8,
-    /// Cờ sử dụng max_completion_tokens thay vì max_tokens.
+    /// Flag to use max_completion_tokens instead of max_tokens.
     openai_compat_use_completion_tokens: bool,
-    /// Anthropic API key. Null = không cấu hình.
+    /// Anthropic API key. Null = unconfigured.
     anthropic_key: ?[]const u8,
     /// Claude model ID.
     claude_model: []const u8,
@@ -106,17 +106,17 @@ pub const Config = struct {
     ollama_model: []const u8,
 
     // Agent
-    /// Số token tối đa trong một response.
+    /// Maximum tokens in a response.
     max_tokens: u32,
-    /// Nội dung system prompt (đọc từ file hoặc dùng default).
+    /// System prompt content (loaded from file or uses default).
     system_prompt: []const u8,
-    /// Bộ nhớ được cấp phát cho system_prompt (null nếu dùng default).
+    /// Allocated memory for system_prompt (null if using default).
     system_prompt_buf: ?[]u8,
 
     // Tools
-    /// Comma-separated allowlist. Null = cho phép tất cả.
+    /// Comma-separated allowlist. Null = allow all.
     tool_allowlist: ?[]const u8,
-    /// Comma-separated blocklist. Null = không chặn gì.
+    /// Comma-separated blocklist. Null = block none.
     tool_blocklist: ?[]const u8,
 
     // MemAct Config
@@ -124,80 +124,80 @@ pub const Config = struct {
     context_window: u32,
     ctx_safety_margin: f32,
     ctx_compact_threshold: f32,
-    /// Số memory item tối đa inject vào prompt (RFC-003).
+    /// Maximum memory items injected into prompt (RFC-003).
     memact_top_k: u32 = 8,
-    /// Ngân sách token dành cho memory block (RFC-003).
+    /// Token budget for memory block (RFC-003).
     memact_memory_budget: u32 = 2000,
-    /// Chế độ extract memory: async | sync | off (RFC-003).
+    /// Memory extraction mode: async | sync | off (RFC-003).
     memact_extract: []const u8 = "async",
-    /// Thư mục memory. Null = caller tự build ~/.mini/memory.
+    /// Memory directory. Null = caller builds ~/.mini/memory.
     memory_dir: ?[]const u8 = null,
 
     // Budget Limits (RFC-002)
     budget_max_tokens: usize,
 
     // MCP
-    /// Đường dẫn file mcp.json. Null = dùng default ~/.mini/mcp.json.
+    /// Path to mcp.json file. Null = default ~/.mini/mcp.json.
     mcp_config_path: ?[]const u8,
 
     // History
-    /// false = không lưu lịch sử.
+    /// false = disable history saving.
     history_enabled: bool,
 
     // Hooks
-    /// Lệnh hook toàn cục. Null = không kích hoạt hook.
+    /// Global hook command. Null = hook disabled.
     hook_command: ?[]const u8,
-    /// Đường dẫn file cấu hình hooks. Null = dùng default.
+    /// Path to hooks configuration file. Null = use default.
     hooks_config_path: ?[]const u8,
 
     // Session
-    /// Session ID (tự động lưu/khôi phục tại ~/.mini/sessions/<id>.json).
+    /// Session ID (auto saved/restored at ~/.mini/sessions/<id>.json).
     session_id: ?[]const u8,
-    /// Đường dẫn file session trực tiếp.
+    /// Direct path to session file.
     session_file: ?[]const u8,
 
-    /// Default system prompt khi không cấu hình MINI_SYSTEM_FILE.
+    /// Default system prompt when MINI_SYSTEM_FILE is not configured.
     pub const default_system_prompt =
-        \\Bạn là mini-agent, một AI assistant mạnh mẽ chạy trên terminal.
-        \\Bạn hỗ trợ cơ chế Code-Centric Agent (CodeAct): để đọc/ghi file, tìm kiếm, chạy shell command hoặc tự động hóa, bạn BẮT BUỘC phải viết mã JavaScript bên trong khối ```js ... ``` (sử dụng đối tượng toàn cục `mini`). Tuyệt đối KHÔNG sử dụng các thẻ XML giả định như <file_read>, <glob>, <bash>.
+        \\You are mini-agent, a powerful AI assistant running in the terminal.
+        \\You support the Code-Centric Agent (CodeAct) mechanism: to read/write files, search, run shell commands, or automate tasks, you MUST write JavaScript code inside a ```js ... ``` block (using the global `mini` object). Absolutely DO NOT use hypothetical XML tags like <file_read>, <glob>, <bash>.
         \\
-        \\Bên trong JavaScript VM, bạn có object toàn cục `mini`:
-        \\  - `mini.read(path, offset?, limit?)`: Đọc file dạng chuỗi
-        \\  - `mini.write(path, content)`: Ghi/tạo file
-        \\  - `mini.patch(path, oldStr, newStr)`: Sửa file theo đoạn code cũ/mới
-        \\  - `mini.exists(path)`: Kiểm tra file tồn tại
+        \\Inside the JavaScript VM, you have the global `mini` object:
+        \\  - `mini.read(path, offset?, limit?)`: Read file as string
+        \\  - `mini.write(path, content)`: Write/create file
+        \\  - `mini.patch(path, oldStr, newStr)`: Patch file matching old/new code blocks
+        \\  - `mini.exists(path)`: Check file existence
         \\  - `mini.stat(path)`: { size, isFile, isDir, modified }
-        \\  - `mini.glob(pattern, basePath?)`: Tìm file theo glob
-        \\  - `mini.grep(pattern, path?)`: Tìm chuỗi trong file [{ path, line, text }]
-        \\  - `mini.sh(command)`: Chạy lệnh shell { exitCode, stdout, stderr, ok }
-        \\  - `mini.shBackground(command)`: Chạy ngầm { jobId, pid, logPath }
-        \\  - `mini.jobStatus(jobId)`: Kiểm tra job { running, exitCode, pid }
-        \\  - `mini.jobLogs(jobId, lines?)`: Đọc log gần nhất của job
-        \\  - `mini.jobKill(jobId, signal?)`: Dừng job
+        \\  - `mini.glob(pattern, basePath?)`: Find files by glob pattern
+        \\  - `mini.grep(pattern, path?)`: Search string in files [{ path, line, text }]
+        \\  - `mini.sh(command)`: Execute shell command { exitCode, stdout, stderr, ok }
+        \\  - `mini.shBackground(command)`: Run in background { jobId, pid, logPath }
+        \\  - `mini.jobStatus(jobId)`: Check job status { running, exitCode, pid }
+        \\  - `mini.jobLogs(jobId, lines?)`: Read recent logs of job
+        \\  - `mini.jobKill(jobId, signal?)`: Terminate job
         \\  - `mini.http(method, url)`: HTTP request { status, body }
-        \\  - `mini.artifact(name, content)`: Lưu artifact
-        \\  - `mini.env(name)`: Đọc biến môi trường
-        \\  - `console.log(...)`: In kết quả ra output
+        \\  - `mini.artifact(name, content)`: Save artifact
+        \\  - `mini.env(name)`: Read environment variable
+        \\  - `console.log(...)`: Print output
         \\
-        \\## Quy tắc tương tác CodeAct (BẮT BUỘC):
-        \\1. Mỗi lượt (turn) bạn chỉ được viết ĐÚNG 1 khối ```js ... ``` duy nhất.
-        \\2. Ngay sau khi đóng thẻ ``` bạn BẮT BUỘC DỪNG LẠI (yield turn) để hệ thống thực thi và trả về kết quả qua lượt tiếp theo.
-        \\3. Tuyệt đối KHÔNG tự giả định output, KHÔNG tự độc thoại suy đoán kết quả và KHÔNG viết nhiều khối code trong cùng một lượt trả lời.
+        \\## CodeAct Interaction Rules (MANDATORY):
+        \\1. In each turn you must write EXACTLY 1 single ```js ... ``` block.
+        \\2. Immediately after closing the ``` tag you MUST STOP (yield turn) for the system to execute and return results in the next turn.
+        \\3. Absolutely DO NOT fabricate outputs, DO NOT self-monologue or speculate results, and DO NOT write multiple code blocks in the same turn.
         \\
-        \\## Nguyên tắc kiểm soát hành động (Execution & Stopping Rules):
-        \\1. Dừng lại khi đạt mục tiêu (Stop on Completion): Ngay khi đã thu thập đủ bằng chứng, xác định được câu trả lời hoặc hoàn thành mục tiêu của yêu cầu: DỪNG GỌI TOOL/CODE NGAY LẬP TỨC để trả lời người dùng. Không tự ý thực hiện thêm các hành động ngoài phạm vi được yêu cầu.
-        \\2. Xác nhận trước khi thay đổi (Confirm Before Mutation): Khi đang trong quá trình khảo sát/chẩn đoán, tuyệt đối KHÔNG tự ý sửa đổi file, cấu hình hoặc trạng thái hệ thống trừ khi người dùng yêu cầu trực tiếp. Luôn trình bày kết quả và đề xuất phương án trước.
-        \\3. Tránh bẫy thao tác lặp lại (Avoid Action Loops): Nếu một phương pháp tiếp cận không mang lại kết quả sau 2-3 lần thử, phải dừng lại đánh giá lại giả thuyết thay vì liên tục thử sai với các thao tác tương tự.
-        \\4. Báo cáo tiến độ theo chặng (Progress Checkpoint): Nếu một tác vụ phức tạp đòi hỏi nhiều bước xử lý, sau một số bước thăm dò ban đầu mà chưa thể dứt điểm, hãy dừng lại tóm tắt tiến độ và xin định hướng tiếp từ người dùng.
+        \\## Execution & Stopping Rules:
+        \\1. Stop on Completion: As soon as enough evidence is gathered, the answer is determined, or the goal is completed: STOP CALLING TOOLS/CODE IMMEDIATELY to respond to the user. Do not perform extraneous actions beyond the scope requested.
+        \\2. Confirm Before Mutation: While investigating/diagnosing, absolutely DO NOT modify files, configuration, or system state unless explicitly requested by the user. Always present findings and propose options first.
+        \\3. Avoid Action Loops: If an approach does not yield results after 2-3 attempts, stop to re-evaluate hypotheses rather than repeating similar failed operations.
+        \\4. Progress Checkpoint: If a complex task requires multiple steps and initial exploration does not conclude it, stop to summarize progress and request direction from the user.
         \\
-        \\Hãy trả lời ngắn gọn, chính xác và hiệu quả bằng tiếng Việt.
+        \\Please answer concisely, accurately, and effectively in English.
     ;
 
 
 
 
-    /// Đọc cấu hình từ biến môi trường (sau khi đã gọi loadDotEnv).
-    /// `alloc` dùng để đọc file system prompt nếu cần.
+    /// Load configuration from environment variables (after calling loadDotEnv).
+    /// `alloc` is used to read system prompt file if needed.
     pub fn load(alloc: Allocator, env_map: *const std.process.Environ.Map, io: std.Io) !Config {
         const exec_mode = if (env_map.get("MINI_EXECUTION_MODE")) |m| ExecutionMode.fromString(m) else .auto;
         const openai_proto = if (env_map.get("OPENAI_PROTOCOL") orelse env_map.get("MINI_OPENAI_PROTOCOL") orelse env_map.get("OPENAI_COMPAT_PROTOCOL")) |p| OpenAiProtocol.fromString(p) else .auto;
@@ -214,16 +214,16 @@ pub const Config = struct {
         const session_id = env_map.get("MINI_SESSION");
         const session_file = env_map.get("MINI_SESSION_FILE");
 
-        // Kiểm tra có ít nhất một backend
+        // Verify at least one backend is configured
         if (openai_url == null and anthropic_key == null) {
             main.stderrPrint(
-                \\[config] Lỗi: chưa cấu hình AI backend.
+                \\[config] Error: AI backend is not configured.
                 \\
-                \\Thiết lập một trong các biến sau:
+                \\Set one of the following environment variables:
                 \\  OPENAI_COMPAT_URL=http://localhost:11434/v1
                 \\  ANTHROPIC_API_KEY=sk-ant-...
                 \\
-                \\Hoặc tạo file .env trong thư mục hiện tại.
+                \\Or create a .env file in the current directory.
                 \\
             , .{});
             return error.MissingBackend;
@@ -239,9 +239,9 @@ pub const Config = struct {
             break :blk std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
         };
 
-        // Auto-detect context window (RFC-003 §5) khi MINI_CONTEXT_WINDOW không set:
-        // chọn theo backend sẽ dùng, đúng thứ tự ưu tiên như AgentLoop.init —
-        // openai_compat_url → anthropic → ollama.
+        // Auto-detect context window (RFC-003 §5) when MINI_CONTEXT_WINDOW is unset:
+        // choose according to backend in use, same priority order as AgentLoop.init —
+        // openai_compat_url -> anthropic -> ollama.
         const context_window: u32 = blk: {
             if (env_map.get("MINI_CONTEXT_WINDOW")) |s| {
                 break :blk std.fmt.parseInt(u32, s, 10) catch 128000;
@@ -273,7 +273,7 @@ pub const Config = struct {
 
         const memact_extract: []const u8 = blk: {
             const s = env_map.get("MINI_MEMACT_EXTRACT") orelse break :blk "async";
-            // Chỉ chấp nhận async|sync|off, giá trị lạ fallback về async.
+            // Only accept async|sync|off, unrecognized values fallback to async.
             if (std.mem.eql(u8, s, "sync") or std.mem.eql(u8, s, "off")) break :blk s;
             if (std.mem.eql(u8, s, "async")) break :blk s;
             break :blk "async";
@@ -291,7 +291,7 @@ pub const Config = struct {
             break :blk !std.mem.eql(u8, v, "1");
         };
 
-        // System prompt: từ file hoặc default
+        // System prompt: from file or default
         const sp_result = loadSystemPrompt(alloc, env_map, io);
 
         const use_completion_tokens = blk: {
@@ -351,7 +351,7 @@ pub const Config = struct {
         };
     }
 
-    /// Giải phóng bộ nhớ được cấp phát (system_prompt_buf + skills arena).
+    /// Releases allocated memory (system_prompt_buf + skills arena).
     pub fn deinit(self: *Config, alloc: Allocator) void {
         if (self.system_prompt_buf) |buf| {
             alloc.free(buf);
@@ -390,7 +390,7 @@ fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, i
                 }
             } else |_| {}
         } else |_| {
-            if (!utils.isSubagent()) main.stderrPrint("[config] Không mở được system prompt: {s}, dùng default.\n", .{path});
+            if (!utils.isSubagent()) main.stderrPrint("[config] Failed to open system prompt: {s}, using default.\n", .{path});
         }
     }
 
@@ -452,9 +452,9 @@ fn readAgentFile(alloc: Allocator, io: std.Io, path: []const u8) ?[]u8 {
     return buf[0..n];
 }
 
-/// Inject skills block vào cuối system prompt.
-/// Load skills từ đĩa trước (loadSkills), rồi build block và nối vào.
-/// Trả về SpResult mới; nếu không có skill nào, trả về nguyên bản.
+/// Injects skills block at the end of system prompt.
+/// Loads skills from disk first (loadSkills), then builds block and appends it.
+/// Returns new SpResult; if no skills exist, returns original.
 fn appendSkillsBlock(alloc: Allocator, env_map: *const std.process.Environ.Map, io: std.Io, prev: SpResult) SpResult {
     const n = skills_mod.loadSkills(alloc, io, env_map);
     if (n == 0) return prev;
@@ -477,14 +477,14 @@ fn appendSkillsBlock(alloc: Allocator, env_map: *const std.process.Environ.Map, 
 // .env loader
 // ---------------------------------------------------------------------------
 
-/// Tải biến môi trường từ các file .env theo thứ tự ưu tiên:
-///   1. $MINI_ENV_FILE — đường dẫn tường minh
-///   2. ./.env         — thư mục hiện tại
+/// Loads environment variables from .env files in priority order:
+///   1. $MINI_ENV_FILE — explicit path
+///   2. ./.env         — current directory
 ///   3. ~/.mini/.env   — user-level
 ///
-/// Shell env variables luôn có ưu tiên cao hơn (setenv overwrite=0).
-/// Hỗ trợ cú pháp: `KEY=VALUE`, `KEY="VALUE"`, `KEY='VALUE'`,
-///                 `export KEY=VALUE`, `# comment`, dòng trống.
+/// Shell env variables always take higher precedence (setenv overwrite=0).
+/// Supports syntax: `KEY=VALUE`, `KEY="VALUE"`, `KEY='VALUE'`,
+///                  `export KEY=VALUE`, `# comment`, empty lines.
 pub const JsonConfig = struct {
     execution_mode: ?[]const u8 = null,
     openai_protocol: ?[]const u8 = null,
@@ -507,7 +507,7 @@ pub const JsonConfig = struct {
     session: ?[]const u8 = null,
 };
 
-/// Tải biến môi trường từ các file .env và config.json theo thứ tự ưu tiên:
+/// Loads environment variables from .env and config.json files in priority order:
 ///   1. $MINI_ENV_FILE
 ///   2. ./.env
 ///   3. .agent/.env
@@ -517,7 +517,7 @@ pub const JsonConfig = struct {
 pub fn loadDotEnv(alloc: Allocator, env_map: *std.process.Environ.Map, io: std.Io) void {
     const home = env_map.get("HOME");
 
-    // 1. Tải các file .env
+    // 1. Load .env files
     var paths: [4][512]u8 = undefined;
     var path_lens: [4]usize = .{ 0, 0, 0, 0 };
     var n: usize = 0;
@@ -561,7 +561,7 @@ pub fn loadDotEnv(alloc: Allocator, env_map: *std.process.Environ.Map, io: std.I
         tryLoadFile(env_map, io, paths[i][0..path_lens[i]]);
     }
 
-    // 2. Tải các file config.json (project -> global)
+    // 2. Load config.json files (project -> global)
     if (env_map.get("MINI_AGENT_FOLDER")) |agent_dir| {
         if (agent_dir.len > 0) {
             var json_path_buf: [512]u8 = undefined;
@@ -681,7 +681,7 @@ fn tryLoadFile(env_map: *std.process.Environ.Map, io: std.Io, path: []const u8) 
 
         if (key.len == 0 or key.len > 255 or val.len > 4095) continue;
 
-        // Không ghi đè nếu đã có trong shell env
+        // Do not overwrite if already present in shell env
         if (env_map.get(key) != null) continue;
         env_map.put(key, val) catch continue;
         loaded += 1;

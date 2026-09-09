@@ -1,14 +1,14 @@
-//! protocol.zig — Kiểu dữ liệu chung cho toàn bộ mini-agent.
+//! protocol.zig — Shared data types for mini-agent.
 //!
-//! Module này định nghĩa các struct và enum được chia sẻ giữa backends,
-//! agent loop và tool dispatcher. Không có logic nghiệp vụ ở đây.
+//! This module defines the structs and enums shared between backends,
+//! the agent loop, and the tool dispatcher. No business logic resides here.
 //!
-//! ## Kiểu chính
-//!   - `Message`        — một tin nhắn trong lịch sử hội thoại
-//!   - `ContentBlock`   — khối nội dung (text, tool_use, tool_result)
-//!   - `Response`       — phản hồi từ AI backend
-//!   - `ToolDefinition` — mô tả tool gửi lên API
-//!   - `ToolResult`     — kết quả thực thi tool
+//! ## Core types
+//!   - `Message`        — a message in conversation history
+//!   - `ContentBlock`   — content block (text, tool_use, tool_result)
+//!   - `Response`       — response from an AI backend
+//!   - `ToolDefinition` — tool definition sent to the API
+//!   - `ToolResult`     — tool execution result
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -18,12 +18,12 @@ const ArrayList = std.ArrayListUnmanaged;
 // Message roles
 // ---------------------------------------------------------------------------
 
-/// Vai trò của một tin nhắn trong hội thoại.
+/// Role of a message in the conversation.
 pub const Role = enum {
     user,
     assistant,
 
-    /// Trả về chuỗi JSON: "user" hoặc "assistant".
+    /// Returns JSON string: "user" or "assistant".
     pub fn toJson(self: Role) []const u8 {
         return switch (self) {
             .user => "user",
@@ -36,47 +36,47 @@ pub const Role = enum {
 // Content blocks
 // ---------------------------------------------------------------------------
 
-/// Thông tin một lần gọi tool từ AI.
+/// Information for a tool call requested by the AI.
 pub const ToolUse = struct {
-    /// ID duy nhất của lần gọi này (trả về trong tool result).
+    /// Unique ID for this call (returned in tool result).
     id: []const u8,
-    /// Tên tool được gọi.
+    /// Name of the invoked tool.
     name: []const u8,
-    /// Tham số dạng JSON string (object).
+    /// Parameters as a JSON string (object).
     input_json: []const u8,
 };
 
-/// Kết quả tool đính kèm vào tin nhắn user (trả lời cho tool_use).
+/// Tool result attached to user message (responding to tool_use).
 pub const ToolResultBlock = struct {
-    /// ID khớp với ToolUse.id.
+    /// Matches ToolUse.id.
     tool_use_id: []const u8,
-    /// Nội dung trả về (plain text hoặc JSON).
+    /// Return content (plain text or JSON).
     content: []const u8,
-    /// Có phải lỗi không (tool thực thi thất bại).
+    /// Indicates whether tool execution failed.
     is_error: bool,
 };
 
-/// Khối suy nghĩ (thinking / reasoning) của AI.
+/// Thinking / reasoning block from the AI.
 pub const ThinkingBlock = struct {
-    /// Nội dung luồng suy nghĩ.
+    /// Content of thinking stream.
     thinking: []const u8,
-    /// Chữ ký xác thực của Anthropic (nếu có, có thể rỗng).
+    /// Anthropic verification signature (if present, may be empty).
     signature: []const u8,
 };
 
-/// Một khối nội dung trong message hoặc response.
+/// A content block within a message or response.
 pub const ContentBlock = union(enum) {
-    /// Văn bản thông thường.
+    /// Regular text.
     text: []const u8,
-    /// Luồng suy nghĩ của AI.
+    /// Thinking stream of the AI.
     thinking: ThinkingBlock,
-    /// AI yêu cầu thực thi tool.
+    /// Tool execution requested by the AI.
     tool_use: ToolUse,
-    /// Kết quả tool gửi lại cho AI.
+    /// Tool result sent back to the AI.
     tool_result: ToolResultBlock,
 };
 
-/// Cấp bậc ngữ cảnh (MemAct RFC-003).
+/// Context tier (MemAct RFC-003).
 pub const Tier = enum {
     pinned,
     recent,
@@ -84,13 +84,13 @@ pub const Tier = enum {
     archived,
 };
 
-/// Một tin nhắn trong lịch sử hội thoại.
-/// `content` là slice sở hữu bởi History — không tự free.
+/// A message in conversation history.
+/// `content` is owned by History — do not free directly.
 pub const Message = struct {
     role: Role,
-    /// Các content block của tin nhắn này.
+    /// Content blocks of this message.
     content: []const ContentBlock,
-    /// Phân cấp ngữ cảnh (MemAct). Null nếu tạo theo cách cũ.
+    /// Context tier (MemAct). Null if created with legacy style.
     tier: ?Tier = null,
 };
 
@@ -98,15 +98,15 @@ pub const Message = struct {
 // Usage (RFC-006)
 // ---------------------------------------------------------------------------
 
-/// Thống kê token usage do backend trả về (OpenAI usage object format).
-/// Dùng chung cho mọi backend (openai-compat, claude, ollama).
+/// Token usage statistics returned by backend (OpenAI usage object format).
+/// Shared across all backends (openai-compat, claude, ollama).
 pub const Usage = struct {
     prompt_tokens: u64 = 0,
     completion_tokens: u64 = 0,
     total_tokens: u64 = 0,
-    /// Prompt tokens tính giá cache-hit (prompt_tokens - cached_tokens).
+    /// Prompt tokens priced as cache hit (prompt_tokens - cached_tokens).
     cached_tokens: u64 = 0,
-    /// Token dành cho reasoning/thinking (DeepSeek reasoner, OpenAI o-series).
+    /// Tokens used for reasoning/thinking (DeepSeek reasoner, OpenAI o-series).
     reasoning_tokens: u64 = 0,
 };
 
@@ -114,37 +114,37 @@ pub const Usage = struct {
 // Response
 // ---------------------------------------------------------------------------
 
-/// Lý do AI dừng sinh text.
+/// Reason why the AI stopped generating text.
 pub const StopReason = enum {
-    /// Kết thúc tự nhiên.
+    /// Natural completion.
     end_turn,
-    /// AI muốn gọi tool.
+    /// AI requested a tool call.
     tool_use,
-    /// Đã đạt giới hạn token.
+    /// Reached token limit.
     max_tokens,
-    /// Stop sequence kích hoạt.
+    /// Stop sequence triggered.
     stop_sequence,
-    /// Lý do không xác định.
+    /// Unknown stop reason.
     unknown,
 };
 
 
-/// Phản hồi đầy đủ từ một AI backend.
-/// Gọi `deinit` sau khi dùng xong để giải phóng bộ nhớ.
+/// Complete response from an AI backend.
+/// Call `deinit` when finished to free memory.
 pub const Response = struct {
     allocator: Allocator,
-    /// Tất cả content block trong phản hồi.
+    /// All content blocks in the response.
     content: ArrayList(ContentBlock),
-    /// Lý do dừng.
+    /// Stop reason.
     stop_reason: StopReason,
-    /// HTTP status code (nếu có lỗi/unknown)
+    /// HTTP status code (in case of error/unknown)
     http_code: u32 = 200,
-    /// Raw debug info từ backend (khi stop_reason == .unknown)
+    /// Raw debug info from backend (when stop_reason == .unknown)
     raw_debug_info: ?[]const u8,
-    /// Token usage thực tế từ backend (RFC-006). Zero nếu backend không trả.
+    /// Actual token usage from backend (RFC-006). Zero if not reported.
     usage: Usage = .{},
 
-    /// Khởi tạo Response rỗng.
+    /// Initialize an empty Response.
     pub fn init(alloc: Allocator) Response {
         return .{
             .allocator = alloc,
@@ -155,7 +155,7 @@ pub const Response = struct {
         };
     }
 
-    /// Giải phóng toàn bộ bộ nhớ.
+    /// Free all allocated memory.
     pub fn deinit(self: *Response) void {
         for (self.content.items) |block| {
             switch (block) {
@@ -184,22 +184,22 @@ pub const Response = struct {
 // Tool types
 // ---------------------------------------------------------------------------
 
-/// Định nghĩa tool gửi lên API để AI biết tool nào có thể dùng.
+/// Tool definition sent to the API so AI knows available tools.
 pub const ToolDefinition = struct {
-    /// Tên tool (dùng để dispatch).
+    /// Tool name (used for dispatch).
     name: []const u8,
-    /// Mô tả ngắn gọn cho AI.
+    /// Concise description for the AI.
     description: []const u8,
-    /// JSON Schema của input_parameters (object).
+    /// JSON Schema of input parameters (object).
     input_schema_json: []const u8,
 };
 
-/// Kết quả thực thi tool để thêm vào history.
+/// Tool execution result to append to history.
 pub const ToolResult = struct {
-    /// Khớp với ToolUse.id.
+    /// Matches ToolUse.id.
     tool_use_id: []const u8,
-    /// Output của tool.
+    /// Tool output.
     content: []const u8,
-    /// True nếu tool báo lỗi.
+    /// True if tool reported an error.
     is_error: bool,
 };

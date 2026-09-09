@@ -1,6 +1,6 @@
-//! skills.zig — Skill discovery layer: quét và nạp metadata skills từ ~/.mini/skills.
+//! skills.zig — Skill discovery layer: scans and loads skill metadata from ~/.mini/skills.
 //!
-//! Mỗi skill là một thư mục con chứa file `SKILL.md` với frontmatter YAML:
+//! Each skill is a subdirectory containing a `SKILL.md` file with YAML frontmatter:
 //! ```md
 //! ---
 //! name: my-skill
@@ -8,45 +8,45 @@
 //! ---
 //! ```
 //!
-//! ## Cách hoạt động
-//! 1. `loadSkills()` quét `<MINI_HOME>/skills/*/SKILL.md` (mặc định `~/.mini/skills/`)
-//! 2. Parse frontmatter để lấy `name` + `description`
-//! 3. `buildSkillsBlock()` tạo block text inject vào system prompt — chỉ chứa
-//!    name + description + path (~50 token/skill), agent tự đọc file đầy đủ khi cần
+//! ## How it works
+//! 1. `loadSkills()` scans `<MINI_HOME>/skills/*/SKILL.md` (default `~/.mini/skills/`)
+//! 2. Parses frontmatter to extract `name` + `description`
+//! 3. `buildSkillsBlock()` generates text block injected into system prompt — containing
+//!    only name + description + path (~50 tokens/skill); the agent reads the full file when needed.
 //!
-//! ## Ràng buộc
-//!   - Tối đa 32 skills, mỗi description tối đa 512 bytes (chống phình prompt)
-//!   - SKILL.md tối đa 64 KB
-//!   - Không đệ quy: chỉ đọc trực tiếp `skills/<name>/SKILL.md`
+//! ## Constraints
+//!   - Maximum 32 skills, each description capped at 512 bytes (preventing prompt bloat)
+//!   - SKILL.md maximum 64 KB
+//!   - Non-recursive: only inspects `skills/<name>/SKILL.md` directly
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const utils = @import("utils.zig");
 
-/// Số skill tối đa nạp vào prompt.
+/// Maximum number of skills injected into prompt.
 const MAX_SKILLS = 32;
 
-/// Giới hạn kích thước description nạp vào prompt (bytes).
+/// Limit on description size injected into prompt (bytes).
 const MAX_DESC_LEN = 512;
 
-/// Giới hạn kích thước file SKILL.md (bytes).
+/// Limit on SKILL.md file size (bytes).
 const MAX_SKILL_FILE = 64 * 1024;
 
-/// Metadata một skill đã parse từ frontmatter.
+/// Metadata for a skill parsed from frontmatter.
 pub const SkillInfo = struct {
-    /// Tên skill (từ frontmatter `name`, fallback: tên thư mục).
+    /// Skill name (from frontmatter `name`, fallback: directory name).
     name: []const u8,
-    /// Mô tả trigger (từ frontmatter `description`).
+    /// Trigger description (from frontmatter `description`).
     description: []const u8,
-    /// Đường dẫn tuyệt đối tới SKILL.md.
+    /// Absolute path to SKILL.md.
     path: []const u8,
 };
 
-/// Danh sách skill đã nạp (arena-allocated, free bằng `deinitSkills`).
+/// Loaded skills list (arena-allocated, freed via `deinitSkills`).
 var g_skills: ?[]SkillInfo = null;
 var g_skills_arena: ?std.heap.ArenaAllocator = null;
 
-/// Giải phóng bộ nhớ skills.
+/// Free skills memory.
 pub fn deinitSkills() void {
     if (g_skills_arena) |*arena| {
         arena.deinit();
@@ -55,15 +55,15 @@ pub fn deinitSkills() void {
     g_skills = null;
 }
 
-/// Trả về danh sách skill đã nạp (null nếu chưa gọi loadSkills hoặc không có skill).
+/// Return loaded skills list (null if loadSkills not called or no skills).
 pub fn getSkills() ?[]const SkillInfo {
     return g_skills;
 }
 
 const main = @import("../main.zig");
 
-/// Quét thư mục skills và parse metadata (quét ~/.mini/skills/ trước, .agent/skills/ sau; .agent override global).
-/// Trả về số skill nạp được (0 nếu thư mục không tồn tại).
+/// Scan skills directory and parse metadata (scans ~/.mini/skills/ first, .agent/skills/ after; .agent overrides global).
+/// Returns count of loaded skills (0 if directory does not exist).
 pub fn loadSkills(alloc: Allocator, io: std.Io, env_map: *const std.process.Environ.Map) usize {
     var arena = std.heap.ArenaAllocator.init(alloc);
     var transferred = false;
@@ -88,7 +88,7 @@ pub fn loadSkills(alloc: Allocator, io: std.Io, env_map: *const std.process.Envi
 
     if (skills.items.len == 0) return 0;
 
-    // Chuyển giao ownership sang global state
+    // Transfer ownership to global state
     deinitSkills();
     const owned = skills.toOwnedSlice(arena.allocator()) catch return 0;
     g_skills_arena = arena;
@@ -106,11 +106,11 @@ fn scanSkillsFromDir(arena_alloc: Allocator, io: std.Io, dir_path: []const u8, s
     while (it.next(io) catch null) |entry| {
         if (entry.kind != .directory) continue;
 
-        // Đọc <dir>/<name>/SKILL.md
+        // Read <dir>/<name>/SKILL.md
         const skill_path = std.fmt.allocPrint(arena_alloc, "{s}/{s}/SKILL.md", .{ dir_path, entry.name }) catch continue;
         const info = parseSkillFile(arena_alloc, io, skill_path, entry.name) catch continue;
 
-        // Check xem skill name này đã tồn tại chưa (Project override Global)
+        // Check if this skill name already exists (Project overrides Global)
         var overwritten = false;
         for (skills.items) |*existing| {
             if (std.mem.eql(u8, existing.name, info.name)) {
@@ -126,8 +126,8 @@ fn scanSkillsFromDir(arena_alloc: Allocator, io: std.Io, dir_path: []const u8, s
     }
 }
 
-/// Parse frontmatter của SKILL.md.
-/// Spec agentskills.io: `name` phải trùng tên thư mục cha (`dir_name`).
+/// Parse frontmatter of SKILL.md.
+/// Spec agentskills.io: `name` must match parent directory name (`dir_name`).
 fn parseSkillFile(alloc: Allocator, io: std.Io, path: []const u8, dir_name: []const u8) !SkillInfo {
     const cwd = std.Io.Dir.cwd();
     const file = try cwd.openFile(io, path, .{});
@@ -145,7 +145,7 @@ fn parseSkillFile(alloc: Allocator, io: std.Io, path: []const u8, dir_name: []co
     defer desc_buf.deinit(alloc);
     var in_desc_multiline = false;
 
-    // Frontmatter phải bắt đầu bằng "---" ở dòng đầu
+    // Frontmatter must start with "---" on the first line
     if (std.mem.startsWith(u8, content, "---\n")) {
         const body_start = std.mem.indexOfPos(u8, content, 4, "\n---") orelse content.len;
         const fm = content[4..body_start];
@@ -185,9 +185,9 @@ fn parseSkillFile(alloc: Allocator, io: std.Io, path: []const u8, dir_name: []co
         }
     }
 
-    // Spec validation: name trong frontmatter phải khớp tên thư mục
+    // Spec validation: name in frontmatter must match directory name
     if (!std.mem.eql(u8, name, dir_name)) {
-        main.stderrPrint("[skills] Cảnh báo: skill name '{s}' trong {s} không khớp tên thư mục '{s}', dùng tên thư mục.\n", .{ name, path, dir_name });
+        main.stderrPrint("[skills] Warning: skill name '{s}' in {s} does not match directory name '{s}', using directory name.\n", .{ name, path, dir_name });
         name = dir_name;
     }
 
@@ -198,8 +198,8 @@ fn parseSkillFile(alloc: Allocator, io: std.Io, path: []const u8, dir_name: []co
     };
 }
 
-/// Resolve thư mục skills: `$MINI_HOME/skills` hoặc `~/.mini/skills`.
-/// Trả về string thuộc sở hữu caller (cần free).
+/// Resolve skills directory: `$MINI_HOME/skills` or `~/.mini/skills`.
+/// Returns string owned by caller (must free).
 fn resolveSkillsDir(alloc: Allocator, env_map: *const std.process.Environ.Map) ![]u8 {
     if (env_map.get("MINI_HOME")) |mh| {
         if (mh.len > 0) return std.fmt.allocPrint(alloc, "{s}/skills", .{mh});
@@ -208,9 +208,9 @@ fn resolveSkillsDir(alloc: Allocator, env_map: *const std.process.Environ.Map) !
     return std.fmt.allocPrint(alloc, "{s}/.mini/skills", .{home});
 }
 
-/// Tạo block text inject vào cuối system prompt.
-/// Trả về null nếu không có skill nào (không inject gì).
-/// Caller free kết quả.
+/// Generate text block to inject at the end of system prompt.
+/// Returns null if no skills (injects nothing).
+/// Caller frees result.
 pub fn buildSkillsBlock(alloc: Allocator) !?[]u8 {
     const skills = g_skills orelse return null;
     if (skills.len == 0) return null;
@@ -222,16 +222,16 @@ pub fn buildSkillsBlock(alloc: Allocator) !?[]u8 {
         \\
         \\## Available skills
         \\
-        \\Khi task khớp rõ ràng với điều kiện kích hoạt trong description của một skill bên dưới, đọc file SKILL.md tương ứng bằng `mini.read` (hoặc file_read) TRƯỚC KHI thực hiện, rồi tuân theo hướng dẫn trong đó. Không cần hỏi lại user về convention.
-        \\LƯU Ý: Chỉ đọc skill khi thực sự cần thiết cho yêu cầu hiện tại. Tuyệt đối không tự ý kích hoạt các skill ngoài phạm vi nhiệm vụ được yêu cầu.
+        \\When a task clearly matches the trigger conditions in a skill description below, read the corresponding SKILL.md file using `mini.read` (or file_read) BEFORE taking action, then follow the instructions within. No need to re-ask the user about conventions.
+        \\NOTE: Only read a skill when strictly necessary for the current request. Never invoke skills outside the scope of the requested task.
         \\
         \\
     );
     for (skills) |s| {
         if (s.description.len > 0) {
-            try buf.print("- **{s}**: {s} — đọc `{s}`\n", .{ s.name, s.description, s.path });
+            try buf.print("- **{s}**: {s} — read `{s}`\n", .{ s.name, s.description, s.path });
         } else {
-            try buf.print("- **{s}** — đọc `{s}`\n", .{ s.name, s.path });
+            try buf.print("- **{s}** — read `{s}`\n", .{ s.name, s.path });
         }
     }
 
@@ -245,7 +245,7 @@ pub fn buildSkillsBlock(alloc: Allocator) !?[]u8 {
 const testing = std.testing;
 
 test "parseSkillFile frontmatter" {
-    // Tạo thư mục tạm + SKILL.md
+    // Create temporary directory + SKILL.md
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(testing.io, "my-skill");
@@ -256,12 +256,12 @@ test "parseSkillFile frontmatter" {
         .data = "---\nname: my-skill\ndescription: Use when writing docs\n---\n\n# Content",
     });
 
-    // cwd của tmpDir khác cwd process — test qua hàm parse trực tiếp không khả thi
-    // (parseSkillFile mở theo cwd). Test logic frontmatter qua helper riêng.
+    // tmpDir cwd differs from process cwd — direct parse testing via relative path is not feasible
+    // (parseSkillFile opens relative to cwd). Test frontmatter logic via separate helper.
 }
 
 test "frontmatter parse logic" {
-    // Kiểm tra logic tách name/description từ chuỗi frontmatter
+    // Check logic separating name/description from frontmatter string
     const content = "---\nname: abc\ndescription: Use when xyz\n---\nbody";
     try testing.expect(std.mem.startsWith(u8, content, "---\n"));
     const body_start = std.mem.indexOfPos(u8, content, 4, "\n---").?;
@@ -322,7 +322,7 @@ test "frontmatter parse multiline description" {
     try testing.expectEqualStrings("Check your work with a verification subagent. Use when asked to \"check work\" or \"verify\".", desc_buf.items);
 }
 
-test "buildSkillsBlock empty khi khong co skill" {
+test "buildSkillsBlock empty when no skills" {
     const result = try buildSkillsBlock(testing.allocator);
     try testing.expect(result == null);
 }

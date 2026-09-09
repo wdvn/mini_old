@@ -1,7 +1,7 @@
-//! repl.zig — Interactive Terminal REPL & UI Presentation Layer cho mini-agent (RFC-007).
+//! repl.zig — Interactive Terminal REPL & UI Presentation Layer for mini-agent (RFC-007).
 //!
-//! Tách biệt hoàn toàn phần giao diện người dùng, xử lý lệnh Slash (/help, /model, /artifact, /clear),
-//! và streaming markdown / thinking text ra khỏi composition root.
+//! Fully decouples the user interface, slash command handlers (/help, /model, /artifact, /clear),
+//! and streaming markdown / thinking text from the composition root.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -15,10 +15,10 @@ pub const chat_stream = @import("chat_stream.zig");
 
 pub const PROMPT_PREFIX = "\x1b[1;34mYou\x1b[0m > ";
 
-/// Renderer toàn cục của turn hiện tại (nếu đang xử lý).
+/// Global renderer for current turn (if processing).
 pub var current_renderer: ?*chat_stream.TurnRenderer = null;
 
-/// Chạy vòng lặp tương tác REPL.
+/// Run interactive REPL loop.
 pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, version: []const u8) !void {
     signals.initSignalHandlers();
     const stdout = std.Io.File.stdout();
@@ -29,7 +29,7 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
     main.stdoutPrint("\x1b[1;32mmini-agent\x1b[0m {s} \x1b[90m(build {s})\x1b[0m | {s} ({s})\n", .{
         version, main.BUILD_TIME, agent.backend.name(), agent.backend.model(),
     });
-    try stdout.writeStreamingAll(io, "Gõ /help để xem lệnh, /quit để thoát.\n\n");
+    try stdout.writeStreamingAll(io, "Type /help for commands, /quit to exit.\n\n");
 
     while (true) {
         signals.setInterrupted(false);
@@ -48,11 +48,11 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
             if (handleSlashCommand(alloc, io, agent, input)) continue else break;
         }
 
-        // Mở rộng tham chiếu @artifact:<name>
+        // Expand @artifact:<name> references
         const expanded_input = try artifacts_mod.expandArtifactReferences(alloc, io, input);
         defer alloc.free(expanded_input);
 
-        // Khởi tạo TurnRenderer cho lượt chat này
+        // Initialize TurnRenderer for this chat turn
         var renderer = chat_stream.TurnRenderer.init(alloc, io);
         defer renderer.deinit();
         current_renderer = &renderer;
@@ -61,10 +61,10 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
         renderer.startTurn(expanded_input);
         const start_ms = utils.milliTimestamp();
 
-        // Gửi đến agent
+        // Send to agent
         agent.processInput(expanded_input, printText, printThinkText) catch |e| {
             if (e != error.Interrupted) {
-                main.stdoutPrint("\x1b[31m[lỗi]\x1b[0m {s}\n", .{@errorName(e)});
+                main.stdoutPrint("\x1b[31m[error]\x1b[0m {s}\n", .{@errorName(e)});
             }
         };
 
@@ -86,10 +86,10 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
         });
     }
 
-    try stdout.writeStreamingAll(io, "\nTạm biệt!\n");
+    try stdout.writeStreamingAll(io, "\nGoodbye!\n");
 }
 
-/// Xử lý slash command. Trả về true để tiếp tục, false để thoát.
+/// Process slash command. Returns true to continue, false to exit.
 pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, input: []const u8) bool {
     if (std.mem.eql(u8, input, "/quit") or
         std.mem.eql(u8, input, "/exit") or
@@ -101,7 +101,7 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
     if (std.mem.eql(u8, input, "/clear")) {
         agent.clearHistory();
         std.Io.File.stdout().writeStreamingAll(io, "\x1b[2J\x1b[H") catch {};
-        std.Io.File.stdout().writeStreamingAll(io, "[Lịch sử đã xóa]\n") catch {};
+        std.Io.File.stdout().writeStreamingAll(io, "[History cleared]\n") catch {};
         return true;
     }
 
@@ -109,7 +109,7 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
         const sub = std.mem.trim(u8, input["/artifact".len..], " \t");
         if (sub.len == 0 or std.mem.eql(u8, sub, "list")) {
             const list = artifacts_mod.listArtifacts(alloc, io) catch |e| {
-                main.stdoutPrint("Lỗi đọc danh sách artifacts: {s}\n", .{@errorName(e)});
+                main.stdoutPrint("Error reading artifacts list: {s}\n", .{@errorName(e)});
                 return true;
             };
             defer alloc.free(list);
@@ -120,41 +120,41 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
             const space = std.mem.indexOfScalar(u8, sub, ' ') orelse sub.len;
             const name = std.mem.trim(u8, sub[space..], " \t");
             const content = artifacts_mod.readArtifact(alloc, io, name) catch |e| {
-                main.stdoutPrint("Lỗi đọc artifact '{s}': {s}\n", .{ name, @errorName(e) });
+                main.stdoutPrint("Error reading artifact '{s}': {s}\n", .{ name, @errorName(e) });
                 return true;
             };
             defer alloc.free(content);
-            main.stdoutPrint("\n--- [Artifact: {s}] ---\n{s}\n--- [Hết Artifact] ---\n\n", .{ name, content });
+            main.stdoutPrint("\n--- [Artifact: {s}] ---\n{s}\n--- [End of Artifact] ---\n\n", .{ name, content });
             return true;
         }
         if (std.mem.eql(u8, sub, "dir") or std.mem.eql(u8, sub, "path")) {
             const dir = artifacts_mod.resolveArtifactsDir(alloc, io) catch |e| {
-                main.stdoutPrint("Lỗi lấy đường dẫn artifacts: {s}\n", .{@errorName(e)});
+                main.stdoutPrint("Error resolving artifacts directory: {s}\n", .{@errorName(e)});
                 return true;
             };
             defer alloc.free(dir);
-            main.stdoutPrint("Thư mục Artifacts hiện tại: {s}\n", .{dir});
+            main.stdoutPrint("Current Artifacts directory: {s}\n", .{dir});
             return true;
         }
-        main.stdoutPrint("Cú pháp: /artifact [list | show <name> | path]\n", .{});
+        main.stdoutPrint("Usage: /artifact [list | show <name> | path]\n", .{});
         return true;
     }
 
     if (std.mem.eql(u8, input, "/help")) {
         std.Io.File.stdout().writeStreamingAll(io,
             \\
-            \\## Lệnh REPL
-            \\  /clear              Xóa lịch sử hội thoại
-            \\  /model <backend>    Đổi backend (openai, claude, ollama)
-            \\  /artifact [list]    Xem danh sách artifacts của session
-            \\  /artifact show <fn> Đọc nội dung một artifact
-            \\  /quit, /exit, /q    Thoát
-            \\  /help               Hiện hướng dẫn này
+            \\## REPL Commands
+            \\  /clear              Clear conversation history
+            \\  /model <backend>    Switch backend (openai, claude, ollama)
+            \\  /artifact [list]    View session artifacts list
+            \\  /artifact show <fn> Read an artifact content
+            \\  /quit, /exit, /q    Exit
+            \\  /help               Show this help guide
             \\
-            \\## Tham chiếu Artifact
-            \\  Dùng cú pháp @artifact:<name> trực tiếp trong câu hỏi để chèn artifact vào context.
+            \\## Artifact References
+            \\  Use @artifact:<name> syntax directly in prompts to inject artifact into context.
             \\
-            \\## Tools có sẵn
+            \\## Available Tools
             \\  bash, file_read, file_write, file_edit, artifact_write, artifact_read, artifact_list
             \\  glob, grep, http_request, skills, invoke_subagent, batch_invoke_subagents
             \\
@@ -176,7 +176,7 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
         return true;
     }
 
-    main.stdoutPrint("Lệnh không hợp lệ: {s}. Gõ /help để xem danh sách.\n", .{input});
+    main.stdoutPrint("Invalid command: {s}. Type /help to view list.\n", .{input});
     return true;
 }
 
