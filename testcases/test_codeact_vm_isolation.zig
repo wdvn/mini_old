@@ -81,3 +81,41 @@ test "codeact: mini bindings available on fresh context" {
     try std.testing.expectEqualStrings("exists again: true\n", res2.stdout);
 }
 
+test "codeact: mini.setThinking sets pending override" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var engine = try quickjs.Engine.init(alloc, io);
+    defer engine.deinit();
+
+    // 1. String level: "low"
+    var res1 = try engine.eval("mini.setThinking('low');", "test1.js");
+    defer res1.deinit();
+    try std.testing.expect(!res1.is_error);
+
+    const override1 = js_bindings.consumePendingThinkingOverride();
+    try std.testing.expect(override1 != null);
+    try std.testing.expectEqualStrings("low", override1.?.effort.?);
+
+    // After consume, pending override is reset to null
+    try std.testing.expect(js_bindings.consumePendingThinkingOverride() == null);
+
+    // 2. Budget tokens number: 4096
+    var res2 = try engine.eval("mini.setThinking(4096);", "test2.js");
+    defer res2.deinit();
+    try std.testing.expect(!res2.is_error);
+
+    const override2 = js_bindings.consumePendingThinkingOverride();
+    try std.testing.expect(override2 != null);
+    try std.testing.expectEqual(@as(u32, 4096), override2.?.budget_tokens.?);
+
+    // 3. String level: "none"
+    var res3 = try engine.eval("mini.setThinking('none');", "test3.js");
+    defer res3.deinit();
+    try std.testing.expect(!res3.is_error);
+
+    const override3 = js_bindings.consumePendingThinkingOverride();
+    try std.testing.expect(override3 != null);
+    try std.testing.expectEqualStrings("none", override3.?.effort.?);
+}
+

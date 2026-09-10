@@ -116,6 +116,22 @@ pub const Backend = union(enum) {
             .ollama => |*c| c.sendMessage(system_prompt, msgs, tool_defs, text_cb, think_cb),
         };
     }
+
+    /// Sets dynamic reasoning effort ("low" | "medium" | "high" | "none" | null).
+    pub fn setReasoningEffort(self: *Backend, effort: ?[]const u8) void {
+        switch (self.*) {
+            .openai => |*c| c.setReasoningEffort(effort),
+            else => {},
+        }
+    }
+
+    /// Sets dynamic thinking budget tokens (or null).
+    pub fn setThinkingBudget(self: *Backend, budget: ?u32) void {
+        switch (self.*) {
+            .claude => |*c| c.setThinkingBudget(budget),
+            else => {},
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -158,6 +174,8 @@ pub const AgentLoop = struct {
     last_turn_acts: usize = 0,
     /// Completion tokens received in the last turn.
     last_turn_completion_tokens: usize = 0,
+    /// Whether the previous act encountered an error (tool failure or JS error).
+    last_act_failed: bool = false,
 
     pub const Error = error{
         LLMAuthenticationError,
@@ -178,7 +196,7 @@ pub const AgentLoop = struct {
         errdefer engine.deinit();
 
         // Select backend in priority order
-        const backend: Backend = blk: {
+        var backend: Backend = blk: {
             if (config.openai_compat_url) |url| {
                 if (!utils.isSubagent()) main.stderrPrint("[agent] Backend: OpenAI-compat @ {s} ({s})\n", .{ url, config.openai_compat_model });
                 const proto_mode: openai_mod.ProtocolMode = switch (config.openai_protocol) {
@@ -215,6 +233,11 @@ pub const AgentLoop = struct {
             ) };
         };
 
+        if (!config.reasoning_effort_disabled) {
+            backend.setReasoningEffort(config.reasoning_effort);
+            backend.setThinkingBudget(config.thinking_budget_tokens);
+        }
+
         // Configure tool policy
         tools_mod.setPolicy(config.tool_allowlist, config.tool_blocklist);
 
@@ -235,6 +258,7 @@ pub const AgentLoop = struct {
             .config = config,
             .engine = engine,
             .js_retry_count = 0,
+            .last_act_failed = false,
             .token_estimator = tokens_mod.TokenEstimator.init(alloc),
             .cas = cas,
             .journal = null,
@@ -380,6 +404,35 @@ pub const AgentLoop = struct {
         const input_msgs_count = self.history.len();
         const input_msgs = self.history.messages()[0..input_msgs_count];
 
+        // Dynamic Thinking / Reasoning Effort modulation
+        if (!self.config.reasoning_effort_disabled) {
+            var effective_effort: ?[]const u8 = self.config.reasoning_effort;
+            var effective_budget: ?u32 = self.config.thinking_budget_tokens;
+
+            // Priority 1: Explicit JS override via mini.setThinking
+            if (js_bindings.consumePendingThinkingOverride()) |override| {
+                if (override.effort) |eff| effective_effort = eff;
+                if (override.budget_tokens) |bud| effective_budget = bud;
+            } else if (self.config.dynamic_thinking_enabled) {
+                // Priority 2: Adaptive cognitive governor
+                if (act_id == 1) {
+                    effective_effort = self.config.reasoning_effort orelse "high";
+                    effective_budget = self.config.thinking_budget_tokens orelse 4096;
+                } else if (self.last_act_failed or self.js_retry_count > 0) {
+                    // Error recovery: allocate high budget to reflect on failure
+                    effective_effort = "high";
+                    effective_budget = 4096;
+                } else {
+                    // Routine tool follow-up: allocate low budget to reduce latency
+                    effective_effort = "low";
+                    effective_budget = 1024;
+                }
+            }
+
+            self.backend.setReasoningEffort(effective_effort);
+            self.backend.setThinkingBudget(effective_budget);
+        }
+
         // Send to AI backend (streaming)
         var response = try self.sendToBackend(
             act_id,
@@ -450,6 +503,7 @@ pub const AgentLoop = struct {
                 defer signals.registerActiveEngine(null);
 
                 var res = self.engine.eval(js_code, "agent_codeact.js") catch |e| {
+                    self.last_act_failed = true;
                     const end_err_ms = utils.milliTimestamp();
                     const dur_ms = if (end_err_ms >= start_codeact_ms) @as(u64, @intCast(end_err_ms - start_codeact_ms)) else 0;
                     self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, js_code, .{
@@ -492,6 +546,7 @@ pub const AgentLoop = struct {
                         main.stderrPrint("\x1b[32m[ok]\x1b[0m\n", .{});
                     }
                     self.js_retry_count = 0;
+                    self.last_act_failed = false;
 
                     var out_buf = utils.BufWriter.init(self.alloc);
                     defer out_buf.deinit();
@@ -516,6 +571,7 @@ pub const AgentLoop = struct {
                         main.stderrPrint("\x1b[31m[error]\x1b[0m\n", .{});
                     }
                     self.js_retry_count += 1;
+                    self.last_act_failed = true;
 
                     var err_buf = utils.BufWriter.init(self.alloc);
                     defer err_buf.deinit();
@@ -696,6 +752,8 @@ pub const AgentLoop = struct {
         self.role_fix_attempts = 0;
         // Reset continue-max_tokens counter for new turn
         self.max_tokens_continues = 0;
+        self.last_act_failed = false;
+        self.js_retry_count = 0;
 
         // Retrieve relevant tool definitions for user message based on execution_mode
         const tool_defs = switch (self.config.execution_mode) {
@@ -1189,6 +1247,7 @@ pub const AgentLoop = struct {
 
     fn executeTools(self: *AgentLoop, act_id: usize, response: *const proto.Response) !void {
         _ = act_id;
+        var any_tool_err = false;
         var results = ArrayList(proto.ToolResult).empty;
         defer results.deinit(self.alloc);
         
@@ -1248,6 +1307,7 @@ pub const AgentLoop = struct {
                     var is_err = false;
                     const result = tools_mod.executeTool(self.alloc, self.io, tu.name, tu.input_json) catch |e| blk: {
                         is_err = true;
+                        any_tool_err = true;
                         const msg = try std.fmt.allocPrint(self.alloc, "Tool error: {s}", .{@errorName(e)});
                         break :blk msg;
                     };
@@ -1299,6 +1359,7 @@ pub const AgentLoop = struct {
         if (results.items.len > 0) {
             try self.history.addToolResults(results.items);
         }
+        self.last_act_failed = any_tool_err;
     }
 };
 

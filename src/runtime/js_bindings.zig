@@ -817,6 +817,75 @@ fn jsMiniSessionKill(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv:
     return c.JS_NewStringLen(ctx, res.ptr, res.len);
 }
 
+// ---------------------------------------------------------------------------
+// Dynamic Thinking Budget & Reasoning Effort (mini.setThinking)
+// ---------------------------------------------------------------------------
+
+pub const ThinkingOverride = struct {
+    effort: ?[]const u8 = null,
+    budget_tokens: ?u32 = null,
+};
+
+var g_pending_thinking: ?ThinkingOverride = null;
+
+pub fn consumePendingThinkingOverride() ?ThinkingOverride {
+    const val = g_pending_thinking;
+    g_pending_thinking = null;
+    return val;
+}
+
+pub fn setPendingThinkingOverride(override: ?ThinkingOverride) void {
+    g_pending_thinking = override;
+}
+
+// ---------------------------------------------------------------------------
+// mini.setThinking(levelOrTokens)
+// ---------------------------------------------------------------------------
+fn jsMiniSetThinking(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.setThinking requires 1 argument (string level or number budget)");
+
+    // Case 1: number budget
+    if (c.JS_IsNumber(argv[0]) != 0) {
+        var budget: i32 = 0;
+        if (c.JS_ToInt32(ctx, &budget, argv[0]) == 0) {
+            if (budget <= 0) {
+                g_pending_thinking = .{ .effort = "none", .budget_tokens = 0 };
+            } else {
+                const b: u32 = @intCast(budget);
+                const eff: []const u8 = if (b <= 1024) "low" else if (b <= 4096) "medium" else "high";
+                g_pending_thinking = .{ .effort = eff, .budget_tokens = b };
+            }
+            return c.JS_NewBool(ctx, 1);
+        }
+    }
+
+    // Case 2: string effort ("low" | "medium" | "high" | "none" | "minimal")
+    if (c.JS_IsString(argv[0]) != 0) {
+        const str = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid string argument");
+        defer engine.alloc.free(str);
+
+        if (std.mem.eql(u8, str, "low")) {
+            g_pending_thinking = .{ .effort = "low", .budget_tokens = 1024 };
+        } else if (std.mem.eql(u8, str, "medium")) {
+            g_pending_thinking = .{ .effort = "medium", .budget_tokens = 4096 };
+        } else if (std.mem.eql(u8, str, "high")) {
+            g_pending_thinking = .{ .effort = "high", .budget_tokens = 8192 };
+        } else if (std.mem.eql(u8, str, "none") or std.mem.eql(u8, str, "off")) {
+            g_pending_thinking = .{ .effort = "none", .budget_tokens = 0 };
+        } else if (std.mem.eql(u8, str, "minimal")) {
+            g_pending_thinking = .{ .effort = "minimal", .budget_tokens = 512 };
+        } else {
+            return c.JS_ThrowTypeError(ctx, "level must be 'low', 'medium', 'high', 'none', or a token budget number");
+        }
+        return c.JS_NewBool(ctx, 1);
+    }
+
+    return c.JS_ThrowTypeError(ctx, "argument must be string or number");
+}
+
 /// Register global `mini` object into JSContext
 pub fn registerBindings(engine: *Engine) !void {
     const ctx = engine.ctx.?;
@@ -842,13 +911,14 @@ pub fn registerBindings(engine: *Engine) !void {
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "jobLogs", c.JS_NewCFunction(ctx, jsMiniJobLogs, "jobLogs", 2));
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "jobKill", c.JS_NewCFunction(ctx, jsMiniJobKill, "jobKill", 2));
 
-    // 3. network & session telemetry
+    // 3. network & session telemetry & agent cognitive modulation
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "http", c.JS_NewCFunction(ctx, jsMiniHttp, "http", 3));
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "artifact", c.JS_NewCFunction(ctx, jsMiniArtifact, "artifact", 3));
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "env", c.JS_NewCFunction(ctx, jsMiniEnv, "env", 1));
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "sessions", c.JS_NewCFunction(ctx, jsMiniSessions, "sessions", 0));
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "sessionDetail", c.JS_NewCFunction(ctx, jsMiniSessionDetail, "sessionDetail", 1));
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "sessionKill", c.JS_NewCFunction(ctx, jsMiniSessionKill, "sessionKill", 2));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "setThinking", c.JS_NewCFunction(ctx, jsMiniSetThinking, "setThinking", 1));
 
     // 4. metadata props
     const pwd_val = getenv("PWD");

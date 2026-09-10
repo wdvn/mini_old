@@ -83,6 +83,8 @@ pub const Client = struct {
     protocol_mode: ProtocolMode,
     /// Cached successfully negotiated protocol (Tier 3: Session Protocol Memory).
     cached_protocol: ?ProtocolMode,
+    /// Dynamic reasoning effort override for next request ("minimal" | "low" | "medium" | "high" | "none" | null).
+    active_reasoning_effort: ?[]const u8,
 
     /// Initialize client.
     pub fn init(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32) Client {
@@ -98,7 +100,13 @@ pub const Client = struct {
             .disable_stream_options = false,
             .protocol_mode = .auto,
             .cached_protocol = null,
+            .active_reasoning_effort = null,
         };
+    }
+
+    /// Set dynamic reasoning effort override.
+    pub fn setReasoningEffort(self: *Client, effort: ?[]const u8) void {
+        self.active_reasoning_effort = effort;
     }
 
     /// Initialize client with explicit protocol mode.
@@ -115,6 +123,7 @@ pub const Client = struct {
             .disable_stream_options = false,
             .protocol_mode = protocol_mode,
             .cached_protocol = null,
+            .active_reasoning_effort = null,
         };
     }
 
@@ -141,9 +150,9 @@ pub const Client = struct {
         var retry_count: u32 = 0;
         while (retry_count < 4) : (retry_count += 1) {
             const body = if (active_protocol == .responses)
-                try buildResponsesRequestBody(self.alloc, self.model, self.max_tokens, self.disable_reasoning_effort, system_prompt, msgs, tools)
+                try buildResponsesRequestBody(self.alloc, self.model, self.max_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, system_prompt, msgs, tools)
             else
-                try buildRequestBody(self.alloc, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.disable_stream_options, system_prompt, msgs, tools);
+                try buildRequestBody(self.alloc, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, self.disable_stream_options, system_prompt, msgs, tools);
             defer self.alloc.free(body);
 
             // Build URL according to active protocol
@@ -270,6 +279,7 @@ fn buildResponsesRequestBody(
     model: []const u8,
     max_tokens: u32,
     disable_reasoning_effort: bool,
+    reasoning_effort: ?[]const u8,
     system_prompt: []const u8,
     msgs: []const proto.Message,
     tools: []const proto.ToolDefinition,
@@ -283,7 +293,13 @@ fn buildResponsesRequestBody(
     try w.print("{{\"model\":\"{s}\",\"stream\":true", .{model});
 
     if (!disable_reasoning_effort) {
-        try w.writeAll(",\"reasoning\":{\"effort\":\"medium\"}");
+        if (reasoning_effort) |effort| {
+            if (!std.mem.eql(u8, effort, "none")) {
+                try w.print(",\"reasoning\":{{\"effort\":\"{s}\"}}", .{effort});
+            }
+        } else {
+            try w.writeAll(",\"reasoning\":{\"effort\":\"medium\"}");
+        }
     }
 
     if (system_prompt.len > 0) {
@@ -351,6 +367,7 @@ fn buildRequestBody(
     max_tokens: u32,
     use_completion_tokens: bool,
     disable_reasoning_effort: bool,
+    reasoning_effort: ?[]const u8,
     disable_stream_options: bool,
     system_prompt: []const u8,
     msgs: []const proto.Message,
@@ -360,7 +377,15 @@ fn buildRequestBody(
     errdefer buf.deinit();
     const w = &buf;
 
-    const reasoning_effort_str = if (disable_reasoning_effort) "\"reasoning_effort\":\"none\"," else "";
+    var reasoning_buf: [64]u8 = undefined;
+    const reasoning_effort_str: []const u8 = blk: {
+        if (disable_reasoning_effort) break :blk "";
+        if (reasoning_effort) |effort| {
+            if (std.mem.eql(u8, effort, "none")) break :blk "";
+            break :blk std.fmt.bufPrint(&reasoning_buf, "\"reasoning_effort\":\"{s}\",", .{effort}) catch "";
+        }
+        break :blk "";
+    };
     // RFC-006 §3.6: adaptive stream_options — omit if compat API does not support it
     const stream_options_str = if (disable_stream_options) "" else ",\"stream_options\":{\"include_usage\":true}";
 
@@ -1023,7 +1048,7 @@ test "openai buildRequestBody includes stream_options, static tools prefix and c
         .{ .name = "test_tool", .description = "desc", .input_schema_json = "{}" },
     };
 
-    const body = try buildRequestBody(alloc, "gpt-4o", 1024, false, false, false, "System prompt test", &msgs, &tools);
+    const body = try buildRequestBody(alloc, "gpt-4o", 1024, false, false, null, false, "System prompt test", &msgs, &tools);
     defer alloc.free(body);
 
     // Check for stream_options include_usage
@@ -1046,7 +1071,7 @@ test "openai buildRequestBody: disable_stream_options omits stream_options" {
     const tools = [_]proto.ToolDefinition{};
 
     // disable_stream_options = true → no stream_options
-    const body = try buildRequestBody(alloc, "gpt-4o", 1024, false, false, true, "test", &msgs, &tools);
+    const body = try buildRequestBody(alloc, "gpt-4o", 1024, false, false, null, true, "test", &msgs, &tools);
     defer alloc.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "stream_options") == null);
     try testing.expect(std.mem.indexOf(u8, body, "include_usage") == null);
@@ -1226,7 +1251,7 @@ test "openai auto-negotiation: buildResponsesRequestBody format" {
         .{ .name = "bash", .description = "Run shell", .input_schema_json = "{\"type\":\"object\"}" },
     };
 
-    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "System instructions", &msgs, &tools);
+    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, null, "System instructions", &msgs, &tools);
     defer alloc.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-5.6-terra\"") != null);
@@ -1323,7 +1348,7 @@ test "openai auto-negotiation: buildResponsesRequestBody multi-turn with functio
         .{ .name = "bash", .description = "Run shell", .input_schema_json = "{\"type\":\"object\"}" },
     };
 
-    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-luna", 4096, false, "System prompt", &msgs, &tools);
+    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-luna", 4096, false, null, "System prompt", &msgs, &tools);
     defer alloc.free(body);
 
     // Verify correct input format generated: user msg -> assistant text -> assistant function_call -> function_call_output
@@ -1378,5 +1403,52 @@ test "openai stream: Responses API output_item.added and output_item.done does n
     try testing.expectEqualStrings("call_test_1", tu.id);
     // Must be unique {"command":"ls"}, not duplicated into {"command":"ls"}{"command":"ls"}
     try testing.expectEqualStrings("{\"command\":\"ls\"}", tu.input_json);
+}
+
+test "openai dynamic reasoning_effort in buildRequestBody" {
+    const alloc = testing.allocator;
+    const msgs = [_]proto.Message{};
+    const tools = [_]proto.ToolDefinition{};
+
+    // 1. With reasoning_effort = "low"
+    const body_low = try buildRequestBody(alloc, "o3-mini", 2048, true, false, "low", false, "", &msgs, &tools);
+    defer alloc.free(body_low);
+    try testing.expect(std.mem.indexOf(u8, body_low, "\"reasoning_effort\":\"low\"") != null);
+
+    // 2. With reasoning_effort = "high"
+    const body_high = try buildRequestBody(alloc, "o3-mini", 2048, true, false, "high", false, "", &msgs, &tools);
+    defer alloc.free(body_high);
+    try testing.expect(std.mem.indexOf(u8, body_high, "\"reasoning_effort\":\"high\"") != null);
+
+    // 3. With reasoning_effort = "none"
+    const body_none = try buildRequestBody(alloc, "o3-mini", 2048, true, false, "none", false, "", &msgs, &tools);
+    defer alloc.free(body_none);
+    try testing.expect(std.mem.indexOf(u8, body_none, "\"reasoning_effort\"") == null);
+
+    // 4. With disable_reasoning_effort = true
+    const body_disabled = try buildRequestBody(alloc, "o3-mini", 2048, true, true, "high", false, "", &msgs, &tools);
+    defer alloc.free(body_disabled);
+    try testing.expect(std.mem.indexOf(u8, body_disabled, "\"reasoning_effort\"") == null);
+}
+
+test "openai dynamic reasoning_effort in buildResponsesRequestBody" {
+    const alloc = testing.allocator;
+    const msgs = [_]proto.Message{};
+    const tools = [_]proto.ToolDefinition{};
+
+    // 1. With reasoning_effort = "low"
+    const body_low = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "low", "", &msgs, &tools);
+    defer alloc.free(body_low);
+    try testing.expect(std.mem.indexOf(u8, body_low, "\"reasoning\":{\"effort\":\"low\"}") != null);
+
+    // 2. With reasoning_effort = "high"
+    const body_high = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "high", "", &msgs, &tools);
+    defer alloc.free(body_high);
+    try testing.expect(std.mem.indexOf(u8, body_high, "\"reasoning\":{\"effort\":\"high\"}") != null);
+
+    // 3. With default null (falls back to medium)
+    const body_default = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, null, "", &msgs, &tools);
+    defer alloc.free(body_default);
+    try testing.expect(std.mem.indexOf(u8, body_default, "\"reasoning\":{\"effort\":\"medium\"}") != null);
 }
 

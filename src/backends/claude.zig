@@ -37,10 +37,23 @@ pub const Client = struct {
     model: []const u8,
     /// Maximum tokens.
     max_tokens: u32,
+    /// Dynamic thinking budget tokens override.
+    active_thinking_budget: ?u32,
 
     /// Initializes client.
     pub fn init(alloc: Allocator, api_key: []const u8, model: []const u8, max_tokens: u32) Client {
-        return .{ .alloc = alloc, .api_key = api_key, .model = model, .max_tokens = max_tokens };
+        return .{
+            .alloc = alloc,
+            .api_key = api_key,
+            .model = model,
+            .max_tokens = max_tokens,
+            .active_thinking_budget = null,
+        };
+    }
+
+    /// Set dynamic thinking budget tokens override.
+    pub fn setThinkingBudget(self: *Client, budget: ?u32) void {
+        self.active_thinking_budget = budget;
     }
 
     /// Sends messages and receives streaming response via Claude SSE.
@@ -52,7 +65,7 @@ pub const Client = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !proto.Response {
-        const body = try buildRequestBody(self.alloc, self.model, self.max_tokens, system_prompt, msgs, tools);
+        const body = try buildRequestBody(self.alloc, self.model, self.max_tokens, self.active_thinking_budget, system_prompt, msgs, tools);
         defer self.alloc.free(body);
 
         hooks.dispatch(self.alloc, main.g_io, .{
@@ -127,6 +140,7 @@ fn buildRequestBody(
     alloc: Allocator,
     model: []const u8,
     max_tokens: u32,
+    thinking_budget: ?u32,
     system_prompt: []const u8,
     msgs: []const proto.Message,
     tools: []const proto.ToolDefinition,
@@ -139,9 +153,23 @@ fn buildRequestBody(
     const escaped_sys = try json.escape(alloc, system_prompt);
     defer alloc.free(escaped_sys);
 
+    var effective_max_tokens = max_tokens;
+    var thinking_str_buf: [128]u8 = undefined;
+    const thinking_str: []const u8 = blk: {
+        if (thinking_budget) |budget| {
+            if (budget > 0) {
+                if (effective_max_tokens <= budget) {
+                    effective_max_tokens = budget + 4096;
+                }
+                break :blk std.fmt.bufPrint(&thinking_str_buf, ",\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}}", .{budget}) catch "";
+            }
+        }
+        break :blk "";
+    };
+
     try w.print(
-        \\{{"model":"{s}","max_tokens":{d},"stream":true,"system":[{{"type":"text","text":"{s}","cache_control":{{"type":"ephemeral"}}}}],"messages":[
-    , .{ model, max_tokens, escaped_sys });
+        \\{{"model":"{s}","max_tokens":{d},"stream":true{s},"system":[{{"type":"text","text":"{s}","cache_control":{{"type":"ephemeral"}}}}],"messages":[
+    , .{ model, effective_max_tokens, thinking_str, escaped_sys });
 
     for (msgs, 0..) |msg, mi| {
         try w.print("{{\"role\":\"{s}\",\"content\":", .{msg.role.toJson()});
@@ -434,7 +462,7 @@ test "claude buildRequestBody contains cache_control" {
         .{ .name = "tool2", .description = "desc2", .input_schema_json = "{}" },
     };
 
-    const body = try buildRequestBody(alloc, "claude-3-5-sonnet", 1024, "System prompt test", &msgs, &tools);
+    const body = try buildRequestBody(alloc, "claude-3-5-sonnet", 1024, null, "System prompt test", &msgs, &tools);
     defer alloc.free(body);
 
     // Verify cache_control exists in system prompt
@@ -443,4 +471,17 @@ test "claude buildRequestBody contains cache_control" {
     try testing.expect(std.mem.indexOf(u8, body, "\"system\":[{\"type\":\"text\",\"text\":\"System prompt test\",\"cache_control\":{\"type\":\"ephemeral\"}}]") != null);
     // Verify tool2 (last tool) has cache_control
     try testing.expect(std.mem.indexOf(u8, body, "\"name\":\"tool2\",\"description\":\"desc2\",\"input_schema\":{},\"cache_control\":{\"type\":\"ephemeral\"}") != null);
+}
+
+test "claude buildRequestBody dynamic thinking budget" {
+    const alloc = testing.allocator;
+    const msgs = [_]proto.Message{};
+    const tools = [_]proto.ToolDefinition{};
+
+    // With thinking budget = 2048, max_tokens = 1024 -> effective_max_tokens auto-adjusted > budget (2048 + 4096 = 6144)
+    const body = try buildRequestBody(alloc, "claude-3-7-sonnet", 1024, 2048, "test", &msgs, &tools);
+    defer alloc.free(body);
+
+    try testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2048}") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":6144") != null);
 }

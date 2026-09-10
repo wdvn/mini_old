@@ -119,6 +119,20 @@ pub const Config = struct {
     /// Comma-separated blocklist. Null = block none.
     tool_blocklist: ?[]const u8,
 
+    // Reasoning & Thinking (RFC-009)
+    /// Reasoning effort for OpenAI-compatible models: "minimal" | "low" | "medium" | "high" | "none" | null.
+    reasoning_effort: ?[]const u8 = null,
+    /// Soft off-switch, set to true to force omitting reasoning params.
+    reasoning_effort_disabled: bool = false,
+    /// Anthropic thinking budget (tokens). Null = extended thinking disabled.
+    thinking_budget_tokens: ?u32 = null,
+    /// Anthropic thinking temperature (fixed 1.0 when thinking is enabled).
+    thinking_temperature: f32 = 1.0,
+    /// Maximum auto-continuations on max_tokens truncation per turn.
+    max_tokens_continue_cap: usize = 3,
+    /// Enable dynamic thinking governor (adaptive per-turn effort & mini.setThinking).
+    dynamic_thinking_enabled: bool = true,
+
     // MemAct Config
     memact_enabled: bool,
     context_window: u32,
@@ -316,6 +330,43 @@ pub const Config = struct {
             }
         }
 
+        const reasoning_effort: ?[]const u8 = blk: {
+            if (env_map.get("MINI_REASONING_EFFORT")) |s| {
+                if (std.mem.eql(u8, s, "minimal") or
+                    std.mem.eql(u8, s, "low") or
+                    std.mem.eql(u8, s, "medium") or
+                    std.mem.eql(u8, s, "high") or
+                    std.mem.eql(u8, s, "none"))
+                {
+                    break :blk s;
+                }
+            }
+            break :blk null;
+        };
+
+        const reasoning_effort_disabled = blk: {
+            const v = env_map.get("MINI_REASONING_EFFORT_DISABLED") orelse "0";
+            break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+        };
+
+        const thinking_budget_tokens: ?u32 = blk: {
+            if (env_map.get("MINI_THINKING_BUDGET")) |s| {
+                const val = std.fmt.parseInt(u32, s, 10) catch break :blk null;
+                if (val >= 1024) break :blk val;
+            }
+            break :blk null;
+        };
+
+        const max_tokens_continue_cap: usize = blk: {
+            const s = env_map.get("MINI_MAX_TOKENS_CONTINUE_CAP") orelse break :blk 3;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 3;
+        };
+
+        const dynamic_thinking_enabled = blk: {
+            const v = env_map.get("MINI_DYNAMIC_THINKING") orelse "1";
+            break :blk !std.mem.eql(u8, v, "0") and !std.mem.eql(u8, v, "false");
+        };
+
         return .{
             .execution_mode = exec_mode,
             .openai_protocol = openai_proto,
@@ -333,6 +384,12 @@ pub const Config = struct {
             .system_prompt_buf = sp_result.buf,
             .tool_allowlist = env_map.get("MINI_TOOL_ALLOWLIST"),
             .tool_blocklist = env_map.get("MINI_TOOL_BLOCKLIST"),
+            .reasoning_effort = reasoning_effort,
+            .reasoning_effort_disabled = reasoning_effort_disabled,
+            .thinking_budget_tokens = thinking_budget_tokens,
+            .thinking_temperature = 1.0,
+            .max_tokens_continue_cap = max_tokens_continue_cap,
+            .dynamic_thinking_enabled = dynamic_thinking_enabled,
             .memact_enabled = memact_enabled,
             .context_window = context_window,
             .ctx_safety_margin = ctx_safety_margin,

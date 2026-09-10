@@ -24,6 +24,7 @@ test {
     _ = @import("test_backend_error_inplace.zig");
     _ = @import("test_session_diagnostics.zig");
     _ = @import("test_procedural_graph.zig");
+    _ = @import("test_dynamic_thinking.zig");
 }
 
 // ---------------------------------------------------------------------------
