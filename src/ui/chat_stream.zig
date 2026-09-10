@@ -56,6 +56,11 @@ pub fn visibleWidth(str: []const u8) usize {
 
 /// Truncate ANSI-colored string so visual width <= max_cols.
 /// Automatically closes ANSI escape sequence with `\x1b[0m` at the end if truncated.
+/// Active reasoning effort label for the current Act, set by AgentLoop
+/// before streaming (e.g. "low" | "medium" | "high" | "minimal" | "none").
+/// Displayed live in the Thinking header and the Thought footer.
+pub var active_effort: ?[]const u8 = null;
+
 pub fn truncateAnsi(buf: []u8, str: []const u8, max_cols: usize) []const u8 {
     if (visibleWidth(str) <= max_cols) return str;
     if (max_cols <= 3) return "";
@@ -679,7 +684,13 @@ pub const TurnRenderer = struct {
         self.think_last_update_ms = 0;
 
         self.ensureNewline();
-        self.write(" \x1b[90m💭 Thinking...\x1b[0m");
+        var hdr_buf: [96]u8 = undefined;
+        if (active_effort) |eff| {
+            const hdr = std.fmt.bufPrint(&hdr_buf, " \x1b[90m💭 Thinking \x1b[36m[{s}]\x1b[0m", .{eff}) catch " \x1b[90m💭 Thinking...\x1b[0m";
+            self.write(hdr);
+        } else {
+            self.write(" \x1b[90m💭 Thinking...\x1b[0m");
+        }
     }
 
     pub fn streamThinking(self: *TurnRenderer, text: []const u8) void {
@@ -723,13 +734,18 @@ pub const TurnRenderer = struct {
 
             const snippet = std.mem.trim(u8, self.think_snippet_buf[0..self.think_snippet_len], " ");
             var out_buf: [256]u8 = undefined;
+            var eff_buf: [48]u8 = undefined;
+            const eff_part = if (active_effort) |eff|
+                std.fmt.bufPrint(&eff_buf, " \x1b[36m[{s}]\x1b[0m", .{eff}) catch ""
+            else
+                "";
             const line = if (snippet.len > 0)
-                std.fmt.bufPrint(&out_buf, " \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})...\x1b[0m \x1b[2;90m{s}\x1b[0m", .{
-                    frame, dur_str, snippet,
+                std.fmt.bufPrint(&out_buf, " \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})\x1b[0m{s} \x1b[2;90m{s}\x1b[0m", .{
+                    frame, dur_str, eff_part, snippet,
                 }) catch ""
             else
-                std.fmt.bufPrint(&out_buf, " \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})...\x1b[0m", .{
-                    frame, dur_str,
+                std.fmt.bufPrint(&out_buf, " \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})\x1b[0m{s}...\x1b[0m", .{
+                    frame, dur_str, eff_part,
                 }) catch "";
 
             if (line.len > 0) self.renderInplaceLine(line);
@@ -745,8 +761,11 @@ pub const TurnRenderer = struct {
         var dur_buf: [32]u8 = undefined;
         const dur_str = utils.formatDuration(&dur_buf, @intCast(diff));
 
-        var buf: [128]u8 = undefined;
-        const footer = std.fmt.bufPrint(&buf, "\r\x1b[2K \x1b[90m💭 Thought for {s}\x1b[0m\n", .{dur_str}) catch "\r\x1b[2K \x1b[90m💭 Thought\x1b[0m\n";
+        var buf: [160]u8 = undefined;
+        const footer = if (active_effort) |eff|
+            std.fmt.bufPrint(&buf, "\r\x1b[2K \x1b[90m💭 Thought for {s} \x1b[36m[{s}]\x1b[0m\n", .{ dur_str, eff }) catch "\r\x1b[2K \x1b[90m💭 Thought\x1b[0m\n"
+        else
+            std.fmt.bufPrint(&buf, "\r\x1b[2K \x1b[90m💭 Thought for {s}\x1b[0m\n", .{dur_str}) catch "\r\x1b[2K \x1b[90m💭 Thought\x1b[0m\n";
         self.write(footer);
     }
 

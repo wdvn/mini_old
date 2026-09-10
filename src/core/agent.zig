@@ -185,6 +185,10 @@ pub const AgentLoop = struct {
     last_turn_completion_tokens: usize = 0,
     /// Whether the previous act encountered an error (tool failure or JS error).
     last_act_failed: bool = false,
+    /// Sticky reasoning effort/budget resolved in the previous Act
+    /// (model-driven selection via mini.setThinking, with sticky fallback).
+    last_effort: ?[]const u8 = null,
+    last_budget: ?u32 = null,
     /// Procedural Graph Store (RFC-010).
     pg_store: ?*graph_store_mod.PGraphStore = null,
     /// Last executed tool name (RFC-010 active node anchor).
@@ -501,27 +505,40 @@ pub const AgentLoop = struct {
             var effective_budget: ?u32 = self.config.thinking_budget_tokens;
 
             // Priority 1: Explicit JS override via mini.setThinking
+            // (Model-driven selection: the model chooses its own effort level
+            // per the agent's guidance in the system prompt.)
             if (js_bindings.consumePendingThinkingOverride()) |override| {
                 if (override.effort) |eff| effective_effort = eff;
                 if (override.budget_tokens) |bud| effective_budget = bud;
             } else if (self.config.dynamic_thinking_enabled) {
-                // Priority 2: Adaptive cognitive governor
                 if (act_id == 1) {
+                    // Act 1: no model choice yet — start from config/default
                     effective_effort = self.config.reasoning_effort orelse "high";
                     effective_budget = self.config.thinking_budget_tokens orelse 4096;
                 } else if (self.last_act_failed or self.js_retry_count > 0) {
-                    // Error recovery: allocate high budget to reflect on failure
+                    // Priority 3a: Error recovery safety net — escalate to high
+                    // regardless of sticky/model preference
                     effective_effort = "high";
                     effective_budget = 4096;
                 } else {
-                    // Routine tool follow-up: allocate low budget to reduce latency
-                    effective_effort = "low";
-                    effective_budget = 1024;
+                    // Priority 3b: Sticky effort — the model did not call
+                    // mini.setThinking last Act, so keep the previous level
+                    // instead of forcing "low". This lets the model sustain
+                    // its chosen effort across routine follow-ups.
+                    effective_effort = self.last_effort;
+                    effective_budget = self.last_budget;
                 }
             }
 
+            // Remember the resolved values so they can stick when the model
+            // makes no explicit choice in subsequent Acts.
+            self.last_effort = effective_effort;
+            self.last_budget = effective_budget;
+
             self.backend.setReasoningEffort(effective_effort);
             self.backend.setThinkingBudget(effective_budget);
+            // Publish effort level to UI for live Thinking/Thought display
+            chat_stream.active_effort = effective_effort;
         }
 
         // Send to AI backend (streaming)
