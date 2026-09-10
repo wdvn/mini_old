@@ -124,6 +124,9 @@ pub const StopReason = enum {
     max_tokens,
     /// Stop sequence triggered.
     stop_sequence,
+    /// Stream aborted by idle stall watchdog (RFC-009 Phase 5) — partial
+    /// content may have been preserved; agent decides how to recover.
+    stream_aborted,
     /// Unknown stop reason.
     unknown,
 };

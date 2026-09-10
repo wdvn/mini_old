@@ -723,6 +723,40 @@ pub const AgentLoop = struct {
                 main.stderrPrint("\n", .{});
                 return .continue_loop;
             },
+            // RFC-009 Phase 5: stream aborted by idle stall watchdog. Partial
+            // content (if any) is already in the response. If a complete tool
+            // call was received, execute it normally; otherwise inject an
+            // observation so the governor escalates effort on retry.
+            .stream_aborted => {
+                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{
+                    .exec_type = "stream_idle_timeout",
+                    .is_error = true,
+                    .error_message = "stream aborted by idle watchdog",
+                });
+                var has_tool_use = false;
+                for (response.content.items) |block| {
+                    if (block == .tool_use) {
+                        has_tool_use = true;
+                        break;
+                    }
+                }
+                if (has_tool_use) {
+                    self.last_act_failed = true;
+                    try self.executeTools(act_id, &response);
+                    return .continue_loop;
+                }
+                if (response.content.items.len == 0) {
+                    self.last_act_failed = true;
+                    main.stderrPrint("\n\x1b[33m[agent] ⚠️ Stream stalled (idle watchdog), retrying...\x1b[0m\n", .{});
+                    return error.LLMProviderUnavailable;
+                }
+                // Partial text present: treat like truncation — ask model to continue.
+                self.last_act_failed = true;
+                main.stderrPrint("\n\x1b[33m[agent] ⚠️ Stream stalled mid-response, requesting continuation...\x1b[0m\n", .{});
+                const note = "[System] The previous response was interrupted because the model stream went silent (idle watchdog). Continue EXACTLY from where it stopped — do not repeat already written content.";
+                try self.history.addUser(note);
+                return .continue_loop;
+            },
             .unknown => {
                 self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{
                     .exec_type = "error",

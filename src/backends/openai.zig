@@ -109,6 +109,18 @@ pub const Client = struct {
         self.active_reasoning_effort = effort;
     }
 
+    /// Idle watchdog timeout scaled by active reasoning effort (RFC-009 Phase 5).
+    /// low/minimal → tight window (routine acts finish fast); high → generous.
+    fn effectiveIdleTimeout(self: *const Client) u32 {
+        if (utils.getEnvSlice("MINI_STREAM_IDLE_TIMEOUT")) |s| {
+            return std.fmt.parseInt(u32, std.mem.trim(u8, s, " \t"), 10) catch 0;
+        }
+        const eff = self.active_reasoning_effort orelse return 30;
+        if (std.mem.eql(u8, eff, "low") or std.mem.eql(u8, eff, "minimal")) return 15;
+        if (std.mem.eql(u8, eff, "high")) return 60;
+        return 30;
+    }
+
     /// Initialize client with explicit protocol mode.
     pub fn initWithProtocol(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32, protocol_mode: ProtocolMode) Client {
         return .{
@@ -183,15 +195,31 @@ pub const Client = struct {
             errdefer if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
 
             const headers = [_][]const u8{ auth_header, "Content-Type: application/json" };
-            const req_http_code = try http_lib.postStream(self.alloc, main.g_io, .{
+            var idle_aborted = false;
+            const stream_result = http_lib.postStream(self.alloc, main.g_io, .{
                 .url = url,
                 .headers = &headers,
                 .body = body,
                 .timeout_secs = 120,
+                .idle_timeout_secs = self.effectiveIdleTimeout(),
+                .out_idle_aborted = &idle_aborted,
             }, StreamCtx.onChunk, &ctx);
+            const req_http_code = if (stream_result) |c| c else |e| switch (e) {
+                error.StreamIdleTimeout => 0, // watchdog fired; finalize below
+                else => return e,
+            };
+
+            if (idle_aborted) {
+                ctx.response.stop_reason = .stream_aborted;
+            }
+
+            if (ctx.line_buf.items.len > 0) {
+                ctx.processLine(ctx.line_buf.items) catch {};
+                ctx.line_buf.clearRetainingCapacity();
+            }
 
             try ctx.finalizeToolCalls();
-            ctx.response.http_code = req_http_code;
+            ctx.response.http_code = if (req_http_code == 0) 598 else req_http_code; // 598 = watchdog-aborted marker
 
             // Auto-Negotiation & Adaptive Cross-Protocol Fallback (Tier 2)
             if (self.protocol_mode == .auto and ctx.raw_accum_init) {
@@ -580,6 +608,11 @@ const StreamCtx = struct {
     fn processLine(self: *StreamCtx, line: []const u8) !void {
         const trimmed = std.mem.trim(u8, line, " \t\r");
 
+        if (trimmed.len == 0) {
+            self.event_type_len = 0;
+            return;
+        }
+
         if (std.mem.startsWith(u8, trimmed, "event: ")) {
             const ev = trimmed["event: ".len..];
             const n = @min(ev.len, self.event_type.len);
@@ -591,20 +624,39 @@ const StreamCtx = struct {
         if (!std.mem.startsWith(u8, trimmed, "data: ")) return;
 
         const data = trimmed["data: ".len..];
-        const ev = self.event_type[0..self.event_type_len];
+        var ev: []const u8 = self.event_type[0..self.event_type_len];
+        if (json.findString(data, "type")) |t| {
+            if (std.mem.startsWith(u8, t, "response.")) {
+                ev = t;
+            }
+        }
 
         // Handle [DONE] or Responses API completion event
         if (std.mem.eql(u8, data, "[DONE]") or std.mem.eql(u8, ev, "response.done") or std.mem.eql(u8, ev, "response.completed")) {
             // Check usage in Responses API payload if present
             if (std.mem.startsWith(u8, data, "{")) {
-                if (json.findObject(data, "response")) |resp_obj| {
-                    if (json.findObject(resp_obj, "usage")) |u_obj| {
-                        const pt = if (json.findInt(u_obj, "input_tokens", u64)) |v| v else (json.findInt(u_obj, "prompt_tokens", u64) orelse 0);
-                        const ct = if (json.findInt(u_obj, "output_tokens", u64)) |v| v else (json.findInt(u_obj, "completion_tokens", u64) orelse 0);
-                        const tt = if (json.findInt(u_obj, "total_tokens", u64)) |v| v else (pt + ct);
-                        self.response.usage.prompt_tokens = pt;
-                        self.response.usage.completion_tokens = ct;
-                        self.response.usage.total_tokens = tt;
+                const usage_obj = blk: {
+                    if (json.findObject(data, "response")) |resp_obj| {
+                        if (json.findObject(resp_obj, "usage")) |u| break :blk u;
+                    }
+                    break :blk json.findObject(data, "usage");
+                };
+                if (usage_obj) |u_obj| {
+                    const pt = if (json.findInt(u_obj, "input_tokens", u64)) |v| v else (json.findInt(u_obj, "prompt_tokens", u64) orelse 0);
+                    const ct = if (json.findInt(u_obj, "output_tokens", u64)) |v| v else (json.findInt(u_obj, "completion_tokens", u64) orelse 0);
+                    const tt = if (json.findInt(u_obj, "total_tokens", u64)) |v| v else (pt + ct);
+                    self.response.usage.prompt_tokens = pt;
+                    self.response.usage.completion_tokens = ct;
+                    self.response.usage.total_tokens = tt;
+                    if (json.findObject(u_obj, "input_tokens_details")) |itd| {
+                        if (json.findInt(itd, "cached_tokens", u64)) |cv| {
+                            self.response.usage.cached_tokens = cv;
+                        }
+                    }
+                    if (json.findObject(u_obj, "output_tokens_details")) |otd| {
+                        if (json.findInt(otd, "reasoning_tokens", u64)) |rv| {
+                            self.response.usage.reasoning_tokens = rv;
+                        }
                     }
                 }
             }
@@ -641,8 +693,8 @@ const StreamCtx = struct {
                     try self.text_accum.appendSlice(self.alloc, unescaped);
                     if (self.text_cb) |cb| cb(unescaped);
                 }
-                return;
             }
+            return;
         }
 
         if (std.mem.eql(u8, ev, "response.reasoning_text.delta") or std.mem.eql(u8, ev, "response.reasoning.delta")) {
@@ -657,8 +709,8 @@ const StreamCtx = struct {
                     try self.think_accum.appendSlice(self.alloc, unescaped);
                     if (self.think_cb) |cb| cb(unescaped);
                 }
-                return;
             }
+            return;
         }
 
         if (std.mem.eql(u8, ev, "response.output_item.added")) {
@@ -715,6 +767,9 @@ const StreamCtx = struct {
             }
             return;
         }
+
+        // All other Responses API events (e.g. response.created, response.in_progress, response.content_part.added, etc.)
+        if (std.mem.startsWith(u8, ev, "response.")) return;
 
 
         // RFC-006 §3.1: Usage JSON parse struct (nested optional)
@@ -934,6 +989,21 @@ const StreamCtx = struct {
     }
 
     fn finalizeToolCalls(self: *StreamCtx) !void {
+        // Fallback: if server closed stream without [DONE] or response.completed
+        if (self.think_accum_init and self.think_accum.items.len > 0) {
+            const think_text = try self.alloc.dupe(u8, self.think_accum.items);
+            try self.response.content.append(self.alloc, .{ .thinking = .{ .thinking = think_text, .signature = "" } });
+            self.think_accum.clearRetainingCapacity();
+        }
+        if (self.text_accum_init and self.text_accum.items.len > 0) {
+            const text = try self.alloc.dupe(u8, self.text_accum.items);
+            try self.response.content.append(self.alloc, .{ .text = text });
+            self.text_accum.clearRetainingCapacity();
+        }
+        if (self.response.content.items.len > 0 and self.response.stop_reason == .unknown) {
+            self.response.stop_reason = .end_turn;
+        }
+
         for (self.tool_calls.items, 0..) |*tc, ti| {
             defer tc.deinit(self.alloc);
             if (tc.name.items.len == 0) continue;
@@ -1450,5 +1520,48 @@ test "openai dynamic reasoning_effort in buildResponsesRequestBody" {
     const body_default = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, null, "", &msgs, &tools);
     defer alloc.free(body_default);
     try testing.expect(std.mem.indexOf(u8, body_default, "\"reasoning\":{\"effort\":\"medium\"}") != null);
+}
+
+test "openai stream: Responses API embedded type in data without event prefix (OpenRouter style)" {
+    const alloc = testing.allocator;
+    var resp = proto.Response.init(alloc);
+    defer resp.deinit();
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = resp,
+        .line_buf = .empty,
+        .tool_calls = .empty,
+    };
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.tool_calls.deinit(alloc);
+
+    try feedLines(&ctx, &.{
+        \\data: {"type":"response.reasoning_text.delta","delta":"Let me think."}
+        ,
+        \\data: {"type":"response.output_text.delta","delta":"Hello "}
+        ,
+        \\data: {"type":"response.output_text.delta","delta":"world!"}
+        ,
+        \\data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":5},"output_tokens_details":{"reasoning_tokens":8}}}}
+        ,
+        \\data: [DONE]
+    });
+
+    try ctx.finalizeToolCalls();
+
+    try testing.expectEqual(proto.StopReason.end_turn, ctx.response.stop_reason);
+    try testing.expectEqual(@as(usize, 2), ctx.response.content.items.len);
+
+    // Thinking block
+    try testing.expectEqualStrings("Let me think.", ctx.response.content.items[0].thinking.thinking);
+    // Text block
+    try testing.expectEqualStrings("Hello world!", ctx.response.content.items[1].text);
+
+    // Usage check
+    try testing.expectEqual(@as(u64, 10), ctx.response.usage.prompt_tokens);
+    try testing.expectEqual(@as(u64, 20), ctx.response.usage.completion_tokens);
+    try testing.expectEqual(@as(u64, 30), ctx.response.usage.total_tokens);
+    try testing.expectEqual(@as(u64, 5), ctx.response.usage.cached_tokens);
+    try testing.expectEqual(@as(u64, 8), ctx.response.usage.reasoning_tokens);
 }
 

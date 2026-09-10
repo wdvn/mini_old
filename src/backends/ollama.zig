@@ -76,13 +76,23 @@ pub const Client = struct {
         errdefer if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
 
         const headers = [_][]const u8{"Content-Type: application/json"};
-        const req_http_code = try http_lib.postStream(self.alloc, main.g_io, .{
+        // RFC-009 Phase 5: stream stall watchdog (fixed 30s idle; Ollama is
+        // local so a longer silence means the model/server is wedged).
+        var idle_aborted = false;
+        const stream_result = http_lib.postStream(self.alloc, main.g_io, .{
             .url = url,
             .headers = &headers,
             .body = body,
+            .idle_timeout_secs = 30,
+            .out_idle_aborted = &idle_aborted,
         }, StreamCtx.onChunk, &ctx);
+        const req_http_code = if (stream_result) |c| c else |e| switch (e) {
+            error.StreamIdleTimeout => 598,
+            else => return e,
+        };
 
         ctx.response.http_code = req_http_code;
+        if (idle_aborted) ctx.response.stop_reason = .stream_aborted;
 
         // Save remaining text
         if (ctx.text_accum.items.len > 0) {

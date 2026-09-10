@@ -25,6 +25,15 @@ pub fn isSubagent() bool {
     return false;
 }
 
+/// Read an environment variable as an optional slice (process lifetime).
+pub fn getEnvSlice(name: [*:0]const u8) ?[]const u8 {
+    if (getenv(name)) |ptr| {
+        const span = std.mem.span(ptr);
+        if (span.len > 0) return span;
+    }
+    return null;
+}
+
 /// Read entire file content into allocated buffer.
 /// Equivalent to File.readAll() removed in newer Zig versions.
 pub fn readAll(io: std.Io, file: std.Io.File, buf: []u8) !usize {

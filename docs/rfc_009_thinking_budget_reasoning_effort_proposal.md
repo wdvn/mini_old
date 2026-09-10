@@ -203,6 +203,13 @@ flowchart TD
 ### Phase 4 — Documentation
 10. Update `docs/agent_loop_execution_architecture.md` on stop-reason handling; add configuration examples to README reasoning section.
 
+### Phase 5 — Stream Stall Watchdog (RFC-009 §3.8)
+11. `openai.zig` / `claude.zig`: per-chunk activity timestamp in StreamCtx; idle watchdog aborts the stream when no bytes arrive for `MINI_STREAM_IDLE_TIMEOUT` (default 30s, scaled by active effort: low=15s, high=60s).
+12. `protocol.zig`: add `stop_reason = .stream_aborted`; finalize flushes accumulated thinking/text content (reuse finalizeToolCalls fallback) so partial data is never lost.
+13. `agent.zig`: on `.stream_aborted`, if a complete tool call was received → execute normally; otherwise inject "stream interrupted" tool result, set `last_act_failed` → dynamic governor escalates effort to high on retry.
+14. Journal: record `stream_idle_timeout` error with received byte count for session-diagnostics.
+15. E2E test: mock SSE server accepts request then goes silent → binary must recover/retry within < idle_timeout + small margin instead of hanging for full HTTP timeout (120s).
+
 ---
 
 ## 5. Risks & Mitigations
@@ -238,6 +245,10 @@ flowchart TD
 - [ ] Phase 3: Continue-loop cap + reasoning-truncation-aware message
 - [ ] Phase 3: E2E mock test: continuous length stops at cap
 - [ ] Phase 4: Docs update (agent_loop doc + README config section)
+- [ ] Phase 5: Stream idle watchdog (per-chunk timestamp, effort-scaled timeout, abort + flush)
+- [ ] Phase 5: `stop_reason = .stream_aborted` + partial-content recovery in agent loop
+- [ ] Phase 5: Journal `stream_idle_timeout` telemetry
+- [ ] Phase 5: E2E silent-server test (< 30s recovery)
 
 ---
 

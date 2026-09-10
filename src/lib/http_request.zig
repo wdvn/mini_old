@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const posix = std.posix;
 const signals = @import("../core/signals.zig");
 
 /// Default body limit: 30KB — consistent with legacy tool protocol.
@@ -419,6 +420,12 @@ pub const StreamOptions = struct {
     body: []const u8 = "",
     /// Total timeout (seconds). Default: 120.
     timeout_secs: u32 = 120,
+    /// Idle (stall) watchdog: abort recv if no bytes arrive for this many
+    /// seconds (RFC-009 Phase 5). Kernel-level SO_RCVTIMEO; 0 = disabled.
+    idle_timeout_secs: u32 = 0,
+    /// Out flag: set true when the stream was aborted by the idle watchdog
+    /// after partial data was already received (partial content preserved).
+    out_idle_aborted: ?*bool = null,
 };
 
 /// Parse list of headers in "Key: Value" format → []std.http.Header (duplicated).
@@ -496,13 +503,48 @@ pub fn postStream(
     var transfer_buf: [4096]u8 = undefined;
     const r = response.reader(&transfer_buf);
 
-    var chunk_buf: [4096]u8 = undefined;
-    while (true) {
-        if (signals.isInterrupted()) return error.Interrupted;
-        const n = try r.readSliceShort(&chunk_buf);
-        if (signals.isInterrupted()) return error.Interrupted;
-        if (n == 0) break;
-        on_chunk(chunk_buf[0..n], userdata);
+    // Idle fd for the Stream Stall Watchdog (RFC-009 Phase 5).
+    const watch_fd: ?posix.socket_t = if (opts.idle_timeout_secs > 0)
+        (if (req.connection) |conn| conn.stream_reader.stream.socket.handle else null)
+    else
+        null;
+
+    var got_any = false;
+    const read_result: anyerror!void = blk: {
+        while (true) {
+            if (signals.isInterrupted()) break :blk error.Interrupted;
+            // Stream Stall Watchdog: poll with idle timeout before each blocked
+            // read. If the server goes silent for > idle_timeout_secs, abort
+            // instead of blocking until the total timeout (120s) elapses.
+            if (watch_fd) |fd| {
+                if (r.bufferedLen() == 0) {
+                    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+                    const timeout_ms: i32 = @intCast(@as(u64, opts.idle_timeout_secs) * 1000);
+                    const prc = posix.poll(&fds, timeout_ms) catch |e| break :blk e;
+                    if (prc == 0) {
+                        // No bytes within the idle window → stream stalled.
+                        if (opts.out_idle_aborted) |flag| flag.* = true;
+                        if (!got_any) return error.StreamIdleTimeout;
+                        break :blk error.StreamIdleTimeout;
+                    }
+                }
+            }
+            const chunk = r.peekGreedy(1) catch |e| switch (e) {
+                error.EndOfStream => break :blk {},
+                else => break :blk e,
+            };
+            if (signals.isInterrupted()) break :blk error.Interrupted;
+            if (chunk.len == 0) break :blk {};
+            got_any = true;
+            on_chunk(chunk, userdata);
+            r.toss(chunk.len);
+        }
+        break :blk {};
+    };
+    if (read_result) |_| {} else |e| {
+        if (e == error.Interrupted) return error.Interrupted;
+        if (e == error.StreamIdleTimeout) return error.StreamIdleTimeout;
+        return e;
     }
 
     return @intFromEnum(response.head.status);
@@ -999,4 +1041,96 @@ test "postStream: SSE stream receives all chunks + status" {
     try testing.expectEqual(@as(u32, 200), status);
     try testing.expectEqualStrings("data: a\n\ndata: b\n\ndata: c\n\n", ctx.buf.items);
     try testing.expect(ctx.chunks >= 1);
+}
+
+/// Epoch milliseconds via raw clock (Zig 0.16 moved std.time.milliTimestamp).
+fn testMilliTimestamp() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1000000);
+}
+
+/// Server that sends a partial response then holds the connection open and
+/// silent, for testing the stream stall watchdog (RFC-009 Phase 5).
+const SilentServerCtx = struct {
+    io: std.Io,
+    port: u16,
+    response: []const u8,
+    ready: std.Io.Event = .unset,
+    done: std.Io.Event = .unset,
+
+    fn run(self: *SilentServerCtx) void {
+        self.serve() catch {};
+        self.done.set(self.io);
+    }
+
+    fn serve(self: *SilentServerCtx) !void {
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", self.port);
+        var server = try addr.listen(self.io, .{ .reuse_address = true });
+        defer server.deinit(self.io);
+        self.ready.set(self.io);
+        var stream = try server.accept(self.io);
+        defer stream.close(self.io);
+        // Read client request head
+        var read_buf: [8192]u8 = undefined;
+        var s_reader = stream.reader(self.io, &read_buf);
+        _ = s_reader.interface.peekGreedy(1) catch {};
+        // Send partial response
+        var write_buf: [8192]u8 = undefined;
+        var s_writer = stream.writer(self.io, &write_buf);
+        try s_writer.interface.writeAll(self.response);
+        try s_writer.interface.flush();
+        // Hold the connection open well past the client's idle window (1s).
+        var ts: std.os.linux.timespec = .{ .sec = 3, .nsec = 0 };
+        _ = std.os.linux.nanosleep(&ts, &ts);
+    }
+};
+
+test "postStream: idle watchdog aborts silent stream with partial data" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Valid SSE headers + one data line, then nothing — the server goes silent.
+    const response =
+        "HTTP/1.1 200 OK\r\n" ++
+        "content-type: text/event-stream\r\n" ++
+        "\r\n" ++
+        "data: partial\n\n";
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var bind_server = try addr.listen(io, .{ .reuse_address = true });
+    const port = bind_server.socket.address.getPort();
+    bind_server.deinit(io);
+
+    var srv = SilentServerCtx{ .io = io, .port = port, .response = response };
+    const thread = try std.Thread.spawn(.{}, SilentServerCtx.run, .{&srv});
+    defer thread.join();
+    defer srv.done.wait(io) catch {};
+    try srv.ready.wait(io);
+
+    const u = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/v1/stream", .{port});
+    defer alloc.free(u);
+
+    var ctx = StreamAccumCtx{ .buf = .empty, .chunks = 0 };
+    defer ctx.buf.deinit(alloc);
+
+    var idle_aborted = false;
+    const start_ms = testMilliTimestamp();
+    const result = postStream(alloc, io, .{
+        .url = u,
+        .body = "{\"q\":1}",
+        .headers = &.{"Content-Type: application/json"},
+        .timeout_secs = 30,
+        .idle_timeout_secs = 1,
+        .out_idle_aborted = &idle_aborted,
+    }, StreamAccumCtx.onChunk, &ctx);
+
+    const elapsed = testMilliTimestamp() - start_ms;
+
+    // Watchdog must fire: error returned, flag set, partial data preserved.
+    try testing.expectError(error.StreamIdleTimeout, result);
+    try testing.expect(idle_aborted);
+    try testing.expectEqualStrings("data: partial\n\n", ctx.buf.items);
+    // Must abort well before a full-request timeout would (30s).
+    try testing.expect(elapsed < 3 * std.time.ns_per_s / std.time.ns_per_ms);
 }

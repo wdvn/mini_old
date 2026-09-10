@@ -56,6 +56,17 @@ pub const Client = struct {
         self.active_thinking_budget = budget;
     }
 
+    /// Idle watchdog timeout scaled by active thinking budget (RFC-009 Phase 5).
+    fn effectiveIdleTimeout(self: *const Client) u32 {
+        if (utils.getEnvSlice("MINI_STREAM_IDLE_TIMEOUT")) |s| {
+            return std.fmt.parseInt(u32, std.mem.trim(u8, s, " \t"), 10) catch 0;
+        }
+        const b = self.active_thinking_budget orelse return 30;
+        if (b <= 1024) return 15;
+        if (b > 4096) return 60;
+        return 30;
+    }
+
     /// Sends messages and receives streaming response via Claude SSE.
     pub fn sendMessage(
         self: *Client,
@@ -102,13 +113,21 @@ pub const Client = struct {
             "anthropic-beta: prompt-caching-2024-07-31",
             "Content-Type: application/json",
         };
-        const req_http_code = try http_lib.postStream(self.alloc, main.g_io, .{
+        var idle_aborted = false;
+        const stream_result = http_lib.postStream(self.alloc, main.g_io, .{
             .url = CLAUDE_API_URL,
             .headers = &headers,
             .body = body,
+            .idle_timeout_secs = self.effectiveIdleTimeout(),
+            .out_idle_aborted = &idle_aborted,
         }, StreamCtx.onChunk, &ctx);
+        const req_http_code = if (stream_result) |c| c else |e| switch (e) {
+            error.StreamIdleTimeout => 598,
+            else => return e,
+        };
 
         ctx.response.http_code = req_http_code;
+        if (idle_aborted) ctx.response.stop_reason = .stream_aborted;
 
         // Save remaining text if any
         if (ctx.text_accum.items.len > 0) {
@@ -157,7 +176,7 @@ fn buildRequestBody(
     var thinking_str_buf: [128]u8 = undefined;
     const thinking_str: []const u8 = blk: {
         if (thinking_budget) |budget| {
-            if (budget > 0) {
+            if (budget >= 1024) {
                 if (effective_max_tokens <= budget) {
                     effective_max_tokens = budget + 4096;
                 }
