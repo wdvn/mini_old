@@ -315,3 +315,98 @@ test "pg: binary snapshot round-trip keeps superseded edges inactive for CAS-sty
     defer nbhd.deinit(alloc);
     try testing.expectEqual(@as(usize, 1), nbhd.edges.len); // only the active v2 edge
 }
+
+// ---------------------------------------------------------------------------
+// 6. PGraphStore (RFC-010 PG-1, PG-2, PG-3)
+// ---------------------------------------------------------------------------
+
+const PGraphStore = mini.graph_store_mod.PGraphStore;
+
+test "pg: PGraphStore seedDefaults creates JSONL and populates graph" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+
+    var buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_pgstore_test_{d}_1", .{std.os.linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var store = try PGraphStore.init(alloc, io, dir);
+    defer store.deinit();
+
+    try store.loadIndex(io);
+
+    // Default tools and edges must be present
+    try testing.expect(store.graph.active_node_count >= 10);
+    try testing.expect(store.graph.active_edge_count >= 5);
+
+    // Verify key nodes
+    try testing.expect(store.matchNode("bash") != null);
+    try testing.expect(store.matchNode("file_read") != null);
+    try testing.expect(store.matchNode("grep") != null);
+    try testing.expect(store.matchNode("file_edit") != null);
+
+    // Verify alias normalization
+    try testing.expectEqual(store.matchNode("bash"), store.matchNode("run_command"));
+    try testing.expectEqual(store.matchNode("bash"), store.matchNode("sh"));
+    try testing.expectEqual(store.matchNode("file_read"), store.matchNode("read_file"));
+    try testing.expectEqual(store.matchNode("file_read"), store.matchNode("view_file"));
+    try testing.expectEqual(store.matchNode("file_edit"), store.matchNode("replace_file_content"));
+    try testing.expectEqual(store.matchNode("file_edit"), store.matchNode("patch"));
+}
+
+test "pg: serializeGuidance generates 2-hop markdown guidance block" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+
+    var buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_pgstore_test_{d}_2", .{std.os.linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var store = try PGraphStore.init(alloc, io, dir);
+    defer store.deinit();
+
+    try store.loadIndex(io);
+
+    // Guidance for file_edit should suggest bash
+    const guidance_opt = try store.serializeGuidance(alloc, "file_edit", &.{}, false, 2);
+    try testing.expect(guidance_opt != null);
+    const guidance = guidance_opt.?;
+    defer alloc.free(guidance);
+
+    try testing.expect(std.mem.indexOf(u8, guidance, "[Procedural Graph Guidance]") != null);
+    try testing.expect(std.mem.indexOf(u8, guidance, "Current Action: `file_edit`") != null);
+    try testing.expect(std.mem.indexOf(u8, guidance, "`bash`") != null);
+}
+
+test "pg: recordTransition frequency gate promotes candidate edge at N >= 3" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+
+    var buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_pgstore_test_{d}_3", .{std.os.linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var store = try PGraphStore.init(alloc, io, dir);
+    defer store.deinit();
+
+    try store.loadIndex(io);
+
+    const initial_edges = store.graph.active_edge_count;
+
+    // Transition from list_dir to glob
+    try store.recordTransition(io, "list_dir", "glob");
+    try testing.expectEqual(initial_edges, store.graph.active_edge_count);
+
+    try store.recordTransition(io, "list_dir", "glob");
+    try testing.expectEqual(initial_edges, store.graph.active_edge_count);
+
+    // 3rd time: threshold reached -> edge promoted!
+    try store.recordTransition(io, "list_dir", "glob");
+    try testing.expectEqual(initial_edges + 1, store.graph.active_edge_count);
+
+    // Reload index from file to confirm persistence to JSONL
+    var store2 = try PGraphStore.init(alloc, io, dir);
+    defer store2.deinit();
+    try store2.loadIndex(io);
+    try testing.expectEqual(initial_edges + 1, store2.graph.active_edge_count);
+}

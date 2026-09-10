@@ -39,6 +39,20 @@ pub fn getHookListener() ?HookListener {
     return g_hook_listener;
 }
 
+/// Callback type for tool lifecycle listener (RFC-010 Procedural Graph).
+pub const ToolListener = *const fn (tool_name: []const u8, is_error: bool) void;
+var g_tool_listener: ?ToolListener = null;
+
+/// Set in-memory tool lifecycle listener.
+pub fn setToolListener(listener: ?ToolListener) void {
+    g_tool_listener = listener;
+}
+
+/// Get current in-memory tool lifecycle listener.
+pub fn getToolListener() ?ToolListener {
+    return g_tool_listener;
+}
+
 /// Struct holding payload data emitted by hook events.
 pub const HookPayload = struct {
     event: []const u8,
@@ -72,6 +86,13 @@ pub const HookPayload = struct {
 pub fn dispatch(alloc: Allocator, io: std.Io, payload: HookPayload) void {
     if (g_hook_listener) |listener| {
         listener(payload);
+    }
+    if (g_tool_listener) |tl| {
+        if (std.mem.eql(u8, payload.event, "post-tool-use")) {
+            if (payload.tool_name) |tname| {
+                tl(tname, payload.is_error);
+            }
+        }
     }
 
     const cmd = g_hook_cmd orelse return;

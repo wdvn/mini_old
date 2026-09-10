@@ -42,6 +42,7 @@ pub const quickjs_engine = @import("runtime/quickjs_engine.zig");
 pub const js_bindings = @import("runtime/js_bindings.zig");
 pub const process_manager = @import("runtime/process_manager.zig");
 pub const graph_mod = @import("lib/graph.zig");
+pub const graph_store_mod = @import("core/memact/graph_store.zig");
 
 pub const VERSION = "1.0.0";
 
@@ -263,11 +264,11 @@ pub fn main(init: std.process.Init) !void {
 
         renderer.finishTurn(.{
             .prompt_tokens = agent.token_estimator.estimate(expanded),
-            .completion_tokens = 0,
+            .completion_tokens = agent.last_turn_completion_tokens,
             .context_tokens = ctx_tokens,
-            .max_context_tokens = 128 * 1024,
+            .max_context_tokens = agent.config.context_window,
             .duration_ms = duration,
-            .acts_count = 1,
+            .acts_count = if (agent.last_turn_acts > 0) agent.last_turn_acts else 1,
         });
         return;
     }
@@ -307,11 +308,11 @@ pub fn main(init: std.process.Init) !void {
 
         renderer.finishTurn(.{
             .prompt_tokens = agent.token_estimator.estimate(expanded),
-            .completion_tokens = 0,
+            .completion_tokens = agent.last_turn_completion_tokens,
             .context_tokens = ctx_tokens,
-            .max_context_tokens = 128 * 1024,
+            .max_context_tokens = agent.config.context_window,
             .duration_ms = duration,
-            .acts_count = 1,
+            .acts_count = if (agent.last_turn_acts > 0) agent.last_turn_acts else 1,
         });
         return;
     }
@@ -513,6 +514,7 @@ test {
     _ = @import("core/config.zig");
     _ = @import("core/memact/tokens.zig");
     _ = @import("core/memact/store.zig");
+    _ = @import("core/memact/graph_store.zig");
     _ = @import("tooling/registry.zig");
     _ = @import("lib/http_request.zig");
     _ = @import("lib/graph.zig");

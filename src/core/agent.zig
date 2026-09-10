@@ -38,6 +38,7 @@ const utils = @import("utils.zig");
 const quickjs = @import("../runtime/quickjs_engine.zig");
 const js_bindings = @import("../runtime/js_bindings.zig");
 const tokens_mod = @import("memact/tokens.zig");
+const graph_store_mod = @import("memact/graph_store.zig");
 const snapshot_mod = @import("snapshot.zig");
 const cas_mod = @import("cas.zig");
 pub const journal_mod = @import("journal.zig");
@@ -53,6 +54,14 @@ fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
         return std.mem.span(ptr);
     }
     return null;
+}
+
+var g_active_agent: ?*AgentLoop = null;
+
+fn agentToolListener(tool_name: []const u8, is_error: bool) void {
+    if (g_active_agent) |agent| {
+        agent.onToolCompleted(tool_name, is_error);
+    }
 }
 
 /// Maximum retries on rate limit.
@@ -176,6 +185,12 @@ pub const AgentLoop = struct {
     last_turn_completion_tokens: usize = 0,
     /// Whether the previous act encountered an error (tool failure or JS error).
     last_act_failed: bool = false,
+    /// Procedural Graph Store (RFC-010).
+    pg_store: ?*graph_store_mod.PGraphStore = null,
+    /// Last executed tool name (RFC-010 active node anchor).
+    last_executed_tool: ?[]u8 = null,
+    /// Recent tool execution sequence (w acts window).
+    recent_tools: std.ArrayListUnmanaged([]u8) = .empty,
 
     pub const Error = error{
         LLMAuthenticationError,
@@ -250,6 +265,35 @@ pub const AgentLoop = struct {
         const acts_path = std.fmt.bufPrint(&acts_buf, "{s}/.mini/acts", .{home_dir}) catch "/tmp/mini_acts";
         const act_logger = act_logger_mod.ActLogger.init(alloc, io, acts_path) catch null;
 
+        var pg_store_ptr: ?*graph_store_mod.PGraphStore = null;
+        if (config.memact_pg_enabled) {
+            var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const cur_cwd = if (std.c.getcwd(&cwd_buf, cwd_buf.len)) |ptr| std.mem.sliceTo(ptr, 0) else ".";
+            const prj_hash = std.hash.Fnv1a_64.hash(cur_cwd);
+
+            var mem_path_buf: [512]u8 = undefined;
+            const mem_base = config.memory_dir orelse (getEnvVar("MINI_HOME") orelse (std.fmt.bufPrint(&mem_path_buf, "{s}/.mini/memory", .{home_dir}) catch ".mini/memory"));
+
+            const prj_mem_dir = std.fmt.allocPrint(alloc, "{s}/{x}", .{ mem_base, prj_hash }) catch null;
+            if (prj_mem_dir) |pmd| {
+                defer alloc.free(pmd);
+                const store = alloc.create(graph_store_mod.PGraphStore) catch null;
+                if (store) |st| {
+                    if (graph_store_mod.PGraphStore.init(alloc, io, pmd)) |val| {
+                        st.* = val;
+                        st.auto_populate = config.memact_pg_auto_populate;
+                        st.loadIndex(io) catch |e| {
+                            main.stderrPrint("[agent] Warning: Failed to load PGraph index: {s}\n", .{@errorName(e)});
+                        };
+                        pg_store_ptr = st;
+                    } else |e| {
+                        main.stderrPrint("[agent] Warning: Failed to init PGraphStore: {s}\n", .{@errorName(e)});
+                        alloc.destroy(st);
+                    }
+                }
+            }
+        }
+
         return .{
             .alloc = alloc,
             .io = io,
@@ -263,6 +307,9 @@ pub const AgentLoop = struct {
             .cas = cas,
             .journal = null,
             .act_logger = act_logger,
+            .pg_store = pg_store_ptr,
+            .last_executed_tool = null,
+            .recent_tools = .empty,
         };
     }
 
@@ -279,6 +326,19 @@ pub const AgentLoop = struct {
         if (self.journal) |*j| j.deinit();
         if (self.act_logger) |*al| al.deinit();
         if (self.last_backend_raw_error) |raw| self.alloc.free(raw);
+        if (self.pg_store) |st| {
+            st.deinit();
+            self.alloc.destroy(st);
+            self.pg_store = null;
+        }
+        if (self.last_executed_tool) |t| {
+            self.alloc.free(t);
+            self.last_executed_tool = null;
+        }
+        for (self.recent_tools.items) |t| {
+            self.alloc.free(t);
+        }
+        self.recent_tools.deinit(self.alloc);
     }
 
     /// Saves the latest backend error context for subsequent journal recordError.
@@ -404,6 +464,37 @@ pub const AgentLoop = struct {
         const input_msgs_count = self.history.len();
         const input_msgs = self.history.messages()[0..input_msgs_count];
 
+        // Procedural Graph (RFC-010): Prepare ephemeral situational guidance block
+        var temp_input_msgs = std.ArrayListUnmanaged(proto.Message).empty;
+        defer temp_input_msgs.deinit(self.alloc);
+        try temp_input_msgs.appendSlice(self.alloc, input_msgs);
+
+        var ephemeral_guidance: ?[]u8 = null;
+        defer if (ephemeral_guidance) |g| self.alloc.free(g);
+
+        var ephemeral_blocks: ?[]proto.ContentBlock = null;
+        defer if (ephemeral_blocks) |b| self.alloc.free(b);
+
+        if (self.pg_store) |pg| {
+            ephemeral_guidance = pg.serializeGuidance(
+                self.alloc,
+                self.last_executed_tool,
+                self.recent_tools.items,
+                self.last_act_failed,
+                self.config.memact_pg_h,
+            ) catch null;
+
+            if (ephemeral_guidance) |guidance_text| {
+                const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+                blocks[0] = .{ .text = guidance_text };
+                ephemeral_blocks = blocks;
+                try temp_input_msgs.append(self.alloc, .{
+                    .role = .user,
+                    .content = blocks,
+                });
+            }
+        }
+
         // Dynamic Thinking / Reasoning Effort modulation
         if (!self.config.reasoning_effort_disabled) {
             var effective_effort: ?[]const u8 = self.config.reasoning_effort;
@@ -437,7 +528,7 @@ pub const AgentLoop = struct {
         var response = try self.sendToBackend(
             act_id,
             self.config.system_prompt,
-            input_msgs,
+            temp_input_msgs.items,
             tool_defs,
             text_cb,
             think_cb,
@@ -717,6 +808,33 @@ pub const AgentLoop = struct {
 
 
     /// Processes user input through agentic loop.
+    /// Handle tool completion lifecycle event (RFC-010 Procedural Graph tracking)
+    pub fn onToolCompleted(self: *AgentLoop, tool_name: []const u8, is_error: bool) void {
+        if (self.pg_store) |pg| {
+            if (self.last_executed_tool) |prev_tool| {
+                pg.recordTransition(self.io, prev_tool, tool_name) catch {};
+            }
+        }
+
+        if (self.last_executed_tool) |old_t| {
+            self.alloc.free(old_t);
+            self.last_executed_tool = null;
+        }
+        self.last_executed_tool = self.alloc.dupe(u8, tool_name) catch null;
+
+        if (self.recent_tools.items.len >= self.config.memact_pg_w) {
+            const oldest = self.recent_tools.orderedRemove(0);
+            self.alloc.free(oldest);
+        }
+        if (self.alloc.dupe(u8, tool_name)) |dup_t| {
+            self.recent_tools.append(self.alloc, dup_t) catch {
+                self.alloc.free(dup_t);
+            };
+        } else |_| {}
+
+        self.last_act_failed = is_error;
+    }
+
     /// `text_cb`: invoked with each text chunk as AI streams.
     pub fn processInput(
         self: *AgentLoop,
@@ -724,6 +842,13 @@ pub const AgentLoop = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !void {
+        g_active_agent = self;
+        hooks_mod.setToolListener(&agentToolListener);
+        defer {
+            g_active_agent = null;
+            hooks_mod.setToolListener(null);
+        }
+
         // Allocate turn-scoped ArenaAllocator for memory cleanup
         var turn_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer turn_arena.deinit();

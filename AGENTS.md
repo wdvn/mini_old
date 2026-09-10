@@ -51,6 +51,7 @@ testcases/            — all test files (standalone, integration, benchmarks, .
 - Tool calls preferentially pass through the JS VM (`runtime/js_bindings.zig`) rather than introducing new JSON tool-calling paths.
 - **Per-Act VM Isolation**: Each Act initializes an independent `JSContext` to eliminate global variable scope pollution (`const`/`let`) across turns.
 - **MemAct Reactive Compaction**: Reactive-only context compression (triggers only when backend returns context limit error, drops-all and inserts summary at index 1, preserving original prompt at index 0).
+- **Procedural Graph (RFC-010)**: Procedural knowledge stored as event-sourced directed graph in `~/.mini/memory/<project_hash>/pgraph.jsonl`. Dynamically localizes active tool nodes, extracts 2-hop neighborhood, injects ephemeral guidance blocks, and automatically learns frequent tool transitions (N >= 3).
 - **Dual-Protocol Auto-Negotiation**: Automatically switch and remember protocol between Chat Completions API and Responses API for OpenAI-compatible endpoints.
 - **Execution & Stopping Rules**: The agent strictly follows 4 stopping rules (Stop on Completion, Confirm Before Mutation, Avoid Action Loops, Progress Checkpoint).
 - Backends conform to `core/protocol.zig`; do not make direct HTTP calls in the agent loop.

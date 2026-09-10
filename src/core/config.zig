@@ -152,6 +152,16 @@ pub const Config = struct {
     /// Memory directory. Null = caller builds ~/.mini/memory.
     memory_dir: ?[]const u8 = null,
 
+    // Procedural Graph (RFC-010)
+    /// Whether Procedural Graph online guidance is enabled.
+    memact_pg_enabled: bool = false,
+    /// Procedural Graph neighborhood hop distance for localized guidance (default: 2).
+    memact_pg_h: u32 = 2,
+    /// Number of recent trajectory acts considered for context (default: 3).
+    memact_pg_w: u32 = 3,
+    /// Automatically learn and persist frequent tool transitions (N >= 3).
+    memact_pg_auto_populate: bool = true,
+
     // Budget Limits (RFC-002)
     budget_max_tokens: usize,
 
@@ -302,6 +312,26 @@ pub const Config = struct {
 
         const memory_dir: ?[]const u8 = env_map.get("MINI_MEMORY_DIR");
 
+        const memact_pg_enabled: bool = blk: {
+            const s = env_map.get("MINI_MEMACT_PG_ENABLED") orelse env_map.get("MINI_PG_ENABLED") orelse break :blk false;
+            break :blk std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
+        };
+
+        const memact_pg_h: u32 = blk: {
+            const s = env_map.get("MINI_MEMACT_PG_H") orelse break :blk 2;
+            break :blk std.fmt.parseInt(u32, s, 10) catch 2;
+        };
+
+        const memact_pg_w: u32 = blk: {
+            const s = env_map.get("MINI_MEMACT_PG_W") orelse break :blk 3;
+            break :blk std.fmt.parseInt(u32, s, 10) catch 3;
+        };
+
+        const memact_pg_auto_populate: bool = blk: {
+            const s = env_map.get("MINI_MEMACT_PG_AUTO_POPULATE") orelse break :blk true;
+            break :blk !std.mem.eql(u8, s, "0") and !std.mem.eql(u8, s, "false");
+        };
+
         const budget_max_tokens: usize = blk: {
             const s = env_map.get("MINI_BUDGET_MAX_TOKENS") orelse break :blk 10_000_000; // default large budget
             break :blk std.fmt.parseInt(usize, s, 10) catch 10_000_000;
@@ -333,6 +363,11 @@ pub const Config = struct {
                 const window_src = if (env_map.get("MINI_CONTEXT_WINDOW") != null) "env" else "auto/backend";
                 main.stderrPrint("[config] MemAct: window={d} ({s}), top_k={d}, budget={d}, extract={s}\n", .{
                     context_window, window_src, memact_top_k, memact_memory_budget, memact_extract,
+                });
+            }
+            if (memact_pg_enabled) {
+                main.stderrPrint("[config] Procedural Graph: enabled, h={d}, w={d}, auto_populate={}\n", .{
+                    memact_pg_h, memact_pg_w, memact_pg_auto_populate,
                 });
             }
         }
@@ -419,6 +454,10 @@ pub const Config = struct {
             .memact_memory_budget = memact_memory_budget,
             .memact_extract = memact_extract,
             .memory_dir = memory_dir,
+            .memact_pg_enabled = memact_pg_enabled,
+            .memact_pg_h = memact_pg_h,
+            .memact_pg_w = memact_pg_w,
+            .memact_pg_auto_populate = memact_pg_auto_populate,
             .budget_max_tokens = budget_max_tokens,
             .mcp_config_path = env_map.get("MINI_MCP_CONFIG"),
             .history_enabled = history_enabled,
