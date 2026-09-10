@@ -865,17 +865,28 @@ pub const TurnRenderer = struct {
         term.writeStdout("\r\x1b[2K");
         term.writeStdout(header_line);
 
+        // Anti-wrap: each in-place line MUST occupy exactly 1 terminal row,
+        // otherwise cursor-up (\x1b[1A) math in subsequent re-renders and in
+        // endCodeAct() lands on the wrong row and garbles the block.
+        const win = term.getTerminalSize();
+        // prefix "  │ " ≈ 6 cols + margins; keep 4 cols spare
+        const max_content_cols: usize = if (win.cols > 14) win.cols - 10 else 60;
+
         // Render Line 2
         if (line2_opt) |l2| {
+            var l2_trunc: [160]u8 = undefined;
+            const l2_safe = truncateAnsi(&l2_trunc, l2, max_content_cols);
             var l2_buf: [256]u8 = undefined;
-            const l2_str = std.fmt.bufPrint(&l2_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m \x1b[2;37m{s}\x1b[0m", .{l2}) catch "";
+            const l2_str = std.fmt.bufPrint(&l2_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m \x1b[2;37m{s}\x1b[0m", .{l2_safe}) catch "";
             term.writeStdout(l2_str);
         }
 
         // Render Line 3
         if (line3_opt) |l3| {
+            var l3_trunc: [160]u8 = undefined;
+            const l3_safe = truncateAnsi(&l3_trunc, l3, max_content_cols);
             var l3_buf: [256]u8 = undefined;
-            const l3_str = std.fmt.bufPrint(&l3_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m \x1b[37m{s}\x1b[0m", .{l3}) catch "";
+            const l3_str = std.fmt.bufPrint(&l3_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m \x1b[37m{s}\x1b[0m", .{l3_safe}) catch "";
             term.writeStdout(l3_str);
         }
 
