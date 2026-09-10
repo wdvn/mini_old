@@ -19,10 +19,15 @@
 //!   `OLLAMA_HOST`           Ollama base URL (default: http://localhost:11434)
 //!   `OLLAMA_MODEL`          Ollama model (default: llama3)
 //!
-//! ### Agent
-//!   `MINI_MAX_TOKENS`       Response token limit (default: 8192)
-//!   `MINI_SYSTEM_FILE`      Path to system prompt file (.md)
-//!   `MINI_NO_HISTORY`       "1" to disable in-memory history saving
+//! ### Agent & Reasoning
+//!   `MINI_MAX_TOKENS`               Response token limit (default: 24000)
+//!   `MINI_MAX_TOKENS_CONTINUE_CAP`  Max consecutive continuation acts when truncated by max_tokens (default: 3)
+//!   `MINI_SYSTEM_FILE`              Path to system prompt file (.md)
+//!   `MINI_NO_HISTORY`               "1" to disable in-memory history saving
+//!   `MINI_DYNAMIC_THINKING`         "0" to disable dynamic thinking governor (default: 1/enabled)
+//!   `MINI_REASONING_EFFORT`         Reasoning effort ("minimal"|"low"|"medium"|"high"|"none")
+//!   `MINI_REASONING_EFFORT_DISABLED` "1" to omit reasoning parameters for compat endpoints
+//!   `MINI_THINKING_BUDGET`          Thinking budget tokens (e.g. for Claude thinking.budget_tokens >= 1024)
 //!
 //! ### MemAct (RFC-003)
 //!   `MINI_MEMACT_ENABLED`       "0" to disable MemAct (default: enabled)
@@ -191,6 +196,7 @@ pub const Config = struct {
         \\  - `mini.http(method, url)`: HTTP request { status, body }
         \\  - `mini.artifact(name, content)`: Save artifact
         \\  - `mini.env(name)`: Read environment variable
+        \\  - `mini.setThinking(levelOrTokens)`: Modulate next-turn reasoning effort ("low"|"medium"|"high"|"none" or token budget number). Use "low" for routine file reads/searches, "high" for complex planning/debugging.
         \\  - `console.log(...)`: Print output
         \\
         \\## CodeAct Interaction Rules (MANDATORY):
@@ -203,6 +209,7 @@ pub const Config = struct {
         \\2. Confirm Before Mutation: While investigating/diagnosing, absolutely DO NOT modify files, configuration, or system state unless explicitly requested by the user. Always present findings and propose options first.
         \\3. Avoid Action Loops: If an approach does not yield results after 2-3 attempts, stop to re-evaluate hypotheses rather than repeating similar failed operations.
         \\4. Progress Checkpoint: If a complex task requires multiple steps and initial exploration does not conclude it, stop to summarize progress and request direction from the user.
+        \\5. Cognitive Efficiency: Minimize thinking latency on simple inspection or routine tool executions by self-modulating with `mini.setThinking("low")`; reserve high thinking effort for architecture design, complex debugging, or error recovery.
         \\
         \\Please answer concisely, accurately, and effectively in English.
     ;
@@ -366,6 +373,20 @@ pub const Config = struct {
             const v = env_map.get("MINI_DYNAMIC_THINKING") orelse "1";
             break :blk !std.mem.eql(u8, v, "0") and !std.mem.eql(u8, v, "false");
         };
+
+        if (!utils.isSubagent()) {
+            if (dynamic_thinking_enabled) {
+                main.stderrPrint("[config] Cognitive Governor: dynamic thinking enabled (effort={s}, budget={?d})\n", .{
+                    reasoning_effort orelse "auto",
+                    thinking_budget_tokens,
+                });
+            } else if (reasoning_effort != null or thinking_budget_tokens != null) {
+                main.stderrPrint("[config] Cognitive Governor: static thinking (effort={s}, budget={?d})\n", .{
+                    reasoning_effort orelse "(none)",
+                    thinking_budget_tokens,
+                });
+            }
+        }
 
         return .{
             .execution_mode = exec_mode,

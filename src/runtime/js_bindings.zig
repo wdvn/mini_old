@@ -17,6 +17,7 @@
 //!   - mini.http(method, url, opts?) → { status, body, truncated, headers }
 //!   - mini.artifact(name, content, metadata?)
 //!   - mini.env(varName)
+//!   - mini.setThinking(levelOrTokens)
 //!   - mini.workspaceRoot, mini.sessionId
 
 const std = @import("std");

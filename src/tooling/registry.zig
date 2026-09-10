@@ -174,7 +174,7 @@ pub fn executeTool(alloc: Allocator, io: std.Io, name: []const u8, input_json: [
 pub const definitions = [_]proto.ToolDefinition{
     .{
         .name = "codeact",
-        .description = "Execute JavaScript in an embedded CodeAct VM with mini.* global API (mini.sh, mini.read, mini.write, mini.patch, mini.http, mini.sessions, mini.sessionDetail, mini.sessionKill). Use for automating complex multi-step logic or data processing.",
+        .description = "Execute JavaScript in an embedded CodeAct VM with mini.* global API (mini.sh, mini.read, mini.write, mini.patch, mini.http, mini.sessions, mini.sessionDetail, mini.sessionKill, mini.setThinking). Use for automating complex multi-step logic or data processing.",
         .input_schema_json = \\{"type":"object","properties":{"code":{"type":"string","description":"JavaScript code to execute in CodeAct VM"}},"required":["code"]}
         ,
     },
