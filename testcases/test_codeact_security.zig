@@ -23,6 +23,7 @@ test {
     _ = @import("test_act_logger.zig");
     _ = @import("test_backend_error_inplace.zig");
     _ = @import("test_session_diagnostics.zig");
+    _ = @import("test_procedural_graph.zig");
 }
 
 // ---------------------------------------------------------------------------

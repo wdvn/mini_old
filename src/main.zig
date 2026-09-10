@@ -41,6 +41,7 @@ pub const resetThinkState = ui_repl.resetThinkState;
 pub const quickjs_engine = @import("runtime/quickjs_engine.zig");
 pub const js_bindings = @import("runtime/js_bindings.zig");
 pub const process_manager = @import("runtime/process_manager.zig");
+pub const graph_mod = @import("lib/graph.zig");
 
 pub const VERSION = "1.0.0";
 
@@ -514,6 +515,7 @@ test {
     _ = @import("core/memact/store.zig");
     _ = @import("tooling/registry.zig");
     _ = @import("lib/http_request.zig");
+    _ = @import("lib/graph.zig");
     _ = @import("tools/bash.zig");
     _ = @import("acp/server.zig");
     _ = @import("ui/unicode.zig");
