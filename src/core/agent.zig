@@ -189,6 +189,8 @@ pub const AgentLoop = struct {
     /// (model-driven selection via mini.setThinking, with sticky fallback).
     last_effort: ?[]const u8 = null,
     last_budget: ?u32 = null,
+    /// Dynamic thinking governor runtime state (enabled by default).
+    dynamic_thinking: bool = true,
     /// Procedural Graph Store (RFC-010).
     pg_store: ?*graph_store_mod.PGraphStore = null,
     /// Last executed tool name (RFC-010 active node anchor).
@@ -311,6 +313,7 @@ pub const AgentLoop = struct {
             .cas = cas,
             .journal = null,
             .act_logger = act_logger,
+            .dynamic_thinking = config.dynamic_thinking_enabled,
             .pg_store = pg_store_ptr,
             .last_executed_tool = null,
             .recent_tools = .empty,
@@ -510,7 +513,7 @@ pub const AgentLoop = struct {
             if (js_bindings.consumePendingThinkingOverride()) |override| {
                 if (override.effort) |eff| effective_effort = eff;
                 if (override.budget_tokens) |bud| effective_budget = bud;
-            } else if (self.config.dynamic_thinking_enabled) {
+            } else if (self.dynamic_thinking) {
                 if (act_id == 1) {
                     // Act 1: no model choice yet — start from config/default
                     effective_effort = self.config.reasoning_effort orelse "high";
@@ -1260,6 +1263,40 @@ pub const AgentLoop = struct {
             else => {
                 main.stderrPrint("[agent] /config protocol only applies to openai-compat backend\n", .{});
             },
+        }
+    }
+
+    /// Toggle dynamic thinking governor at runtime.
+    pub fn setDynamicThinking(self: *AgentLoop, enabled: bool) void {
+        self.dynamic_thinking = enabled;
+        main.stderrPrint("[agent] Dynamic thinking: {s}\n", .{if (enabled) "enabled" else "disabled"});
+    }
+
+    /// Set reasoning effort at runtime ("low" | "medium" | "high" | "none" | "auto").
+    pub fn setReasoningEffort(self: *AgentLoop, effort: []const u8) void {
+        if (std.mem.eql(u8, effort, "auto")) {
+            self.dynamic_thinking = true;
+            self.last_effort = null;
+            self.backend.setReasoningEffort(null);
+            main.stderrPrint("[agent] Reasoning effort set to: auto (dynamic thinking enabled)\n", .{});
+        } else if (std.mem.eql(u8, effort, "low")) {
+            self.last_effort = "low";
+            self.backend.setReasoningEffort("low");
+            main.stderrPrint("[agent] Reasoning effort set to: low\n", .{});
+        } else if (std.mem.eql(u8, effort, "medium") or std.mem.eql(u8, effort, "med")) {
+            self.last_effort = "medium";
+            self.backend.setReasoningEffort("medium");
+            main.stderrPrint("[agent] Reasoning effort set to: medium\n", .{});
+        } else if (std.mem.eql(u8, effort, "high")) {
+            self.last_effort = "high";
+            self.backend.setReasoningEffort("high");
+            main.stderrPrint("[agent] Reasoning effort set to: high\n", .{});
+        } else if (std.mem.eql(u8, effort, "none") or std.mem.eql(u8, effort, "off")) {
+            self.last_effort = "none";
+            self.backend.setReasoningEffort("none");
+            main.stderrPrint("[agent] Reasoning effort set to: none\n", .{});
+        } else {
+            main.stderrPrint("[agent] Invalid reasoning effort: {s}. Choices: auto, low, medium, high, none\n", .{effort});
         }
     }
 

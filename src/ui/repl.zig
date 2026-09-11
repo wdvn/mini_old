@@ -148,6 +148,8 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
             \\  /model <backend>    Switch backend (openai, claude, ollama)
             \\  /config [show]      Show current configuration
             \\  /config protocol <auto|chat|responses>  Set OpenAI protocol mode
+            \\  /config thinking <on|off>               Toggle dynamic thinking governor
+            \\  /config reasoning <auto|low|med|high|none> Set reasoning effort
             \\  /artifact [list]    View session artifacts list
             \\  /artifact show <fn> Read an artifact content
             \\  /quit, /exit, /q    Exit
@@ -185,8 +187,24 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
             } else {
                 main.stdoutPrint("Usage: /config protocol <auto|chat|responses>\n", .{});
             }
+        } else if (std.mem.startsWith(u8, sub, "thinking")) {
+            const val_str = std.mem.trim(u8, sub["thinking".len..], " \t");
+            if (std.mem.eql(u8, val_str, "on") or std.mem.eql(u8, val_str, "1") or std.mem.eql(u8, val_str, "true")) {
+                agent.setDynamicThinking(true);
+            } else if (std.mem.eql(u8, val_str, "off") or std.mem.eql(u8, val_str, "0") or std.mem.eql(u8, val_str, "false")) {
+                agent.setDynamicThinking(false);
+            } else {
+                main.stdoutPrint("Usage: /config thinking <on|off>\n", .{});
+            }
+        } else if (std.mem.startsWith(u8, sub, "reasoning")) {
+            const effort_str = std.mem.trim(u8, sub["reasoning".len..], " \t");
+            if (effort_str.len > 0) {
+                agent.setReasoningEffort(effort_str);
+            } else {
+                main.stdoutPrint("Usage: /config reasoning <auto|low|medium|high|none>\n", .{});
+            }
         } else {
-            main.stdoutPrint("Usage: /config [show] | /config protocol <auto|chat|responses>\n", .{});
+            main.stdoutPrint("Usage: /config [show] | protocol <auto|chat|responses> | thinking <on|off> | reasoning <auto|low|medium|high|none>\n", .{});
         }
         return true;
     }
@@ -239,40 +257,72 @@ fn printConfig(agent: *agent_mod.AgentLoop) void {
         },
     }
 
-    const reasoning_str = if (agent.config.reasoning_effort_disabled)
-        "disabled"
-    else
-        agent.config.reasoning_effort orelse "none";
+    var reasoning_buf: [64]u8 = undefined;
+    var reasoning_str: []const u8 = "none";
 
+    if (agent.config.reasoning_effort_disabled) {
+        reasoning_str = "disabled";
+    } else {
+        switch (agent.backend) {
+            .openai => |c| {
+                if (c.disable_reasoning_effort) {
+                    reasoning_str = "disabled (endpoint incompatible)";
+                } else if (agent.last_effort) |last| {
+                    if (agent.dynamic_thinking) {
+                        reasoning_str = std.fmt.bufPrint(&reasoning_buf, "auto (active: {s})", .{last}) catch "auto";
+                    } else {
+                        reasoning_str = last;
+                    }
+                } else if (agent.dynamic_thinking) {
+                    if (agent.config.reasoning_effort) |re| {
+                        reasoning_str = std.fmt.bufPrint(&reasoning_buf, "auto (configured: {s})", .{re}) catch "auto";
+                    } else {
+                        reasoning_str = "auto (dynamic)";
+                    }
+                } else if (agent.config.reasoning_effort) |re| {
+                    reasoning_str = re;
+                }
+            },
+            .claude => |c| {
+                const budget = c.active_thinking_budget orelse agent.config.thinking_budget_tokens;
+                if (budget) |b| {
+                    reasoning_str = std.fmt.bufPrint(&reasoning_buf, "{d} tokens", .{b}) catch "enabled";
+                }
+            },
+            .ollama => {},
+        }
+    }
+
+    const dynamic_thinking_str: []const u8 = if (agent.dynamic_thinking) "enabled (Cognitive Governor)" else "disabled";
     const memact_str: []const u8 = if (agent.config.memact_enabled) "enabled" else "disabled";
 
     main.stdoutPrint(
-        \\
-        \\\x1b[1;36mmini-agent Configuration\x1b[0m
-        \\  \x1b[1mBackend:\x1b[0m         {s}
-        \\  \x1b[1mModel:\x1b[0m           {s}
-        \\  \x1b[1mEndpoint:\x1b[0m        {s}
-        \\  \x1b[1mProtocol:\x1b[0m        {s}
-        \\  \x1b[1mAPI Key:\x1b[0m         {s}
-        \\  \x1b[1mExecution Mode:\x1b[0m  {s}
-        \\  \x1b[1mContext Window:\x1b[0m  {d} tokens
-        \\  \x1b[1mMax Tokens:\x1b[0m      {d} tokens
-        \\  \x1b[1mReasoning:\x1b[0m       {s}
-        \\  \x1b[1mMemAct:\x1b[0m          {s}
-        \\
-        \\
-    , .{
-        backend_name,
-        model_name,
-        endpoint,
-        proto_str,
-        api_key_status,
-        @tagName(agent.config.execution_mode),
-        agent.config.context_window,
-        agent.config.max_tokens,
-        reasoning_str,
-        memact_str,
-    });
+        "\n\x1b[1;36mmini-agent Configuration\x1b[0m\n" ++
+        "  \x1b[1mBackend:\x1b[0m          {s}\n" ++
+        "  \x1b[1mModel:\x1b[0m            {s}\n" ++
+        "  \x1b[1mEndpoint:\x1b[0m         {s}\n" ++
+        "  \x1b[1mProtocol:\x1b[0m         {s}\n" ++
+        "  \x1b[1mAPI Key:\x1b[0m          {s}\n" ++
+        "  \x1b[1mExecution Mode:\x1b[0m   {s}\n" ++
+        "  \x1b[1mContext Window:\x1b[0m   {d} tokens\n" ++
+        "  \x1b[1mMax Tokens:\x1b[0m       {d} tokens\n" ++
+        "  \x1b[1mDynamic Thinking:\x1b[0m {s}\n" ++
+        "  \x1b[1mReasoning Effort:\x1b[0m {s}\n" ++
+        "  \x1b[1mMemAct:\x1b[0m           {s}\n\n",
+        .{
+            backend_name,
+            model_name,
+            endpoint,
+            proto_str,
+            api_key_status,
+            @tagName(agent.config.execution_mode),
+            agent.config.context_window,
+            agent.config.max_tokens,
+            dynamic_thinking_str,
+            reasoning_str,
+            memact_str,
+        },
+    );
 }
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
