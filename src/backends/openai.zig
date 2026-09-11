@@ -41,6 +41,12 @@ pub const ProtocolMode = enum {
     auto,
     chat_completions,
     responses,
+
+    pub fn fromString(s: []const u8) ProtocolMode {
+        if (std.mem.eql(u8, s, "chat") or std.mem.eql(u8, s, "chat_completions") or std.mem.eql(u8, s, "completions")) return .chat_completions;
+        if (std.mem.eql(u8, s, "responses") or std.mem.eql(u8, s, "response")) return .responses;
+        return .auto;
+    }
 };
 
 /// Extracts root base URL (strips endpoint suffixes if present).
@@ -239,8 +245,17 @@ pub const Client = struct {
                     }
                 }
 
-                // Fallback 2: Responses API -> Chat Completions when older server returns 404 (endpoint /responses does not exist)
-                if (active_protocol == .responses and (req_http_code == 404 or (req_http_code == 400 and std.mem.indexOf(u8, raw_resp, "not found") != null))) {
+                // Fallback 2: Responses API -> Chat Completions when:
+                //   - Server returns 404 (endpoint /responses does not exist), OR
+                //   - Server returns 400 + "not found" (endpoint exists but model not found), OR
+                //   - Server returns 400 + json_parse_error / ResponseInput (endpoint exists but does not
+                //     understand Responses API JSON format — e.g. OpenAI-compat proxies like agnes).
+                const responses_format_rejected = req_http_code == 400 and (
+                    std.mem.indexOf(u8, raw_resp, "not found") != null or
+                    std.mem.indexOf(u8, raw_resp, "json_parse_error") != null or
+                    std.mem.indexOf(u8, raw_resp, "ResponseInput") != null
+                );
+                if (active_protocol == .responses and (req_http_code == 404 or responses_format_rejected)) {
                     active_protocol = .chat_completions;
                     self.cached_protocol = .chat_completions;
                     if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);

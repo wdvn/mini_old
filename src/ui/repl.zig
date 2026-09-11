@@ -146,6 +146,8 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
             \\## REPL Commands
             \\  /clear              Clear conversation history
             \\  /model <backend>    Switch backend (openai, claude, ollama)
+            \\  /config [show]      Show current configuration
+            \\  /config protocol <auto|chat|responses>  Set OpenAI protocol mode
             \\  /artifact [list]    View session artifacts list
             \\  /artifact show <fn> Read an artifact content
             \\  /quit, /exit, /q    Exit
@@ -172,12 +174,105 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
         return true;
     }
 
+    if (std.mem.eql(u8, input, "/config") or std.mem.startsWith(u8, input, "/config ")) {
+        const sub = std.mem.trim(u8, input["/config".len..], " \t");
+        if (sub.len == 0 or std.mem.eql(u8, sub, "show") or std.mem.startsWith(u8, sub, "show ")) {
+            printConfig(agent);
+        } else if (std.mem.startsWith(u8, sub, "protocol")) {
+            const mode_str = std.mem.trim(u8, sub["protocol".len..], " \t");
+            if (mode_str.len > 0) {
+                agent.setProtocol(mode_str);
+            } else {
+                main.stdoutPrint("Usage: /config protocol <auto|chat|responses>\n", .{});
+            }
+        } else {
+            main.stdoutPrint("Usage: /config [show] | /config protocol <auto|chat|responses>\n", .{});
+        }
+        return true;
+    }
+
     if (tryExecuteCustomSlashCommand(alloc, io, agent, input) catch false) {
         return true;
     }
 
     main.stdoutPrint("Invalid command: {s}. Type /help to view list.\n", .{input});
     return true;
+}
+
+fn printConfig(agent: *agent_mod.AgentLoop) void {
+    const backend_name = agent.backend.name();
+    const model_name = agent.backend.model();
+
+    var endpoint: []const u8 = "N/A";
+    var proto_buf: [64]u8 = undefined;
+    var proto_str: []const u8 = "N/A";
+    var api_key_status: []const u8 = "none";
+
+    switch (agent.backend) {
+        .openai => |c| {
+            endpoint = c.base_url;
+            if (c.api_key.len > 0) api_key_status = "configured";
+            if (c.cached_protocol) |cached| {
+                if (c.protocol_mode == .auto) {
+                    proto_str = std.fmt.bufPrint(&proto_buf, "auto (negotiated: {s})", .{
+                        @tagName(cached),
+                    }) catch "auto";
+                } else if (cached != c.protocol_mode) {
+                    proto_str = std.fmt.bufPrint(&proto_buf, "{s} (active: {s})", .{
+                        @tagName(c.protocol_mode),
+                        @tagName(cached),
+                    }) catch @tagName(c.protocol_mode);
+                } else {
+                    proto_str = @tagName(c.protocol_mode);
+                }
+            } else {
+                proto_str = @tagName(c.protocol_mode);
+            }
+        },
+        .claude => |c| {
+            endpoint = "https://api.anthropic.com/v1";
+            if (c.api_key.len > 0) api_key_status = "configured";
+        },
+        .ollama => |c| {
+            endpoint = c.base_url;
+            api_key_status = "not required";
+        },
+    }
+
+    const reasoning_str = if (agent.config.reasoning_effort_disabled)
+        "disabled"
+    else
+        agent.config.reasoning_effort orelse "none";
+
+    const memact_str: []const u8 = if (agent.config.memact_enabled) "enabled" else "disabled";
+
+    main.stdoutPrint(
+        \\
+        \\\x1b[1;36mmini-agent Configuration\x1b[0m
+        \\  \x1b[1mBackend:\x1b[0m         {s}
+        \\  \x1b[1mModel:\x1b[0m           {s}
+        \\  \x1b[1mEndpoint:\x1b[0m        {s}
+        \\  \x1b[1mProtocol:\x1b[0m        {s}
+        \\  \x1b[1mAPI Key:\x1b[0m         {s}
+        \\  \x1b[1mExecution Mode:\x1b[0m  {s}
+        \\  \x1b[1mContext Window:\x1b[0m  {d} tokens
+        \\  \x1b[1mMax Tokens:\x1b[0m      {d} tokens
+        \\  \x1b[1mReasoning:\x1b[0m       {s}
+        \\  \x1b[1mMemAct:\x1b[0m          {s}
+        \\
+        \\
+    , .{
+        backend_name,
+        model_name,
+        endpoint,
+        proto_str,
+        api_key_status,
+        @tagName(agent.config.execution_mode),
+        agent.config.context_window,
+        agent.config.max_tokens,
+        reasoning_str,
+        memact_str,
+    });
 }
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;

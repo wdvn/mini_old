@@ -1247,6 +1247,22 @@ pub const AgentLoop = struct {
         main.stderrPrint("[agent] Switched to {s} ({s})\n", .{ self.backend.name(), self.backend.model() });
     }
 
+    /// Set OpenAI protocol mode at runtime (auto | chat | responses).
+    /// Only applies when the active backend is OpenAI-compatible.
+    pub fn setProtocol(self: *AgentLoop, mode_str: []const u8) void {
+        const mode: openai_mod.ProtocolMode = openai_mod.ProtocolMode.fromString(mode_str);
+        switch (self.backend) {
+            .openai => |*c| {
+                c.protocol_mode = mode;
+                c.cached_protocol = null; // clear cached negotiation so new mode takes effect immediately
+                main.stderrPrint("[agent] Protocol set to: {s}\n", .{@tagName(mode)});
+            },
+            else => {
+                main.stderrPrint("[agent] /config protocol only applies to openai-compat backend\n", .{});
+            },
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Internal
     // -----------------------------------------------------------------------
