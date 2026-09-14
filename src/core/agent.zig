@@ -28,6 +28,7 @@ const proto = @import("protocol.zig");
 const config_mod = @import("config.zig");
 const history_mod = @import("history.zig");
 const tools_mod = @import("../tooling/registry.zig");
+const media_gen_tool = @import("../tools/media_gen.zig");
 const json_mod = @import("json.zig");
 const openai_mod = @import("../backends/openai.zig");
 const claude_mod = @import("../backends/claude.zig");
@@ -259,8 +260,23 @@ pub const AgentLoop = struct {
             backend.setThinkingBudget(config.thinking_budget_tokens);
         }
 
-        // Configure tool policy
+        // Configure tool policy & media capability gates
         tools_mod.setPolicy(config.tool_allowlist, config.tool_blocklist);
+        tools_mod.setMediaConfig(config.image_gen_enabled, config.video_gen_enabled, config.image_input_enabled);
+        media_gen_tool.setConfig(.{
+            .image_gen_enabled = config.image_gen_enabled,
+            .image_gen_provider = config.image_gen_provider,
+            .image_gen_model = config.image_gen_model,
+            .image_gen_size = config.image_gen_size,
+            .video_gen_enabled = config.video_gen_enabled,
+            .video_gen_model = config.video_gen_model,
+            .media_output_dir = config.media_output_dir,
+            .video_poll_timeout_secs = config.video_poll_timeout_secs,
+            .openai_compat_url = config.openai_compat_url,
+            .openai_compat_key = config.openai_compat_key,
+            .image_input_max_bytes = config.image_input_max_bytes,
+            .image_input_max_per_turn = config.image_input_max_per_turn,
+        });
 
         var path_buf: [256]u8 = undefined;
         const home_dir = getEnvVar("HOME") orelse ".";
@@ -896,12 +912,26 @@ pub const AgentLoop = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !void {
+        return self.processInputWithImages(user_text, &.{}, text_cb, think_cb);
+    }
+
+    /// Process user input with optional attached image blocks (RFC-011 Media Ingestion).
+    pub fn processInputWithImages(
+        self: *AgentLoop,
+        user_text: []const u8,
+        images: []const proto.ImageBlock,
+        text_cb: ?*const fn ([]const u8) void,
+        think_cb: ?*const fn ([]const u8) void,
+    ) !void {
         g_active_agent = self;
         hooks_mod.setToolListener(&agentToolListener);
         defer {
             g_active_agent = null;
             hooks_mod.setToolListener(null);
         }
+
+        // Clear turn-level tool attachments
+        media_gen_tool.clearTurnAttachments(self.alloc);
 
         // Allocate turn-scoped ArenaAllocator for memory cleanup
         var turn_arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -921,7 +951,11 @@ pub const AgentLoop = struct {
         }
 
         // Append user message to history
-        try self.history.addUser(user_text);
+        if (images.len > 0) {
+            try self.history.addUserWithImages(user_text, images);
+        } else {
+            try self.history.addUser(user_text);
+        }
 
         // Reset turn metrics
         self.last_turn_acts = 0;
@@ -1586,7 +1620,13 @@ pub const AgentLoop = struct {
         }
 
         if (results.items.len > 0) {
-            try self.history.addToolResults(results.items);
+            const turn_attached = media_gen_tool.getTurnAttachments();
+            if (turn_attached.len > 0) {
+                try self.history.addToolResultsWithImages(results.items, turn_attached);
+                media_gen_tool.clearTurnAttachments(self.alloc);
+            } else {
+                try self.history.addToolResults(results.items);
+            }
         }
         self.last_act_failed = any_tool_err;
     }

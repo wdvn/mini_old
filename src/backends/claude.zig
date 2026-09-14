@@ -155,7 +155,7 @@ pub const Client = struct {
 // Request building
 // ---------------------------------------------------------------------------
 
-fn buildRequestBody(
+pub fn buildRequestBody(
     alloc: Allocator,
     model: []const u8,
     max_tokens: u32,
@@ -221,6 +221,11 @@ fn buildRequestBody(
                         \\[{{"type":"tool_result","tool_use_id":"{s}","content":"{s}","is_error":{s}}}]
                     , .{ tr.tool_use_id, e, if (tr.is_error) "true" else "false" });
                 },
+                .image => |img| {
+                    try w.print(
+                        \\[{{"type":"image","source":{{"type":"base64","media_type":"{s}","data":"{s}"}}}}]
+                    , .{ img.media_type, img.data });
+                },
             }
         } else {
             try w.writeByte('[');
@@ -252,6 +257,11 @@ fn buildRequestBody(
                         try w.print(
                             \\{{"type":"tool_result","tool_use_id":"{s}","content":"{s}","is_error":{s}}}
                         , .{ tr.tool_use_id, e, if (tr.is_error) "true" else "false" });
+                    },
+                    .image => |img| {
+                        try w.print(
+                            \\{{"type":"image","source":{{"type":"base64","media_type":"{s}","data":"{s}"}}}}
+                        , .{ img.media_type, img.data });
                     },
                 }
             }

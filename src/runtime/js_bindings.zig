@@ -39,6 +39,7 @@ const grep_tool = @import("../tools/grep.zig");
 const http_lib = @import("../lib/http_request.zig");
 const artifact_tool = @import("../tools/artifact.zig");
 const session_diag = @import("../tools/session_diagnostics.zig");
+const media_gen_tool = @import("../tools/media_gen.zig");
 const artifacts_mod = @import("../core/artifacts.zig");
 const utils = @import("../core/utils.zig");
 const json_mod = @import("../core/json.zig");
@@ -887,6 +888,98 @@ fn jsMiniSetThinking(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv:
     return c.JS_ThrowTypeError(ctx, "argument must be string or number");
 }
 
+// ---------------------------------------------------------------------------
+// mini.media(kind, promptOrPath, opts?)
+//   kind: "image" | "video" | "attach"
+//   opts: { size?: string, filename?: string, model?: string, seconds?: int }
+//   Returns: { ok: bool, path: string, media_type: string, bytes: int, message?: string }
+// ---------------------------------------------------------------------------
+fn jsMiniMedia(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 2) return c.JS_ThrowTypeError(ctx, "mini.media requires kind ('image'|'video'|'attach') and prompt/path arguments");
+
+    const kind = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid kind");
+    defer engine.alloc.free(kind);
+
+    const prompt_or_path = jsStringSlice(ctx, argv[1], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid prompt or path");
+    defer engine.alloc.free(prompt_or_path);
+
+    const tool_name: []const u8 = if (std.mem.eql(u8, kind, "video"))
+        "generate_video"
+    else if (std.mem.eql(u8, kind, "attach"))
+        "image_attach"
+    else
+        "generate_image";
+
+    if (guardPolicy(engine, tool_name)) {
+        hooks.dispatch(engine.alloc, engine.io, .{
+            .event = "post-tool-use", .tool_name = tool_name,
+            .input_json = prompt_or_path, .tool_result = "blocked by policy", .is_error = true,
+        });
+        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.media is blocked by policy");
+    }
+
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "pre-tool-use", .tool_name = tool_name, .input_json = prompt_or_path,
+    });
+
+    // Parse optional opts
+    var size_opt: ?[]u8 = null;
+    defer if (size_opt) |s| engine.alloc.free(s);
+    var filename_opt: ?[]u8 = null;
+    defer if (filename_opt) |f| engine.alloc.free(f);
+    var model_opt: ?[]u8 = null;
+    defer if (model_opt) |m| engine.alloc.free(m);
+    var seconds: u32 = 4;
+
+    if (argc >= 3 and c.JS_IsObject(argv[2]) != 0) {
+        const opts = argv[2];
+        size_opt = jsOptString(ctx, opts, "size", engine.alloc);
+        filename_opt = jsOptString(ctx, opts, "filename", engine.alloc);
+        model_opt = jsOptString(ctx, opts, "model", engine.alloc);
+        if (jsOptInt(ctx, opts, "seconds")) |sec| {
+            if (sec > 0) seconds = @intCast(sec);
+        }
+    }
+
+    const res = if (std.mem.eql(u8, kind, "video"))
+        media_gen_tool.generateVideoDirect(engine.alloc, engine.io, prompt_or_path, seconds, filename_opt, model_opt) catch |e| {
+            return c.JS_ThrowTypeError(ctx, @errorName(e));
+        }
+    else if (std.mem.eql(u8, kind, "attach"))
+        media_gen_tool.attachImageDirect(engine.alloc, engine.io, prompt_or_path) catch |e| {
+            return c.JS_ThrowTypeError(ctx, @errorName(e));
+        }
+    else
+        media_gen_tool.generateImageDirect(engine.alloc, engine.io, prompt_or_path, size_opt, filename_opt, model_opt) catch |e| {
+            return c.JS_ThrowTypeError(ctx, @errorName(e));
+        };
+    defer {
+        engine.alloc.free(res.path);
+        engine.alloc.free(res.media_type);
+        if (res.message.len > 0) engine.alloc.free(res.message);
+    }
+
+    // Post-hook
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "post-tool-use", .tool_name = tool_name,
+        .input_json = prompt_or_path, .tool_result = res.path,
+        .is_error = !res.ok,
+    });
+
+    const obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, if (res.ok) 1 else 0));
+    _ = c.JS_SetPropertyStr(ctx, obj, "path", c.JS_NewStringLen(ctx, res.path.ptr, res.path.len));
+    _ = c.JS_SetPropertyStr(ctx, obj, "media_type", c.JS_NewStringLen(ctx, res.media_type.ptr, res.media_type.len));
+    _ = c.JS_SetPropertyStr(ctx, obj, "bytes", c.JS_NewInt64(ctx, @intCast(res.bytes)));
+    if (res.message.len > 0) {
+        _ = c.JS_SetPropertyStr(ctx, obj, "message", c.JS_NewStringLen(ctx, res.message.ptr, res.message.len));
+    }
+    return obj;
+}
+
 /// Register global `mini` object into JSContext
 pub fn registerBindings(engine: *Engine) !void {
     const ctx = engine.ctx.?;
@@ -920,6 +1013,7 @@ pub fn registerBindings(engine: *Engine) !void {
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "sessionDetail", c.JS_NewCFunction(ctx, jsMiniSessionDetail, "sessionDetail", 1));
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "sessionKill", c.JS_NewCFunction(ctx, jsMiniSessionKill, "sessionKill", 2));
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "setThinking", c.JS_NewCFunction(ctx, jsMiniSetThinking, "setThinking", 1));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "media", c.JS_NewCFunction(ctx, jsMiniMedia, "media", 3));
 
     // 4. metadata props
     const pwd_val = getenv("PWD");

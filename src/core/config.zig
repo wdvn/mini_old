@@ -185,6 +185,30 @@ pub const Config = struct {
     /// Direct path to session file.
     session_file: ?[]const u8,
 
+    // RFC-011: Media I/O
+    /// Enable @image:<path> parsing in prompt (Ingestion, Phase 0). Default: true.
+    image_input_enabled: bool = true,
+    /// Maximum image attachments per turn.
+    image_input_max_per_turn: u8 = 5,
+    /// Maximum file size for input image in bytes (default: 10MB).
+    image_input_max_bytes: usize = 10 * 1024 * 1024,
+    /// Enable generate_image tool. Default: false.
+    image_gen_enabled: bool = false,
+    /// Image gen provider: "openai" | "openai_compat".
+    image_gen_provider: []const u8 = "openai",
+    /// Image gen model: "gpt-image-1", "dall-e-3", etc.
+    image_gen_model: []const u8 = "gpt-image-1",
+    /// Default image size: "1024x1024" | "1536x1024" | "1024x1536" | "auto".
+    image_gen_size: []const u8 = "1024x1024",
+    /// Enable generate_video tool. Default: false.
+    video_gen_enabled: bool = false,
+    /// Video gen model: "sora-2", "sora-2-pro", etc.
+    video_gen_model: []const u8 = "sora-2",
+    /// Media output directory. Null = "<workspace>/media".
+    media_output_dir: ?[]const u8 = null,
+    /// Video job polling timeout in seconds (default: 600).
+    video_poll_timeout_secs: u32 = 600,
+
     /// Default system prompt when MINI_SYSTEM_FILE is not configured.
     pub const default_system_prompt =
         \\You are mini-agent, a powerful AI assistant running in the terminal.
@@ -204,6 +228,7 @@ pub const Config = struct {
         \\  - `mini.jobLogs(jobId, lines?)`: Read recent logs of job
         \\  - `mini.jobKill(jobId, signal?)`: Terminate job
         \\  - `mini.http(method, url)`: HTTP request { status, body }
+        \\  - `mini.media(kind, prompt, opts?)`: Generate media (image/video) or attach image { path, media_type, bytes }
         \\  - `mini.artifact(name, content)`: Save artifact
         \\  - `mini.env(name)`: Read environment variable
         \\  - `mini.setThinking(levelOrTokens)`: Modulate next-turn reasoning effort ("low"|"medium"|"high"|"none" or token budget number). Use "low" for routine file reads/searches, "high" for complex planning/debugging.
@@ -409,6 +434,44 @@ pub const Config = struct {
             break :blk !std.mem.eql(u8, v, "0") and !std.mem.eql(u8, v, "false");
         };
 
+        // RFC-011: Media configuration
+        const image_input_enabled: bool = blk: {
+            const v = env_map.get("MINI_IMAGE_INPUT_ENABLED") orelse "1";
+            break :blk !std.mem.eql(u8, v, "0") and !std.mem.eql(u8, v, "false");
+        };
+
+        const image_input_max_per_turn: u8 = blk: {
+            const s = env_map.get("MINI_IMAGE_INPUT_MAX_PER_TURN") orelse break :blk 5;
+            break :blk std.fmt.parseInt(u8, s, 10) catch 5;
+        };
+
+        const image_input_max_bytes: usize = blk: {
+            const s = env_map.get("MINI_IMAGE_INPUT_MAX_BYTES") orelse break :blk 10 * 1024 * 1024;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 10 * 1024 * 1024;
+        };
+
+        const image_gen_enabled: bool = blk: {
+            const v = env_map.get("MINI_IMAGE_GEN_ENABLED") orelse "0";
+            break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+        };
+
+        const image_gen_provider = env_map.get("MINI_IMAGE_GEN_PROVIDER") orelse "openai";
+        const image_gen_model = env_map.get("MINI_IMAGE_GEN_MODEL") orelse "gpt-image-1";
+        const image_gen_size = env_map.get("MINI_IMAGE_GEN_SIZE") orelse "1024x1024";
+
+        const video_gen_enabled: bool = blk: {
+            const v = env_map.get("MINI_VIDEO_GEN_ENABLED") orelse "0";
+            break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+        };
+
+        const video_gen_model = env_map.get("MINI_VIDEO_GEN_MODEL") orelse "sora-2";
+        const media_output_dir = env_map.get("MINI_MEDIA_OUTPUT_DIR");
+
+        const video_poll_timeout_secs: u32 = blk: {
+            const s = env_map.get("MINI_VIDEO_POLL_TIMEOUT_SECS") orelse break :blk 600;
+            break :blk std.fmt.parseInt(u32, s, 10) catch 600;
+        };
+
         if (!utils.isSubagent()) {
             if (dynamic_thinking_enabled) {
                 main.stderrPrint("[config] Cognitive Governor: dynamic thinking enabled (effort={s}, budget={?d})\n", .{
@@ -465,6 +528,17 @@ pub const Config = struct {
             .hooks_config_path = hooks_cfg,
             .session_id = session_id,
             .session_file = session_file,
+            .image_input_enabled = image_input_enabled,
+            .image_input_max_per_turn = image_input_max_per_turn,
+            .image_input_max_bytes = image_input_max_bytes,
+            .image_gen_enabled = image_gen_enabled,
+            .image_gen_provider = image_gen_provider,
+            .image_gen_model = image_gen_model,
+            .image_gen_size = image_gen_size,
+            .video_gen_enabled = video_gen_enabled,
+            .video_gen_model = video_gen_model,
+            .media_output_dir = media_output_dir,
+            .video_poll_timeout_secs = video_poll_timeout_secs,
         };
     }
 

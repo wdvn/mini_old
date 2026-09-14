@@ -35,6 +35,7 @@ const subagent = @import("../tools/subagent.zig");
 const batch_subagent = @import("../tools/batch_subagent.zig");
 const artifact_tool = @import("../tools/artifact.zig");
 const session_diag = @import("../tools/session_diagnostics.zig");
+const media_gen_tool = @import("../tools/media_gen.zig");
 const mcp_mod = @import("mcp.zig");
 const hooks = @import("../core/hooks.zig");
 const skills_mod = @import("../core/skills.zig");
@@ -52,6 +53,17 @@ var g_allowlist: ?[]const u8 = null;
 
 /// Blocklist comma-separated. Null = nothing blocked.
 var g_blocklist: ?[]const u8 = null;
+
+/// RFC-011: Media generation & vision capability gates
+var g_image_gen_enabled: bool = false;
+var g_video_gen_enabled: bool = false;
+var g_image_input_enabled: bool = true;
+
+pub fn setMediaConfig(image_gen: bool, video_gen: bool, image_input: bool) void {
+    g_image_gen_enabled = image_gen;
+    g_video_gen_enabled = video_gen;
+    g_image_input_enabled = image_input;
+}
 
 /// Configure MCP manager fallback when no built-in tool matches.
 pub fn setMcpManager(m: ?*mcp_mod.McpClientManager) void {
@@ -84,6 +96,9 @@ fn executeToolInternal(alloc: Allocator, io: std.Io, name: []const u8, input_jso
     if (std.mem.eql(u8, name, "artifact_read"))         return artifact_tool.readTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "artifact_list"))         return artifact_tool.listTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "session_diagnostics"))   return session_diag.executeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "generate_image"))        return media_gen_tool.generateImageTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "generate_video"))        return media_gen_tool.generateVideoTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "image_attach"))          return media_gen_tool.attachImageTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "skills"))                return executeSkills(alloc, io, input_json);
     if (std.mem.eql(u8, name, "codeact"))               return executeCodeActTool(alloc, io, input_json);
 
@@ -262,6 +277,24 @@ pub const definitions = [_]proto.ToolDefinition{
         .input_schema_json = \\{"type":"object","properties":{},"required":[]}
         ,
     },
+    .{
+        .name = "generate_image",
+        .description = "Generate an image from a text prompt using OpenAI Images API or compatible provider, saving to the media output directory.",
+        .input_schema_json = \\{"type":"object","properties":{"prompt":{"type":"string","description":"Detailed image description / prompt"},"size":{"type":"string","enum":["1024x1024","1536x1024","1024x1536","auto"],"description":"Image dimensions (default: 1024x1024)"},"filename":{"type":"string","description":"Optional sanitized target filename"},"model":{"type":"string","description":"Optional image model"}},"required":["prompt"]}
+        ,
+    },
+    .{
+        .name = "generate_video",
+        .description = "Generate a video from a text prompt using OpenAI Sora or compatible provider with async polling, saving to media output directory.",
+        .input_schema_json = \\{"type":"object","properties":{"prompt":{"type":"string","description":"Detailed video description / prompt"},"seconds":{"type":"integer","description":"Duration in seconds (default: 4)"},"filename":{"type":"string","description":"Optional sanitized target filename"},"model":{"type":"string","description":"Optional video model"}},"required":["prompt"]}
+        ,
+    },
+    .{
+        .name = "image_attach",
+        .description = "Attach a local image file to the conversation for multi-turn inspection and vision loop-back.",
+        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"Path to local image file to attach"}},"required":["path"]}
+        ,
+    },
 };
 
 /// Core tool names (always sent to API).
@@ -269,6 +302,7 @@ const core_tools = [_][]const u8{
     "bash", "file_read", "file_write", "file_edit",
     "glob", "grep", "http_request", "invoke_subagent", "batch_invoke_subagents", "skills",
     "session_diagnostics", "artifact_write", "artifact_read", "artifact_list",
+    "generate_image", "generate_video", "image_attach",
 };
 
 /// Keyword triggers for extended tools (sent conditionally).
@@ -363,6 +397,17 @@ pub fn isPermitted(name: []const u8) bool {
         const cur_depth = subagent.getCurrentDepth();
         const max_depth = subagent.getMaxDepth();
         if (cur_depth >= max_depth) return false;
+    }
+
+    // RFC-011: Capability gates for media tools
+    if (std.mem.eql(u8, name, "generate_image")) {
+        if (!g_image_gen_enabled) return false;
+    }
+    if (std.mem.eql(u8, name, "generate_video")) {
+        if (!g_video_gen_enabled) return false;
+    }
+    if (std.mem.eql(u8, name, "image_attach")) {
+        if (!g_image_input_enabled) return false;
     }
 
     if (g_allowlist) |list| {

@@ -118,7 +118,7 @@ pub const Client = struct {
 // Request building
 // ---------------------------------------------------------------------------
 
-fn buildRequestBody(
+pub fn buildRequestBody(
     alloc: Allocator,
     model: []const u8,
     system_prompt: []const u8,
@@ -153,10 +153,12 @@ fn buildRequestBody(
         if (msgs.len > 0) try w.writeByte(',');
     }
 
-    // Messages (Ollama uses content string, not array)
+    // Messages (Ollama uses content string, and optional top-level images array)
     for (msgs, 0..) |msg, mi| {
         var content_buf = ArrayList(u8).empty;
         defer content_buf.deinit(alloc);
+        var image_list = ArrayList([]const u8).empty;
+        defer image_list.deinit(alloc);
         for (msg.content) |block| {
             switch (block) {
                 .text => |t| try content_buf.appendSlice(alloc, t),
@@ -165,12 +167,22 @@ fn buildRequestBody(
                     defer alloc.free(s);
                     try content_buf.appendSlice(alloc, s);
                 },
+                .image => |img| try image_list.append(alloc, img.data),
                 else => {},
             }
         }
         const escaped = try json.escape(alloc, content_buf.items);
         defer alloc.free(escaped);
-        try w.print("{{\"role\":\"{s}\",\"content\":\"{s}\"}}", .{ msg.role.toJson(), escaped });
+        try w.print("{{\"role\":\"{s}\",\"content\":\"{s}\"", .{ msg.role.toJson(), escaped });
+        if (image_list.items.len > 0) {
+            try w.writeAll(",\"images\":[");
+            for (image_list.items, 0..) |img_data, ii| {
+                if (ii > 0) try w.writeByte(',');
+                try w.print("\"{s}\"", .{img_data});
+            }
+            try w.writeByte(']');
+        }
+        try w.writeByte('}');
         if (mi + 1 < msgs.len) try w.writeByte(',');
     }
     try w.writeByte(']');
