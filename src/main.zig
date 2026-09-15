@@ -20,6 +20,7 @@ pub const backends = struct {
     pub const claude_mod = @import("backends/claude.zig");
     pub const ollama_mod = @import("backends/ollama.zig");
     pub const provider_mod = @import("backends/provider.zig");
+    pub const js_provider = @import("backends/js_provider.zig");
 };
 pub const tools_mod = @import("tooling/registry.zig");
 pub const session_diagnostics = @import("tools/session_diagnostics.zig");
@@ -193,10 +194,10 @@ pub fn main(init: std.process.Init) !void {
             stderrPrint("Error: --install-cron requires -e <prompt>\n", .{});
             std.process.exit(1);
         }
-        
+
         const exe_path = try getAbsoluteExePath(alloc, init.io, args_raw[0]);
         defer alloc.free(exe_path);
-        
+
         cron_mod.installCronjob(alloc, init.io, cron_expr, exe_path, args.prompt.?) catch |e| {
             if (e == error.AlreadyExists) {
                 stdoutPrint("This cronjob already exists on the system!\n", .{});
@@ -261,6 +262,7 @@ pub fn main(init: std.process.Init) !void {
         defer media_res.deinit(alloc);
 
         var renderer = ui_repl.chat_stream.TurnRenderer.init(alloc, init.io);
+        renderer.parser.thinking_tags = backends.provider_mod.getProfile(cfg.openai_provider).thinking_tags;
         defer renderer.deinit();
         ui_repl.current_renderer = &renderer;
         defer ui_repl.current_renderer = null;
@@ -318,6 +320,7 @@ pub fn main(init: std.process.Init) !void {
         defer media_res.deinit(alloc);
 
         var renderer = ui_repl.chat_stream.TurnRenderer.init(alloc, init.io);
+        renderer.parser.thinking_tags = backends.provider_mod.getProfile(cfg.openai_provider).thinking_tags;
         defer renderer.deinit();
         ui_repl.current_renderer = &renderer;
         defer ui_repl.current_renderer = null;
@@ -456,17 +459,17 @@ fn getAbsoluteExePath(alloc: Allocator, io: std.Io, arg0: []const u8) ![]u8 {
     if (std.mem.startsWith(u8, arg0, "/")) {
         return alloc.dupe(u8, arg0);
     }
-    const argv = [_][]const u8{"realpath", arg0};
+    const argv = [_][]const u8{ "realpath", arg0 };
     var child = try std.process.spawn(io, .{
         .argv = &argv,
         .stdout = .pipe,
         .stderr = .ignore,
         .stdin = .ignore,
     });
-    
+
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(alloc);
-    
+
     if (child.stdout) |out| {
         var chunk: [1024]u8 = undefined;
         while (true) {
@@ -475,7 +478,7 @@ fn getAbsoluteExePath(alloc: Allocator, io: std.Io, arg0: []const u8) ![]u8 {
             try buf.appendSlice(alloc, chunk[0..n]);
         }
     }
-    
+
     _ = child.wait(io) catch {};
     return alloc.dupe(u8, std.mem.trim(u8, buf.items, " \t\r\n"));
 }
@@ -562,4 +565,3 @@ test {
     _ = js_bindings;
     _ = process_manager;
 }
-

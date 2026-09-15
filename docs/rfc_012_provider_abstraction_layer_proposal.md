@@ -169,9 +169,33 @@ pub const ProviderProfile = struct {
 };
 ```
 
-### 3.2. Built-in Provider Registry
+### 3.2. Built-in Provider Registry & Modular Structure
+
+Each provider profile is encapsulated in its own dedicated file under `src/backends/providers/` (`openai.zig`, `deepseek.zig`, `qwen.zig`, `minimax.zig`, `glm.zig`, `kimi.zig`, `xai.zig`, `vllm.zig`, `generic.zig`), defining its identifier, `ProviderProfile`, and endpoint URL matcher:
 
 ```zig
+//! src/backends/providers/deepseek.zig
+pub const key = "deepseek";
+pub const profile: ProviderProfile = .{
+    .name = "DeepSeek",
+    .protocol = .chat_completions,
+    .reasoning_field = .reasoning_content,
+    .echo_policy = .echo_required,
+    .thinking_tags = .none,
+    .reasoning_param = .unsupported,
+    .supports_stream_options = true,
+    .use_completion_tokens = false,
+};
+pub fn matchesUrl(url: []const u8) bool {
+    return std.mem.indexOf(u8, url, "deepseek") != null;
+}
+```
+
+`src/backends/provider.zig` aggregates all provider submodules and exports unified lookups:
+
+```zig
+pub const providers = @import("providers/mod.zig");
+
 /// Built-in provider profiles.
 /// Keyed by provider slug (matched from config or auto-detected from URL).
 pub const profiles = [_]struct { key: []const u8, profile: ProviderProfile }{
@@ -467,6 +491,47 @@ After:   .auto → profile.protocol determines initial attempt
 
 This eliminates the "Agnes AI trap" where the provider accepts `/v1/responses` with HTTP 200 but streams incomplete data.
 
+### 3.7. Dynamic JavaScript Provider Adapter (`JsProviderAdapter`)
+
+To eliminate the need to recompile `mini` for third-party proxies, aggregator gateways, or proprietary wrappers that emit non-standard JSON envelopes (such as `delta.detail.reasoning_content` or `delta.details.reasoning_content`), RFC-012 defines a dynamic JavaScript provider extension mechanism running in an isolated embedded QuickJS instance (`src/backends/js_provider.zig`).
+
+#### 3.7.1. JavaScript Provider Adapter Contract
+
+A provider adapter script can be defined in a `.js` file or inline string adhering to ESM `export default`, CommonJS `module.exports`, or direct object literal:
+
+```javascript
+export default {
+    name: "Custom Proxy",
+    protocol: "chat_completions", // "chat_completions" | "responses" | "auto"
+    echo_policy: "drop",          // "drop" | "echo_required"
+    thinking_tags: "english_only", // "english_and_chinese" | "english_only" | "none"
+    reasoning_param: "top_level_effort", // "nested_reasoning_object" | "top_level_effort" | "unsupported"
+
+    // Hook: extract custom reasoning content from raw SSE chunk JSON
+    extractReasoning(chunk) {
+        return chunk?.choices?.[0]?.delta?.detail?.reasoning_content ||
+               chunk?.choices?.[0]?.delta?.details?.reasoning_content ||
+               null;
+    },
+
+    // Hook: extract custom text content from raw SSE chunk JSON
+    extractContent(chunk) {
+        return chunk?.choices?.[0]?.delta?.content || null;
+    },
+
+    // Hook: pre-flight request payload transformation
+    transformRequest(req) {
+        // e.g. inject vendor-specific routing headers or mutate options
+        return req;
+    }
+};
+```
+
+#### 3.7.2. Integration & Native Fallback
+
+1. **Native Fallback in `ChoiceDelta`**: Even without a JS file, `src/backends/openai.zig` natively parses `delta.detail` and `delta.details` to catch common proxy wrapping patterns out-of-the-box.
+2. **Dynamic Overrides via `JsProviderAdapter`**: When custom behavior is provided via a JS script, `JsProviderAdapter` executes `extractReasoning()`, `extractContent()`, and `transformRequest()` hooks with zero rebuild of the binary.
+
 ---
 
 ## 4. Data Flow Diagram
@@ -544,11 +609,14 @@ This eliminates the "Agnes AI trap" where the provider accepts `/v1/responses` w
 
 | File | Change Type | Description |
 |---|---|---|
-| `src/backends/provider.zig` | **NEW** | ProviderProfile struct, built-in registry, URL auto-detect |
-| `src/backends/openai.zig` | MODIFY | Profile-driven protocol, echo policy, param format |
+| `src/backends/provider.zig` | **NEW** | ProviderProfile struct, facade registry, URL auto-detect |
+| `src/backends/providers/*.zig` | **NEW** | Dedicated profile files for each provider (`openai`, `deepseek`, `qwen`, `minimax`, `glm`, `kimi`, `xai`, `vllm`, `generic`) |
+| `src/backends/js_provider.zig` | **NEW** | Dynamic JavaScript provider adapter running in isolated QuickJS |
+| `src/backends/openai.zig` | MODIFY | Profile-driven protocol, echo policy, param format, detail.reasoning_content |
 | `src/core/config.zig` | MODIFY | `OPENAI_COMPAT_PROVIDER` env, `openai_provider` config field |
 | `src/ui/chat_stream.zig` | MODIFY | Chinese thinking tag recognition in `StreamEventParser` |
 | `testcases/test_provider_profiles.zig` | **NEW** | Unit tests for profile lookup and URL detection |
+| `testcases/test_js_provider.zig` | **NEW** | Integration tests for dynamic JS provider adapter |
 
 ---
 

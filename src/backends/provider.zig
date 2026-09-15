@@ -76,116 +76,20 @@ pub const ProviderProfile = struct {
     use_completion_tokens: bool,
 };
 
+pub const providers = @import("providers/mod.zig");
+
 /// Built-in provider profiles.
 /// Keyed by provider slug (matched from config or auto-detected from URL).
 pub const profiles = [_]struct { key: []const u8, profile: ProviderProfile }{
-    // ── OpenAI Official ──
-    .{ .key = "openai", .profile = .{
-        .name = "OpenAI",
-        .protocol = .auto,
-        .reasoning_field = .reasoning,
-        .echo_policy = .drop,
-        .thinking_tags = .none,
-        .reasoning_param = .top_level_effort,
-        .supports_stream_options = true,
-        .use_completion_tokens = true,
-    } },
-
-    // ── DeepSeek ──
-    .{ .key = "deepseek", .profile = .{
-        .name = "DeepSeek",
-        .protocol = .chat_completions, // Never use Responses API
-        .reasoning_field = .reasoning_content,
-        .echo_policy = .echo_required, // MUST echo reasoning_content
-        .thinking_tags = .none,
-        .reasoning_param = .unsupported, // DeepSeek ignores/rejects reasoning_effort
-        .supports_stream_options = true,
-        .use_completion_tokens = false,
-    } },
-
-    // ── Qwen / DashScope (Alibaba Cloud) ──
-    .{ .key = "qwen", .profile = .{
-        .name = "Qwen / DashScope",
-        .protocol = .chat_completions,
-        .reasoning_field = .both,
-        .echo_policy = .drop,
-        .thinking_tags = .english_and_chinese,
-        .reasoning_param = .top_level_effort,
-        .supports_stream_options = true,
-        .use_completion_tokens = false,
-    } },
-
-    // ── MiniMax ──
-    .{ .key = "minimax", .profile = .{
-        .name = "MiniMax",
-        .protocol = .chat_completions,
-        .reasoning_field = .reasoning_content,
-        .echo_policy = .drop,
-        .thinking_tags = .english_and_chinese,
-        .reasoning_param = .unsupported,
-        .supports_stream_options = false,
-        .use_completion_tokens = false,
-    } },
-
-    // ── GLM / ZhipuAI ──
-    .{ .key = "glm", .profile = .{
-        .name = "GLM / ZhipuAI",
-        .protocol = .chat_completions,
-        .reasoning_field = .reasoning_content,
-        .echo_policy = .drop,
-        .thinking_tags = .english_and_chinese,
-        .reasoning_param = .unsupported,
-        .supports_stream_options = false,
-        .use_completion_tokens = false,
-    } },
-
-    // ── Kimi / Moonshot ──
-    .{ .key = "kimi", .profile = .{
-        .name = "Kimi / Moonshot",
-        .protocol = .chat_completions,
-        .reasoning_field = .reasoning_content,
-        .echo_policy = .drop,
-        .thinking_tags = .english_only,
-        .reasoning_param = .top_level_effort,
-        .supports_stream_options = true,
-        .use_completion_tokens = false,
-    } },
-
-    // ── xAI (Grok) ──
-    .{ .key = "xai", .profile = .{
-        .name = "xAI Grok",
-        .protocol = .responses,
-        .reasoning_field = .reasoning,
-        .echo_policy = .drop,
-        .thinking_tags = .none,
-        .reasoning_param = .nested_reasoning_object,
-        .supports_stream_options = true,
-        .use_completion_tokens = true,
-    } },
-
-    // ── vLLM ──
-    .{ .key = "vllm", .profile = .{
-        .name = "vLLM",
-        .protocol = .chat_completions,
-        .reasoning_field = .both,
-        .echo_policy = .drop,
-        .thinking_tags = .english_only,
-        .reasoning_param = .top_level_effort,
-        .supports_stream_options = true,
-        .use_completion_tokens = false,
-    } },
-
-    // ── Generic (default fallback) ──
-    .{ .key = "generic", .profile = .{
-        .name = "Generic OpenAI-compat",
-        .protocol = .auto,
-        .reasoning_field = .both,
-        .echo_policy = .drop,
-        .thinking_tags = .english_only,
-        .reasoning_param = .top_level_effort,
-        .supports_stream_options = true,
-        .use_completion_tokens = false,
-    } },
+    .{ .key = providers.openai.key, .profile = providers.openai.profile },
+    .{ .key = providers.deepseek.key, .profile = providers.deepseek.profile },
+    .{ .key = providers.qwen.key, .profile = providers.qwen.profile },
+    .{ .key = providers.minimax.key, .profile = providers.minimax.profile },
+    .{ .key = providers.glm.key, .profile = providers.glm.profile },
+    .{ .key = providers.kimi.key, .profile = providers.kimi.profile },
+    .{ .key = providers.xai.key, .profile = providers.xai.profile },
+    .{ .key = providers.vllm.key, .profile = providers.vllm.profile },
+    .{ .key = providers.generic.key, .profile = providers.generic.profile },
 };
 
 /// Lookup profile by key. Returns generic if not found.
@@ -193,38 +97,32 @@ pub fn getProfile(key: []const u8) ProviderProfile {
     for (profiles) |entry| {
         if (std.mem.eql(u8, entry.key, key)) return entry.profile;
     }
-    return getProfile("generic");
+    return getProfile(providers.generic.key);
 }
 
 /// Auto-detect provider from base URL.
 pub fn detectFromUrl(url: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, url, "deepseek") != null) return "deepseek";
-    if (std.mem.indexOf(u8, url, "dashscope") != null or
-        std.mem.indexOf(u8, url, "qwen") != null or
-        std.mem.indexOf(u8, url, "aliyun") != null) return "qwen";
-    if (std.mem.indexOf(u8, url, "minimax") != null) return "minimax";
-    if (std.mem.indexOf(u8, url, "zhipuai") != null or
-        std.mem.indexOf(u8, url, "bigmodel") != null or
-        std.mem.indexOf(u8, url, "glm") != null) return "glm";
-    if (std.mem.indexOf(u8, url, "moonshot") != null or
-        std.mem.indexOf(u8, url, "kimi") != null) return "kimi";
-    if (std.mem.indexOf(u8, url, "x.ai") != null or
-        std.mem.indexOf(u8, url, "grok") != null) return "xai";
-    if (std.mem.indexOf(u8, url, "openai.com") != null) return "openai";
-    if (std.mem.indexOf(u8, url, "vllm") != null) return "vllm";
-    return "generic";
+    if (providers.deepseek.matchesUrl(url)) return providers.deepseek.key;
+    if (providers.qwen.matchesUrl(url)) return providers.qwen.key;
+    if (providers.minimax.matchesUrl(url)) return providers.minimax.key;
+    if (providers.glm.matchesUrl(url)) return providers.glm.key;
+    if (providers.kimi.matchesUrl(url)) return providers.kimi.key;
+    if (providers.xai.matchesUrl(url)) return providers.xai.key;
+    if (providers.openai.matchesUrl(url)) return providers.openai.key;
+    if (providers.vllm.matchesUrl(url)) return providers.vllm.key;
+    return providers.generic.key;
 }
 
 /// Resolve profile from explicit key or auto-detected URL.
 pub fn resolveProfile(explicit_key: ?[]const u8, url: ?[]const u8) ProviderProfile {
+    // RFC-012 §3.3: an explicit, non-empty provider key always wins;
+    // URL auto-detection applies only when no explicit key is given.
     if (explicit_key) |k| {
-        if (k.len > 0 and !std.mem.eql(u8, k, "generic")) {
-            return getProfile(k);
-        }
+        if (k.len > 0) return getProfile(k);
     }
     if (url) |u| {
-        const detected = detectFromUrl(u);
-        if (!std.mem.eql(u8, detected, "generic")) {
+        if (u.len > 0) {
+            const detected = detectFromUrl(u);
             return getProfile(detected);
         }
     }

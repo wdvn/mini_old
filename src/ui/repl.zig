@@ -73,6 +73,7 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
 
         // Initialize TurnRenderer for this chat turn
         var renderer = chat_stream.TurnRenderer.init(alloc, io);
+        renderer.parser.thinking_tags = main.backends.provider_mod.getProfile(agent.config.openai_provider).thinking_tags;
         defer renderer.deinit();
         current_renderer = &renderer;
         defer current_renderer = null;
@@ -317,17 +318,17 @@ fn printConfig(agent: *agent_mod.AgentLoop) void {
 
     main.stdoutPrint(
         "\n\x1b[1;36mmini-agent Configuration\x1b[0m\n" ++
-        "  \x1b[1mBackend:\x1b[0m          {s}\n" ++
-        "  \x1b[1mModel:\x1b[0m            {s}\n" ++
-        "  \x1b[1mEndpoint:\x1b[0m         {s}\n" ++
-        "  \x1b[1mProtocol:\x1b[0m         {s}\n" ++
-        "  \x1b[1mAPI Key:\x1b[0m          {s}\n" ++
-        "  \x1b[1mExecution Mode:\x1b[0m   {s}\n" ++
-        "  \x1b[1mContext Window:\x1b[0m   {d} tokens\n" ++
-        "  \x1b[1mMax Tokens:\x1b[0m       {d} tokens\n" ++
-        "  \x1b[1mDynamic Thinking:\x1b[0m {s}\n" ++
-        "  \x1b[1mReasoning Effort:\x1b[0m {s}\n" ++
-        "  \x1b[1mMemAct:\x1b[0m           {s}\n\n",
+            "  \x1b[1mBackend:\x1b[0m          {s}\n" ++
+            "  \x1b[1mModel:\x1b[0m            {s}\n" ++
+            "  \x1b[1mEndpoint:\x1b[0m         {s}\n" ++
+            "  \x1b[1mProtocol:\x1b[0m         {s}\n" ++
+            "  \x1b[1mAPI Key:\x1b[0m          {s}\n" ++
+            "  \x1b[1mExecution Mode:\x1b[0m   {s}\n" ++
+            "  \x1b[1mContext Window:\x1b[0m   {d} tokens\n" ++
+            "  \x1b[1mMax Tokens:\x1b[0m       {d} tokens\n" ++
+            "  \x1b[1mDynamic Thinking:\x1b[0m {s}\n" ++
+            "  \x1b[1mReasoning Effort:\x1b[0m {s}\n" ++
+            "  \x1b[1mMemAct:\x1b[0m           {s}\n\n",
         .{
             backend_name,
             model_name,
@@ -385,6 +386,7 @@ fn tryExecuteCustomSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.
     main.stdoutPrint("\x1b[90m[command /{s}]\x1b[0m\n", .{cmd_name});
 
     var renderer = chat_stream.TurnRenderer.init(alloc, io);
+    renderer.parser.thinking_tags = main.backends.provider_mod.getProfile(agent.config.openai_provider).thinking_tags;
     defer renderer.deinit();
     current_renderer = &renderer;
     defer current_renderer = null;

@@ -101,21 +101,55 @@ test "provider: detectFromUrl accurately classifies vendor endpoints" {
 }
 
 test "provider: resolveProfile prioritizes explicit key over URL" {
-    // Explicit key provided
+    // Explicit non-empty key always wins, even over a vendor URL
     const p1 = provider.resolveProfile("deepseek", "https://api.openai.com/v1");
     try testing.expectEqualStrings("DeepSeek", p1.name);
 
-    // Explicit key generic -> falls back to auto-detect from URL
+    // Explicit "generic" is also a non-empty key -> wins over URL detection (RFC-012 §3.3)
     const p2 = provider.resolveProfile("generic", "https://api.deepseek.com/v1");
-    try testing.expectEqualStrings("DeepSeek", p2.name);
+    try testing.expectEqualStrings("Generic OpenAI-compat", p2.name);
 
-    // No explicit key -> auto-detect from URL
+    // null explicit key -> auto-detect from URL
     const p3 = provider.resolveProfile(null, "https://open.bigmodel.cn/api/paas/v4");
     try testing.expectEqualStrings("GLM / ZhipuAI", p3.name);
+
+    // Empty explicit key -> treated as unset, auto-detect from URL
+    const p3b = provider.resolveProfile("", "https://api.deepseek.com/v1");
+    try testing.expectEqualStrings("DeepSeek", p3b.name);
 
     // No key and no URL -> generic
     const p4 = provider.resolveProfile(null, null);
     try testing.expectEqualStrings("Generic OpenAI-compat", p4.name);
+}
+
+test "provider: modular provider modules match URLs and expose distinct profiles" {
+    try testing.expectEqualStrings("deepseek", provider.providers.deepseek.key);
+    try testing.expect(provider.providers.deepseek.matchesUrl("https://api.deepseek.com/v1"));
+    try testing.expect(!provider.providers.deepseek.matchesUrl("https://api.openai.com/v1"));
+
+    try testing.expectEqualStrings("openai", provider.providers.openai.key);
+    try testing.expect(provider.providers.openai.matchesUrl("https://api.openai.com/v1"));
+
+    try testing.expectEqualStrings("qwen", provider.providers.qwen.key);
+    try testing.expect(provider.providers.qwen.matchesUrl("https://dashscope.aliyuncs.com"));
+
+    try testing.expectEqualStrings("minimax", provider.providers.minimax.key);
+    try testing.expect(provider.providers.minimax.matchesUrl("https://api.minimax.chat"));
+
+    try testing.expectEqualStrings("glm", provider.providers.glm.key);
+    try testing.expect(provider.providers.glm.matchesUrl("https://open.bigmodel.cn"));
+
+    try testing.expectEqualStrings("kimi", provider.providers.kimi.key);
+    try testing.expect(provider.providers.kimi.matchesUrl("https://api.moonshot.cn"));
+
+    try testing.expectEqualStrings("xai", provider.providers.xai.key);
+    try testing.expect(provider.providers.xai.matchesUrl("https://api.x.ai"));
+
+    try testing.expectEqualStrings("vllm", provider.providers.vllm.key);
+    try testing.expect(provider.providers.vllm.matchesUrl("http://vllm-host:8000"));
+
+    try testing.expectEqualStrings("generic", provider.providers.generic.key);
+    try testing.expect(!provider.providers.generic.matchesUrl("http://any-url"));
 }
 
 test "provider: DeepSeek request body omits reasoning_effort and echoes reasoning_content" {
@@ -236,6 +270,48 @@ test "provider: xAI request body formats nested reasoning object" {
     try testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"medium\"}") != null);
 }
 
+test "provider: Qwen request body emits reasoning_effort and uses max_tokens" {
+    const alloc = testing.allocator;
+    const profile = provider.getProfile("qwen");
+
+    var msgs: std.ArrayListUnmanaged(proto.Message) = .empty;
+    defer msgs.deinit(alloc);
+
+    const a1_blocks = try alloc.alloc(proto.ContentBlock, 2);
+    defer alloc.free(a1_blocks);
+    a1_blocks[0] = .{ .thinking = .{ .thinking = "Qwen internal thought", .signature = "" } };
+    a1_blocks[1] = .{ .text = "Qwen public answer" };
+    try msgs.append(alloc, .{ .role = .assistant, .content = a1_blocks });
+
+    const tools = [_]proto.ToolDefinition{};
+
+    const body = try openai.buildRequestBodyWithProfile(
+        alloc,
+        profile,
+        "qwen-max",
+        4096,
+        false, // use_completion_tokens (profile also has false)
+        false,
+        "medium",
+        false,
+        "",
+        msgs.items,
+        &tools,
+    );
+    defer alloc.free(body);
+
+    // 1. Qwen profile has .top_level_effort -> reasoning_effort is emitted
+    try testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"medium\"") != null);
+
+    // 2. echo_policy = drop -> reasoning_content is NOT echoed back
+    try testing.expect(std.mem.indexOf(u8, body, "reasoning_content") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"content\":\"Qwen public answer\"") != null);
+
+    // 3. use_completion_tokens = false -> max_tokens is used, NOT max_completion_tokens
+    try testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":4096") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "max_completion_tokens") == null);
+}
+
 // ---------------------------------------------------------------------------
 // Thinking Tag Parsing Tests (Chinese & English)
 // ---------------------------------------------------------------------------
@@ -352,4 +428,74 @@ test "StreamEventParser: handles multi-byte chunk split across Chinese thinking 
 
     try testing.expectEqualStrings("Deep thought in chunks", collector.think_text.items);
     try testing.expectEqualStrings("Visible response", collector.regular_text.items);
+}
+
+test "StreamEventParser: parses Chinese <推敲> thinking tag" {
+    const alloc = testing.allocator;
+    var collector = EventCollector.init(alloc);
+    defer collector.deinit();
+
+    var parser = chat_stream.StreamEventParser.init();
+
+    const input = "<推敲>Weighing each word carefully.</推敲>Here is the polished answer.";
+    parser.feed(input, &collector, EventCollector.onEvent);
+
+    try testing.expectEqualStrings("Weighing each word carefully.", collector.think_text.items);
+    try testing.expectEqualStrings("Here is the polished answer.", collector.regular_text.items);
+}
+
+test "StreamEventParser: reasoning-only stream without text" {
+    const alloc = testing.allocator;
+
+    // Case 1: full reasoning-only stream (no regular text at all)
+    {
+        var col = EventCollector.init(alloc);
+        defer col.deinit();
+        var parser = chat_stream.StreamEventParser.init();
+
+        parser.feed("<思考>Only reasoning, no visible answer.</思考>", &col, EventCollector.onEvent);
+
+        try testing.expectEqualStrings("Only reasoning, no visible answer.", col.think_text.items);
+        try testing.expectEqualStrings("", col.regular_text.items);
+    }
+
+    // Case 2: unclosed tag — must not crash and must not leak into regular_text
+    {
+        var col = EventCollector.init(alloc);
+        defer col.deinit();
+        var parser = chat_stream.StreamEventParser.init();
+
+        parser.feed("<推理>unfinished without a close tag", &col, EventCollector.onEvent);
+
+        try testing.expectEqualStrings("unfinished without a close tag", col.think_text.items);
+        try testing.expectEqualStrings("", col.regular_text.items);
+    }
+}
+
+test "StreamEventParser: english_only set ignores Chinese tags" {
+    const alloc = testing.allocator;
+    var collector = EventCollector.init(alloc);
+    defer collector.deinit();
+
+    var parser = chat_stream.StreamEventParser.initWithTags(.english_only);
+
+    parser.feed("<思考>x</思考>hello", &collector, EventCollector.onEvent);
+
+    // Chinese tags are not recognized: everything flows through as regular text
+    try testing.expectEqualStrings("", collector.think_text.items);
+    try testing.expectEqualStrings("<思考>x</思考>hello", collector.regular_text.items);
+}
+
+test "StreamEventParser: none set passes everything as text" {
+    const alloc = testing.allocator;
+    var collector = EventCollector.init(alloc);
+    defer collector.deinit();
+
+    var parser = chat_stream.StreamEventParser.initWithTags(.none);
+
+    parser.feed("<think>y</think>z", &collector, EventCollector.onEvent);
+
+    // Tag parsing disabled: '<' bytes flow straight through as plain text
+    try testing.expectEqualStrings("", collector.think_text.items);
+    try testing.expectEqualStrings("<think>y</think>z", collector.regular_text.items);
 }

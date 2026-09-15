@@ -154,21 +154,23 @@ pub const Client = struct {
         const root_url = getRootApiUrl(self.base_url);
         const profile = provider.resolveProfile(self.provider_key, self.base_url);
         var active_protocol: ProtocolMode = blk: {
+            // RFC-012 §7 priority: explicit OPENAI_PROTOCOL > ProviderProfile.protocol > cached auto-negotiate.
             if (self.protocol_mode == .chat_completions) break :blk .chat_completions;
             if (self.protocol_mode == .responses) break :blk .responses;
-            if (self.cached_protocol) |p| break :blk p;
-            // Profile wire protocol determines initial auto attempt:
             switch (profile.protocol) {
                 .chat_completions => break :blk .chat_completions,
                 .responses => break :blk .responses,
-                .auto => break :blk .responses,
+                .auto => {
+                    if (self.cached_protocol) |p| break :blk p;
+                    break :blk .responses; // existing auto-negotiate default
+                },
             }
         };
 
         var retry_count: u32 = 0;
         while (retry_count < 4) : (retry_count += 1) {
             const body = if (active_protocol == .responses)
-                try buildResponsesRequestBody(self.alloc, self.model, self.max_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, system_prompt, msgs, tools)
+                try buildResponsesRequestBody(self.alloc, self.model, self.max_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, system_prompt, msgs, tools, profile)
             else
                 try buildRequestBodyWithProfile(self.alloc, profile, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, self.disable_stream_options, system_prompt, msgs, tools);
             defer self.alloc.free(body);
@@ -230,9 +232,11 @@ pub const Client = struct {
             // Auto-Negotiation & Adaptive Cross-Protocol Fallback (Tier 2)
             if (self.protocol_mode == .auto and ctx.raw_accum_init) {
                 const raw_resp = ctx.raw_accum.items;
-                
+
                 // Fallback 1: Chat Completions -> Responses API on 400 error due to lack of support or tools/reasoning conflict
-                if (active_protocol == .chat_completions and req_http_code == 400) {
+                // RFC-012 §3.6: profile-pinned protocol (e.g. deepseek/qwen/minimax/glm/kimi/vllm) must NOT cross-fallback;
+                // only profiles with .auto wire protocol are allowed to negotiate up.
+                if (active_protocol == .chat_completions and profile.protocol == .auto and req_http_code == 400) {
                     if (std.mem.indexOf(u8, raw_resp, "responses") != null or
                         std.mem.indexOf(u8, raw_resp, "unsupported_model") != null or
                         (std.mem.indexOf(u8, raw_resp, "reasoning") != null and tools.len > 0))
@@ -250,11 +254,9 @@ pub const Client = struct {
                 //   - Server returns 400 + "not found" (endpoint exists but model not found), OR
                 //   - Server returns 400 + json_parse_error / ResponseInput (endpoint exists but does not
                 //     understand Responses API JSON format — e.g. OpenAI-compat proxies like agnes).
-                const responses_format_rejected = req_http_code == 400 and (
-                    std.mem.indexOf(u8, raw_resp, "not found") != null or
+                const responses_format_rejected = req_http_code == 400 and (std.mem.indexOf(u8, raw_resp, "not found") != null or
                     std.mem.indexOf(u8, raw_resp, "json_parse_error") != null or
-                    std.mem.indexOf(u8, raw_resp, "ResponseInput") != null
-                );
+                    std.mem.indexOf(u8, raw_resp, "ResponseInput") != null);
                 if (active_protocol == .responses and (req_http_code == 404 or responses_format_rejected)) {
                     active_protocol = .chat_completions;
                     self.cached_protocol = .chat_completions;
@@ -268,13 +270,14 @@ pub const Client = struct {
             if (req_http_code == 400 and ctx.raw_accum_init) {
                 const raw_resp = ctx.raw_accum.items;
                 var should_retry = false;
-                
+
                 if (std.mem.indexOf(u8, raw_resp, "unsupported_parameter") != null and
-                    (std.mem.indexOf(u8, raw_resp, "max_tokens") != null or std.mem.indexOf(u8, raw_resp, "max_completion_tokens") != null)) {
+                    (std.mem.indexOf(u8, raw_resp, "max_tokens") != null or std.mem.indexOf(u8, raw_resp, "max_completion_tokens") != null))
+                {
                     self.use_completion_tokens = !self.use_completion_tokens;
                     should_retry = true;
                 }
-                
+
                 if (std.mem.indexOf(u8, raw_resp, "reasoning_effort") != null) {
                     self.disable_reasoning_effort = true;
                     should_retry = true;
@@ -282,11 +285,12 @@ pub const Client = struct {
 
                 // RFC-006 §3.6: stream_options not supported by older compat APIs
                 if (std.mem.indexOf(u8, raw_resp, "stream_options") != null or
-                    std.mem.indexOf(u8, raw_resp, "include_usage") != null) {
+                    std.mem.indexOf(u8, raw_resp, "include_usage") != null)
+                {
                     self.disable_stream_options = true;
                     should_retry = true;
                 }
-                
+
                 if (should_retry) {
                     if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
                     ctx.response.deinit();
@@ -326,6 +330,7 @@ pub fn buildResponsesRequestBody(
     system_prompt: []const u8,
     msgs: []const proto.Message,
     tools: []const proto.ToolDefinition,
+    profile: provider.ProviderProfile,
 ) ![]u8 {
     var buf = utils.BufWriter.init(alloc);
     errdefer buf.deinit();
@@ -336,12 +341,16 @@ pub fn buildResponsesRequestBody(
     try w.print("{{\"model\":\"{s}\",\"stream\":true", .{model});
 
     if (!disable_reasoning_effort) {
-        if (reasoning_effort) |effort| {
-            if (!std.mem.eql(u8, effort, "none")) {
-                try w.print(",\"reasoning\":{{\"effort\":\"{s}\"}}", .{effort});
+        // RFC-012: providers with unsupported reasoning_param (deepseek/minimax/glm)
+        // must never emit any reasoning field, even when forced onto the Responses API.
+        if (profile.reasoning_param != .unsupported) {
+            if (reasoning_effort) |effort| {
+                if (!std.mem.eql(u8, effort, "none")) {
+                    try w.print(",\"reasoning\":{{\"effort\":\"{s}\"}}", .{effort});
+                }
+            } else {
+                try w.writeAll(",\"reasoning\":{\"effort\":\"medium\"}");
             }
-        } else {
-            try w.writeAll(",\"reasoning\":{\"effort\":\"medium\"}");
         }
     }
 
@@ -881,7 +890,6 @@ const StreamCtx = struct {
         // All other Responses API events (e.g. response.created, response.in_progress, response.content_part.added, etc.)
         if (std.mem.startsWith(u8, ev, "response.")) return;
 
-
         // RFC-006 §3.1: Usage JSON parse struct (nested optional)
         const UsagePromptDetails = struct {
             cached_tokens: ?u64 = null,
@@ -910,11 +918,18 @@ const StreamCtx = struct {
                 type: ?[]const u8 = null,
                 function: ?ChoiceDeltaToolCallFunction = null,
             };
+            const ChoiceDeltaDetail = struct {
+                reasoning_content: ?[]const u8 = null,
+                reasoning: ?[]const u8 = null,
+            };
             const ChoiceDelta = struct {
                 content: ?[]const u8 = null,
                 reasoning_content: ?[]const u8 = null,
                 // RFC-006 §3.3: OpenAI o-series/GPT-5.x uses field "reasoning"
                 reasoning: ?[]const u8 = null,
+                // Nested proxy/aggregator wrappers: delta.detail.reasoning_content or delta.details
+                detail: ?ChoiceDeltaDetail = null,
+                details: ?ChoiceDeltaDetail = null,
                 tool_calls: ?[]ChoiceDeltaToolCall = null,
             };
             const Choice = struct {
@@ -938,10 +953,17 @@ const StreamCtx = struct {
         if (chunk.choices) |choices| {
             for (choices) |choice| {
                 if (choice.delta) |delta| {
-                    // RFC-006 §3.3: receive reasoning from both variants
-                    // DeepSeek-style: delta.reasoning_content
-                    // OpenAI o-series/GPT-5.x: delta.reasoning
-                    const reasoning = delta.reasoning_content orelse delta.reasoning;
+                    // Receive reasoning from variants:
+                    // 1. DeepSeek-style: delta.reasoning_content
+                    // 2. OpenAI o-series/GPT-5.x: delta.reasoning
+                    // 3. Nested proxy/aggregator wrappers: delta.detail.reasoning_content / delta.details
+                    const detail_reasoning = if (delta.detail) |d|
+                        (d.reasoning_content orelse d.reasoning)
+                    else if (delta.details) |d|
+                        (d.reasoning_content orelse d.reasoning)
+                    else
+                        null;
+                    const reasoning = delta.reasoning_content orelse delta.reasoning orelse detail_reasoning;
                     if (reasoning) |r| {
                         if (r.len > 0) {
                             if (!self.think_accum_init) {
@@ -1132,7 +1154,7 @@ const StreamCtx = struct {
                 .id = id,
                 .name = name,
                 .input_json = args,
-            }});
+            } });
         }
         if (self.tool_calls.items.len > 0 and self.response.stop_reason != .tool_use) {
             self.response.stop_reason = .tool_use;
@@ -1431,7 +1453,7 @@ test "openai auto-negotiation: buildResponsesRequestBody format" {
         .{ .name = "bash", .description = "Run shell", .input_schema_json = "{\"type\":\"object\"}" },
     };
 
-    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, null, "System instructions", &msgs, &tools);
+    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, null, "System instructions", &msgs, &tools, provider.getProfile("openai"));
     defer alloc.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-5.6-terra\"") != null);
@@ -1528,7 +1550,7 @@ test "openai auto-negotiation: buildResponsesRequestBody multi-turn with functio
         .{ .name = "bash", .description = "Run shell", .input_schema_json = "{\"type\":\"object\"}" },
     };
 
-    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-luna", 4096, false, null, "System prompt", &msgs, &tools);
+    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-luna", 4096, false, null, "System prompt", &msgs, &tools, provider.getProfile("openai"));
     defer alloc.free(body);
 
     // Verify correct input format generated: user msg -> assistant text -> assistant function_call -> function_call_output
@@ -1617,17 +1639,17 @@ test "openai dynamic reasoning_effort in buildResponsesRequestBody" {
     const tools = [_]proto.ToolDefinition{};
 
     // 1. With reasoning_effort = "low"
-    const body_low = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "low", "", &msgs, &tools);
+    const body_low = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "low", "", &msgs, &tools, provider.getProfile("openai"));
     defer alloc.free(body_low);
     try testing.expect(std.mem.indexOf(u8, body_low, "\"reasoning\":{\"effort\":\"low\"}") != null);
 
     // 2. With reasoning_effort = "high"
-    const body_high = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "high", "", &msgs, &tools);
+    const body_high = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "high", "", &msgs, &tools, provider.getProfile("openai"));
     defer alloc.free(body_high);
     try testing.expect(std.mem.indexOf(u8, body_high, "\"reasoning\":{\"effort\":\"high\"}") != null);
 
     // 3. With default null (falls back to medium)
-    const body_default = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, null, "", &msgs, &tools);
+    const body_default = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, null, "", &msgs, &tools, provider.getProfile("openai"));
     defer alloc.free(body_default);
     try testing.expect(std.mem.indexOf(u8, body_default, "\"reasoning\":{\"effort\":\"medium\"}") != null);
 }
@@ -1675,3 +1697,15 @@ test "openai stream: Responses API embedded type in data without event prefix (O
     try testing.expectEqual(@as(u64, 8), ctx.response.usage.reasoning_tokens);
 }
 
+test "openai buildResponsesRequestBody: unsupported reasoning_param omits reasoning" {
+    const alloc = testing.allocator;
+    const msgs = [_]proto.Message{};
+    const tools = [_]proto.ToolDefinition{};
+
+    // RFC-012: profile-pinned .unsupported reasoning_param (deepseek) must never
+    // emit any reasoning field, even when forced onto the Responses API.
+    const body = try buildResponsesRequestBody(alloc, "deepseek-chat", 4096, false, "high", "", &msgs, &tools, provider.getProfile("deepseek"));
+    defer alloc.free(body);
+
+    try testing.expect(std.mem.indexOf(u8, body, "reasoning") == null);
+}
