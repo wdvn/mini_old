@@ -25,6 +25,8 @@ test {
     _ = @import("test_session_diagnostics.zig");
     _ = @import("test_procedural_graph.zig");
     _ = @import("test_dynamic_thinking.zig");
+    _ = @import("test_media_ingest.zig");
+    _ = @import("test_media_gen.zig");
 }
 
 // ---------------------------------------------------------------------------

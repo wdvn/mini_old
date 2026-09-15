@@ -83,6 +83,11 @@ pub const TokenEstimator = struct {
                     total += 20; // overhead
                     total += self.estimate(tr.content);
                 },
+                .image => |img| {
+                    // RFC-011 §3.0.3: direct calculation without caching raw base64 in StringHashMap
+                    const cost = @as(u32, @intCast(@max(85, img.data.len / 1000)));
+                    total += cost;
+                },
             }
         }
         return total;

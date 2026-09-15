@@ -65,6 +65,10 @@ pub const History = struct {
                     alloc.free(tr.tool_use_id);
                     alloc.free(tr.content);
                 },
+                .image => |img| {
+                    alloc.free(img.data);
+                    alloc.free(img.media_type);
+                },
             }
         }
         alloc.free(blocks);
@@ -132,6 +136,10 @@ pub const History = struct {
                         .content = try self.alloc.dupe(u8, tr.content),
                         .is_error = tr.is_error,
                     } },
+                    .image => |img| .{ .image = .{
+                        .data = try self.alloc.dupe(u8, img.data),
+                        .media_type = try self.alloc.dupe(u8, img.media_type),
+                    } },
                 };
             }
             try self.msgs.append(self.alloc, .{
@@ -149,6 +157,21 @@ pub const History = struct {
         const text_copy = try self.alloc.dupe(u8, text);
         const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
         blocks[0] = .{ .text = text_copy };
+        try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks, .tier = .recent });
+    }
+
+    /// Appends user message with image attachments (RFC-011 Media Ingestion).
+    pub fn addUserWithImages(self: *History, text: []const u8, images: []const proto.ImageBlock) !void {
+        const text_copy = try self.alloc.dupe(u8, text);
+        const total_blocks = 1 + images.len;
+        const blocks = try self.alloc.alloc(proto.ContentBlock, total_blocks);
+        blocks[0] = .{ .text = text_copy };
+        for (images, 0..) |img, idx| {
+            blocks[1 + idx] = .{ .image = .{
+                .data = try self.alloc.dupe(u8, img.data),
+                .media_type = try self.alloc.dupe(u8, img.media_type),
+            } };
+        }
         try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks, .tier = .recent });
     }
 
@@ -182,6 +205,10 @@ pub const History = struct {
                     .content = try self.alloc.dupe(u8, tr.content),
                     .is_error = tr.is_error,
                 }},
+                .image => |img| .{ .image = .{
+                    .data = try self.alloc.dupe(u8, img.data),
+                    .media_type = try self.alloc.dupe(u8, img.media_type),
+                }},
             };
         }
         try self.msgs.append(self.alloc, .{ .role = .assistant, .content = blocks, .tier = .recent });
@@ -197,6 +224,27 @@ pub const History = struct {
                 .tool_use_id = try self.alloc.dupe(u8, r.tool_use_id),
                 .content = try self.alloc.dupe(u8, r.content),
                 .is_error = r.is_error,
+            }};
+        }
+        try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks, .tier = .recent });
+    }
+
+    /// Appends tool execution results + attached loop-back images (RFC-011 §3.5).
+    pub fn addToolResultsWithImages(self: *History, results: []const proto.ToolResult, images: []const proto.ImageBlock) !void {
+        const total_blocks = results.len + images.len;
+        if (total_blocks == 0) return;
+        const blocks = try self.alloc.alloc(proto.ContentBlock, total_blocks);
+        for (results, 0..) |r, i| {
+            blocks[i] = .{ .tool_result = .{
+                .tool_use_id = try self.alloc.dupe(u8, r.tool_use_id),
+                .content = try self.alloc.dupe(u8, r.content),
+                .is_error = r.is_error,
+            }};
+        }
+        for (images, 0..) |img, j| {
+            blocks[results.len + j] = .{ .image = .{
+                .data = try self.alloc.dupe(u8, img.data),
+                .media_type = try self.alloc.dupe(u8, img.media_type),
             }};
         }
         try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks, .tier = .recent });

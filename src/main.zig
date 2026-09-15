@@ -43,6 +43,9 @@ pub const js_bindings = @import("runtime/js_bindings.zig");
 pub const process_manager = @import("runtime/process_manager.zig");
 pub const graph_mod = @import("lib/graph.zig");
 pub const graph_store_mod = @import("core/memact/graph_store.zig");
+pub const tokens_mod = @import("core/memact/tokens.zig");
+pub const media_lib = @import("lib/media.zig");
+pub const media_gen_tool = @import("tools/media_gen.zig");
 
 pub const VERSION = "1.0.0";
 
@@ -244,15 +247,27 @@ pub fn main(init: std.process.Init) !void {
         const expanded = try artifacts_mod.expandArtifactReferences(alloc, init.io, prompt);
         defer alloc.free(expanded);
 
+        const media_res = if (agent.config.image_input_enabled)
+            media_lib.parsePromptImages(alloc, init.io, expanded, .{
+                .max_per_turn = agent.config.image_input_max_per_turn,
+                .max_bytes = agent.config.image_input_max_bytes,
+            }) catch |err| {
+                stderrPrint("Failed to process image attachment: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            }
+        else
+            media_lib.PromptParseResult{ .clean_text = try alloc.dupe(u8, expanded), .images = try alloc.alloc(protocol_mod.ImageBlock, 0) };
+        defer media_res.deinit(alloc);
+
         var renderer = ui_repl.chat_stream.TurnRenderer.init(alloc, init.io);
         defer renderer.deinit();
         ui_repl.current_renderer = &renderer;
         defer ui_repl.current_renderer = null;
 
-        renderer.startTurn(expanded);
+        renderer.startTurn(media_res.clean_text);
         const start_ms = utils.milliTimestamp();
 
-        try agent.processInput(expanded, ui_repl.printText, ui_repl.printThinkText);
+        try agent.processInputWithImages(media_res.clean_text, media_res.images, ui_repl.printText, ui_repl.printThinkText);
 
         if (signals_mod.isInterrupted()) {
             std.process.exit(130);
@@ -263,7 +278,7 @@ pub fn main(init: std.process.Init) !void {
         const ctx_tokens = agent.token_estimator.estimateMessages(agent.history.messages());
 
         renderer.finishTurn(.{
-            .prompt_tokens = agent.token_estimator.estimate(expanded),
+            .prompt_tokens = agent.token_estimator.estimate(media_res.clean_text),
             .completion_tokens = agent.last_turn_completion_tokens,
             .context_tokens = ctx_tokens,
             .max_context_tokens = agent.config.context_window,
@@ -289,14 +304,27 @@ pub fn main(init: std.process.Init) !void {
         const expanded = try artifacts_mod.expandArtifactReferences(alloc, init.io, file_prompt);
         defer alloc.free(expanded);
 
+        const media_res = if (agent.config.image_input_enabled)
+            media_lib.parsePromptImages(alloc, init.io, expanded, .{
+                .max_per_turn = agent.config.image_input_max_per_turn,
+                .max_bytes = agent.config.image_input_max_bytes,
+            }) catch |err| {
+                stderrPrint("Failed to process image attachment: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            }
+        else
+            media_lib.PromptParseResult{ .clean_text = try alloc.dupe(u8, expanded), .images = try alloc.alloc(protocol_mod.ImageBlock, 0) };
+        defer media_res.deinit(alloc);
+
         var renderer = ui_repl.chat_stream.TurnRenderer.init(alloc, init.io);
+        defer renderer.deinit();
         ui_repl.current_renderer = &renderer;
         defer ui_repl.current_renderer = null;
 
-        renderer.startTurn(expanded);
+        renderer.startTurn(media_res.clean_text);
         const start_ms = utils.milliTimestamp();
 
-        try agent.processInput(expanded, ui_repl.printText, ui_repl.printThinkText);
+        try agent.processInputWithImages(media_res.clean_text, media_res.images, ui_repl.printText, ui_repl.printThinkText);
 
         if (signals_mod.isInterrupted()) {
             std.process.exit(130);
@@ -307,7 +335,7 @@ pub fn main(init: std.process.Init) !void {
         const ctx_tokens = agent.token_estimator.estimateMessages(agent.history.messages());
 
         renderer.finishTurn(.{
-            .prompt_tokens = agent.token_estimator.estimate(expanded),
+            .prompt_tokens = agent.token_estimator.estimate(media_res.clean_text),
             .completion_tokens = agent.last_turn_completion_tokens,
             .context_tokens = ctx_tokens,
             .max_context_tokens = agent.config.context_window,

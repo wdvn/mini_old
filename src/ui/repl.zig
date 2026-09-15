@@ -11,6 +11,8 @@ const editor_mod = @import("editor.zig");
 const main = @import("../main.zig");
 const utils = @import("../core/utils.zig");
 const signals = @import("../core/signals.zig");
+const proto = @import("../core/protocol.zig");
+const media_lib = @import("../lib/media.zig");
 pub const chat_stream = @import("chat_stream.zig");
 
 pub const PROMPT_PREFIX = "\x1b[1;34mYou\x1b[0m > ";
@@ -52,17 +54,34 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
         const expanded_input = try artifacts_mod.expandArtifactReferences(alloc, io, input);
         defer alloc.free(expanded_input);
 
+        // Parse @image:<path> references if media ingestion is enabled
+        const media_res = if (agent.config.image_input_enabled)
+            media_lib.parsePromptImages(alloc, io, expanded_input, .{
+                .max_per_turn = agent.config.image_input_max_per_turn,
+                .max_bytes = agent.config.image_input_max_bytes,
+            }) catch |err| {
+                main.stdoutPrint("\x1b[31m[media error]\x1b[0m Failed to process image attachment: {s}\n", .{@errorName(err)});
+                continue;
+            }
+        else
+            media_lib.PromptParseResult{ .clean_text = try alloc.dupe(u8, expanded_input), .images = try alloc.alloc(proto.ImageBlock, 0) };
+        defer media_res.deinit(alloc);
+
+        if (media_res.images.len > 0) {
+            main.stdoutPrint("\x1b[90m[attached {d} image(s)]\x1b[0m\n", .{media_res.images.len});
+        }
+
         // Initialize TurnRenderer for this chat turn
         var renderer = chat_stream.TurnRenderer.init(alloc, io);
         defer renderer.deinit();
         current_renderer = &renderer;
         defer current_renderer = null;
 
-        renderer.startTurn(expanded_input);
+        renderer.startTurn(media_res.clean_text);
         const start_ms = utils.milliTimestamp();
 
         // Send to agent
-        agent.processInput(expanded_input, printText, printThinkText) catch |e| {
+        agent.processInputWithImages(media_res.clean_text, media_res.images, printText, printThinkText) catch |e| {
             if (e != error.Interrupted) {
                 main.stdoutPrint("\x1b[31m[error]\x1b[0m {s}\n", .{@errorName(e)});
             }
@@ -77,7 +96,7 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
         const ctx_tokens = agent.token_estimator.estimateMessages(agent.history.messages());
 
         renderer.finishTurn(.{
-            .prompt_tokens = agent.token_estimator.estimate(expanded_input),
+            .prompt_tokens = agent.token_estimator.estimate(media_res.clean_text),
             .completion_tokens = agent.last_turn_completion_tokens,
             .context_tokens = ctx_tokens,
             .max_context_tokens = agent.config.context_window,

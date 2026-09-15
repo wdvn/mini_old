@@ -56,6 +56,14 @@ pub const ToolResultBlock = struct {
     is_error: bool,
 };
 
+/// Image block attached in a message (RFC-010 Vision).
+pub const ImageBlock = struct {
+    /// Base64 data (WITHOUT prefix "data:...;base64,").
+    data: []const u8,
+    /// MIME type: "image/png", "image/jpeg", "image/webp", "image/gif".
+    media_type: []const u8,
+};
+
 /// Thinking / reasoning block from the AI.
 pub const ThinkingBlock = struct {
     /// Content of thinking stream.
@@ -68,6 +76,8 @@ pub const ThinkingBlock = struct {
 pub const ContentBlock = union(enum) {
     /// Regular text.
     text: []const u8,
+    /// Image block attached in a message (RFC-010 Vision).
+    image: ImageBlock,
     /// Thinking stream of the AI.
     thinking: ThinkingBlock,
     /// Tool execution requested by the AI.
@@ -175,6 +185,10 @@ pub const Response = struct {
                 .tool_result => |tr| {
                     self.allocator.free(tr.tool_use_id);
                     self.allocator.free(tr.content);
+                },
+                .image => |img| {
+                    self.allocator.free(img.data);
+                    self.allocator.free(img.media_type);
                 },
             }
         }

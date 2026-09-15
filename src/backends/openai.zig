@@ -317,7 +317,7 @@ pub const Client = struct {
 // ---------------------------------------------------------------------------
 
 /// Build request body for OpenAI Responses API (POST /v1/responses).
-fn buildResponsesRequestBody(
+pub fn buildResponsesRequestBody(
     alloc: Allocator,
     model: []const u8,
     max_tokens: u32,
@@ -395,6 +395,13 @@ fn buildResponsesRequestBody(
                         \\{{"type":"function_call_output","call_id":"{s}","output":"{s}"}}
                     , .{ tr.tool_use_id, escaped });
                 },
+                .image => |img| {
+                    if (!first_item) try w.writeByte(',');
+                    first_item = false;
+                    try w.print(
+                        \\{{"type":"input_image","image_url":"data:{s};base64,{s}"}}
+                    , .{ img.media_type, img.data });
+                },
                 .thinking => {},
             }
         }
@@ -404,7 +411,11 @@ fn buildResponsesRequestBody(
     return buf.toOwnedSlice();
 }
 
-fn buildRequestBody(
+// ---------------------------------------------------------------------------
+// Chat Completions Request building
+// ---------------------------------------------------------------------------
+
+pub fn buildRequestBody(
     alloc: Allocator,
     model: []const u8,
     max_tokens: u32,
@@ -469,23 +480,23 @@ fn buildRequestBody(
     // Messages
     var first_msg = true;
     for (msgs) |msg| {
-        if (!first_msg) try w.writeByte(',');
-        first_msg = false;
-
-        // Check if message is entirely tool_results
-        var all_tool_results = true;
+        // Check if message has tool_results
+        var has_tool_results = false;
+        var has_other_blocks = false;
         for (msg.content) |block| {
-            if (block != .tool_result) {
-                all_tool_results = false;
-                break;
+            if (block == .tool_result) {
+                has_tool_results = true;
+            } else {
+                has_other_blocks = true;
             }
         }
 
-        if (all_tool_results and msg.content.len > 0) {
-            // Encode as multiple "tool" role messages
-            for (msg.content, 0..) |block, bi| {
-                if (bi > 0) try w.writeByte(',');
+        if (has_tool_results) {
+            // Encode all tool_results as "tool" role messages
+            for (msg.content) |block| {
                 if (block == .tool_result) {
+                    if (!first_msg) try w.writeByte(',');
+                    first_msg = false;
                     const tr = block.tool_result;
                     const escaped = try json.escape(alloc, tr.content);
                     defer alloc.free(escaped);
@@ -494,28 +505,64 @@ fn buildRequestBody(
                     , .{ tr.tool_use_id, escaped });
                 }
             }
-            continue;
+            if (!has_other_blocks) continue;
+            // Otherwise, continue to encode non-tool blocks (e.g. attached images) as standard message
         }
 
         // Standard user or assistant message
+        if (!first_msg) try w.writeByte(',');
+        first_msg = false;
         try w.print("{{\"role\":\"{s}\",", .{msg.role.toJson()});
 
-        var has_text = false;
-        var text_content: ?[]const u8 = null;
+        var has_images = false;
         for (msg.content) |block| {
-            if (block == .text) {
-                has_text = true;
-                text_content = block.text;
+            if (block == .image) {
+                has_images = true;
                 break;
             }
         }
 
-        if (has_text and text_content != null) {
-            const escaped = try json.escape(alloc, text_content.?);
-            defer alloc.free(escaped);
-            try w.print("\"content\":\"{s}\"", .{escaped});
+        if (has_images) {
+            try w.writeAll("\"content\":[");
+            var first_cb = true;
+            for (msg.content) |block| {
+                switch (block) {
+                    .text => |t| {
+                        if (!first_cb) try w.writeByte(',');
+                        first_cb = false;
+                        const escaped = try json.escape(alloc, t);
+                        defer alloc.free(escaped);
+                        try w.print("{{\"type\":\"text\",\"text\":\"{s}\"}}", .{escaped});
+                    },
+                    .image => |img| {
+                        if (!first_cb) try w.writeByte(',');
+                        first_cb = false;
+                        try w.print(
+                            \\{{"type":"image_url","image_url":{{"url":"data:{s};base64,{s}"}}}}
+                        , .{ img.media_type, img.data });
+                    },
+                    else => {},
+                }
+            }
+            try w.writeByte(']');
         } else {
-            try w.print("\"content\":null", .{});
+            var has_text = false;
+            var text_content: ?[]const u8 = null;
+            for (msg.content) |block| {
+                if (block == .text) {
+                    has_text = true;
+                    text_content = block.text;
+                    break;
+                }
+            }
+
+            if (has_text and text_content != null) {
+                const escaped = try json.escape(alloc, text_content.?);
+                defer alloc.free(escaped);
+                try w.print("\"content\":\"{s}\"", .{escaped});
+            } else {
+                try w.print("\"content\":null", .{});
+            }
         }
 
         // Handle tool_calls
