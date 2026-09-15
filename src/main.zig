@@ -19,6 +19,7 @@ pub const backends = struct {
     pub const openai_mod = @import("backends/openai.zig");
     pub const claude_mod = @import("backends/claude.zig");
     pub const ollama_mod = @import("backends/ollama.zig");
+    pub const provider_mod = @import("backends/provider.zig");
 };
 pub const tools_mod = @import("tooling/registry.zig");
 pub const session_diagnostics = @import("tools/session_diagnostics.zig");

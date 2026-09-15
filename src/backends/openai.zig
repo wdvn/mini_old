@@ -30,6 +30,7 @@ const json = @import("../core/json.zig");
 const http_lib = @import("../lib/http_request.zig");
 const main = @import("../main.zig");
 const utils = @import("../core/utils.zig");
+const provider = @import("provider.zig");
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -91,23 +92,12 @@ pub const Client = struct {
     cached_protocol: ?ProtocolMode,
     /// Dynamic reasoning effort override for next request ("minimal" | "low" | "medium" | "high" | "none" | null).
     active_reasoning_effort: ?[]const u8,
+    /// Provider key for wire protocol quirks normalization (RFC-012).
+    provider_key: []const u8 = "generic",
 
     /// Initialize client.
     pub fn init(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32) Client {
-        return .{
-            .alloc = alloc,
-            .base_url = base_url,
-            .api_key = api_key,
-            .api_header = api_header,
-            .model = model,
-            .max_tokens = max_tokens,
-            .use_completion_tokens = false,
-            .disable_reasoning_effort = false,
-            .disable_stream_options = false,
-            .protocol_mode = .auto,
-            .cached_protocol = null,
-            .active_reasoning_effort = null,
-        };
+        return initWithProvider(alloc, base_url, api_key, api_header, model, max_tokens, .auto, "generic");
     }
 
     /// Set dynamic reasoning effort override.
@@ -129,6 +119,11 @@ pub const Client = struct {
 
     /// Initialize client with explicit protocol mode.
     pub fn initWithProtocol(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32, protocol_mode: ProtocolMode) Client {
+        return initWithProvider(alloc, base_url, api_key, api_header, model, max_tokens, protocol_mode, "generic");
+    }
+
+    /// Initialize client with explicit provider key and protocol mode (RFC-012).
+    pub fn initWithProvider(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32, protocol_mode: ProtocolMode, provider_key: []const u8) Client {
         return .{
             .alloc = alloc,
             .base_url = base_url,
@@ -142,6 +137,7 @@ pub const Client = struct {
             .protocol_mode = protocol_mode,
             .cached_protocol = null,
             .active_reasoning_effort = null,
+            .provider_key = provider_key,
         };
     }
 
@@ -156,13 +152,17 @@ pub const Client = struct {
         think_cb: ?*const fn ([]const u8) void,
     ) !proto.Response {
         const root_url = getRootApiUrl(self.base_url);
+        const profile = provider.resolveProfile(self.provider_key, self.base_url);
         var active_protocol: ProtocolMode = blk: {
             if (self.protocol_mode == .chat_completions) break :blk .chat_completions;
             if (self.protocol_mode == .responses) break :blk .responses;
             if (self.cached_protocol) |p| break :blk p;
-            // Auto mode: default to prioritizing Responses API. Backend not supporting it
-            // (404/400 "not found") will automatically fallback to chat_completions in Tier 2.
-            break :blk .responses;
+            // Profile wire protocol determines initial auto attempt:
+            switch (profile.protocol) {
+                .chat_completions => break :blk .chat_completions,
+                .responses => break :blk .responses,
+                .auto => break :blk .responses,
+            }
         };
 
         var retry_count: u32 = 0;
@@ -170,7 +170,7 @@ pub const Client = struct {
             const body = if (active_protocol == .responses)
                 try buildResponsesRequestBody(self.alloc, self.model, self.max_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, system_prompt, msgs, tools)
             else
-                try buildRequestBody(self.alloc, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, self.disable_stream_options, system_prompt, msgs, tools);
+                try buildRequestBodyWithProfile(self.alloc, profile, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, self.disable_stream_options, system_prompt, msgs, tools);
             defer self.alloc.free(body);
 
             // Build URL according to active protocol
@@ -415,8 +415,10 @@ pub fn buildResponsesRequestBody(
 // Chat Completions Request building
 // ---------------------------------------------------------------------------
 
-pub fn buildRequestBody(
+/// Build request body for OpenAI Chat Completions API with a specific ProviderProfile (RFC-012).
+pub fn buildRequestBodyWithProfile(
     alloc: Allocator,
+    profile: provider.ProviderProfile,
     model: []const u8,
     max_tokens: u32,
     use_completion_tokens: bool,
@@ -434,16 +436,23 @@ pub fn buildRequestBody(
     var reasoning_buf: [64]u8 = undefined;
     const reasoning_effort_str: []const u8 = blk: {
         if (disable_reasoning_effort) break :blk "";
+        if (profile.reasoning_param == .unsupported) break :blk "";
         if (reasoning_effort) |effort| {
             if (std.mem.eql(u8, effort, "none")) break :blk "";
-            break :blk std.fmt.bufPrint(&reasoning_buf, "\"reasoning_effort\":\"{s}\",", .{effort}) catch "";
+            if (profile.reasoning_param == .top_level_effort) {
+                break :blk std.fmt.bufPrint(&reasoning_buf, "\"reasoning_effort\":\"{s}\",", .{effort}) catch "";
+            } else if (profile.reasoning_param == .nested_reasoning_object) {
+                break :blk std.fmt.bufPrint(&reasoning_buf, "\"reasoning\":{{\"effort\":\"{s}\"}},", .{effort}) catch "";
+            }
         }
         break :blk "";
     };
-    // RFC-006 §3.6: adaptive stream_options — omit if compat API does not support it
-    const stream_options_str = if (disable_stream_options) "" else ",\"stream_options\":{\"include_usage\":true}";
+    // RFC-006 §3.6: adaptive stream_options — omit if compat API or provider does not support it
+    const effective_stream_opts = !disable_stream_options and profile.supports_stream_options;
+    const stream_options_str = if (effective_stream_opts) ",\"stream_options\":{\"include_usage\":true}" else "";
 
-    if (use_completion_tokens) {
+    const effective_use_completion_tokens = use_completion_tokens or profile.use_completion_tokens;
+    if (effective_use_completion_tokens) {
         try w.print(
             \\{{"model":"{s}","max_completion_tokens":{d},{s}"stream":true{s}
         , .{ model, max_tokens, reasoning_effort_str, stream_options_str });
@@ -515,10 +524,12 @@ pub fn buildRequestBody(
         try w.print("{{\"role\":\"{s}\",", .{msg.role.toJson()});
 
         var has_images = false;
+        var reasoning_text: ?[]const u8 = null;
         for (msg.content) |block| {
             if (block == .image) {
                 has_images = true;
-                break;
+            } else if (block == .thinking) {
+                reasoning_text = block.thinking.thinking;
             }
         }
 
@@ -565,6 +576,15 @@ pub fn buildRequestBody(
             }
         }
 
+        // Echo reasoning_content for providers requiring it in assistant history (DeepSeek)
+        if (msg.role == .assistant and reasoning_text != null) {
+            if (profile.echo_policy == .echo_required or profile.echo_policy == .echo_optional) {
+                const escaped_rt = try json.escape(alloc, reasoning_text.?);
+                defer alloc.free(escaped_rt);
+                try w.print(",\"reasoning_content\":\"{s}\"", .{escaped_rt});
+            }
+        }
+
         // Handle tool_calls
         var has_tool_calls = false;
         for (msg.content) |block| {
@@ -598,6 +618,34 @@ pub fn buildRequestBody(
     try w.writeByte(']');
     try w.writeByte('}');
     return buf.toOwnedSlice();
+}
+
+/// Backward compatible wrapper defaulting to generic profile.
+pub fn buildRequestBody(
+    alloc: Allocator,
+    model: []const u8,
+    max_tokens: u32,
+    use_completion_tokens: bool,
+    disable_reasoning_effort: bool,
+    reasoning_effort: ?[]const u8,
+    disable_stream_options: bool,
+    system_prompt: []const u8,
+    msgs: []const proto.Message,
+    tools: []const proto.ToolDefinition,
+) ![]u8 {
+    return buildRequestBodyWithProfile(
+        alloc,
+        provider.getProfile("generic"),
+        model,
+        max_tokens,
+        use_completion_tokens,
+        disable_reasoning_effort,
+        reasoning_effort,
+        disable_stream_options,
+        system_prompt,
+        msgs,
+        tools,
+    );
 }
 
 // ---------------------------------------------------------------------------

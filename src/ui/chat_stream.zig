@@ -120,6 +120,40 @@ pub const StreamEvent = union(enum) {
     text_end,
 };
 
+pub const open_think_tags = [_][]const u8{
+    "<think>",
+    "<思考>",
+    "<推理>",
+    "<反思>",
+    "<推敲>",
+};
+
+pub const close_think_tags = [_][]const u8{
+    "</think>",
+    "</思考>",
+    "</推理>",
+    "</反思>",
+    "</推敲>",
+};
+
+fn isPrefixOfAny(buf: []const u8, tags: []const []const u8) bool {
+    for (tags) |tag| {
+        if (buf.len <= tag.len and std.mem.eql(u8, buf, tag[0..buf.len])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn isExactMatch(buf: []const u8, tags: []const []const u8) bool {
+    for (tags) |tag| {
+        if (std.mem.eql(u8, buf, tag)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Finite State Machine parsing stream chunks and emitting typed StreamEvents
 pub const StreamEventParser = struct {
     pub const ParseState = enum {
@@ -130,7 +164,7 @@ pub const StreamEventParser = struct {
     };
 
     state: ParseState = .idle,
-    tag_buf: [16]u8 = undefined,
+    tag_buf: [32]u8 = undefined,
     tag_len: usize = 0,
     fence_buf: [32]u8 = undefined,
     fence_len: usize = 0,
@@ -160,19 +194,24 @@ pub const StreamEventParser = struct {
         while (i < chunk.len) {
             const c = chunk[i];
 
-            // 1. Parse <think>...</think>
+            // 1. Parse <think>...</think> and Chinese variants (<思考>...</思考>, <推理>, <反思>, <推敲>)
             if (self.state == .in_think) {
-                const expected = "</think>";
                 if (c == '<' or self.tag_len > 0) {
-                    self.tag_buf[self.tag_len] = c;
-                    self.tag_len += 1;
-                    i += 1;
+                    if (self.tag_len < self.tag_buf.len) {
+                        self.tag_buf[self.tag_len] = c;
+                        self.tag_len += 1;
+                        i += 1;
 
-                    if (self.tag_buf[self.tag_len - 1] == expected[self.tag_len - 1]) {
-                        if (self.tag_len == expected.len) {
+                        const cur = self.tag_buf[0..self.tag_len];
+                        if (isExactMatch(cur, &close_think_tags)) {
                             self.state = .idle;
                             self.tag_len = 0;
                             emitFn(context, .think_end);
+                        } else if (isPrefixOfAny(cur, &close_think_tags)) {
+                            // Valid prefix of a close tag, continue buffering
+                        } else {
+                            emitFn(context, .{ .think_chunk = cur });
+                            self.tag_len = 0;
                         }
                     } else {
                         emitFn(context, .{ .think_chunk = self.tag_buf[0..self.tag_len] });
@@ -273,15 +312,15 @@ pub const StreamEventParser = struct {
                 }
             }
 
-            // 4. Check opening <think> tag
-            const think_expected = "<think>";
+            // 4. Check opening thinking tags (<think>, <思考>, <推理>, <反思>, <推敲>)
             if (c == '<' or self.tag_len > 0) {
-                self.tag_buf[self.tag_len] = c;
-                self.tag_len += 1;
-                i += 1;
+                if (self.tag_len < self.tag_buf.len) {
+                    self.tag_buf[self.tag_len] = c;
+                    self.tag_len += 1;
+                    i += 1;
 
-                if (self.tag_buf[self.tag_len - 1] == think_expected[self.tag_len - 1]) {
-                    if (self.tag_len == think_expected.len) {
+                    const cur = self.tag_buf[0..self.tag_len];
+                    if (isExactMatch(cur, &open_think_tags)) {
                         if (self.state == .in_text) {
                             self.state = .idle;
                             emitFn(context, .text_end);
@@ -289,6 +328,15 @@ pub const StreamEventParser = struct {
                         self.state = .in_think;
                         self.tag_len = 0;
                         emitFn(context, .think_start);
+                    } else if (isPrefixOfAny(cur, &open_think_tags)) {
+                        // Valid prefix of an open tag, continue buffering
+                    } else {
+                        if (self.state != .in_text) {
+                            self.state = .in_text;
+                            emitFn(context, .text_start);
+                        }
+                        emitFn(context, .{ .text_chunk = cur });
+                        self.tag_len = 0;
                     }
                 } else {
                     if (self.state != .in_text) {

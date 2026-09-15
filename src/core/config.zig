@@ -53,6 +53,7 @@ const Allocator = std.mem.Allocator;
 const utils = @import("utils.zig");
 const skills_mod = @import("skills.zig");
 const main = @import("../main.zig");
+const provider_mod = @import("../backends/provider.zig");
 
 
 // ---------------------------------------------------------------------------
@@ -101,6 +102,8 @@ pub const Config = struct {
     openai_compat_model: []const u8,
     /// Flag to use max_completion_tokens instead of max_tokens.
     openai_compat_use_completion_tokens: bool,
+    /// Provider profile key for OpenAI-compat backend (RFC-012).
+    openai_provider: []const u8 = "generic",
     /// Anthropic API key. Null = unconfigured.
     anthropic_key: ?[]const u8,
     /// Claude model ID.
@@ -261,6 +264,16 @@ pub const Config = struct {
         const openai_key = env_map.get("OPENAI_COMPAT_API_KEY");
         const openai_api_header = env_map.get("OPENAI_COMPAT_API_HEADER") orelse "Authorization";
         const openai_model = env_map.get("OPENAI_COMPAT_MODEL") orelse "gpt-4o-mini";
+        const openai_provider_key = blk: {
+            if (env_map.get("OPENAI_COMPAT_PROVIDER") orelse env_map.get("MINI_PROVIDER")) |p| {
+                if (p.len > 0) break :blk p;
+            }
+            if (openai_url) |url| {
+                const detected = provider_mod.detectFromUrl(url);
+                if (!std.mem.eql(u8, detected, "generic")) break :blk detected;
+            }
+            break :blk "generic";
+        };
         const anthropic_key = env_map.get("ANTHROPIC_API_KEY");
         const claude_model = env_map.get("CLAUDE_MODEL") orelse "claude-opus-4-5";
         const ollama_url = env_map.get("OLLAMA_HOST") orelse "http://localhost:11434";
@@ -376,9 +389,10 @@ pub const Config = struct {
         };
 
         if (!utils.isSubagent()) {
-            main.stderrPrint("[config] Env bindings: OPENAI_COMPAT_URL={s}, OPENAI_COMPAT_MODEL={s}, MINI_HOME={s}\n", .{
+            main.stderrPrint("[config] Env bindings: OPENAI_COMPAT_URL={s}, OPENAI_COMPAT_MODEL={s}, PROVIDER={s}, MINI_HOME={s}\n", .{
                 openai_url orelse "(null)",
                 openai_model,
+                openai_provider_key,
                 env_map.get("MINI_HOME") orelse "(null)",
             });
             main.stderrPrint("[config] Build: {s} | {s} | {s} | zig {s}\n", .{
@@ -494,6 +508,7 @@ pub const Config = struct {
             .openai_compat_api_header = openai_api_header,
             .openai_compat_model = openai_model,
             .openai_compat_use_completion_tokens = use_completion_tokens,
+            .openai_provider = openai_provider_key,
             .anthropic_key = anthropic_key,
             .claude_model = claude_model,
             .ollama_url = ollama_url,
@@ -684,6 +699,8 @@ pub const JsonConfig = struct {
     openai_compat_api_header: ?[]const u8 = null,
     openai_compat_model: ?[]const u8 = null,
     openai_compat_use_completion_tokens: ?bool = null,
+    openai_compat_provider: ?[]const u8 = null,
+    openai_provider: ?[]const u8 = null,
     anthropic_api_key: ?[]const u8 = null,
     claude_model: ?[]const u8 = null,
     ollama_host: ?[]const u8 = null,
@@ -804,6 +821,7 @@ fn tryLoadJsonConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: st
     if (cfg.openai_compat_api_header) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_API_HEADER", val);
     if (cfg.openai_compat_model) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_MODEL", val);
     if (cfg.openai_compat_use_completion_tokens) |val| count += setEnvDefault(env_map, "MINI_USE_COMPLETION_TOKENS", if (val) "1" else "0");
+    if (cfg.openai_compat_provider orelse cfg.openai_provider) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER", val);
     if (cfg.anthropic_api_key) |val| count += setEnvDefault(env_map, "ANTHROPIC_API_KEY", val);
     if (cfg.claude_model) |val| count += setEnvDefault(env_map, "CLAUDE_MODEL", val);
     if (cfg.ollama_host) |val| count += setEnvDefault(env_map, "OLLAMA_HOST", val);

@@ -27,6 +27,7 @@ test {
     _ = @import("test_dynamic_thinking.zig");
     _ = @import("test_media_ingest.zig");
     _ = @import("test_media_gen.zig");
+    _ = @import("test_provider_profiles.zig");
 }
 
 // ---------------------------------------------------------------------------

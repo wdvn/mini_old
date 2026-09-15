@@ -226,7 +226,7 @@ pub const AgentLoop = struct {
                     .chat_completions => .chat_completions,
                     .responses => .responses,
                 };
-                break :blk .{ .openai = openai_mod.Client.initWithProtocol(
+                break :blk .{ .openai = openai_mod.Client.initWithProvider(
                     alloc,
                     url,
                     config.openai_compat_key orelse "",
@@ -234,6 +234,7 @@ pub const AgentLoop = struct {
                     config.openai_compat_model,
                     config.max_tokens,
                     proto_mode,
+                    config.openai_provider,
                 ) };
             }
             if (config.anthropic_key) |key| {
@@ -1249,7 +1250,7 @@ pub const AgentLoop = struct {
                 .chat_completions => .chat_completions,
                 .responses => .responses,
             };
-            self.backend = .{ .openai = openai_mod.Client.initWithProtocol(
+            self.backend = .{ .openai = openai_mod.Client.initWithProvider(
                 self.alloc,
                 url,
                 cfg.openai_compat_key orelse "",
@@ -1257,6 +1258,7 @@ pub const AgentLoop = struct {
                 model_override orelse cfg.openai_compat_model,
                 cfg.max_tokens,
                 proto_mode,
+                cfg.openai_provider,
             ) };
         } else if (std.mem.eql(u8, backend_name, "claude")) {
             const key = cfg.anthropic_key orelse {
