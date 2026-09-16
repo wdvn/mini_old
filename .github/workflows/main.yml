@@ -30,12 +30,12 @@ jobs:
           #   target: x86_64-macos
           #   artifact_name: mini-agent-macos-x86_64
           #   bin_name: mini
-          - os: windows-latest
-            target: x86_64-windows
-            artifact_name: mini-agent-windows-x86_64
-            bin_name: mini.exe
+          # - os: windows-latest
+          #   target: x86_64-windows
+          #   artifact_name: mini-agent-windows-x86_64
+          #   bin_name: mini.exe
 
-    runs-on: ${{ matrix.os }}
+    runs-on:  self-hosted
     
     steps:
       - name: Checkout repository
