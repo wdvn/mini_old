@@ -1,4 +1,4 @@
-name: Release
+name: Build and Release (Main)
 
 on:
   push:
@@ -18,33 +18,19 @@ jobs:
             target: x86_64-linux-gnu
             artifact_name: mini-agent-linux-x86_64
             bin_name: mini
-          # - os: ubuntu-latest
-          #   target: aarch64-linux-gnu
-          #   artifact_name: mini-agent-linux-aarch64
-          #   bin_name: mini
-          # - os: macos-latest
-          #   target: aarch64-macos
-          #   artifact_name: mini-agent-macos-aarch64
-          #   bin_name: mini
-          # - os: macos-13
-          #   target: x86_64-macos
-          #   artifact_name: mini-agent-macos-x86_64
-          #   bin_name: mini
-          # - os: windows-latest
-          #   target: x86_64-windows
-          #   artifact_name: mini-agent-windows-x86_64
-          #   bin_name: mini.exe
 
-    runs-on:  self-hosted
+    runs-on: self-hosted
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Zig
         uses: goto-bus-stop/setup-zig@v2
         with:
-          version: 0.16.0 # Điều chỉnh phiên bản Zig phù hợp với dự án của bạn (VD: 0.13.0, 0.14.0...)
+          version: 0.16.0
 
       - name: Build
         run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
@@ -62,9 +48,22 @@ jobs:
           mv zig-out\bin\${{ matrix.bin_name }} ${{ matrix.artifact_name }}.exe
           Compress-Archive -Path ${{ matrix.artifact_name }}.exe -DestinationPath ${{ matrix.artifact_name }}.zip
 
+      - name: Create or Update Nightly Tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -d nightly || true
+          git push origin :nightly || true
+          git tag nightly
+          git push origin nightly
+
       - name: Upload Release Asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
+          tag_name: nightly
+          name: "Development Build (Nightly)"
+          body: "Tự động cập nhật từ nhánh main."
+          prerelease: true
           files: |
             ${{ matrix.artifact_name }}.tar.gz
             ${{ matrix.artifact_name }}.zip
