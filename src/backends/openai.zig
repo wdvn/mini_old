@@ -716,6 +716,7 @@ const StreamCtx = struct {
     raw_accum_init: bool = false,
     event_type: [64]u8 = undefined,
     event_type_len: usize = 0,
+    finish_reason_received: bool = false,
 
     pub fn emitNormalized(self: *StreamCtx, text: []const u8, thinking: bool) !void {
         if (text.len == 0) return;
@@ -834,7 +835,7 @@ const StreamCtx = struct {
                 self.text_accum.clearRetainingCapacity();
             }
             // Only set to end_turn if tool_use or max_tokens not already set
-            if (self.response.stop_reason == .unknown) {
+            if (self.response.stop_reason == .unknown and !self.finish_reason_received) {
                 self.response.stop_reason = .end_turn;
             }
             return;
@@ -1043,6 +1044,7 @@ const StreamCtx = struct {
                     }
                 }
                 if (choice.finish_reason) |reason| {
+                    self.finish_reason_received = true;
                     // RFC-006 §3.4: fully map OpenAI finish_reason
                     if (std.mem.eql(u8, reason, "tool_calls")) {
                         self.response.stop_reason = .tool_use;
@@ -1180,7 +1182,7 @@ const StreamCtx = struct {
             try self.response.content.append(self.alloc, .{ .text = text });
             self.text_accum.clearRetainingCapacity();
         }
-        if (self.response.content.items.len > 0 and self.response.stop_reason == .unknown) {
+        if (self.response.content.items.len > 0 and self.response.stop_reason == .unknown and !self.finish_reason_received) {
             self.response.stop_reason = .end_turn;
         }
 
@@ -1239,24 +1241,28 @@ fn feedLines(ctx: anytype, lines: []const []const u8) !void {
 
 test "openai stream: parallel tool calls gop theo index (DeepSeek style)" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
     // Chunk dau: id+name; cac chunk sau chi index+arguments (DeepSeek khong lap id)
     try feedLines(&ctx, &.{
         \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"bash","arguments":"{\"com"}}]}}]}
+        ,
         \\data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"file_read","arguments":"{\"pa"}}]}}]}
+        ,
         \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"mand\":\"ls\"}"}}]}}]}
+        ,
         \\data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"th\":\"a.zig\"}"}}]}}]}
+        ,
         \\data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+        ,
         \\data: [DONE]
     });
 
@@ -1277,21 +1283,22 @@ test "openai stream: parallel tool calls gop theo index (DeepSeek style)" {
 
 test "openai stream: tool call khong co id — sinh id du phong" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
     // Provider compat khong gui id, chi index
     try feedLines(&ctx, &.{
         \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"glob","arguments":"{\"pat"}}]}}]}
+        ,
         \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"tern\":\"*.zig\"}"}}]}}]}
+        ,
         \\data: [DONE]
     });
 
@@ -1342,14 +1349,13 @@ test "openai buildRequestBody: disable_stream_options omits stream_options" {
 
 test "openai stream: parse usage chunk (RFC-006 §3.1)" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
@@ -1374,14 +1380,13 @@ test "openai stream: parse usage chunk (RFC-006 §3.1)" {
 
 test "openai stream: DeepSeek usage alias prompt_cache_hit_tokens (RFC-006 §3.1)" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
@@ -1400,14 +1405,13 @@ test "openai stream: DeepSeek usage alias prompt_cache_hit_tokens (RFC-006 §3.1
 
 test "openai stream: delta.reasoning parsed as thinking (RFC-006 §3.3)" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
@@ -1438,14 +1442,13 @@ test "openai stream: delta.reasoning parsed as thinking (RFC-006 §3.3)" {
 
 test "openai stream: finish_reason content_filter maps to unknown (RFC-006 §3.4)" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
@@ -1462,14 +1465,13 @@ test "openai stream: finish_reason content_filter maps to unknown (RFC-006 §3.4
 
 test "openai stream: finish_reason function maps to tool_use (RFC-006 §3.4)" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
@@ -1526,14 +1528,13 @@ test "openai auto-negotiation: buildResponsesRequestBody format" {
 
 test "openai stream: Responses API event-based streaming parse" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
@@ -1623,14 +1624,13 @@ test "openai auto-negotiation: buildResponsesRequestBody multi-turn with functio
 
 test "openai stream: Responses API output_item.added and output_item.done does not duplicate arguments" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
@@ -1717,14 +1717,13 @@ test "openai dynamic reasoning_effort in buildResponsesRequestBody" {
 
 test "openai stream: Responses API embedded type in data without event prefix (OpenRouter style)" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
