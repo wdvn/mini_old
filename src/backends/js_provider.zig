@@ -51,6 +51,22 @@ pub const JsProviderAdapter = struct {
     fn_transform_request: ?c.JSValue = null,
     profile: ProviderProfile,
     name_owned: ?[]const u8 = null,
+    deadline_ms: i64 = 0,
+
+    fn nowMs() i64 {
+        var ts: std.os.linux.timespec = undefined;
+        if (std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts) != 0) return std.math.maxInt(i64);
+        return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1000000);
+    }
+
+    fn interrupt(_: ?*c.JSRuntime, opaque_ptr: ?*anyopaque) callconv(.c) c_int {
+        const deadline: *i64 = @ptrCast(@alignCast(opaque_ptr orelse return 1));
+        return if (nowMs() >= deadline.*) 1 else 0;
+    }
+
+    fn beginCall(self: *JsProviderAdapter) void {
+        self.deadline_ms = nowMs() + 100;
+    }
 
     /// Initialize adapter from JS source code.
     pub fn initFromSource(alloc: Allocator, source: []const u8) !*JsProviderAdapter {
@@ -60,6 +76,8 @@ pub const JsProviderAdapter = struct {
         // Limit RAM for safety (32MB is plenty for provider adapters)
         c.JS_SetMemoryLimit(rt, 32 * 1024 * 1024);
         c.JS_SetMaxStackSize(rt, 512 * 1024);
+        var deadline = nowMs() + 100;
+        c.JS_SetInterruptHandler(rt, interrupt, &deadline);
 
         const ctx = c.JS_NewContext(rt) orelse return error.QuickJSContextInitFailed;
         errdefer c.JS_FreeContext(ctx);
@@ -112,7 +130,7 @@ pub const JsProviderAdapter = struct {
         if (isException(eval_val)) {
             const exc = c.JS_GetException(ctx);
             c.JS_FreeValue(ctx, exc);
-            eval_val = JS_NULL;
+            return error.JsEvaluationFailed;
         }
 
         // If wrapper didn't produce an object, try direct expression `( <source> )`
@@ -143,7 +161,10 @@ pub const JsProviderAdapter = struct {
             }
         }
 
-        const self = try alloc.create(JsProviderAdapter);
+        const self = alloc.create(JsProviderAdapter) catch |err| {
+            c.JS_FreeValue(ctx, eval_val);
+            return err;
+        };
         errdefer alloc.destroy(self);
 
         self.* = JsProviderAdapter{
@@ -154,7 +175,14 @@ pub const JsProviderAdapter = struct {
             .profile = provider_mod.getProfile("generic"),
         };
 
-        try self.parseExportedObject();
+        // Transfer ownership before parsing getters (which may execute JS).
+        c.JS_SetInterruptHandler(rt, interrupt, &self.deadline_ms);
+        self.beginCall();
+        self.parseExportedObject() catch |err| {
+            if (self.name_owned) |n| alloc.free(n);
+            c.JS_FreeValue(ctx, self.export_obj);
+            return err;
+        };
 
         return self;
     }
@@ -240,6 +268,16 @@ pub const JsProviderAdapter = struct {
             }
         }
 
+        const param_val = c.JS_GetPropertyStr(ctx, obj, "reasoning_param");
+        defer c.JS_FreeValue(ctx, param_val);
+        if (isString(param_val)) {
+            const str = c.JS_ToCString(ctx, param_val);
+            if (str != null) {
+                defer c.JS_FreeCString(ctx, str);
+                self.profile.reasoning_param = std.meta.stringToEnum(provider_mod.ReasoningParamFormat, std.mem.span(str)) orelse return error.InvalidReasoningParam;
+            }
+        }
+
         // 5. Hooks: extractReasoning
         const fn_er = c.JS_GetPropertyStr(ctx, obj, "extractReasoning");
         if (isFunction(ctx, fn_er)) {
@@ -268,6 +306,7 @@ pub const JsProviderAdapter = struct {
     /// Extract reasoning tokens from raw SSE JSON chunk.
     /// Returns allocated slice owned by caller if reasoning was found, or null.
     pub fn extractReasoning(self: *JsProviderAdapter, alloc: Allocator, raw_chunk_json: []const u8) ?[]const u8 {
+        self.beginCall();
         const fn_hook = self.fn_extract_reasoning orelse return null;
         if (raw_chunk_json.len == 0) return null;
 
@@ -305,6 +344,7 @@ pub const JsProviderAdapter = struct {
 
     /// Extract text content from raw SSE JSON chunk.
     pub fn extractContent(self: *JsProviderAdapter, alloc: Allocator, raw_chunk_json: []const u8) ?[]const u8 {
+        self.beginCall();
         const fn_hook = self.fn_extract_content orelse return null;
         if (raw_chunk_json.len == 0) return null;
 
@@ -343,6 +383,7 @@ pub const JsProviderAdapter = struct {
     /// Transform outgoing request JSON string before dispatch.
     /// Caller owns returned memory.
     pub fn transformRequest(self: *JsProviderAdapter, alloc: Allocator, raw_request_json: []const u8) ![]const u8 {
+        self.beginCall();
         const fn_hook = self.fn_transform_request orelse return try alloc.dupe(u8, raw_request_json);
         if (raw_request_json.len == 0) return try alloc.dupe(u8, raw_request_json);
 
@@ -350,7 +391,7 @@ pub const JsProviderAdapter = struct {
         if (isException(req_val)) {
             const exc = c.JS_GetException(self.ctx);
             c.JS_FreeValue(self.ctx, exc);
-            return try alloc.dupe(u8, raw_request_json);
+            return error.InvalidRequestJson;
         }
         defer c.JS_FreeValue(self.ctx, req_val);
 
@@ -361,7 +402,7 @@ pub const JsProviderAdapter = struct {
         if (isException(ret_val)) {
             const exc = c.JS_GetException(self.ctx);
             c.JS_FreeValue(self.ctx, exc);
-            return try alloc.dupe(u8, raw_request_json);
+            return error.JsRequestTransformFailed;
         }
 
         if (isObject(ret_val)) {
@@ -376,7 +417,7 @@ pub const JsProviderAdapter = struct {
             }
         }
 
-        return try alloc.dupe(u8, raw_request_json);
+        return error.JsRequestTransformFailed;
     }
 
     pub fn deinit(self: *JsProviderAdapter) void {

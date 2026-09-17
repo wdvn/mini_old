@@ -31,6 +31,8 @@ const http_lib = @import("../lib/http_request.zig");
 const main = @import("../main.zig");
 const utils = @import("../core/utils.zig");
 const provider = @import("provider.zig");
+const JsProviderAdapter = @import("js_provider.zig").JsProviderAdapter;
+const ThinkingFilter = @import("thinking_filter.zig").Filter;
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -94,6 +96,16 @@ pub const Client = struct {
     active_reasoning_effort: ?[]const u8,
     /// Provider key for wire protocol quirks normalization (RFC-012).
     provider_key: []const u8 = "generic",
+    /// Explicit trusted adapter source; never loaded from model output.
+    provider_js: ?[]const u8 = null,
+
+    fn loadAdapter(self: *const Client) !?*JsProviderAdapter {
+        return if (self.provider_js) |source| try JsProviderAdapter.initFromSource(self.alloc, source) else null;
+    }
+
+    fn transformBody(self: *const Client, adapter: ?*JsProviderAdapter, body: []const u8) ![]const u8 {
+        return if (adapter) |a| try a.transformRequest(self.alloc, body) else try self.alloc.dupe(u8, body);
+    }
 
     /// Initialize client.
     pub fn init(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32) Client {
@@ -152,7 +164,9 @@ pub const Client = struct {
         think_cb: ?*const fn ([]const u8) void,
     ) !proto.Response {
         const root_url = getRootApiUrl(self.base_url);
-        const profile = provider.resolveProfile(self.provider_key, self.base_url);
+        const adapter = try self.loadAdapter();
+        defer if (adapter) |a| a.deinit();
+        const profile = if (adapter) |a| a.profile else provider.resolveProfile(self.provider_key, self.base_url);
         var active_protocol: ProtocolMode = blk: {
             // RFC-012 §7 priority: explicit OPENAI_PROTOCOL > ProviderProfile.protocol > cached auto-negotiate.
             if (self.protocol_mode == .chat_completions) break :blk .chat_completions;
@@ -169,10 +183,12 @@ pub const Client = struct {
 
         var retry_count: u32 = 0;
         while (retry_count < 4) : (retry_count += 1) {
-            const body = if (active_protocol == .responses)
+            const native_body = if (active_protocol == .responses)
                 try buildResponsesRequestBody(self.alloc, self.model, self.max_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, system_prompt, msgs, tools, profile)
             else
                 try buildRequestBodyWithProfile(self.alloc, profile, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, self.disable_stream_options, system_prompt, msgs, tools);
+            defer self.alloc.free(native_body);
+            const body = try self.transformBody(adapter, native_body);
             defer self.alloc.free(body);
 
             // Build URL according to active protocol
@@ -192,6 +208,8 @@ pub const Client = struct {
             var ctx = StreamCtx{
                 .alloc = self.alloc,
                 .response = proto.Response.init(self.alloc),
+                .adapter = adapter,
+                .filter = .{ .tags = profile.thinking_tags },
                 .text_cb = text_cb,
                 .think_cb = think_cb,
                 .line_buf = .empty,
@@ -257,7 +275,7 @@ pub const Client = struct {
                 const responses_format_rejected = req_http_code == 400 and (std.mem.indexOf(u8, raw_resp, "not found") != null or
                     std.mem.indexOf(u8, raw_resp, "json_parse_error") != null or
                     std.mem.indexOf(u8, raw_resp, "ResponseInput") != null);
-                if (active_protocol == .responses and (req_http_code == 404 or responses_format_rejected)) {
+                if (active_protocol == .responses and profile.protocol == .auto and (req_http_code == 404 or responses_format_rejected)) {
                     active_protocol = .chat_completions;
                     self.cached_protocol = .chat_completions;
                     if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
@@ -683,8 +701,11 @@ const PartialToolCall = struct {
 const StreamCtx = struct {
     alloc: Allocator,
     response: proto.Response,
-    text_cb: ?*const fn ([]const u8) void,
-    think_cb: ?*const fn ([]const u8) void,
+    adapter: ?*JsProviderAdapter = null,
+    filter: ThinkingFilter = .{},
+
+    text_cb: ?*const fn ([]const u8) void = null,
+    think_cb: ?*const fn ([]const u8) void = null,
     line_buf: ArrayList(u8),
     tool_calls: ArrayList(PartialToolCall),
     text_accum: ArrayList(u8) = undefined,
@@ -695,6 +716,25 @@ const StreamCtx = struct {
     raw_accum_init: bool = false,
     event_type: [64]u8 = undefined,
     event_type_len: usize = 0,
+
+    pub fn emitNormalized(self: *StreamCtx, text: []const u8, thinking: bool) !void {
+        if (text.len == 0) return;
+        if (thinking) {
+            if (!self.think_accum_init) {
+                self.think_accum = .empty;
+                self.think_accum_init = true;
+            }
+            try self.think_accum.appendSlice(self.alloc, text);
+            if (self.think_cb) |cb| cb(text);
+        } else {
+            if (!self.text_accum_init) {
+                self.text_accum = .empty;
+                self.text_accum_init = true;
+            }
+            try self.text_accum.appendSlice(self.alloc, text);
+            if (self.text_cb) |cb| cb(text);
+        }
+    }
 
     fn onChunk(chunk: []const u8, userdata: *anyopaque) void {
         const self: *StreamCtx = @ptrCast(@alignCast(userdata));
@@ -780,6 +820,7 @@ const StreamCtx = struct {
                 }
             }
 
+            try self.filter.finish(self);
             // Save accumulated thinking
             if (self.think_accum_init and self.think_accum.items.len > 0) {
                 const think_text = try self.alloc.dupe(u8, self.think_accum.items);
@@ -799,6 +840,15 @@ const StreamCtx = struct {
             return;
         }
 
+        // Adapter overrides are evaluated once per JSON event. Null/failed extraction
+        // falls back to native fields; tool calls and usage always use native parsing.
+        const custom_text = if (self.adapter) |a| a.extractContent(self.alloc, data) else null;
+        defer if (custom_text) |s| self.alloc.free(s);
+        const custom_reasoning = if (self.adapter) |a| a.extractReasoning(self.alloc, data) else null;
+        defer if (custom_reasoning) |s| self.alloc.free(s);
+        if (custom_text) |s| try self.filter.feed(s, self);
+        if (custom_reasoning) |s| try self.emitNormalized(s, true);
+
         // Responses API event handlers
         if (std.mem.eql(u8, ev, "response.output_text.delta") or std.mem.eql(u8, ev, "response.text.delta")) {
             if (json.findString(data, "delta")) |delta_text| {
@@ -809,8 +859,7 @@ const StreamCtx = struct {
                         self.text_accum = .empty;
                         self.text_accum_init = true;
                     }
-                    try self.text_accum.appendSlice(self.alloc, unescaped);
-                    if (self.text_cb) |cb| cb(unescaped);
+                    if (custom_text == null) try self.filter.feed(unescaped, self);
                 }
             }
             return;
@@ -825,8 +874,7 @@ const StreamCtx = struct {
                         self.think_accum = .empty;
                         self.think_accum_init = true;
                     }
-                    try self.think_accum.appendSlice(self.alloc, unescaped);
-                    if (self.think_cb) |cb| cb(unescaped);
+                    if (custom_reasoning == null) try self.emitNormalized(unescaped, true);
                 }
             }
             return;
@@ -964,7 +1012,7 @@ const StreamCtx = struct {
                     else
                         null;
                     const reasoning = delta.reasoning_content orelse delta.reasoning orelse detail_reasoning;
-                    if (reasoning) |r| {
+                    if (if (custom_reasoning == null) reasoning else null) |r| {
                         if (r.len > 0) {
                             if (!self.think_accum_init) {
                                 self.think_accum = .empty;
@@ -974,14 +1022,13 @@ const StreamCtx = struct {
                             if (self.think_cb) |cb| cb(r);
                         }
                     }
-                    if (delta.content) |text| {
+                    if (if (custom_text == null) delta.content else null) |text| {
                         if (text.len > 0) {
                             if (!self.text_accum_init) {
                                 self.text_accum = .empty;
                                 self.text_accum_init = true;
                             }
-                            try self.text_accum.appendSlice(self.alloc, text);
-                            if (self.text_cb) |cb| cb(text);
+                            try self.filter.feed(text, self);
                         }
                     }
                     if (delta.tool_calls) |tool_calls| {
@@ -1121,6 +1168,7 @@ const StreamCtx = struct {
     }
 
     fn finalizeToolCalls(self: *StreamCtx) !void {
+        try self.filter.finish(self);
         // Fallback: if server closed stream without [DONE] or response.completed
         if (self.think_accum_init and self.think_accum.items.len > 0) {
             const think_text = try self.alloc.dupe(u8, self.think_accum.items);
@@ -1170,6 +1218,19 @@ const StreamCtx = struct {
 
 const testing = std.testing;
 
+test "js_provider: client loads configured adapter and transforms outgoing body" {
+    var client = Client.init(testing.allocator, "http://localhost/v1", "", "Authorization", "mock", 100);
+    client.provider_js =
+        \\export default { protocol: "chat_completions", transformRequest(req) { req.model = "adapted"; return req; } };
+    ;
+    const adapter = (try client.loadAdapter()).?;
+    defer adapter.deinit();
+    try testing.expectEqual(provider.WireProtocol.chat_completions, adapter.profile.protocol);
+    const body = try client.transformBody(adapter, "{\"model\":\"original\"}");
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("{\"model\":\"adapted\"}", body);
+}
+
 // --- Tests: streaming tool_calls gop theo index (DeepSeek style) ---
 
 fn feedLines(ctx: anytype, lines: []const []const u8) !void {
@@ -1201,14 +1262,14 @@ test "openai stream: parallel tool calls gop theo index (DeepSeek style)" {
 
     try ctx.finalizeToolCalls();
     try testing.expectEqual(proto.StopReason.tool_use, ctx.response.stop_reason);
-    try testing.expectEqual(@as(usize, 2), ctx.response.content.len);
+    try testing.expectEqual(@as(usize, 2), ctx.response.content.items.len);
 
-    const first = ctx.response.content[0].tool_use;
+    const first = ctx.response.content.items[0].tool_use;
     try testing.expectEqualStrings("bash", first.name);
     try testing.expectEqualStrings("call_a", first.id);
     try testing.expectEqualStrings("{\"command\":\"ls\"}", first.input_json);
 
-    const second = ctx.response.content[1].tool_use;
+    const second = ctx.response.content.items[1].tool_use;
     try testing.expectEqualStrings("file_read", second.name);
     try testing.expectEqualStrings("call_b", second.id);
     try testing.expectEqualStrings("{\"path\":\"a.zig\"}", second.input_json);
@@ -1236,8 +1297,8 @@ test "openai stream: tool call khong co id — sinh id du phong" {
 
     try ctx.finalizeToolCalls();
     try testing.expectEqual(proto.StopReason.tool_use, ctx.response.stop_reason);
-    try testing.expectEqual(@as(usize, 1), ctx.response.content.len);
-    const tu = ctx.response.content[0].tool_use;
+    try testing.expectEqual(@as(usize, 1), ctx.response.content.items.len);
+    const tu = ctx.response.content.items[0].tool_use;
     try testing.expectEqualStrings("glob", tu.name);
     try testing.expectEqualStrings("{\"pattern\":\"*.zig\"}", tu.input_json);
     try testing.expect(std.mem.startsWith(u8, tu.id, "call_"));

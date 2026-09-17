@@ -226,7 +226,7 @@ pub const AgentLoop = struct {
                     .chat_completions => .chat_completions,
                     .responses => .responses,
                 };
-                break :blk .{ .openai = openai_mod.Client.initWithProvider(
+                var client = openai_mod.Client.initWithProvider(
                     alloc,
                     url,
                     config.openai_compat_key orelse "",
@@ -235,7 +235,9 @@ pub const AgentLoop = struct {
                     config.max_tokens,
                     proto_mode,
                     config.openai_provider,
-                ) };
+                );
+                client.provider_js = config.openai_provider_js;
+                break :blk .{ .openai = client };
             }
             if (config.anthropic_key) |key| {
                 if (!utils.isSubagent()) main.stderrPrint("[agent] Backend: Claude ({s})\n", .{config.claude_model});
@@ -1260,6 +1262,7 @@ pub const AgentLoop = struct {
                 proto_mode,
                 cfg.openai_provider,
             ) };
+            self.backend.openai.provider_js = cfg.openai_provider_js;
         } else if (std.mem.eql(u8, backend_name, "claude")) {
             const key = cfg.anthropic_key orelse {
                 main.stderrPrint("[agent] ANTHROPIC_API_KEY is not configured\n", .{});

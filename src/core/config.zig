@@ -104,6 +104,7 @@ pub const Config = struct {
     openai_compat_use_completion_tokens: bool,
     /// Provider profile key for OpenAI-compat backend (RFC-012).
     openai_provider: []const u8 = "generic",
+    openai_provider_js: ?[]const u8 = null,
     /// Anthropic API key. Null = unconfigured.
     anthropic_key: ?[]const u8,
     /// Claude model ID.
@@ -509,6 +510,7 @@ pub const Config = struct {
             .openai_compat_model = openai_model,
             .openai_compat_use_completion_tokens = use_completion_tokens,
             .openai_provider = openai_provider_key,
+            .openai_provider_js = env_map.get("OPENAI_COMPAT_PROVIDER_JS"),
             .anthropic_key = anthropic_key,
             .claude_model = claude_model,
             .ollama_url = ollama_url,
@@ -700,6 +702,7 @@ pub const JsonConfig = struct {
     openai_compat_model: ?[]const u8 = null,
     openai_compat_use_completion_tokens: ?bool = null,
     openai_compat_provider: ?[]const u8 = null,
+    openai_compat_provider_js: ?[]const u8 = null,
     openai_provider: ?[]const u8 = null,
     anthropic_api_key: ?[]const u8 = null,
     claude_model: ?[]const u8 = null,
@@ -821,6 +824,7 @@ fn tryLoadJsonConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: st
     if (cfg.openai_compat_api_header) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_API_HEADER", val);
     if (cfg.openai_compat_model) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_MODEL", val);
     if (cfg.openai_compat_use_completion_tokens) |val| count += setEnvDefault(env_map, "MINI_USE_COMPLETION_TOKENS", if (val) "1" else "0");
+    if (cfg.openai_compat_provider_js) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER_JS", val);
     if (cfg.openai_compat_provider orelse cfg.openai_provider) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER", val);
     if (cfg.anthropic_api_key) |val| count += setEnvDefault(env_map, "ANTHROPIC_API_KEY", val);
     if (cfg.claude_model) |val| count += setEnvDefault(env_map, "CLAUDE_MODEL", val);

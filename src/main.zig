@@ -540,6 +540,7 @@ test {
     _ = @import("core/artifacts.zig");
     _ = @import("core/agent.zig");
     _ = @import("core/history.zig");
+    _ = @import("backends/openai.zig");
     _ = @import("core/journal.zig");
     _ = @import("core/protocol.zig");
     _ = @import("core/json.zig");
