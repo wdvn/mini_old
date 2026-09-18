@@ -8,6 +8,12 @@
 //!   - Undo/Redo: Ctrl+Z / Ctrl+Y (16-snapshot ring, 4KB/snapshot cap)
 //!   - Kill ring: Ctrl+W cut left word, Ctrl+K cut to end of line, Ctrl+Y yank (5-slot ring)
 //!   - Ctrl+A/E/U/L, Home/End, ↑/↓ history, bracketed paste
+//!   - Multiline insert: Shift+Enter / Ctrl+Enter / Alt+Enter, Ctrl+J (RFC-008 §5B).
+//!     Modified Enter is decoded from xterm modifyOtherKeys ("ESC[27;2;13~")
+//!     or kitty keyboard protocol ("ESC[13;2u"); the editor requests
+//!     modifyOtherKeys=1 (level 1: only re-encodes keys whose legacy encoding
+//!     is ambiguous, e.g. Shift+Enter, leaving Ctrl/Alt+letter untouched)
+//!     while in raw mode.
 //!
 //! Still a single-line composer (multiline is Phase 1 — RFC-000).
 
@@ -75,6 +81,9 @@ pub const LineEditor = struct {
     suppress_redraw: bool,
     /// Timestamp of the most recent Ctrl+C press (ms).
     last_ctrl_c_ms: i64,
+    /// Set when Ctrl+C / Ctrl+D arrives as a CSI-u sequence with empty buffer
+    /// (kitty protocol mode) — readLine exits on next loop iteration.
+    exit_pending: bool,
 
     pub fn init(alloc: Allocator) LineEditor {
         return .{
@@ -104,6 +113,7 @@ pub const LineEditor = struct {
             .paste_buf = .empty,
             .suppress_redraw = false,
             .last_ctrl_c_ms = 0,
+            .exit_pending = false,
         };
     }
 
@@ -516,24 +526,39 @@ pub const LineEditor = struct {
 
         try std.posix.tcsetattr(stdin_fd, .FLUSH, raw);
         defer {
-            stdout_file.writeStreamingAll(io, "\x1b[?2004l") catch {};
+            stdout_file.writeStreamingAll(io, "\x1b[?2004l\x1b[>4;0m") catch {};
             std.posix.tcsetattr(stdin_fd, .FLUSH, orig_termios) catch {};
         }
 
-        // Bracketed paste mode.
-        stdout_file.writeStreamingAll(io, "\x1b[?2004h") catch {};
+        // Bracketed paste mode + enhanced keyboard reporting so that
+        // Shift/Ctrl+Enter arrive as a distinguishable sequence instead of
+        // a plain '\r' (13):
+        //   - xterm modifyOtherKeys level 1:  Shift+Enter -> ESC[27;2;13~
+        //   - kitty protocol (flag 1):       Shift+Enter -> ESC[13;2u
+        // Level 1 only re-encodes keys whose legacy encoding is ambiguous
+        // (Shift+Enter and plain Enter both legacy-encode as '\r'), so
+        // Ctrl/Alt+letter keep their legacy bytes and existing bindings are
+        // unaffected. Unknown terminals ignore the request (no-op), plain
+        // Enter still sends '\r'.
+        stdout_file.writeStreamingAll(io, "\x1b[>4;1m\x1b[?2004h") catch {};
 
         self.buf.clearRetainingCapacity();
         self.pos = 0;
         self.rendered_rows = 0;
         self.cursor_row = 0;
         self.limit_msg = false;
+        self.exit_pending = false;
         self.history_index = self.prompt_history.entries.items.len;
         self.draft.clearRetainingCapacity();
 
         self.redraw(io, prompt);
 
         while (true) {
+            // CSI-u exit request (Ctrl+C via kitty protocol) handled after
+            // pending input is consumed (see handleEscapeSlice, code 3 / 99).
+            if (self.exit_pending and self.buf.items.len == 0) {
+                return null;
+            }
             var read_buf: [1024]u8 = undefined;
             const n = stdin_file.readStreaming(io, &.{&read_buf}) catch |err| {
                 if (err == error.Interrupted) {
@@ -797,6 +822,112 @@ pub const LineEditor = struct {
             }
         }
 
+        // Digit-led CSI (kitty CSI-u / xterm modifyOtherKeys), e.g.
+        //   ESC [ 13 ; 2 u       Shift+Enter (kitty keyboard protocol)
+        //   ESC [ 27 ; 2 ; 13 ~  Shift+Enter (xterm modifyOtherKeys=1)
+        // Enter (code 13) with modifier -> insert newline (RFC-008 §5B).
+        // Ctrl+C delivered as CSI-u (code 3, or 99 with ctrl modifier)
+        // cancels the line / exits REPL. NOTE: the exact bracketed-paste
+        // START marker "ESC[200~" is excluded here — it must fall through
+        // to the paste handler below (any other '2xx...' digit sequence,
+        // including modifyOtherKeys "27;...", is parsed as CSI-u).
+        if (seq_len >= 3 and seq_buf[0] == 0x1b and seq_buf[1] == '[' and
+            seq_buf[2] >= '1' and seq_buf[2] <= '9' and
+            !std.mem.startsWith(u8, seq_buf[0..@min(seq_len, 6)], "\x1b[200~"))
+        {
+            var seq: [32]u8 = undefined;
+            var slen: usize = 0;
+            const take = @min(slice.len, seq.len);
+            @memcpy(seq[0..take], slice[0..take]);
+            slen = take;
+
+            // Locate terminator 'u' (CSI-u) or '~' (modifyOtherKeys). If the
+            // sequence is incomplete (chunk boundary), read the rest from stdin.
+            var t: usize = 2;
+            while (t < slen) : (t += 1) {
+                const b = seq[t];
+                if (b == 'u' or b == '~') break;
+                if (!std.ascii.isDigit(b) and b != ';') break;
+            }
+            if (t >= slen or (seq[t] != 'u' and seq[t] != '~')) {
+                while (slen < seq.len) {
+                    var b: [1]u8 = undefined;
+                    if ((stdin_file.readStreaming(io, &.{&b}) catch 0) == 0) break;
+                    seq[slen] = b[0];
+                    slen += 1;
+                    if (seq[slen - 1] == 'u' or seq[slen - 1] == '~') break;
+                }
+                t = slen;
+            }
+
+            // Parse parameters "13;2" / "27;2;13".
+            var params: [4]usize = .{ 0, 0, 0, 0 };
+            var n_params: usize = 0;
+            var val: usize = 0;
+            var have_val = false;
+            for (seq[2..@min(t, slen)]) |b| {
+                if (b >= '0' and b <= '9') {
+                    val = val * 10 + (b - '0');
+                    have_val = true;
+                } else if (b == ';') {
+                    if (n_params < 4) params[n_params] = val;
+                    n_params += 1;
+                    val = 0;
+                    have_val = false;
+                }
+            }
+            if (have_val and n_params < 4) {
+                params[n_params] = val;
+                n_params += 1;
+            }
+
+            const term_ch: u8 = if (slen > 0) seq[@min(t, slen - 1)] else 0;
+            var code: usize = params[0];
+            var modv: usize = 1;
+            if (term_ch == '~') {
+                // modifyOtherKeys encoding: ESC [ 27 ; <mod> ; <code> ~
+                if (params[0] == 27 and n_params >= 3) {
+                    modv = params[1];
+                    code = params[2];
+                } else {
+                    // Unrelated '~' sequence (F5, PageUp, ...) — consume, no action.
+                    return @min(t + 1, slice.len);
+                }
+            } else {
+                modv = if (n_params > 1) params[1] else 1;
+            }
+
+            if (code == 13) { // Enter + modifier (Shift/Ctrl/Alt) -> newline
+                self.insertNewlineAtCursor(io, prompt);
+                return @min(t + 1, slice.len);
+            }
+            if (code == 3 or (code == 99 and modv >= 5)) { // Ctrl+C as CSI-u
+                const now_ms = utils.milliTimestamp();
+                const out = std.Io.File.stdout();
+                if (self.buf.items.len > 0) {
+                    out.writeStreamingAll(io, "^C\r\n") catch {};
+                    self.buf.clearRetainingCapacity();
+                    self.pos = 0;
+                    self.rendered_rows = 0;
+                    self.cursor_row = 0;
+                    self.last_ctrl_c_ms = now_ms;
+                    self.redraw(io, prompt);
+                } else if (now_ms - self.last_ctrl_c_ms <= 2000 and self.last_ctrl_c_ms > 0) {
+                    out.writeStreamingAll(io, "^C\r\n") catch {};
+                    self.exit_pending = true; // exit REPL on next loop iteration
+                } else {
+                    self.last_ctrl_c_ms = now_ms;
+                    out.writeStreamingAll(io, "^C\r\n") catch {};
+                    self.rendered_rows = 0;
+                    self.cursor_row = 0;
+                    self.redraw(io, prompt);
+                }
+                return @min(t + 1, slice.len);
+            }
+            // Unknown CSI-u sequence: consume entirely, no action.
+            return @min(t + 1, slice.len);
+        }
+
         if (seq_len >= 3 and seq_buf[0] == 0x1b and seq_buf[1] == '[') {
             switch (seq_buf[2]) {
                 'A' => { // ↑ history
@@ -901,6 +1032,10 @@ pub const LineEditor = struct {
             }
         } else if (seq_len >= 2 and seq_buf[0] == 0x1b) {
             switch (seq_buf[1]) {
+                '\r', '\n' => { // Alt+Enter (legacy ESC-prefixed) -> newline (RFC-008 §5B)
+                    self.insertNewlineAtCursor(io, prompt);
+                    return @min(2, slice.len);
+                },
                 'b', 'B' => {
                     self.pos = self.wordLeft();
                     self.redraw(io, prompt);
