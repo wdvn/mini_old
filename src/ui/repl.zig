@@ -160,12 +160,39 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
         return true;
     }
 
+    // `/provider` command: switch OpenAI-compatible provider profile (RFC-012).
+    // Changes provider key which affects wire protocol, reasoning echo policy,
+    // thinking tag handling, and parameter format. Also reloads agent context
+    // with the new provider's thinking_tags for the TurnRenderer.
+    if (std.mem.startsWith(u8, input, "/provider ")) {
+        const provider_key = std.mem.trim(u8, input["/provider ".len..], " \t");
+        if (provider_key.len == 0) {
+            main.stdoutPrint("Usage: /provider <key>\n  Available: openai, deepseek, qwen, minimax, glm, kimi, xai, vllm, agnes, generic\n", .{});
+        } else {
+            // Update backend's provider key if using OpenAI-compat
+            switch (agent.backend) {
+                .openai => |*c| c.provider_key = provider_key,
+                else => {
+                    main.stdoutPrint("Provider switch only works with OpenAI-compatible backend.\n", .{});
+                    return true;
+                },
+            }
+            // Update renderer's thinking tags to match new provider
+            if (main.ui_repl.current_renderer) |r| {
+                r.parser.thinking_tags = main.backends.provider_mod.getProfile(provider_key).thinking_tags;
+            }
+            main.stdoutPrint("Provider set to: {s}\n", .{provider_key});
+        }
+        return true;
+    }
+
     if (std.mem.eql(u8, input, "/help")) {
         std.Io.File.stdout().writeStreamingAll(io,
             \\
             \\## REPL Commands
             \\  /clear              Clear conversation history
             \\  /model <backend>    Switch backend (openai, claude, ollama)
+            \\  /provider <key>     Switch OpenAI provider profile (openai|deepseek|qwen|minimax|glm|kimi|xai|vllm|agnes|generic)
             \\  /config [show]      Show current configuration
             \\  /config protocol <auto|chat|responses>  Set OpenAI protocol mode
             \\  /config thinking <on|off>               Toggle dynamic thinking governor
