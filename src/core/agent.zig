@@ -1035,10 +1035,12 @@ pub const AgentLoop = struct {
                     if (self.loop_plan_retries < 2) {
                         self.loop_plan_retries += 1;
                         self.plan_execution_pending = true;
-                        main.stderrPrint(
-                            "\n\x1b[33m[agent] ⚠️ Action loop detected: identical CodeAct script repeated without progress. Requesting model to formulate plan and execute next step.\x1b[0m\n",
-                            .{},
-                        );
+                        if (self.config.action_loop_display) {
+                            main.stderrPrint(
+                                "\n\x1b[33m[agent] ⚠️ Action loop detected: identical CodeAct script repeated without progress. Requesting model to formulate plan and execute next step.\x1b[0m\n",
+                                .{},
+                            );
+                        }
                         if (main.ui_repl.current_renderer) |r| {
                             r.ensureNewline();
                             r.write(" \x1b[33m[Action Loop Detected: Requesting Plan & Execution]\x1b[0m\n");

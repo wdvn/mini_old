@@ -188,6 +188,8 @@ pub const Config = struct {
     action_loop_macro_cycle_cap: usize = 2,
     /// 3D procedural map orbit repetition threshold before tripping action loop circuit breaker (default: 2).
     action_loop_orbit_cap: usize = 2,
+    /// Whether to display action loop detection messages to stderr/REPL (default: true). Set MINI_ACTION_LOOP_DISPLAY=0 to suppress.
+    action_loop_display: bool = true,
 
     // MCP
     /// Path to mcp.json file. Null = default ~/.mini/mcp.json.
@@ -442,6 +444,11 @@ pub const Config = struct {
             break :blk std.fmt.parseInt(usize, s, 10) catch 2;
         };
 
+        const action_loop_display: bool = blk: {
+            const v = env_map.get("MINI_ACTION_LOOP_DISPLAY") orelse "1";
+            break :blk !std.mem.eql(u8, v, "0") and !std.mem.eql(u8, v, "false");
+        };
+
         // System prompt: from file or default
         const sp_result = loadSystemPrompt(alloc, env_map, io);
 
@@ -609,6 +616,7 @@ pub const Config = struct {
             .action_loop_readonly_trip_cap = action_loop_readonly_trip_cap,
             .action_loop_macro_cycle_cap = action_loop_macro_cycle_cap,
             .action_loop_orbit_cap = action_loop_orbit_cap,
+            .action_loop_display = action_loop_display,
             .mcp_config_path = env_map.get("MINI_MCP_CONFIG"),
             .history_enabled = history_enabled,
             .hook_command = hook_cmd,
