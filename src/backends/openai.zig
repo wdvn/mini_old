@@ -566,6 +566,7 @@ pub fn buildRequestBodyWithProfile(
             for (msg.content) |block| {
                 switch (block) {
                     .text => |t| {
+                        if (t.len == 0) continue;
                         if (!first_cb) try w.writeByte(',');
                         first_cb = false;
                         const escaped = try json.escape(alloc, t);

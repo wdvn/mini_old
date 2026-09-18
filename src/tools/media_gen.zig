@@ -493,25 +493,6 @@ pub fn generateVideoDirect(
         try std.fmt.allocPrint(alloc, "{s}/v1/videos/{s}/content", .{ base_url, job_id });
     defer alloc.free(content_url);
 
-    var dl_res = try http_lib.fetch(alloc, io, .{
-        .url = content_url,
-        .method = "GET",
-        .headers_json = headers_json,
-        .max_body_size = 200 * 1024 * 1024,
-        .timeout_s = 300,
-    });
-    defer dl_res.deinit(alloc);
-
-    if (dl_res.status != 200 or dl_res.body.len == 0) {
-        return MediaResult{
-            .path = "",
-            .media_type = "",
-            .bytes = 0,
-            .ok = false,
-            .message = try alloc.dupe(u8, "Failed to download video content"),
-        };
-    }
-
     const base_filename = if (filename_opt) |f|
         try sanitizeFilename(alloc, f)
     else
@@ -531,10 +512,33 @@ pub fn generateVideoDirect(
     const final_path = try std.fmt.allocPrint(alloc, "{s}/{d}_{s}", .{ output_dir, ts, safe_name });
     errdefer alloc.free(final_path);
 
-    const cwd = std.Io.Dir.cwd();
-    const file = try cwd.createFile(io, final_path, .{});
-    defer file.close(io);
-    try file.writeStreamingAll(io, dl_res.body);
+    const dl_res = http_lib.downloadToFile(alloc, io, .{
+        .url = content_url,
+        .method = "GET",
+        .headers_json = headers_json,
+        .max_body_size = 200 * 1024 * 1024,
+        .timeout_s = 300,
+    }, final_path) catch |e| {
+        return MediaResult{
+            .path = "",
+            .media_type = "",
+            .bytes = 0,
+            .ok = false,
+            .message = try std.fmt.allocPrint(alloc, "Failed to download video: {s}", .{@errorName(e)}),
+        };
+    };
+    defer if (dl_res.error_message) |m| alloc.free(m);
+
+    if (dl_res.status != 200 or dl_res.total_bytes == 0) {
+        const err_msg = dl_res.error_message orelse "Failed to download video content";
+        return MediaResult{
+            .path = "",
+            .media_type = "",
+            .bytes = 0,
+            .ok = false,
+            .message = try alloc.dupe(u8, err_msg),
+        };
+    }
 
     hooks.dispatch(alloc, io, .{
         .event = "media_saved",
@@ -545,7 +549,7 @@ pub fn generateVideoDirect(
     return MediaResult{
         .path = final_path,
         .media_type = try alloc.dupe(u8, "video/mp4"),
-        .bytes = dl_res.body.len,
+        .bytes = dl_res.total_bytes,
         .ok = true,
         .message = try alloc.dupe(u8, "Video generated successfully"),
     };

@@ -494,6 +494,113 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
     };
 }
 
+pub const DownloadResult = struct {
+    status: u16,
+    total_bytes: usize,
+    error_message: ?[]const u8 = null,
+};
+
+/// Download an HTTP resource directly into a file on disk in chunks (RFC-011 §3.3).
+/// Avoids loading large bodies (e.g. 200MB video) into memory buffers.
+pub fn downloadToFile(
+    alloc: Allocator,
+    io: std.Io,
+    opts: Options,
+    target_path: []const u8,
+) !DownloadResult {
+    var client = std.http.Client{
+        .allocator = alloc,
+        .io = io,
+    };
+    defer client.deinit();
+    initTlsState(&client, io);
+
+    const http_method = try parseMethod(opts.method);
+
+    var extra_headers: []std.http.Header = &.{};
+    var extra_headers_owned = false;
+    defer if (extra_headers_owned) {
+        for (extra_headers) |h| {
+            alloc.free(h.name);
+            alloc.free(h.value);
+        }
+        alloc.free(extra_headers);
+    };
+    if (opts.headers_json) |hj| {
+        extra_headers = try parseHeadersJson(alloc, hj);
+        extra_headers_owned = true;
+    }
+
+    const uri = try std.Uri.parse(opts.url);
+    var req = try client.request(http_method, uri, .{
+        .extra_headers = extra_headers,
+        .headers = .{
+            .accept_encoding = .omit,
+        },
+        .keep_alive = false,
+        .connection = preconnectIpv4(&client, uri),
+    });
+    defer req.deinit();
+
+    if (opts.body) |b| {
+        if (b.len > 0) {
+            req.transfer_encoding = .{ .content_length = b.len };
+            var req_body = try req.sendBodyUnflushed(&.{});
+            try req_body.writer.writeAll(b);
+            try req_body.end();
+            try req.connection.?.flush();
+        } else {
+            try req.sendBodiless();
+        }
+    } else {
+        try req.sendBodiless();
+    }
+
+    var redirect_buffer: [4096]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buffer);
+    const status: u16 = @intFromEnum(response.head.status);
+
+    var transfer_buf: [4096]u8 = undefined;
+    const r = response.reader(&transfer_buf);
+
+    if (status < 200 or status >= 300) {
+        var err_buf: [2048]u8 = undefined;
+        const n = r.readSliceShort(&err_buf) catch 0;
+        const msg = if (n > 0) try alloc.dupe(u8, err_buf[0..n]) else null;
+        return DownloadResult{
+            .status = status,
+            .total_bytes = 0,
+            .error_message = msg,
+        };
+    }
+
+    const cwd = std.Io.Dir.cwd();
+    const file = try cwd.createFile(io, target_path, .{});
+    defer file.close(io);
+
+    var chunk_buf: [16 * 1024]u8 = undefined;
+    var total_bytes: usize = 0;
+    while (true) {
+        if (signals.isInterrupted()) return error.Interrupted;
+        const n = r.readSliceShort(&chunk_buf) catch |e| {
+            if (total_bytes > 0) break;
+            return e;
+        };
+        if (signals.isInterrupted()) return error.Interrupted;
+        if (n == 0) break;
+        total_bytes += n;
+        if (total_bytes > opts.max_body_size) {
+            return error.FileTooLarge;
+        }
+        try file.writeStreamingAll(io, chunk_buf[0..n]);
+    }
+
+    return DownloadResult{
+        .status = status,
+        .total_bytes = total_bytes,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // postStream — streaming cho SSE / NDJSON (backends AI)
 // ---------------------------------------------------------------------------

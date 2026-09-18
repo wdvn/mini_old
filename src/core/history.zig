@@ -162,12 +162,17 @@ pub const History = struct {
 
     /// Appends user message with image attachments (RFC-011 Media Ingestion).
     pub fn addUserWithImages(self: *History, text: []const u8, images: []const proto.ImageBlock) !void {
-        const text_copy = try self.alloc.dupe(u8, text);
-        const total_blocks = 1 + images.len;
+        const has_text = text.len > 0;
+        const total_blocks = (if (has_text) @as(usize, 1) else 0) + images.len;
+        if (total_blocks == 0) return;
         const blocks = try self.alloc.alloc(proto.ContentBlock, total_blocks);
-        blocks[0] = .{ .text = text_copy };
+        var offset: usize = 0;
+        if (has_text) {
+            blocks[0] = .{ .text = try self.alloc.dupe(u8, text) };
+            offset = 1;
+        }
         for (images, 0..) |img, idx| {
-            blocks[1 + idx] = .{ .image = .{
+            blocks[offset + idx] = .{ .image = .{
                 .data = try self.alloc.dupe(u8, img.data),
                 .media_type = try self.alloc.dupe(u8, img.media_type),
             } };

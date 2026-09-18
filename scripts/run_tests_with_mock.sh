@@ -91,7 +91,7 @@ run_case() {
   if [[ $rc -eq 124 ]]; then
     echo "  [FAIL] $name (TIMEOUT 30s — mini hanging/waiting on SSE)"; FAIL=$((FAIL+1)); return
   fi
-  if echo "$out" | grep -q "$expect"; then
+  if echo "$out" | grep -F -q "$expect"; then
     echo "  [PASS] $name"; PASS=$((PASS+1))
   else
     echo "  [FAIL] $name (expected: '$expect')"; FAIL=$((FAIL+1))
@@ -103,6 +103,10 @@ echo "=== [E2E] Running test cases (mock LLM) ==="
 run_case "simple text response"   "Say hello"                 "Hello from mock LLM!"
 run_case "long text streaming"    "read long text help me"    "AAAAAAAAAAAAAAAAAAAA"
 run_case "tool call bash"         "please use bash to run echo" "mock-tool-ok"
+
+# Media vision ingestion testcase
+printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89' > "$TEMP_HOME/test_img.png"
+run_case "media vision ingestion" "@image:$TEMP_HOME/test_img.png Describe this" "[Vision Verified] Image received"
 
 echo ""
 echo "======================================"

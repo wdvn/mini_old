@@ -748,6 +748,7 @@ pub const AgentLoop = struct {
                 defer signals.registerActiveEngine(null);
 
                 var res = self.engine.eval(js_code, "agent_codeact.js") catch |e| {
+                    media_gen_tool.clearTurnAttachments(self.alloc);
                     self.last_act_failed = true;
                     const end_err_ms = utils.milliTimestamp();
                     const dur_ms = if (end_err_ms >= start_codeact_ms) @as(u64, @intCast(end_err_ms - start_codeact_ms)) else 0;
@@ -807,9 +808,16 @@ pub const AgentLoop = struct {
                         try out_buf.writeAll("(Code executed successfully with no output)\n");
                     }
 
-                    try self.history.addUser(out_buf.list.items);
+                    const turn_attached = media_gen_tool.getTurnAttachments();
+                    if (turn_attached.len > 0) {
+                        try self.history.addUserWithImages(out_buf.list.items, turn_attached);
+                        media_gen_tool.clearTurnAttachments(self.alloc);
+                    } else {
+                        try self.history.addUser(out_buf.list.items);
+                    }
                     return .continue_loop;
                 } else {
+                    media_gen_tool.clearTurnAttachments(self.alloc);
                     if (main.ui_repl.current_renderer) |r| {
                         r.finishTool("codeact", if (res.error_message) |m| m else "JS Error", true, dur_ms, null, null);
                     } else {
