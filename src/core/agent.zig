@@ -888,28 +888,32 @@ pub const AgentLoop = struct {
         defer if (ephemeral_blocks) |b| self.alloc.free(b);
 
         if (self.pg_store) |pg| {
-            const traj_slice: []const []const u8 = if (self.turn_tool_trajectory.items.len > 0)
-                self.turn_tool_trajectory.items
-            else
-                self.recent_tools.items;
+            // Only inject procedural guidance if advisory is enabled
+            if (self.config.memact_pg_advisory) {
+                const traj_slice: []const []const u8 = if (self.turn_tool_trajectory.items.len > 0)
+                    self.turn_tool_trajectory.items
+                else
+                    self.recent_tools.items;
 
-            ephemeral_guidance = pg.serializeGuidance(
-                self.alloc,
-                self.last_executed_tool,
-                traj_slice,
-                self.last_act_failed,
-                self.config.memact_pg_h,
-                self.current_user_request,
-            ) catch null;
+                ephemeral_guidance = pg.serializeGuidance(
+                    self.alloc,
+                    self.last_executed_tool,
+                    traj_slice,
+                    self.last_act_failed,
+                    self.config.memact_pg_h,
+                    self.current_user_request,
+                    self.config.memact_pg_advisory,
+                ) catch null;
 
-            if (ephemeral_guidance) |guidance_text| {
-                const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
-                blocks[0] = .{ .text = guidance_text };
-                ephemeral_blocks = blocks;
-                try temp_input_msgs.append(self.alloc, .{
-                    .role = .user,
-                    .content = blocks,
-                });
+                if (ephemeral_guidance) |guidance_text| {
+                    const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+                    blocks[0] = .{ .text = guidance_text };
+                    ephemeral_blocks = blocks;
+                    try temp_input_msgs.append(self.alloc, .{
+                        .role = .user,
+                        .content = blocks,
+                    });
+                }
             }
         }
 

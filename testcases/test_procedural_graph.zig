@@ -368,7 +368,7 @@ test "pg: serializeGuidance generates 2-hop markdown guidance block" {
     try store.loadIndex(io);
 
     // Guidance for file_edit should suggest bash
-    const guidance_opt = try store.serializeGuidance(alloc, "file_edit", &.{}, false, 2, null);
+    const guidance_opt = try store.serializeGuidance(alloc, "file_edit", &.{}, false, 2, null, true);
     try testing.expect(guidance_opt != null);
     const guidance = guidance_opt.?;
     defer alloc.free(guidance);
@@ -458,18 +458,18 @@ test "pg: serializeGuidance suppresses recent actions in trajectory window" {
 
     // Default for file_edit leads to bash.
     // If bash was NOT recently run, it is suggested:
-    const g_normal = try store.serializeGuidance(alloc, "file_edit", &.{}, false, 2, null);
+    const g_normal = try store.serializeGuidance(alloc, "file_edit", &.{}, false, 2, null, true);
     try testing.expect(g_normal != null);
     defer alloc.free(g_normal.?);
     try testing.expect(std.mem.indexOf(u8, g_normal.?, "`bash`") != null);
 
     // If bash WAS recently run, it is suppressed to prevent ping-pong:
-    const g_suppressed = try store.serializeGuidance(alloc, "file_edit", &.{ "bash" }, false, 2, null);
+    const g_suppressed = try store.serializeGuidance(alloc, "file_edit", &.{ "bash" }, false, 2, null, true);
     try testing.expect(g_suppressed == null);
 
     // If previous act failed, suppression is STILL enforced to prevent infinite ping-pong loops.
     // Instead of re-suggesting recently executed bash, it emits an anti-loop advisory:
-    const g_retry = try store.serializeGuidance(alloc, "file_edit", &.{ "bash" }, true, 2, null);
+    const g_retry = try store.serializeGuidance(alloc, "file_edit", &.{ "bash" }, true, 2, null, true);
     try testing.expect(g_retry != null);
     defer alloc.free(g_retry.?);
     try testing.expect(std.mem.indexOf(u8, g_retry.?, "`bash` →") == null); // bash is NOT suggested as next step
@@ -517,7 +517,7 @@ test "pg: serializeGuidance generates 3D Map Checkpoint & Recap on orbit" {
 
     // Provide trajectory with closed orbit: bash -> grep -> file_read -> bash
     const traj: []const []const u8 = &.{ "bash", "grep", "file_read", "bash" };
-    const g_orbit = try store.serializeGuidance(alloc, "bash", traj, false, 2, null);
+    const g_orbit = try store.serializeGuidance(alloc, "bash", traj, false, 2, null, true);
     try testing.expect(g_orbit != null);
     defer alloc.free(g_orbit.?);
 
@@ -547,7 +547,7 @@ test "pg: serializeGuidance anchors to user_request prompt" {
 
     const traj: []const []const u8 = &.{ "bash", "grep", "file_read", "bash" };
     const task_text = "implement subagent sandbox runner";
-    const g_orbit = try store.serializeGuidance(alloc, "bash", traj, false, 2, task_text);
+    const g_orbit = try store.serializeGuidance(alloc, "bash", traj, false, 2, task_text, true);
     try testing.expect(g_orbit != null);
     defer alloc.free(g_orbit.?);
 

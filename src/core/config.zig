@@ -160,6 +160,9 @@ pub const Config = struct {
     // Procedural Graph (RFC-010)
     /// Whether Procedural Graph online guidance is enabled.
     memact_pg_enabled: bool = true,
+    /// Whether to emit procedural advisory/checkpoint messages to stderr.
+    /// Default: true (show). Set MINI_MEMACT_PG_QUIET=1 to hide.
+    memact_pg_advisory: bool = true,
     /// Procedural Graph neighborhood hop distance for localized guidance (default: 2).
     memact_pg_h: u32 = 2,
     /// Number of recent trajectory acts considered for context (default: 3).
@@ -372,6 +375,11 @@ pub const Config = struct {
         const memact_pg_enabled: bool = blk: {
             const s = env_map.get("MINI_MEMACT_PG_ENABLED") orelse env_map.get("MINI_PG_ENABLED") orelse "1";
             break :blk std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
+        };
+
+        const memact_pg_advisory: bool = blk: {
+            const s = env_map.get("MINI_MEMACT_PG_ADVISORY") orelse "1";
+            break :blk !std.mem.eql(u8, s, "0") and !std.mem.eql(u8, s, "false");
         };
 
         const memact_pg_h: u32 = blk: {
@@ -589,6 +597,7 @@ pub const Config = struct {
             .memact_extract = memact_extract,
             .memory_dir = memory_dir,
             .memact_pg_enabled = memact_pg_enabled,
+            .memact_pg_advisory = memact_pg_advisory,
             .memact_pg_h = memact_pg_h,
             .memact_pg_w = memact_pg_w,
             .memact_pg_auto_populate = memact_pg_auto_populate,
@@ -773,6 +782,7 @@ pub const JsonConfig = struct {
     max_tokens: ?u32 = null,
     memact_enabled: ?bool = null,
     memact_pg_enabled: ?bool = null,
+    memact_pg_advisory: ?bool = null,
     context_window: ?u32 = null,
     tool_allowlist: ?[]const u8 = null,
     tool_blocklist: ?[]const u8 = null,
@@ -900,6 +910,7 @@ fn tryLoadJsonConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: st
     }
     if (cfg.memact_enabled) |val| count += setEnvDefault(env_map, "MINI_MEMACT_ENABLED", if (val) "1" else "0");
     if (cfg.memact_pg_enabled) |val| count += setEnvDefault(env_map, "MINI_MEMACT_PG_ENABLED", if (val) "1" else "0");
+    if (cfg.memact_pg_advisory) |val| count += setEnvDefault(env_map, "MINI_MEMACT_PG_ADVISORY", if (val) "1" else "0");
     if (cfg.context_window) |val| {
         var num_buf: [32]u8 = undefined;
         if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_CONTEXT_WINDOW", s) else |_| {}
