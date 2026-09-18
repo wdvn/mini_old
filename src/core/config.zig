@@ -158,7 +158,7 @@ pub const Config = struct {
 
     // Procedural Graph (RFC-010)
     /// Whether Procedural Graph online guidance is enabled.
-    memact_pg_enabled: bool = false,
+    memact_pg_enabled: bool = true,
     /// Procedural Graph neighborhood hop distance for localized guidance (default: 2).
     memact_pg_h: u32 = 2,
     /// Number of recent trajectory acts considered for context (default: 3).
@@ -352,7 +352,7 @@ pub const Config = struct {
         const memory_dir: ?[]const u8 = env_map.get("MINI_MEMORY_DIR");
 
         const memact_pg_enabled: bool = blk: {
-            const s = env_map.get("MINI_MEMACT_PG_ENABLED") orelse env_map.get("MINI_PG_ENABLED") orelse break :blk false;
+            const s = env_map.get("MINI_MEMACT_PG_ENABLED") orelse env_map.get("MINI_PG_ENABLED") orelse "1";
             break :blk std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
         };
 
@@ -710,6 +710,7 @@ pub const JsonConfig = struct {
     ollama_model: ?[]const u8 = null,
     max_tokens: ?u32 = null,
     memact_enabled: ?bool = null,
+    memact_pg_enabled: ?bool = null,
     context_window: ?u32 = null,
     tool_allowlist: ?[]const u8 = null,
     tool_blocklist: ?[]const u8 = null,
@@ -835,6 +836,7 @@ fn tryLoadJsonConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: st
         if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_MAX_TOKENS", s) else |_| {}
     }
     if (cfg.memact_enabled) |val| count += setEnvDefault(env_map, "MINI_MEMACT_ENABLED", if (val) "1" else "0");
+    if (cfg.memact_pg_enabled) |val| count += setEnvDefault(env_map, "MINI_MEMACT_PG_ENABLED", if (val) "1" else "0");
     if (cfg.context_window) |val| {
         var num_buf: [32]u8 = undefined;
         if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_CONTEXT_WINDOW", s) else |_| {}
@@ -913,7 +915,8 @@ test "JsonConfig parsing" {
         \\  "openai_protocol": "responses",
         \\  "openai_compat_model": "gpt-4o",
         \\  "max_tokens": 4096,
-        \\  "memact_enabled": true
+        \\  "memact_enabled": true,
+        \\  "memact_pg_enabled": true
         \\}
     ;
 
@@ -925,4 +928,26 @@ test "JsonConfig parsing" {
     try std.testing.expectEqualStrings("gpt-4o", parsed.value.openai_compat_model.?);
     try std.testing.expectEqual(4096, parsed.value.max_tokens.?);
     try std.testing.expectEqual(true, parsed.value.memact_enabled.?);
+    try std.testing.expectEqual(true, parsed.value.memact_pg_enabled.?);
 }
+
+test "Config default memact_pg_enabled is true" {
+    const alloc = std.testing.allocator;
+    var env_map = std.process.Environ.Map.init(alloc);
+    defer env_map.deinit();
+
+    const def_val: bool = blk: {
+        const s = env_map.get("MINI_MEMACT_PG_ENABLED") orelse env_map.get("MINI_PG_ENABLED") orelse "1";
+        break :blk std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
+    };
+    try std.testing.expect(def_val);
+
+    try env_map.put("MINI_MEMACT_PG_ENABLED", "0");
+    const disabled_val: bool = blk: {
+        const s = env_map.get("MINI_MEMACT_PG_ENABLED") orelse env_map.get("MINI_PG_ENABLED") orelse "1";
+        break :blk std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
+    };
+    try std.testing.expect(!disabled_val);
+}
+
+
