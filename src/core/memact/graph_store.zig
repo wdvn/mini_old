@@ -463,6 +463,8 @@ pub const PGraphStore = struct {
     /// Extract h-hop neighborhood subgraph guidance formatted as markdown (RFC-010 PG-3).
     /// If an orbit is detected in 3D procedural space ("dấu hiệu quay vòng"), produces a
     /// Checkpoint & Recap block instead of cyclic forward step suggestions.
+    /// `user_request` is the original task prompt — injected to keep the model anchored
+    /// to its goal rather than drifting into generic exploration.
     pub fn serializeGuidance(
         self: *PGraphStore,
         alloc: Allocator,
@@ -470,6 +472,7 @@ pub const PGraphStore = struct {
         recent_actions: []const []const u8,
         last_failed: bool,
         max_hops: u32,
+        user_request: ?[]const u8,
     ) !?[]u8 {
         const act_str = last_action orelse return null;
         const start_node_id = self.matchNode(act_str) orelse return null;
@@ -498,9 +501,18 @@ pub const PGraphStore = struct {
 
             try bw.writeAll("⚡ Orbit Break Directive:\n");
             try bw.writeAll("Do NOT repeat this exploratory cycle. You have already gathered sufficient context in your context window.\n");
+
+            // Anchor to the user's original task so the model knows WHAT to advance toward
+            if (user_request) |req| {
+                const trunc = if (req.len > 180) req[0..180] ++ "..." else req;
+                try bw.print("🎯 Your task: \"{s}\"\n\n", .{trunc});
+            }
+
             try bw.writeAll("You MUST:\n");
-            try bw.writeAll("1. Formulate a concise step-by-step plan for the next execution steps.\n");
-            try bw.writeAll("2. Proceed immediately with executing the first step of your plan (e.g. advance to MUTATE domain with `file_edit`/`file_write`, switch tool, or launch subagent).\n");
+            try bw.writeAll("1. Summarize the key findings from your exploration in 1-2 sentences.\n");
+            try bw.writeAll("2. Use those findings to make DIRECT PROGRESS on the task — e.g. edit code with `file_edit`/`file_write`, run a targeted test, or conclude with a direct answer.\n");
+            try bw.writeAll("3. Execute the first concrete step NOW — do NOT output another exploratory tool call.\n");
+            try bw.writeAll("4. If you already have enough information, skip further exploration and answer the user's question directly.\n");
 
             const slice = try bw.toOwnedSlice();
             return slice;
@@ -587,6 +599,15 @@ pub const PGraphStore = struct {
         }
 
         try bw.writeAll("⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed directly to modifying code or concluding.\n");
+
+        // Anchor to the user's original request so suggestions stay task-focused
+        if (user_request) |req| {
+            try bw.writeAll("\n🎯 Current task reminder: \"");
+            // Truncate to first ~200 chars to keep advisory compact
+            const trunc = if (req.len > 200) req[0..200] ++ "..." else req;
+            try bw.writeAll(trunc);
+            try bw.writeAll("\" — tailor your next step to make direct progress on this task.\n");
+        }
 
         const slice = try bw.toOwnedSlice();
         return slice;

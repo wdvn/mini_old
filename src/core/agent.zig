@@ -219,6 +219,36 @@ pub const AgentLoop = struct {
     /// Flag indicating that a plan has been requested to break an action loop; if the model returns text without tool execution, prompts the model to execute step 1.
     plan_execution_pending: bool = false,
 
+    // Plan Watchdog: Enforces execution of committed plans and prevents action procrastination
+    plan_active: bool = false,
+    plan_summary_buf: [160]u8 = undefined,
+    plan_summary_len: usize = 0,
+    plan_procrastination_count: usize = 0,
+    plan_procrastination_cap: usize = 2,
+    current_user_request: ?[]const u8 = null,
+
+    pub fn setPlan(self: *AgentLoop, summary: []const u8) void {
+        if (!self.plan_active) {
+            self.plan_active = true;
+            self.plan_procrastination_count = 0;
+        }
+        const len = @min(summary.len, self.plan_summary_buf.len);
+        @memcpy(self.plan_summary_buf[0..len], summary[0..len]);
+        self.plan_summary_len = len;
+    }
+
+    pub fn clearPlan(self: *AgentLoop) void {
+        self.plan_active = false;
+        self.plan_summary_len = 0;
+        self.plan_procrastination_count = 0;
+        self.plan_execution_pending = false;
+    }
+
+    pub fn getPlanSummary(self: *const AgentLoop) []const u8 {
+        if (self.plan_summary_len > 0) return self.plan_summary_buf[0..self.plan_summary_len];
+        return "active implementation plan";
+    }
+
     pub const ToolCallRecord = struct {
         name: []u8,
         args_hash: u64,
@@ -427,6 +457,99 @@ pub const AgentLoop = struct {
             std.mem.eql(u8, name, "write");
     }
 
+    pub fn isExploratoryToolCall(tool_name: []const u8, input_json: []const u8) bool {
+        if (isReadOnlyTool(tool_name)) return true;
+        if (std.mem.eql(u8, tool_name, "bash")) {
+            if (json_mod.findString(input_json, "command")) |cmd| {
+                const trimmed = std.mem.trim(u8, cmd, " \t\r\n");
+                // Check if modifying or redirecting output
+                if (std.mem.startsWith(u8, trimmed, "sed -i") or
+                    std.mem.indexOf(u8, trimmed, " > ") != null or
+                    std.mem.indexOf(u8, trimmed, " >> ") != null or
+                    std.mem.startsWith(u8, trimmed, "cat >") or
+                    std.mem.startsWith(u8, trimmed, "cat <<"))
+                {
+                    return false;
+                }
+                if (std.mem.startsWith(u8, trimmed, "cat ") or
+                    std.mem.startsWith(u8, trimmed, "sed ") or
+                    std.mem.startsWith(u8, trimmed, "grep ") or
+                    std.mem.startsWith(u8, trimmed, "head ") or
+                    std.mem.startsWith(u8, trimmed, "tail ") or
+                    std.mem.startsWith(u8, trimmed, "ls ") or
+                    std.mem.eql(u8, trimmed, "ls") or
+                    std.mem.startsWith(u8, trimmed, "find "))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    pub fn detectPlanInText(text: []const u8) ?[]const u8 {
+        const markers = [_][]const u8{
+            "tôi sẽ implement",
+            "tôi sẽ thực hiện",
+            "tôi sẽ tiến hành",
+            "sẽ implement",
+            "sẽ thực thi",
+            "sẽ tiến hành",
+            "kế hoạch:",
+            "bước 1:",
+            "i will implement",
+            "i'll implement",
+            "i will now apply",
+            "i will now edit",
+            "i will now create",
+            "plan:",
+            "step 1:",
+            "here is the plan",
+            "implementation plan",
+        };
+
+        for (markers) |marker| {
+            if (marker.len == 0 or text.len < marker.len) continue;
+            var i: usize = 0;
+            while (i <= text.len - marker.len) : (i += 1) {
+                if (std.ascii.eqlIgnoreCase(text[i .. i + marker.len], marker)) {
+                    const start = i;
+                    const end = @min(text.len, start + 120);
+                    return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
+                }
+            }
+        }
+        return null;
+    }
+
+    pub fn isPlanOnlyRequest(user_text_opt: ?[]const u8) bool {
+        const text = user_text_opt orelse return false;
+        const markers = [_][]const u8{
+            "chỉ lên kế hoạch",
+            "chỉ lập kế hoạch",
+            "không sửa file",
+            "không sửa code",
+            "không edit",
+            "only plan",
+            "just plan",
+            "plan only",
+            "do not edit",
+            "don't edit",
+            "do not modify",
+            "don't modify",
+        };
+        for (markers) |m| {
+            var i: usize = 0;
+            if (text.len < m.len) continue;
+            while (i <= text.len - m.len) : (i += 1) {
+                if (std.ascii.eqlIgnoreCase(text[i .. i + m.len], m)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     pub const MacroCycle = struct {
         period: usize,
         repetitions: usize,
@@ -487,7 +610,8 @@ pub const AgentLoop = struct {
         // 1. Update read-only exploratory counter
         if (isReadOnlyTool(tool_name)) {
             self.consecutive_readonly_count += 1;
-        } else if (isMutatingTool(tool_name)) {
+        } else {
+            // Any non-readonly tool resets the read-only counter (dropping rule requiring file mutation)
             self.consecutive_readonly_count = 0;
         }
 
@@ -566,11 +690,8 @@ pub const AgentLoop = struct {
             }
         }
 
-        if (self.consecutive_readonly_count >= self.config.action_loop_readonly_trip_cap) {
-            self.action_loop_tripped = true;
-            self.last_loop_reason = .readonly_budget;
-            return .trip;
-        }
+        // Note: readonly actions do not trip circuit breaker alone unless repetitive (handled by window/consecutive/orbit checks)
+        // or procrastinating on an active plan (handled by Plan Watchdog).
 
         // 7. Evaluate warning thresholds (WARN)
         if (self.consecutive_dup_tool_count >= 2 or window_count >= 3) {
@@ -778,6 +899,7 @@ pub const AgentLoop = struct {
                 traj_slice,
                 self.last_act_failed,
                 self.config.memact_pg_h,
+                self.current_user_request,
             ) catch null;
 
             if (ephemeral_guidance) |guidance_text| {
@@ -861,11 +983,21 @@ pub const AgentLoop = struct {
         // Retrieve safe slice after history may have reallocated
         const valid_input_msgs = self.history.messages()[0..input_msgs_count];
 
-        // Accumulate completion tokens
+        // Accumulate completion tokens and detect plan commitments
         for (response.content.items) |block| {
             switch (block) {
-                .text => |t| self.last_turn_completion_tokens += self.token_estimator.estimate(t),
-                .thinking => |th| self.last_turn_completion_tokens += self.token_estimator.estimate(th.thinking),
+                .text => |t| {
+                    self.last_turn_completion_tokens += self.token_estimator.estimate(t);
+                    if (detectPlanInText(t)) |plan_summary| {
+                        self.setPlan(plan_summary);
+                    }
+                },
+                .thinking => |th| {
+                    self.last_turn_completion_tokens += self.token_estimator.estimate(th.thinking);
+                    if (detectPlanInText(th.thinking)) |plan_summary| {
+                        self.setPlan(plan_summary);
+                    }
+                },
                 .tool_use => |tu| self.last_turn_completion_tokens += self.token_estimator.estimate(tu.name) + self.token_estimator.estimate(tu.input_json),
                 else => {},
             }
@@ -911,7 +1043,7 @@ pub const AgentLoop = struct {
                         if (self.journal) |*j| {
                             j.recordEvent(self.io, act_id, .checkpoint_created, "CodeAct action loop - requesting plan & execution") catch {};
                         }
-                        const trip_msg = "[CodeAct Checkpoint & Recap]: Action loop detected. You have repeatedly executed identical CodeAct scripts without making progress. You MUST NOT repeat the identical script. Formulate a concise step-by-step plan for the next action and execute it immediately with an alternate approach.";
+                        const trip_msg = "[CodeAct Checkpoint & Recap]: Action loop detected.\n\n[CodeAct Advisory (Optional Suggestions)]\nCurrent Action: repeated identical CodeAct script\nObservation: Identical script executed without progress.\n⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed at your discretion.";
                         try self.history.addUser(trip_msg);
                         self.action_loop_tripped = false;
                         self.consecutive_dup_tool_count = 0;
@@ -925,6 +1057,39 @@ pub const AgentLoop = struct {
                         try self.history.addUser(trip_msg);
                         self.action_loop_tripped = true;
                         return .exit_loop;
+                    }
+                }
+
+                if (self.plan_active and !isPlanOnlyRequest(self.current_user_request)) {
+                    if (std.mem.indexOf(u8, js_code, "file_edit") != null or
+                        std.mem.indexOf(u8, js_code, "file_write") != null or
+                        std.mem.indexOf(u8, js_code, "write") != null)
+                    {
+                        self.clearPlan();
+                    } else if (std.mem.indexOf(u8, js_code, "file_read") != null or
+                        std.mem.indexOf(u8, js_code, "grep") != null or
+                        std.mem.indexOf(u8, js_code, "glob") != null or
+                        std.mem.indexOf(u8, js_code, "list_dir") != null)
+                    {
+                        self.plan_procrastination_count += 1;
+                        if (self.plan_procrastination_count >= self.plan_procrastination_cap) {
+                            main.stderrPrint(
+                                "\n\x1b[31m[watchdog] ⛔ CodeAct Plan Procrastination Blocked: Active plan must be executed immediately.\x1b[0m\n",
+                                .{},
+                            );
+                            if (main.ui_repl.current_renderer) |r| {
+                                r.ensureNewline();
+                                r.write(" \x1b[31m[Plan Watchdog: CodeAct script blocked. Plan execution required]\x1b[0m\n");
+                            }
+                            var err_buf = utils.BufWriter.init(self.alloc);
+                            defer err_buf.deinit();
+                            try err_buf.print(
+                                "[Plan Watchdog Intercept]: CodeAct execution denied. You declared an active plan ('{s}') but have performed {d} consecutive read-only/exploratory calls in JavaScript instead of executing it. Stop inspecting. You MUST immediately execute your plan using mini.file_edit or modifying code.",
+                                .{ self.getPlanSummary(), self.plan_procrastination_count },
+                            );
+                            try self.history.addUser(err_buf.list.items);
+                            return .continue_loop;
+                        }
                     }
                 }
 
@@ -1045,11 +1210,23 @@ pub const AgentLoop = struct {
         switch (response.stop_reason) {
             .end_turn, .stop_sequence => {
                 self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "none" });
-                if (self.plan_execution_pending) {
+                if ((self.plan_active or self.plan_execution_pending) and !isPlanOnlyRequest(self.current_user_request)) {
                     self.plan_execution_pending = false;
-                    main.stderrPrint("\n\x1b[33m[agent] ⚠️ Plan received without tool execution. Prompting model to execute Step 1...\x1b[0m\n", .{});
-                    const exec_directive = "[System Directive]: Execution plan noted. Now proceed immediately to execute Step 1 of your plan using tools (e.g. modify code via file_edit/file_write, switch tool, or launch subagent). Do not output text without executing tools.";
-                    try self.history.addUser(exec_directive);
+                    main.stderrPrint(
+                        "\n\x1b[33m[watchdog] ⚠️ Model emitted text without tool execution while an implementation plan is active. Commanding immediate execution of Step 1...\x1b[0m\n",
+                        .{},
+                    );
+                    if (main.ui_repl.current_renderer) |r| {
+                        r.ensureNewline();
+                        r.write(" \x1b[33m[Plan Watchdog: Plan declared without execution. Enforcing Step 1 execution]\x1b[0m\n");
+                    }
+                    var dir_buf = utils.BufWriter.init(self.alloc);
+                    defer dir_buf.deinit();
+                    try dir_buf.print(
+                        "[Plan Watchdog Directive]: You formulated an active implementation plan ('{s}') but ended your turn with descriptive text only without executing any tools. You MUST now proceed directly to executing Step 1 using tools (e.g. file_edit, bash, etc.). Do not return monologue or explanation without tool actions.",
+                        .{ self.getPlanSummary() },
+                    );
+                    try self.history.addUser(dir_buf.list.items);
                     return .continue_loop;
                 }
                 if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
@@ -1303,6 +1480,8 @@ pub const AgentLoop = struct {
         self.action_loop_tripped = false;
         self.loop_plan_retries = 0;
         self.plan_execution_pending = false;
+        self.clearPlan();
+        self.current_user_request = user_text;
 
         // Retrieve relevant tool definitions for user message based on execution_mode
         const tool_defs = switch (self.config.execution_mode) {
@@ -1885,19 +2064,19 @@ pub const AgentLoop = struct {
                                         if (i > 0) mbw.writeAll(" → ") catch {};
                                         mbw.print("`{s}`", .{tn}) catch {};
                                     }
-                                    mbw.writeAll("\n⚠️ Action Required: Exploration has circled in place without forward progress (ΔZ = 0). DO NOT continue calling the previous exploratory actions.\n") catch {};
-                                    mbw.writeAll("You MUST:\n1. Formulate a concise, concrete step-by-step plan for the next actions.\n2. Proceed immediately with executing the first step of your plan (e.g. modify code with file_edit/file_write, switch tool, or launch a subagent).\nPlan and execute the next step now.") catch {};
+                                    mbw.writeAll("\n⚠️ Exploration has circled in place without forward progress (ΔZ = 0).\n") catch {};
+                                    mbw.writeAll("Consider a different approach for the next step if appropriate.\n") catch {};
                                     break :blk try mbw.toOwnedSlice();
                                 },
                                 .readonly_budget => try std.fmt.allocPrint(
                                     self.alloc,
-                                    "[Action Loop Checkpoint & Trajectory Recap]\n📍 Waypoint: Read-only exploratory budget exceeded ({d} consecutive search/read actions without mutation).\n⚠️ Action Required: You have gathered sufficient context. DO NOT continue searching. Formulate a concrete plan and proceed immediately with executing the fix (e.g. using file_edit). Plan and execute the next step now.",
+                                    "[Action Loop Checkpoint & Trajectory Recap]\n📍 Waypoint: Read-only exploratory budget exceeded ({d} consecutive search/read actions without mutation).\n\n[Exploration Advisory (Optional Suggestions)]\nCurrent Action: read-only exploration\nObservation: Sufficient context gathered.\n⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed directly to modifying code or concluding.",
                                     .{self.consecutive_readonly_count},
                                 ),
                                 else => try std.fmt.allocPrint(
                                     self.alloc,
-                                    "[Action Loop Checkpoint & Trajectory Recap]\n📍 Waypoint: Repeated invocation of '{s}' with identical parameters.\n⚠️ Action Required: You already have this data in context. DO NOT invoke this tool with identical parameters. Formulate a plan for the next step and execute it immediately with an alternate approach.",
-                                    .{tu.name},
+                                    "[Action Loop Checkpoint & Trajectory Recap]\n📍 Waypoint: Repeated invocation of '{s}' with identical parameters.\n\n[Tool Call Advisory (Optional Suggestions)]\nCurrent Action: `{s}`\nObservation: Already invoked with identical arguments. Data is in context.\n⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed directly to modifying code or concluding.",
+                                    .{ tu.name, tu.name },
                                 ),
                             };
                             try allocated_strings.append(self.alloc, trip_msg);
@@ -1940,20 +2119,62 @@ pub const AgentLoop = struct {
                         warn_suffix = switch (self.last_loop_reason) {
                             .orbit_cycle, .macro_cycle_2, .macro_cycle_3 => std.fmt.allocPrint(
                                 self.alloc,
-                                "\n\n[3D Procedural Map Advisory: Orbit Checkpoint & Recap]\n⚠️ Trajectory Orbit Detected: You are circling around already-scouted nodes in procedural space. Stop repeating exploratory queries. Formulate a direct fix and advance to code mutation (file_edit) or conclude.",
+                                "\n\n[3D Procedural Map Advisory: Orbit Checkpoint & Recap]\n⚠️ Trajectory Orbit Detected: You are circling around already-scouted nodes in procedural space. If you have gathered sufficient context, consider whether further exploration is needed or if you may proceed to conclude.",
                                 .{},
                             ) catch null,
                             .readonly_budget => std.fmt.allocPrint(
                                 self.alloc,
-                                "\n\n[System Advisory]: You have performed {d} consecutive read-only exploratory actions without editing code. If you have located the problem, apply the fix using file_edit instead of continuing to search.",
+                                "\n\n[System Advisory]: You have performed {d} consecutive read-only exploratory actions. If you have gathered sufficient information, proceed to take action or synthesize your response.",
                                 .{self.consecutive_readonly_count},
                             ) catch null,
                             else => std.fmt.allocPrint(
                                 self.alloc,
-                                "\n\n[System Warning]: Action loop detected. You have called '{s}' with identical arguments multiple times. You already have this data in your context. DO NOT call this tool with the same arguments again. Synthesize your findings and answer the user now.",
+                                "\n\n[System Advisory]: Action loop detected. You have called '{s}' with identical arguments multiple times. You already have this data in your context. If you feel you have enough information, you may synthesize your findings and respond to the user.",
                                 .{tu.name},
                             ) catch null,
                         };
+                    }
+
+                    // Plan Watchdog enforcement:
+                    var watchdog_suffix: ?[]u8 = null;
+                    defer if (watchdog_suffix) |ws| self.alloc.free(ws);
+
+                    if (self.plan_active and !isPlanOnlyRequest(self.current_user_request)) {
+                        if (isExploratoryToolCall(tu.name, tu.input_json)) {
+                            self.plan_procrastination_count += 1;
+                            if (self.plan_procrastination_count >= self.plan_procrastination_cap) {
+                                main.stderrPrint(
+                                    "\n\x1b[31m[watchdog] ⛔ Plan Procrastination Blocked: Tool '{s}' denied. Active plan must be executed immediately.\x1b[0m\n",
+                                    .{tu.name},
+                                );
+                                if (main.ui_repl.current_renderer) |r| {
+                                    r.ensureNewline();
+                                    r.write(" \x1b[31m[Plan Watchdog: Tool blocked. Plan execution required]\x1b[0m\n");
+                                }
+                                const block_msg = try std.fmt.allocPrint(
+                                    self.alloc,
+                                    "[Plan Watchdog Intercept]: Action denied. You declared an active plan ('{s}') but have performed {d} consecutive read-only/exploratory calls instead of executing it. Stop inspecting or searching. You MUST immediately execute the next step of your plan (e.g. modify files using file_edit or run implementation commands).",
+                                    .{ self.getPlanSummary(), self.plan_procrastination_count },
+                                );
+                                try allocated_strings.append(self.alloc, block_msg);
+                                try results.append(self.alloc, .{
+                                    .tool_use_id = tu.id,
+                                    .content = block_msg,
+                                    .is_error = true,
+                                });
+                                any_tool_err = true;
+                                continue;
+                            } else if (self.plan_procrastination_count == 1) {
+                                watchdog_suffix = std.fmt.allocPrint(
+                                    self.alloc,
+                                    "\n\n[Plan Watchdog Warning]: You previously committed to an implementation plan ('{s}'). You are performing an exploratory read-only tool call ({d}/{d}). You must begin executing your plan (e.g. file_edit or implementation commands) in the next act; further exploratory tool calls will be hard-blocked.",
+                                    .{ self.getPlanSummary(), self.plan_procrastination_count, self.plan_procrastination_cap },
+                                ) catch null;
+                            }
+                        } else {
+                            // Non-exploratory tool call: model is executing its plan
+                            self.clearPlan();
+                        }
                     }
 
                     const start_tool_ms = utils.milliTimestamp();
@@ -2012,8 +2233,13 @@ pub const AgentLoop = struct {
                     const max_tool_result = 64 * 1024;
                     const truncated = if (result.len > max_tool_result) result[0..max_tool_result] else result;
 
-                    const final_content = if (warn_suffix) |ws| blk: {
-                        const merged = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ truncated, ws });
+                    var merged_suffix = utils.BufWriter.init(self.alloc);
+                    defer merged_suffix.deinit();
+                    if (warn_suffix) |ws| try merged_suffix.writeAll(ws);
+                    if (watchdog_suffix) |wds| try merged_suffix.writeAll(wds);
+
+                    const final_content = if (merged_suffix.list.items.len > 0) blk: {
+                        const merged = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ truncated, merged_suffix.list.items });
                         try allocated_strings.append(self.alloc, merged);
                         break :blk merged;
                     } else truncated;
@@ -2500,11 +2726,16 @@ test "agent - checkActionLoop read-only exploratory budget and mutation reset" {
     _ = try agent.checkActionLoop("grep", "{\"query\":\"bar\"}");
     _ = try agent.checkActionLoop("glob", "{\"pattern\":\"*.zig\"}");
     _ = try agent.checkActionLoop("list_dir", "{\"path\":\"src\"}");
-    // 5th read-only tool in a row -> hits readonly_trip_cap (5) -> trip!
-    const res_trip = try agent.checkActionLoop("session_diagnostics", "{}");
-    try std.testing.expectEqual(AgentLoop.LoopCheckResult.trip, res_trip);
+    // 5th read-only tool in a row -> hits readonly_warn_cap (3) -> warns, but does NOT trip circuit breaker
+    const res_warn = try agent.checkActionLoop("session_diagnostics", "{}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.warn, res_warn);
     try std.testing.expectEqual(AgentLoop.LoopReason.readonly_budget, agent.last_loop_reason);
-    try std.testing.expect(agent.action_loop_tripped);
+    try std.testing.expect(!agent.action_loop_tripped);
+
+    // Non-readonly action (e.g. bash test command) resets consecutive_readonly_count to 0!
+    const res_bash = try agent.checkActionLoop("bash", "{\"command\":\"zig build test\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.allow, res_bash);
+    try std.testing.expectEqual(@as(usize, 0), agent.consecutive_readonly_count);
 }
 
 test "agent - checkActionLoop 3D procedural map orbit detection and checkpoint trip" {
@@ -2600,5 +2831,69 @@ test "agent - action loop recovery via plan and execute" {
     try std.testing.expectEqual(@as(usize, 0), agent.loop_plan_retries);
     try std.testing.expect(!agent.plan_execution_pending);
 }
+
+test "agent - plan watchdog enforcement and procrastination intercept" {
+    const alloc = std.testing.allocator;
+    var cfg: config_mod.Config = undefined;
+    cfg.action_loop_consecutive_cap = 5;
+    cfg.action_loop_window_cap = 8;
+    cfg.action_loop_readonly_warn_cap = 5;
+    cfg.action_loop_readonly_trip_cap = 10;
+    cfg.action_loop_macro_cycle_cap = 4;
+    cfg.action_loop_orbit_cap = 4;
+
+    var agent: AgentLoop = undefined;
+    agent.alloc = alloc;
+    agent.config = &cfg;
+    agent.turn_tool_records = .empty;
+    agent.turn_tool_trajectory = .empty;
+    agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
+    agent.action_loop_tripped = false;
+    agent.plan_active = false;
+    agent.plan_summary_len = 0;
+    agent.plan_procrastination_count = 0;
+    agent.plan_procrastination_cap = 2;
+    agent.current_user_request = null;
+    defer agent.deinitTurnToolRecords();
+
+    // 1. Detect plan in Vietnamese text
+    const vn_plan = AgentLoop.detectPlanInText("Đúng rồi, tôi sẽ implement fix cho bug này bằng cách thêm guard.");
+    try std.testing.expect(vn_plan != null);
+    agent.setPlan(vn_plan.?);
+    try std.testing.expect(agent.plan_active);
+    try std.testing.expectEqual(@as(usize, 0), agent.plan_procrastination_count);
+
+    // 2. Exploratory tool call detection
+    try std.testing.expect(AgentLoop.isExploratoryToolCall("file_read", "{\"path\":\"src/core/agent.zig\"}"));
+    try std.testing.expect(AgentLoop.isExploratoryToolCall("grep", "{\"query\":\"plan\"}"));
+    try std.testing.expect(AgentLoop.isExploratoryToolCall("bash", "{\"command\":\"cat src/core/agent.zig\"}"));
+    try std.testing.expect(AgentLoop.isExploratoryToolCall("bash", "{\"command\":\"sed -n '1,10p' file\"}"));
+    try std.testing.expect(!AgentLoop.isExploratoryToolCall("bash", "{\"command\":\"sed -i 's/a/b/g' file\"}"));
+    try std.testing.expect(!AgentLoop.isExploratoryToolCall("bash", "{\"command\":\"zig build test\"}"));
+    try std.testing.expect(!AgentLoop.isExploratoryToolCall("file_edit", "{\"path\":\"a.zig\"}"));
+
+    // 3. Procrastination counter increments on exploratory calls
+    agent.plan_procrastination_count += 1;
+    try std.testing.expectEqual(@as(usize, 1), agent.plan_procrastination_count);
+    try std.testing.expect(agent.plan_procrastination_count < agent.plan_procrastination_cap);
+
+    // 4. At cap, procrastination trips watchdog intercept
+    agent.plan_procrastination_count += 1;
+    try std.testing.expectEqual(@as(usize, 2), agent.plan_procrastination_count);
+    try std.testing.expect(agent.plan_procrastination_count >= agent.plan_procrastination_cap);
+
+    // 5. Executing mutating tool clears plan
+    agent.clearPlan();
+    try std.testing.expect(!agent.plan_active);
+    try std.testing.expectEqual(@as(usize, 0), agent.plan_procrastination_count);
+
+    // 6. Test isPlanOnlyRequest
+    try std.testing.expect(AgentLoop.isPlanOnlyRequest("Lập kế hoạch, không sửa file"));
+    try std.testing.expect(AgentLoop.isPlanOnlyRequest("please provide plan only"));
+    try std.testing.expect(!AgentLoop.isPlanOnlyRequest("hãy sửa bug này và chạy test"));
+}
+
 
 
