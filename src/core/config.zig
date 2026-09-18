@@ -169,6 +169,14 @@ pub const Config = struct {
     // Budget Limits (RFC-002)
     budget_max_tokens: usize,
 
+    // Execution & Action Loop Limits
+    /// Maximum acts allowed per turn before yielding control to user (default: 30).
+    max_acts_per_turn: usize = 30,
+    /// Maximum consecutive identical tool calls before circuit breaker trips (default: 3).
+    action_loop_consecutive_cap: usize = 3,
+    /// Maximum occurrences of identical tool call within sliding window before circuit breaker trips (default: 4).
+    action_loop_window_cap: usize = 4,
+
     // MCP
     /// Path to mcp.json file. Null = default ~/.mini/mcp.json.
     mcp_config_path: ?[]const u8,
@@ -381,6 +389,21 @@ pub const Config = struct {
             break :blk !std.mem.eql(u8, v, "1");
         };
 
+        const max_acts_per_turn: usize = blk: {
+            const s = env_map.get("MINI_MAX_ACTS") orelse break :blk 30;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 30;
+        };
+
+        const action_loop_consecutive_cap: usize = blk: {
+            const s = env_map.get("MINI_LOOP_CONSECUTIVE_CAP") orelse break :blk 3;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 3;
+        };
+
+        const action_loop_window_cap: usize = blk: {
+            const s = env_map.get("MINI_LOOP_WINDOW_CAP") orelse break :blk 4;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 4;
+        };
+
         // System prompt: from file or default
         const sp_result = loadSystemPrompt(alloc, env_map, io);
 
@@ -539,6 +562,9 @@ pub const Config = struct {
             .memact_pg_w = memact_pg_w,
             .memact_pg_auto_populate = memact_pg_auto_populate,
             .budget_max_tokens = budget_max_tokens,
+            .max_acts_per_turn = max_acts_per_turn,
+            .action_loop_consecutive_cap = action_loop_consecutive_cap,
+            .action_loop_window_cap = action_loop_window_cap,
             .mcp_config_path = env_map.get("MINI_MCP_CONFIG"),
             .history_enabled = history_enabled,
             .hook_command = hook_cmd,

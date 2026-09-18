@@ -1189,13 +1189,14 @@ const StreamCtx = struct {
         for (self.tool_calls.items, 0..) |*tc, ti| {
             defer tc.deinit(self.alloc);
             if (tc.name.items.len == 0) continue;
+            const clean_name = sanitizeToolName(tc.name.items) orelse continue;
             // Provider did not send id (some compat/proxies) → generate fallback id
             // so tool_result always matches tool_call_id (avoiding 400 from API).
             const id = if (tc.id.items.len > 0)
                 try self.alloc.dupe(u8, tc.id.items)
             else
                 try std.fmt.allocPrint(self.alloc, "call_{d}", .{ti});
-            const name = try self.alloc.dupe(u8, tc.name.items);
+            const name = try self.alloc.dupe(u8, clean_name);
             const args = if (tc.args.items.len > 0)
                 try self.alloc.dupe(u8, tc.args.items)
             else
@@ -1213,6 +1214,25 @@ const StreamCtx = struct {
         if (self.text_accum_init) self.text_accum.deinit(self.alloc);
     }
 };
+
+/// Sanitize raw tool name from streaming chunks:
+/// Strips trailing XML/DSML tags (`<...`), newlines, and non-identifier characters.
+/// Returns null if name is empty or completely malformed.
+pub fn sanitizeToolName(raw: []const u8) ?[]const u8 {
+    var name = raw;
+    if (std.mem.indexOfScalar(u8, name, '<')) |idx| {
+        name = name[0..idx];
+    }
+    if (std.mem.indexOfScalar(u8, name, '\n')) |idx| {
+        name = name[0..idx];
+    }
+    name = std.mem.trim(u8, name, " \t\r");
+    if (name.len == 0) return null;
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return null;
+    }
+    return name;
+}
 
 // ---------------------------------------------------------------------------
 // Unit Tests
@@ -1769,3 +1789,20 @@ test "openai buildResponsesRequestBody: unsupported reasoning_param omits reason
 
     try testing.expect(std.mem.indexOf(u8, body, "reasoning") == null);
 }
+
+test "openai sanitizeToolName: strips DSML tags and rejects invalid tool names" {
+    // Normal tool names
+    try testing.expectEqualStrings("bash", sanitizeToolName("bash").?);
+    try testing.expectEqualStrings("file_read", sanitizeToolName("file_read").?);
+    try testing.expectEqualStrings("my-custom_tool1", sanitizeToolName("my-custom_tool1").?);
+
+    // DeepSeek DSML leaked tag stripping
+    try testing.expectEqualStrings("read", sanitizeToolName("read</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>").?);
+    try testing.expectEqualStrings("file_read", sanitizeToolName("file_read<any_tag>").?);
+
+    // Empty or pure tags
+    try testing.expect(sanitizeToolName("</｜DSML｜tool_calls>") == null);
+    try testing.expect(sanitizeToolName("   ") == null);
+    try testing.expect(sanitizeToolName("invalid tool with spaces") == null);
+}
+

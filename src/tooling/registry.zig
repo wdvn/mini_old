@@ -102,6 +102,12 @@ fn executeToolInternal(alloc: Allocator, io: std.Io, name: []const u8, input_jso
     if (std.mem.eql(u8, name, "skills"))                return executeSkills(alloc, io, input_json);
     if (std.mem.eql(u8, name, "codeact"))               return executeCodeActTool(alloc, io, input_json);
 
+    // Common LLM alias fallback normalization
+    if (std.mem.eql(u8, name, "read"))                  return file_tool.readTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "write"))                 return file_tool.writeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "edit"))                  return file_tool.editTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "sh") or std.mem.eql(u8, name, "shell") or std.mem.eql(u8, name, "terminal")) return bash_tool.executeTool(alloc, io, input_json);
+
     // MCP fallback: names follow "server__toolname" format
     if (g_mcp) |mgr| {
         if (mgr.callTool(name, input_json)) |result| return result;
