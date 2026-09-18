@@ -465,7 +465,6 @@ pub const PGraphStore = struct {
     /// Checkpoint & Recap block instead of cyclic forward step suggestions.
     /// `user_request` is the original task prompt — injected to keep the model anchored
     /// to its goal rather than drifting into generic exploration.
-    /// `show_advisory` controls whether to print to stderr (true) or silently inject into prompt (false).
     pub fn serializeGuidance(
         self: *PGraphStore,
         alloc: Allocator,
@@ -474,7 +473,6 @@ pub const PGraphStore = struct {
         last_failed: bool,
         max_hops: u32,
         user_request: ?[]const u8,
-        show_advisory: bool,
     ) !?[]u8 {
         const act_str = last_action orelse return null;
         const start_node_id = self.matchNode(act_str) orelse return null;
@@ -542,7 +540,6 @@ pub const PGraphStore = struct {
         errdefer bw.deinit();
 
         try bw.writeAll("[Procedural Advisory (Optional Suggestions)]\n");
-        _ = show_advisory; // controlled via MINI_MEMACT_PG_ADVISORY env var
         if (last_failed) {
             try bw.writeAll("Notice: Previous action reported a non-zero exit code or failure. Consider these heuristic suggestions if helpful (you are NOT required to follow them):\n");
         }

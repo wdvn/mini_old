@@ -902,7 +902,6 @@ pub const AgentLoop = struct {
                     self.last_act_failed,
                     self.config.memact_pg_h,
                     self.current_user_request,
-                    self.config.memact_pg_advisory,
                 ) catch null;
 
                 if (ephemeral_guidance) |guidance_text| {
