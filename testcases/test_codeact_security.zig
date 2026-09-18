@@ -279,3 +279,5 @@ test "security: per-act VM isolation — global variables do not leak across 2 e
     try std.testing.expect(!res2.is_error);
     try std.testing.expectEqualStrings("leaked: undefined", std.mem.trim(u8, res2.stdout, "\n"));
 }
+
+// ---------------------------------------------------------------------------
