@@ -410,3 +410,67 @@ test "pg: recordTransition frequency gate promotes candidate edge at N >= 3" {
     try store2.loadIndex(io);
     try testing.expectEqual(initial_edges + 1, store2.graph.active_edge_count);
 }
+
+test "pg: recordTransition rejects cycle and generic observational pairs" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+
+    var buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_pgstore_test_{d}_4", .{std.os.linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var store = try PGraphStore.init(alloc, io, dir);
+    defer store.deinit();
+    try store.loadIndex(io);
+
+    const initial_edges = store.graph.active_edge_count;
+
+    // 1. Generic observational pair (bash <-> file_read) should never be promoted
+    try store.recordTransition(io, "bash", "file_read");
+    try store.recordTransition(io, "bash", "file_read");
+    try store.recordTransition(io, "bash", "file_read");
+    try testing.expectEqual(initial_edges, store.graph.active_edge_count);
+
+    // 2. Add valid edge list_dir -> glob
+    try store.recordTransition(io, "list_dir", "glob");
+    try store.recordTransition(io, "list_dir", "glob");
+    try store.recordTransition(io, "list_dir", "glob");
+    try testing.expectEqual(initial_edges + 1, store.graph.active_edge_count);
+
+    // 3. Attempting reverse edge glob -> list_dir must be rejected by cycle guard
+    try store.recordTransition(io, "glob", "list_dir");
+    try store.recordTransition(io, "glob", "list_dir");
+    try store.recordTransition(io, "glob", "list_dir");
+    try testing.expectEqual(initial_edges + 1, store.graph.active_edge_count);
+}
+
+test "pg: serializeGuidance suppresses recent actions in trajectory window" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+
+    var buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_pgstore_test_{d}_5", .{std.os.linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var store = try PGraphStore.init(alloc, io, dir);
+    defer store.deinit();
+    try store.loadIndex(io);
+
+    // Default for file_edit leads to bash.
+    // If bash was NOT recently run, it is suggested:
+    const g_normal = try store.serializeGuidance(alloc, "file_edit", &.{}, false, 2);
+    try testing.expect(g_normal != null);
+    defer alloc.free(g_normal.?);
+    try testing.expect(std.mem.indexOf(u8, g_normal.?, "`bash`") != null);
+
+    // If bash WAS recently run, it is suppressed to prevent ping-pong:
+    const g_suppressed = try store.serializeGuidance(alloc, "file_edit", &.{ "bash" }, false, 2);
+    try testing.expect(g_suppressed == null);
+
+    // If previous act failed, suppression is bypassed to allow retry/recovery:
+    const g_retry = try store.serializeGuidance(alloc, "file_edit", &.{ "bash" }, true, 2);
+    try testing.expect(g_retry != null);
+    defer alloc.free(g_retry.?);
+    try testing.expect(std.mem.indexOf(u8, g_retry.?, "`bash`") != null);
+}
+

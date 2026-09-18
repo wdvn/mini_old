@@ -257,6 +257,42 @@ pub const PGraphStore = struct {
         return self.graph.findNodeByName(normalized);
     }
 
+    /// Check whether `to` node is reachable from `from` node via active directed edges.
+    fn isReachable(graph: *const Graph, from: NodeId, to: NodeId, alloc: Allocator) bool {
+        if (from == to) return true;
+        var visited = std.AutoHashMap(NodeId, void).init(alloc);
+        defer visited.deinit();
+        var queue = std.ArrayList(NodeId).empty;
+        defer queue.deinit(alloc);
+
+        queue.append(alloc, from) catch return false;
+        visited.put(from, {}) catch return false;
+
+        var head: usize = 0;
+        while (head < queue.items.len) : (head += 1) {
+            const curr = queue.items[head];
+            if (curr == to) return true;
+            if (curr >= graph.out_adj.items.len) continue;
+            for (graph.out_adj.items[curr].items) |eid| {
+                if (eid >= graph.edges.items.len) continue;
+                const edge = graph.edges.items[eid];
+                if (!edge.is_active) continue;
+                if (!visited.contains(edge.dst)) {
+                    if (edge.dst == to) return true;
+                    visited.put(edge.dst, {}) catch continue;
+                    queue.append(alloc, edge.dst) catch continue;
+                }
+            }
+        }
+        return false;
+    }
+
+    fn isObservationalOrGeneric(name: []const u8) bool {
+        return std.mem.eql(u8, name, "bash") or
+            std.mem.eql(u8, name, "file_read") or
+            std.mem.eql(u8, name, "session_diagnostics");
+    }
+
     /// Extract h-hop neighborhood subgraph guidance formatted as markdown (RFC-010 PG-3).
     /// Returns null if no active transitions or if selective policy decides no guidance is needed.
     pub fn serializeGuidance(
@@ -267,7 +303,6 @@ pub const PGraphStore = struct {
         last_failed: bool,
         max_hops: u32,
     ) !?[]u8 {
-        _ = recent_actions;
         const act_str = last_action orelse return null;
         const start_node_id = self.matchNode(act_str) orelse return null;
 
@@ -304,8 +339,27 @@ pub const PGraphStore = struct {
             const edge = self.graph.edges.items[eid];
             if (!edge.is_active) continue;
 
-            const src_name = self.graph.nodes.items[edge.src].name;
+            // Suppress self-loops
+            if (edge.src == edge.dst) continue;
+
             const dst_name = self.graph.nodes.items[edge.dst].name;
+
+            // Cycle suppression: if destination tool (or intermediate path node) was executed recently in trajectory,
+            // suppress it from admissible next steps to avoid ping-pong loops (unless last act failed)
+            if (!last_failed) {
+                var in_recent = false;
+                for (recent_actions) |ra| {
+                    if (self.matchNode(ra)) |ra_id| {
+                        if (ra_id == edge.dst or (edge.src != start_node_id and ra_id == edge.src)) {
+                            in_recent = true;
+                            break;
+                        }
+                    }
+                }
+                if (in_recent) continue;
+            }
+
+            const src_name = self.graph.nodes.items[edge.src].name;
             const rel_str = edge.rel.toString();
 
             try bw.print("- `{s}` → `{s}` ({s})\n", .{ src_name, dst_name, rel_str });
@@ -341,7 +395,10 @@ pub const PGraphStore = struct {
         const src_name = self.graph.nodes.items[src_id].name;
         const dst_name = self.graph.nodes.items[dst_id].name;
 
-        // If edge already exists and is active, no need to learn
+        // Guard 1: Do not auto-populate transitions between two generic observation/execution tools
+        if (isObservationalOrGeneric(src_name) and isObservationalOrGeneric(dst_name)) return;
+
+        // Guard 2: If edge already exists and is active, no need to learn
         const out_edges = if (src_id < self.graph.out_adj.items.len) self.graph.out_adj.items[src_id].items else &.{};
         for (out_edges) |eid| {
             if (eid < self.graph.edges.items.len) {
@@ -349,6 +406,18 @@ pub const PGraphStore = struct {
                 if (edge.is_active and edge.dst == dst_id) return;
             }
         }
+
+        // Guard 3: Direct reverse edge check (prevent immediate 2-cycles A <-> B)
+        const rev_edges = if (dst_id < self.graph.out_adj.items.len) self.graph.out_adj.items[dst_id].items else &.{};
+        for (rev_edges) |eid| {
+            if (eid < self.graph.edges.items.len) {
+                const edge = self.graph.edges.items[eid];
+                if (edge.is_active and edge.dst == src_id) return;
+            }
+        }
+
+        // Guard 4: Reachability check (prevent multi-hop cycles A -> B -> ... -> A)
+        if (isReachable(&self.graph, dst_id, src_id, self.alloc)) return;
 
         const key = try std.fmt.allocPrint(self.alloc, "{s}->{s}", .{ src_name, dst_name });
         defer self.alloc.free(key);
@@ -366,6 +435,9 @@ pub const PGraphStore = struct {
                 defer self.alloc.free(line);
 
                 try self.appendEvent(io, line);
+
+                // Run cycle repair as secondary safety guarantee
+                _ = repairCycles(&self.graph, self.alloc) catch 0;
             }
         } else {
             const owned_key = try self.alloc.dupe(u8, key);
