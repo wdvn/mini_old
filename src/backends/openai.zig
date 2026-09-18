@@ -120,6 +120,11 @@ pub const Client = struct {
     /// Idle watchdog timeout scaled by active reasoning effort (RFC-009 Phase 5).
     /// low/minimal → tight window (routine acts finish fast); high → generous.
     fn effectiveIdleTimeout(self: *const Client) u32 {
+        // Disabled? Return 0 to skip idle polling entirely.
+        if (utils.getEnvSlice("MINI_WATCHDOG_ENABLED")) |s| {
+            const v = std.mem.trim(u8, s, " \t");
+            if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "off")) return 0;
+        }
         if (utils.getEnvSlice("MINI_STREAM_IDLE_TIMEOUT")) |s| {
             return std.fmt.parseInt(u32, std.mem.trim(u8, s, " \t"), 10) catch 0;
         }

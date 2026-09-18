@@ -28,6 +28,7 @@
 //!   `MINI_REASONING_EFFORT`         Reasoning effort ("minimal"|"low"|"medium"|"high"|"none")
 //!   `MINI_REASONING_EFFORT_DISABLED` "1" to omit reasoning parameters for compat endpoints
 //!   `MINI_THINKING_BUDGET`          Thinking budget tokens (e.g. for Claude thinking.budget_tokens >= 1024)
+//!   `MINI_WATCHDOG_ENABLED`         "0" to disable stream stall watchdog (idle timeout); default: enabled
 //!
 //! ### MemAct (RFC-003)
 //!   `MINI_MEMACT_ENABLED`       "0" to disable MemAct (default: enabled)
@@ -775,6 +776,7 @@ pub const JsonConfig = struct {
     context_window: ?u32 = null,
     tool_allowlist: ?[]const u8 = null,
     tool_blocklist: ?[]const u8 = null,
+    watchdog_enabled: ?bool = null,
     mcp_config: ?[]const u8 = null,
     hook_command: ?[]const u8 = null,
     session: ?[]const u8 = null,
@@ -904,6 +906,7 @@ fn tryLoadJsonConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: st
     }
     if (cfg.tool_allowlist) |val| count += setEnvDefault(env_map, "MINI_TOOL_ALLOWLIST", val);
     if (cfg.tool_blocklist) |val| count += setEnvDefault(env_map, "MINI_TOOL_BLOCKLIST", val);
+    if (cfg.watchdog_enabled) |val| count += setEnvDefault(env_map, "MINI_WATCHDOG_ENABLED", if (val) "1" else "0");
     if (cfg.mcp_config) |val| count += setEnvDefault(env_map, "MINI_MCP_CONFIG", val);
     if (cfg.hook_command) |val| count += setEnvDefault(env_map, "MINI_HOOK_COMMAND", val);
     if (cfg.session) |val| count += setEnvDefault(env_map, "MINI_SESSION", val);
