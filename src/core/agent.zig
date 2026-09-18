@@ -13,13 +13,17 @@
 //! ```
 //!
 //! ## Backends
-//! Agent prioritizes backends in the following order:
+//! Agent selects a single backend at startup, in the following order:
 //!   1. OpenAI-compatible (if OPENAI_COMPAT_URL is set)
 //!   2. Claude (if ANTHROPIC_API_KEY is set)
-//!   3. Ollama (local fallback)
+//!   3. Ollama (local)
 //!
 //! ## Fallback
-//! If primary backend fails, agent attempts remaining backends.
+//! There is no cross-provider fallback at this layer: protocol/vendor
+//! fallback is handled inside the provider abstraction (RFC-012), and the
+//! act retry loop in `processInput` re-runs the same backend on transient
+//! transport errors. A blind extra Ollama attempt was removed because it
+//! usually pointed at a non-running local server and masked the real error.
 //!
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -375,6 +379,17 @@ pub const AgentLoop = struct {
         self.last_backend_raw_error = null;
         if (raw) |r| {
             self.last_backend_raw_error = self.alloc.dupe(u8, r) catch null;
+        }
+    }
+
+    /// Resets the captured HTTP error context. Called at the start of every
+    /// backend attempt so that a *transport* failure (which never sets a status
+    /// code) is not mis-attributed to a previous request's 429/400 body.
+    fn clearLastErrorContext(self: *AgentLoop) void {
+        self.last_backend_http_code = 0;
+        if (self.last_backend_raw_error) |old| {
+            self.alloc.free(old);
+            self.last_backend_raw_error = null;
         }
     }
 
@@ -1358,7 +1373,19 @@ pub const AgentLoop = struct {
             r.startWaiting();
         }
 
-        // Primary backend
+        // Clear stale HTTP error context (e.g. a previous act's 429/400). Without
+        // this a transport failure below would be mis-attributed to that old
+        // status/body in the journal (see sendToBackend error handling).
+        self.clearLastErrorContext();
+
+        // Primary backend.
+        //
+        // Cross-provider fallback (e.g. OpenAI-compat -> Responses API, or
+        // vendor routing) is already handled *inside* the backend / provider
+        // abstraction layer (RFC-012), so there is no second Ollama attempt
+        // here. Blindly falling back to a local Ollama that is usually not
+        // running only added an extra failing round-trip and masked the real
+        // primary error in the journal.
         const primary = self.backend.send(system_prompt, msgs, tool_defs, text_cb, think_cb);
         if (primary) |resp| return resp else |e| {
             if (e == error.Interrupted or signals.isInterrupted()) {
@@ -1369,58 +1396,24 @@ pub const AgentLoop = struct {
                 if (r.is_thinking) r.endThinking();
                 r.ensureNewline();
             }
-            // Fallback: try Ollama if primary is not Ollama
-            main.stderrPrint("\n[agent] {s} error ({s}), trying Ollama...\n", .{ self.backend.name(), @errorName(e) });
-            if (self.backend != .ollama) {
-                if (main.ui_repl.current_renderer) |r| {
-                    r.startWaiting();
-                }
-                var fallback = ollama_mod.Client.init(
+            // Journal the transport/parse error using the PRIMARY backend's error
+            // name (previously this was recorded as the Ollama fallback's
+            // ConnectionRefused, which masked the true cause).
+            if (self.journal) |*j| {
+                const desc = std.fmt.allocPrint(
                     self.alloc,
-                    self.config.ollama_url,
-                    self.config.ollama_model,
-                    self.config.max_tokens,
-                );
-                if (fallback.sendMessage(system_prompt, msgs, tool_defs, text_cb, think_cb)) |resp| {
-                    main.stderrPrint("[agent] Ollama fallback succeeded\n", .{});
-                    // Journal: primary error (transport/parse — e.g. ReadFailed) but
-                    // fallback succeeded. Turn continues, but primary error is recorded
-                    // for debugging from journal (stderr is ephemeral).
-                    if (self.journal) |*j| {
-                        j.recordError(self.io, act_id, .llm_provider_error, "Primary backend error, fallback Ollama succeeded — continuing turn", .{
-                            .backend = self.backend.name(),
-                            .model = self.backend.model(),
-                            .error_name = @errorName(e),
-                            .http_code = self.last_backend_http_code,
-                            .attempt = 1,
-                            .raw_snippet = self.last_backend_raw_error,
-                        }) catch {};
-                    }
-                    return resp;
-                } else |fb_err| {
-                    if (main.ui_repl.current_renderer) |r| {
-                        r.stopWaiting();
-                        if (r.is_thinking) r.endThinking();
-                        r.ensureNewline();
-                    }
-                    // Journal: fallback also failed — record both errors for debugging
-                    // (primary + ollama fallback) in the same event.
-                    if (self.journal) |*j| {
-                        const desc = std.fmt.allocPrint(
-                            self.alloc,
-                            "Primary {s} error ({s}), fallback Ollama also failed ({s})",
-                            .{ self.backend.name(), @errorName(e), @errorName(fb_err) },
-                        ) catch "Primary + fallback both failed";
-                        defer self.alloc.free(desc);
-                        j.recordError(self.io, act_id, .llm_provider_error, desc, .{
-                            .backend = self.backend.name(),
-                            .model = self.backend.model(),
-                            .error_name = @errorName(fb_err),
-                            .attempt = 1,
-                            .raw_snippet = self.last_backend_raw_error,
-                        }) catch {};
-                    }
-                }
+                    "{s} backend error ({s})",
+                    .{ self.backend.name(), @errorName(e) },
+                ) catch "Backend error";
+                defer self.alloc.free(desc);
+                j.recordError(self.io, act_id, .llm_provider_error, desc, .{
+                    .backend = self.backend.name(),
+                    .model = self.backend.model(),
+                    .error_name = @errorName(e),
+                    .http_code = self.last_backend_http_code,
+                    .attempt = 1,
+                    .raw_snippet = self.last_backend_raw_error,
+                }) catch {};
             }
             return e;
         }

@@ -26,6 +26,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
+const net = std.Io.net;
 const signals = @import("../core/signals.zig");
 
 /// Default body limit: 30KB — consistent with legacy tool protocol.
@@ -260,6 +261,95 @@ fn initTlsState(client: *std.http.Client, io: std.Io) void {
     std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
 }
 
+/// Whether to prefer IPv4 when establishing connections.
+///
+/// Defaults to enabled. Set `MINI_FORCE_IPV4=0` / `false` / `off` to restore
+/// std's default "race every resolved address" behaviour.
+fn preferIpv4() bool {
+    const raw = std.c.getenv("MINI_FORCE_IPV4") orelse return true;
+    const v = std.mem.span(raw);
+    return !(std.mem.eql(u8, v, "0") or
+        std.ascii.eqlIgnoreCase(v, "false") or
+        std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+/// Best-effort IPv4 pre-connect to work around blackholed IPv6 routes.
+///
+/// Problem: some networks advertise a global IPv6 default route that cannot
+/// actually reach the internet (a "IPv6 blackhole"). std's `HostName.connect`
+/// races *all* resolved addresses and may pick the IPv6 path, whose TCP connect
+/// succeeds but whose TLS handshake then stalls/fails — surfacing as
+/// `error.TlsInitializationFailed` after a long timeout. This intermittently
+/// kills an AI act (and thus the CodeAct it was about to emit).
+///
+/// Fix: resolve the URL host to an A record and eagerly acquire an IPv4
+/// connection, keeping the original host name for TLS SNI / certificate
+/// verification and for the HTTP `Host` header. The acquired connection is
+/// handed to `client.request` (via `RequestOptions.connection`) so std reuses
+/// it instead of racing the broken IPv6 address again.
+///
+/// Returns `null` when disabled, when the host has no IPv4 address, when the
+/// host is already an IP literal, or on any error — callers then fall back to
+/// std's default connection logic (IPv6-only hosts keep working).
+fn preconnectIpv4(client: *std.http.Client, uri: std.Uri) ?*std.http.Client.Connection {
+    if (!preferIpv4()) return null;
+
+    const protocol = std.http.Client.Protocol.fromUri(uri) orelse return null;
+    if (protocol == .tls and std.http.Client.disable_tls) return null;
+
+    const io = client.io;
+
+    var host_buf: [net.HostName.max_len]u8 = undefined;
+    const host_name = uri.getHost(&host_buf) catch return null;
+
+    // Already an IP literal — std connects directly, no DNS/race involved.
+    if (net.IpAddress.parseIp4(host_name.bytes, uri.port orelse 0)) |_| return null else |_| {}
+    if (net.IpAddress.parseIp6(host_name.bytes, uri.port orelse 0)) |_| return null else |_| {}
+
+    const port: u16 = uri.port orelse switch (protocol) {
+        .plain => 80,
+        .tls => 443,
+    };
+
+    var results_buf: [16]net.HostName.LookupResult = undefined;
+    var results: std.Io.Queue(net.HostName.LookupResult) = .init(&results_buf);
+    host_name.lookup(io, &results, .{ .port = port, .family = .ip4 }) catch return null;
+
+    var ip4: ?net.Ip4Address = null;
+    while (results.getOne(io)) |res| {
+        switch (res) {
+            .address => |addr| {
+                if (ip4 == null) switch (addr) {
+                    .ip4 => |v| ip4 = v,
+                    else => {},
+                };
+            },
+            .canonical_name => {},
+        }
+    } else |_| {}
+
+    const addr = ip4 orelse return null;
+
+    var ip_buf: [net.HostName.max_len]u8 = undefined;
+    const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{
+        addr.bytes[0], addr.bytes[1], addr.bytes[2], addr.bytes[3],
+    }) catch return null;
+
+    // TLS needs `now` + CA bundle warmed before `Tls.create` runs.
+    if (client.now == null) initTlsState(client, io);
+
+    return client.connectTcpOptions(.{
+        .host = .{ .bytes = ip_str },
+        .port = port,
+        .protocol = protocol,
+        // Preserve the real host name for SNI + certificate verification and so
+        // the pooled connection matches the request's URI host.
+        .proxied_host = host_name,
+        .proxied_port = port,
+    }) catch null;
+}
+
 /// Like `fetch` but uses existing client (reuses connection pool, caller manages deinit).
 pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options) !Response {
     const http_method = try parseMethod(opts.method);
@@ -285,6 +375,9 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
             .accept_encoding = .omit,
         },
         .keep_alive = false,
+        // Prefer IPv4 when available (works around blackholed IPv6 routes,
+        // which otherwise fail as TlsInitializationFailed during handshake).
+        .connection = preconnectIpv4(client, uri),
     });
     defer req.deinit();
 
@@ -482,6 +575,9 @@ pub fn postStream(
             .accept_encoding = .omit,
         },
         .keep_alive = false,
+        // Prefer IPv4 when available (works around blackholed IPv6 routes,
+        // which otherwise fail as TlsInitializationFailed during handshake).
+        .connection = preconnectIpv4(&client, uri),
     });
     defer req.deinit();
 
