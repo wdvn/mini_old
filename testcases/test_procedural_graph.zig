@@ -373,7 +373,7 @@ test "pg: serializeGuidance generates 2-hop markdown guidance block" {
     const guidance = guidance_opt.?;
     defer alloc.free(guidance);
 
-    try testing.expect(std.mem.indexOf(u8, guidance, "[Procedural Graph Guidance]") != null);
+    try testing.expect(std.mem.indexOf(u8, guidance, "[Procedural Advisory") != null);
     try testing.expect(std.mem.indexOf(u8, guidance, "Current Action: `file_edit`") != null);
     try testing.expect(std.mem.indexOf(u8, guidance, "`bash`") != null);
 }
@@ -467,10 +467,70 @@ test "pg: serializeGuidance suppresses recent actions in trajectory window" {
     const g_suppressed = try store.serializeGuidance(alloc, "file_edit", &.{ "bash" }, false, 2);
     try testing.expect(g_suppressed == null);
 
-    // If previous act failed, suppression is bypassed to allow retry/recovery:
+    // If previous act failed, suppression is STILL enforced to prevent infinite ping-pong loops.
+    // Instead of re-suggesting recently executed bash, it emits an anti-loop advisory:
     const g_retry = try store.serializeGuidance(alloc, "file_edit", &.{ "bash" }, true, 2);
     try testing.expect(g_retry != null);
     defer alloc.free(g_retry.?);
-    try testing.expect(std.mem.indexOf(u8, g_retry.?, "`bash`") != null);
+    try testing.expect(std.mem.indexOf(u8, g_retry.?, "`bash` →") == null); // bash is NOT suggested as next step
+    try testing.expect(std.mem.indexOf(u8, g_retry.?, "No new untried recovery steps found") != null);
+    try testing.expect(std.mem.indexOf(u8, g_retry.?, "Do NOT repeat previous searches") != null);
 }
+
+test "pg: detectTrajectoryOrbit identifies 3D exploratory loops and respects mutation displacement" {
+    // Case 1: Closed orbit of period 3 (bash -> grep -> file_read -> bash)
+    const traj_orbit1: []const []const u8 = &.{ "bash", "grep", "file_read", "bash" };
+    const res1 = PGraphStore.detectTrajectoryOrbit(traj_orbit1, "bash");
+    try testing.expect(res1 != null);
+    try testing.expectEqual(@as(usize, 3), res1.?.period);
+    try testing.expectEqual(@as(usize, 1), res1.?.revolutions);
+
+    // Case 2: Trajectory containing mutation tool (file_edit) has ΔZ > 0 -> not an exploratory orbit!
+    const traj_mutate: []const []const u8 = &.{ "bash", "grep", "file_read", "file_edit", "bash" };
+    const res_mutate = PGraphStore.detectTrajectoryOrbit(traj_mutate, "bash");
+    try testing.expect(res_mutate == null);
+
+    // Case 3: Degenerate self-loops (consecutive bash) are not simple orbits
+    const traj_self: []const []const u8 = &.{ "bash", "bash", "bash", "bash" };
+    const res_self = PGraphStore.detectTrajectoryOrbit(traj_self, "bash");
+    try testing.expect(res_self == null);
+
+    // Case 4: Multi-revolution orbit (2 full cycles of bash -> grep -> file_read)
+    const traj_orbit2: []const []const u8 = &.{ "bash", "grep", "file_read", "bash", "grep", "file_read" };
+    const res2 = PGraphStore.detectTrajectoryOrbit(traj_orbit2, "file_read");
+    try testing.expect(res2 != null);
+    try testing.expectEqual(@as(usize, 3), res2.?.period);
+    try testing.expectEqual(@as(usize, 2), res2.?.revolutions);
+}
+
+test "pg: serializeGuidance generates 3D Map Checkpoint & Recap on orbit" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+
+    var buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_pgstore_test_{d}_6", .{std.os.linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var store = try PGraphStore.init(alloc, io, dir);
+    defer store.deinit();
+    try store.loadIndex(io);
+
+    // Provide trajectory with closed orbit: bash -> grep -> file_read -> bash
+    const traj: []const []const u8 = &.{ "bash", "grep", "file_read", "bash" };
+    const g_orbit = try store.serializeGuidance(alloc, "bash", traj, false, 2);
+    try testing.expect(g_orbit != null);
+    defer alloc.free(g_orbit.?);
+
+    // Verify Checkpoint & Recap formatting
+    try testing.expect(std.mem.indexOf(u8, g_orbit.?, "[Procedural 3D Map Checkpoint & Trajectory Recap]") != null);
+    try testing.expect(std.mem.indexOf(u8, g_orbit.?, "3D Trajectory Orbit Detected") != null);
+    try testing.expect(std.mem.indexOf(u8, g_orbit.?, "Explored Territory Recap") != null);
+    try testing.expect(std.mem.indexOf(u8, g_orbit.?, "Orbit Break Directive") != null);
+    try testing.expect(std.mem.indexOf(u8, g_orbit.?, "Formulate a concise step-by-step plan") != null);
+    try testing.expect(std.mem.indexOf(u8, g_orbit.?, "MUTATE domain") != null);
+
+    // Crucial: regular forward step suggestion is suppressed during orbit!
+    try testing.expect(std.mem.indexOf(u8, g_orbit.?, "Observed Pattern Suggestions") == null);
+}
+
 

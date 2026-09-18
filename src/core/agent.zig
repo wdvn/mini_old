@@ -204,14 +204,34 @@ pub const AgentLoop = struct {
     recent_tools: std.ArrayListUnmanaged([]u8) = .empty,
     /// Action Loop Guard: tool signatures executed in current turn.
     turn_tool_records: std.ArrayListUnmanaged(ToolCallRecord) = .empty,
+    /// 3D Procedural Map trajectory tracking for orbit detection and Checkpoint & Recap.
+    turn_tool_trajectory: std.ArrayListUnmanaged([]u8) = .empty,
     /// Consecutive identical tool call counter.
     consecutive_dup_tool_count: usize = 0,
+    /// Consecutive read-only exploratory tool call counter.
+    consecutive_readonly_count: usize = 0,
+    /// Last detected loop reason.
+    last_loop_reason: LoopReason = .none,
     /// Flag set when action loop circuit breaker trips to break out of agent loop.
     action_loop_tripped: bool = false,
+    /// Number of times the agent has prompted the model to formulate a plan and execute next step to recover from an action loop in the current turn.
+    loop_plan_retries: usize = 0,
+    /// Flag indicating that a plan has been requested to break an action loop; if the model returns text without tool execution, prompts the model to execute step 1.
+    plan_execution_pending: bool = false,
 
     pub const ToolCallRecord = struct {
         name: []u8,
         args_hash: u64,
+    };
+
+    pub const LoopReason = enum {
+        none,
+        identical_repeat,
+        window_repeat,
+        macro_cycle_2,
+        macro_cycle_3,
+        readonly_budget,
+        orbit_cycle,
     };
 
     pub const LoopCheckResult = enum {
@@ -390,12 +410,91 @@ pub const AgentLoop = struct {
         self.deinitTurnToolRecords();
     }
 
-    /// Evaluates whether a tool call constitutes an action loop (consecutive identical or sliding window repeat).
+    pub fn isReadOnlyTool(name: []const u8) bool {
+        return std.mem.eql(u8, name, "file_read") or
+            std.mem.eql(u8, name, "read") or
+            std.mem.eql(u8, name, "grep") or
+            std.mem.eql(u8, name, "glob") or
+            std.mem.eql(u8, name, "list_dir") or
+            std.mem.eql(u8, name, "session_diagnostics");
+    }
+
+    pub fn isMutatingTool(name: []const u8) bool {
+        return std.mem.eql(u8, name, "file_edit") or
+            std.mem.eql(u8, name, "edit") or
+            std.mem.eql(u8, name, "multi_file_edit") or
+            std.mem.eql(u8, name, "file_write") or
+            std.mem.eql(u8, name, "write");
+    }
+
+    pub const MacroCycle = struct {
+        period: usize,
+        repetitions: usize,
+    };
+
+    /// Detects repeating patterns in tool name sequence:
+    /// - 2-cycle: [A, B, A, B] (period = 2)
+    /// - 3-cycle: [A, B, C, A, B, C] (period = 3)
+    pub fn detectMacroCycle(records: []const ToolCallRecord, current_name: []const u8) ?MacroCycle {
+        const len = records.len;
+        // Check period 2: [A, B, A, B]
+        if (len >= 3) {
+            const b = current_name;
+            const a = records[len - 1].name;
+            if (!std.mem.eql(u8, a, b)) {
+                if (std.mem.eql(u8, records[len - 2].name, b) and std.mem.eql(u8, records[len - 3].name, a)) {
+                    var reps: usize = 2;
+                    if (len >= 5 and std.mem.eql(u8, records[len - 4].name, b) and std.mem.eql(u8, records[len - 5].name, a)) {
+                        reps = 3;
+                    }
+                    return .{ .period = 2, .repetitions = reps };
+                }
+            }
+        }
+
+        // Check period 3: [A, B, C, A, B, C]
+        if (len >= 5) {
+            const c = current_name;
+            const b = records[len - 1].name;
+            const a = records[len - 2].name;
+            if (!std.mem.eql(u8, a, b) and !std.mem.eql(u8, b, c) and !std.mem.eql(u8, a, c)) {
+                if (std.mem.eql(u8, records[len - 3].name, c) and
+                    std.mem.eql(u8, records[len - 4].name, b) and
+                    std.mem.eql(u8, records[len - 5].name, a))
+                {
+                    var reps: usize = 2;
+                    if (len >= 8 and
+                        std.mem.eql(u8, records[len - 6].name, c) and
+                        std.mem.eql(u8, records[len - 7].name, b) and
+                        std.mem.eql(u8, records[len - 8].name, a))
+                    {
+                        reps = 3;
+                    }
+                    return .{ .period = 3, .repetitions = reps };
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// Evaluates whether a tool call constitutes an action loop (consecutive identical, sliding window repeat,
+    /// macro-cycle alternating sequence, or read-only exploratory budget exceeded).
     pub fn checkActionLoop(self: *AgentLoop, tool_name: []const u8, input_json: []const u8) !LoopCheckResult {
         const trimmed = std.mem.trim(u8, input_json, " \t\r\n");
         const args_hash = std.hash.Wyhash.hash(0, trimmed);
 
-        // 1. Check consecutive duplicates
+        // 1. Update read-only exploratory counter
+        if (isReadOnlyTool(tool_name)) {
+            self.consecutive_readonly_count += 1;
+        } else if (isMutatingTool(tool_name)) {
+            self.consecutive_readonly_count = 0;
+        }
+
+        // 2. Check macro-cycle (alternating tool names across consecutive calls)
+        const macro_cycle = detectMacroCycle(self.turn_tool_records.items, tool_name);
+
+        // 3. Check consecutive duplicates (identical arguments)
         if (self.turn_tool_records.items.len > 0) {
             const last = self.turn_tool_records.items[self.turn_tool_records.items.len - 1];
             if (std.mem.eql(u8, last.name, tool_name) and last.args_hash == args_hash) {
@@ -407,7 +506,7 @@ pub const AgentLoop = struct {
             self.consecutive_dup_tool_count = 1;
         }
 
-        // 2. Count occurrences in sliding window of recent tool executions
+        // 4. Count occurrences in sliding window of recent tool executions
         var window_count: usize = 0;
         const window_size = @min(self.turn_tool_records.items.len, 10);
         const start_idx = self.turn_tool_records.items.len - window_size;
@@ -418,7 +517,7 @@ pub const AgentLoop = struct {
         }
         window_count += 1; // including current
 
-        // 3. Append to turn records (cap at 16 items)
+        // 5. Append to turn records (cap at 16 items)
         if (self.turn_tool_records.items.len >= 16) {
             const oldest = self.turn_tool_records.orderedRemove(0);
             self.alloc.free(oldest.name);
@@ -430,18 +529,75 @@ pub const AgentLoop = struct {
             .args_hash = args_hash,
         });
 
-        // 4. Evaluate circuit breaker thresholds
+        // Also append to 3D trajectory (cap at 32 items)
+        if (self.turn_tool_trajectory.items.len >= 32) {
+            const oldest_t = self.turn_tool_trajectory.orderedRemove(0);
+            self.alloc.free(oldest_t);
+        }
+        const dup_traj = try self.alloc.dupe(u8, tool_name);
+        errdefer self.alloc.free(dup_traj);
+        try self.turn_tool_trajectory.append(self.alloc, dup_traj);
+
+        // Check 3D procedural map orbit
+        const traj_orbit = graph_store_mod.PGraphStore.detectTrajectoryOrbit(self.turn_tool_trajectory.items, tool_name);
+
+        // 6. Evaluate circuit breaker thresholds (TRIP)
         if (self.consecutive_dup_tool_count >= self.config.action_loop_consecutive_cap or
             window_count >= self.config.action_loop_window_cap)
         {
             self.action_loop_tripped = true;
+            self.last_loop_reason = if (self.consecutive_dup_tool_count >= self.config.action_loop_consecutive_cap) .identical_repeat else .window_repeat;
             return .trip;
         }
 
+        if (macro_cycle) |mc| {
+            if (mc.repetitions >= 3) {
+                self.action_loop_tripped = true;
+                self.last_loop_reason = if (mc.period == 2) .macro_cycle_2 else .macro_cycle_3;
+                return .trip;
+            }
+        }
+
+        if (traj_orbit) |orbit| {
+            if (orbit.revolutions >= self.config.action_loop_orbit_cap) {
+                self.action_loop_tripped = true;
+                self.last_loop_reason = .orbit_cycle;
+                return .trip;
+            }
+        }
+
+        if (self.consecutive_readonly_count >= self.config.action_loop_readonly_trip_cap) {
+            self.action_loop_tripped = true;
+            self.last_loop_reason = .readonly_budget;
+            return .trip;
+        }
+
+        // 7. Evaluate warning thresholds (WARN)
         if (self.consecutive_dup_tool_count >= 2 or window_count >= 3) {
+            self.last_loop_reason = if (self.consecutive_dup_tool_count >= 2) .identical_repeat else .window_repeat;
             return .warn;
         }
 
+        if (macro_cycle) |mc| {
+            if (mc.repetitions >= self.config.action_loop_macro_cycle_cap) {
+                self.last_loop_reason = if (mc.period == 2) .macro_cycle_2 else .macro_cycle_3;
+                return .warn;
+            }
+        }
+
+        if (traj_orbit) |orbit| {
+            if (orbit.revolutions >= 1) {
+                self.last_loop_reason = .orbit_cycle;
+                return .warn;
+            }
+        }
+
+        if (self.consecutive_readonly_count >= self.config.action_loop_readonly_warn_cap) {
+            self.last_loop_reason = .readonly_budget;
+            return .warn;
+        }
+
+        self.last_loop_reason = .none;
         return .allow;
     }
 
@@ -450,11 +606,19 @@ pub const AgentLoop = struct {
             self.alloc.free(rec.name);
         }
         self.turn_tool_records.clearRetainingCapacity();
+        for (self.turn_tool_trajectory.items) |t| {
+            self.alloc.free(t);
+        }
+        self.turn_tool_trajectory.clearRetainingCapacity();
+        self.consecutive_dup_tool_count = 0;
+        self.consecutive_readonly_count = 0;
+        self.last_loop_reason = .none;
     }
 
     pub fn deinitTurnToolRecords(self: *AgentLoop) void {
         self.clearTurnToolRecords();
         self.turn_tool_records.deinit(self.alloc);
+        self.turn_tool_trajectory.deinit(self.alloc);
     }
 
     /// Saves the latest backend error context for subsequent journal recordError.
@@ -603,10 +767,15 @@ pub const AgentLoop = struct {
         defer if (ephemeral_blocks) |b| self.alloc.free(b);
 
         if (self.pg_store) |pg| {
+            const traj_slice: []const []const u8 = if (self.turn_tool_trajectory.items.len > 0)
+                self.turn_tool_trajectory.items
+            else
+                self.recent_tools.items;
+
             ephemeral_guidance = pg.serializeGuidance(
                 self.alloc,
                 self.last_executed_tool,
-                self.recent_tools.items,
+                traj_slice,
                 self.last_act_failed,
                 self.config.memact_pg_h,
             ) catch null;
@@ -728,14 +897,35 @@ pub const AgentLoop = struct {
 
                 const js_loop_check = self.checkActionLoop("codeact", js_code) catch .allow;
                 if (js_loop_check == .trip) {
-                    main.stderrPrint(
-                        "\n\x1b[33m[agent] ⚠️ Action loop circuit breaker tripped: identical CodeAct script repeated without progress. Halting loop.\x1b[0m\n",
-                        .{},
-                    );
-                    const trip_msg = "[CodeAct System Intervention]: Action loop circuit breaker triggered. You have repeatedly executed identical CodeAct scripts without making progress. Halting execution. Synthesize your findings and answer the user now.";
-                    try self.history.addUser(trip_msg);
-                    self.action_loop_tripped = true;
-                    return .exit_loop;
+                    if (self.loop_plan_retries < 2) {
+                        self.loop_plan_retries += 1;
+                        self.plan_execution_pending = true;
+                        main.stderrPrint(
+                            "\n\x1b[33m[agent] ⚠️ Action loop detected: identical CodeAct script repeated without progress. Requesting model to formulate plan and execute next step.\x1b[0m\n",
+                            .{},
+                        );
+                        if (main.ui_repl.current_renderer) |r| {
+                            r.ensureNewline();
+                            r.write(" \x1b[33m[Action Loop Detected: Requesting Plan & Execution]\x1b[0m\n");
+                        }
+                        if (self.journal) |*j| {
+                            j.recordEvent(self.io, act_id, .checkpoint_created, "CodeAct action loop - requesting plan & execution") catch {};
+                        }
+                        const trip_msg = "[CodeAct Checkpoint & Recap]: Action loop detected. You have repeatedly executed identical CodeAct scripts without making progress. You MUST NOT repeat the identical script. Formulate a concise step-by-step plan for the next action and execute it immediately with an alternate approach.";
+                        try self.history.addUser(trip_msg);
+                        self.action_loop_tripped = false;
+                        self.consecutive_dup_tool_count = 0;
+                        return .continue_loop;
+                    } else {
+                        main.stderrPrint(
+                            "\n\x1b[33m[agent] ⚠️ Action loop persisted after replanning attempts: identical CodeAct script repeated. Halting loop.\x1b[0m\n",
+                            .{},
+                        );
+                        const trip_msg = "[CodeAct System Intervention]: Action loop persisted after multiple replanning attempts. Halting execution. Synthesize your findings and answer the user now.";
+                        try self.history.addUser(trip_msg);
+                        self.action_loop_tripped = true;
+                        return .exit_loop;
+                    }
                 }
 
                 const start_codeact_ms = utils.milliTimestamp();
@@ -855,6 +1045,13 @@ pub const AgentLoop = struct {
         switch (response.stop_reason) {
             .end_turn, .stop_sequence => {
                 self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "none" });
+                if (self.plan_execution_pending) {
+                    self.plan_execution_pending = false;
+                    main.stderrPrint("\n\x1b[33m[agent] ⚠️ Plan received without tool execution. Prompting model to execute Step 1...\x1b[0m\n", .{});
+                    const exec_directive = "[System Directive]: Execution plan noted. Now proceed immediately to execute Step 1 of your plan using tools (e.g. modify code via file_edit/file_write, switch tool, or launch subagent). Do not output text without executing tools.";
+                    try self.history.addUser(exec_directive);
+                    return .continue_loop;
+                }
                 if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
                     main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
                 }
@@ -1102,7 +1299,10 @@ pub const AgentLoop = struct {
         self.js_retry_count = 0;
         self.clearTurnToolRecords();
         self.consecutive_dup_tool_count = 0;
+        self.consecutive_readonly_count = 0;
         self.action_loop_tripped = false;
+        self.loop_plan_retries = 0;
+        self.plan_execution_pending = false;
 
         // Retrieve relevant tool definitions for user message based on execution_mode
         const tool_defs = switch (self.config.execution_mode) {
@@ -1367,11 +1567,11 @@ pub const AgentLoop = struct {
 
         if (act_id > max_acts) {
             main.stderrPrint(
-                "\n\x1b[33m[agent] ⚠️ Turn act limit ({d}) reached. Halting loop to request user direction (Stopping Rule 4: Progress Checkpoint).\x1b[0m\n",
+                "\n\x1b[33m[agent] ⚠️ Turn act limit ({d}) reached. Pausing turn to request direction.\x1b[0m\n",
                 .{max_acts},
             );
-            if (self.journal) |*j| j.recordEvent(self.io, act_id - 1, .task_completed, "Max acts reached") catch {};
-            try self.history.addSystemErrorObservation("[System]: Maximum acts limit reached for this turn. Pausing to request direction from the user (Stopping Rule 4: Progress Checkpoint).");
+            if (self.journal) |*j| j.recordEvent(self.io, act_id - 1, .checkpoint_created, "Max acts reached") catch {};
+            try self.history.addSystemErrorObservation("[System]: Maximum acts limit reached for this turn. Pausing to request direction from the user.");
             return;
         }
     }
@@ -1636,7 +1836,6 @@ pub const AgentLoop = struct {
     /// Executes all tool_use blocks in response.
 
     fn executeTools(self: *AgentLoop, act_id: usize, response: *const proto.Response) !void {
-        _ = act_id;
         var any_tool_err = false;
         var results = ArrayList(proto.ToolResult).empty;
         defer results.deinit(self.alloc);
@@ -1653,37 +1852,108 @@ pub const AgentLoop = struct {
                 .tool_use => |tu| {
                     const loop_check = self.checkActionLoop(tu.name, tu.input_json) catch .allow;
                     if (loop_check == .trip) {
-                        main.stderrPrint(
-                            "\n\x1b[33m[agent] ⚠️ Action loop circuit breaker tripped: '{s}' called repeatedly with identical parameters without progress. Halting loop.\x1b[0m\n",
-                            .{tu.name},
-                        );
-                        if (main.ui_repl.current_renderer) |r| {
-                            r.ensureNewline();
-                            r.write(" \x1b[33m[Action loop detected: repeated identical tool calls halted]\x1b[0m\n");
+                        const trip_reason_str = switch (self.last_loop_reason) {
+                            .macro_cycle_2 => "alternating tool loop (A ↔ B) repeated",
+                            .macro_cycle_3 => "3-step tool cycle (A → B → C) repeated",
+                            .orbit_cycle => "closed orbit in 3D procedural map repeated",
+                            .readonly_budget => "read-only exploratory budget exceeded without code mutation",
+                            else => "called repeatedly with identical parameters",
+                        };
+
+                        if (self.loop_plan_retries < 2) {
+                            self.loop_plan_retries += 1;
+                            self.plan_execution_pending = true;
+                            main.stderrPrint(
+                                "\n\x1b[33m[agent] ⚠️ Action loop detected: {s}. Requesting model to formulate plan and execute next step.\x1b[0m\n",
+                                .{trip_reason_str},
+                            );
+                            if (main.ui_repl.current_renderer) |r| {
+                                r.ensureNewline();
+                                r.write(" \x1b[33m[Action Loop Checkpoint: Requesting Plan & Execution]\x1b[0m\n");
+                            }
+                            if (self.journal) |*j| {
+                                j.recordEvent(self.io, act_id, .checkpoint_created, "Action loop detected - requesting plan & execution") catch {};
+                            }
+                            const trip_msg = switch (self.last_loop_reason) {
+                                .orbit_cycle, .macro_cycle_2, .macro_cycle_3 => blk: {
+                                    var mbw = utils.BufWriter.init(self.alloc);
+                                    errdefer mbw.deinit();
+                                    mbw.writeAll("[Action Loop Checkpoint & Trajectory Recap]\n") catch {};
+                                    mbw.print("📍 Waypoint: Action loop detected ({s}).\n", .{trip_reason_str}) catch {};
+                                    mbw.writeAll("🗺️ Trajectory Scouted: ") catch {};
+                                    for (self.turn_tool_trajectory.items, 0..) |tn, i| {
+                                        if (i > 0) mbw.writeAll(" → ") catch {};
+                                        mbw.print("`{s}`", .{tn}) catch {};
+                                    }
+                                    mbw.writeAll("\n⚠️ Action Required: Exploration has circled in place without forward progress (ΔZ = 0). DO NOT continue calling the previous exploratory actions.\n") catch {};
+                                    mbw.writeAll("You MUST:\n1. Formulate a concise, concrete step-by-step plan for the next actions.\n2. Proceed immediately with executing the first step of your plan (e.g. modify code with file_edit/file_write, switch tool, or launch a subagent).\nPlan and execute the next step now.") catch {};
+                                    break :blk try mbw.toOwnedSlice();
+                                },
+                                .readonly_budget => try std.fmt.allocPrint(
+                                    self.alloc,
+                                    "[Action Loop Checkpoint & Trajectory Recap]\n📍 Waypoint: Read-only exploratory budget exceeded ({d} consecutive search/read actions without mutation).\n⚠️ Action Required: You have gathered sufficient context. DO NOT continue searching. Formulate a concrete plan and proceed immediately with executing the fix (e.g. using file_edit). Plan and execute the next step now.",
+                                    .{self.consecutive_readonly_count},
+                                ),
+                                else => try std.fmt.allocPrint(
+                                    self.alloc,
+                                    "[Action Loop Checkpoint & Trajectory Recap]\n📍 Waypoint: Repeated invocation of '{s}' with identical parameters.\n⚠️ Action Required: You already have this data in context. DO NOT invoke this tool with identical parameters. Formulate a plan for the next step and execute it immediately with an alternate approach.",
+                                    .{tu.name},
+                                ),
+                            };
+                            try allocated_strings.append(self.alloc, trip_msg);
+                            try results.append(self.alloc, .{
+                                .tool_use_id = tu.id,
+                                .content = trip_msg,
+                                .is_error = true,
+                            });
+                            self.action_loop_tripped = false;
+                            self.consecutive_dup_tool_count = 0;
+                            break;
+                        } else {
+                            main.stderrPrint(
+                                "\n\x1b[33m[agent] ⚠️ Action loop persisted after replanning attempts: {s}. Halting turn.\x1b[0m\n",
+                                .{trip_reason_str},
+                            );
+                            if (main.ui_repl.current_renderer) |r| {
+                                r.ensureNewline();
+                                r.write(" \x1b[33m[Action loop persisted: halting turn]\x1b[0m\n");
+                            }
+                            const trip_msg = try std.fmt.allocPrint(
+                                self.alloc,
+                                "[Action Loop Halt]: Action loop persisted after multiple replanning requests ({s}). Execution paused. Please explain your status and request user guidance.",
+                                .{trip_reason_str},
+                            );
+                            try allocated_strings.append(self.alloc, trip_msg);
+                            try results.append(self.alloc, .{
+                                .tool_use_id = tu.id,
+                                .content = trip_msg,
+                                .is_error = true,
+                            });
+                            self.action_loop_tripped = true;
+                            break;
                         }
-                        const trip_msg = try std.fmt.allocPrint(
-                            self.alloc,
-                            "[System Intervention]: Action loop circuit breaker triggered. You have repeatedly invoked '{s}' with the same parameters without making progress. Execution halted. Synthesize your findings and answer the user now.",
-                            .{tu.name},
-                        );
-                        try allocated_strings.append(self.alloc, trip_msg);
-                        try results.append(self.alloc, .{
-                            .tool_use_id = tu.id,
-                            .content = trip_msg,
-                            .is_error = true,
-                        });
-                        self.action_loop_tripped = true;
-                        break;
                     }
 
                     var warn_suffix: ?[]u8 = null;
                     defer if (warn_suffix) |w| self.alloc.free(w);
                     if (loop_check == .warn) {
-                        warn_suffix = std.fmt.allocPrint(
-                            self.alloc,
-                            "\n\n[System Warning]: Action loop detected. You have called '{s}' with identical arguments multiple times. You already have this data in your context. DO NOT call this tool with the same arguments again. Synthesize your findings and answer the user now.",
-                            .{tu.name},
-                        ) catch null;
+                        warn_suffix = switch (self.last_loop_reason) {
+                            .orbit_cycle, .macro_cycle_2, .macro_cycle_3 => std.fmt.allocPrint(
+                                self.alloc,
+                                "\n\n[3D Procedural Map Advisory: Orbit Checkpoint & Recap]\n⚠️ Trajectory Orbit Detected: You are circling around already-scouted nodes in procedural space. Stop repeating exploratory queries. Formulate a direct fix and advance to code mutation (file_edit) or conclude.",
+                                .{},
+                            ) catch null,
+                            .readonly_budget => std.fmt.allocPrint(
+                                self.alloc,
+                                "\n\n[System Advisory]: You have performed {d} consecutive read-only exploratory actions without editing code. If you have located the problem, apply the fix using file_edit instead of continuing to search.",
+                                .{self.consecutive_readonly_count},
+                            ) catch null,
+                            else => std.fmt.allocPrint(
+                                self.alloc,
+                                "\n\n[System Warning]: Action loop detected. You have called '{s}' with identical arguments multiple times. You already have this data in your context. DO NOT call this tool with the same arguments again. Synthesize your findings and answer the user now.",
+                                .{tu.name},
+                            ) catch null,
+                        };
                     }
 
                     const start_tool_ms = utils.milliTimestamp();
@@ -1763,6 +2033,10 @@ pub const AgentLoop = struct {
                         .content = final_content,
                         .is_error = is_err,
                     });
+                    if (!is_err) {
+                        self.loop_plan_retries = 0;
+                        self.plan_execution_pending = false;
+                    }
 
                     const end_tool_ms = utils.milliTimestamp();
                     const dur_ms = if (end_tool_ms >= start_tool_ms) @as(u64, @intCast(end_tool_ms - start_tool_ms)) else 0;
@@ -1983,12 +2257,19 @@ test "agent - checkActionLoop consecutive identical tool calls" {
     var cfg: config_mod.Config = undefined;
     cfg.action_loop_consecutive_cap = 3;
     cfg.action_loop_window_cap = 4;
+    cfg.action_loop_readonly_warn_cap = 5;
+    cfg.action_loop_readonly_trip_cap = 10;
+    cfg.action_loop_macro_cycle_cap = 2;
+    cfg.action_loop_orbit_cap = 2;
 
     var agent: AgentLoop = undefined;
     agent.alloc = alloc;
     agent.config = &cfg;
     agent.turn_tool_records = .empty;
+    agent.turn_tool_trajectory = .empty;
     agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
     agent.action_loop_tripped = false;
     defer agent.deinitTurnToolRecords();
 
@@ -2016,12 +2297,19 @@ test "agent - checkActionLoop different commands reset consecutive count" {
     var cfg: config_mod.Config = undefined;
     cfg.action_loop_consecutive_cap = 3;
     cfg.action_loop_window_cap = 4;
+    cfg.action_loop_readonly_warn_cap = 5;
+    cfg.action_loop_readonly_trip_cap = 10;
+    cfg.action_loop_macro_cycle_cap = 2;
+    cfg.action_loop_orbit_cap = 2;
 
     var agent: AgentLoop = undefined;
     agent.alloc = alloc;
     agent.config = &cfg;
     agent.turn_tool_records = .empty;
+    agent.turn_tool_trajectory = .empty;
     agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
     agent.action_loop_tripped = false;
     defer agent.deinitTurnToolRecords();
 
@@ -2041,16 +2329,23 @@ test "agent - checkActionLoop windowed repetition detection" {
     var cfg: config_mod.Config = undefined;
     cfg.action_loop_consecutive_cap = 3;
     cfg.action_loop_window_cap = 4;
+    cfg.action_loop_readonly_warn_cap = 5;
+    cfg.action_loop_readonly_trip_cap = 10;
+    cfg.action_loop_macro_cycle_cap = 2;
+    cfg.action_loop_orbit_cap = 2;
 
     var agent: AgentLoop = undefined;
     agent.alloc = alloc;
     agent.config = &cfg;
     agent.turn_tool_records = .empty;
+    agent.turn_tool_trajectory = .empty;
     agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
     agent.action_loop_tripped = false;
     defer agent.deinitTurnToolRecords();
 
-    // Alternating calls: A, B, A, B, A, B, A
+    // Alternating calls with same tool name ("bash"): A, B, A, B, A, B, A
     _ = try agent.checkActionLoop("bash", "{\"command\":\"cat SKILL.md\"}");
     _ = try agent.checkActionLoop("bash", "{\"command\":\"ls\"}");
     _ = try agent.checkActionLoop("bash", "{\"command\":\"cat SKILL.md\"}");
@@ -2068,6 +2363,242 @@ test "agent - checkActionLoop windowed repetition detection" {
     const res_a4 = try agent.checkActionLoop("bash", "{\"command\":\"cat SKILL.md\"}");
     try std.testing.expectEqual(AgentLoop.LoopCheckResult.trip, res_a4);
     try std.testing.expect(agent.action_loop_tripped);
+}
+
+test "agent - checkActionLoop 2-cycle alternating tool names detection" {
+    const alloc = std.testing.allocator;
+    var cfg: config_mod.Config = undefined;
+    cfg.action_loop_consecutive_cap = 5;
+    cfg.action_loop_window_cap = 8;
+    cfg.action_loop_readonly_warn_cap = 10;
+    cfg.action_loop_readonly_trip_cap = 20;
+    cfg.action_loop_macro_cycle_cap = 2;
+    cfg.action_loop_orbit_cap = 4;
+
+    var agent: AgentLoop = undefined;
+    agent.alloc = alloc;
+    agent.config = &cfg;
+    agent.turn_tool_records = .empty;
+    agent.turn_tool_trajectory = .empty;
+    agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
+    agent.action_loop_tripped = false;
+    defer agent.deinitTurnToolRecords();
+
+    // Sequence: grep(q1) -> bash(c1) -> grep(q2) -> bash(c2)
+    // Note: parameters are DIFFERENT so argument hashes never repeat!
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"fn foo\"}");
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"zig build test\"}");
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"fn bar\"}");
+
+    // 4th step: 2 full cycles of [grep, bash] -> warn!
+    const res4 = try agent.checkActionLoop("bash", "{\"command\":\"zig build run\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.warn, res4);
+    try std.testing.expectEqual(AgentLoop.LoopReason.macro_cycle_2, agent.last_loop_reason);
+    try std.testing.expect(!agent.action_loop_tripped);
+
+    // Cycle 3: grep(q3) -> bash(c3)
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"fn baz\"}");
+    const res6 = try agent.checkActionLoop("bash", "{\"command\":\"zig build test\"}");
+    // 3 full cycles of alternating tools -> trip!
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.trip, res6);
+    try std.testing.expectEqual(AgentLoop.LoopReason.macro_cycle_2, agent.last_loop_reason);
+    try std.testing.expect(agent.action_loop_tripped);
+}
+
+test "agent - checkActionLoop 3-cycle macro sequence detection" {
+    const alloc = std.testing.allocator;
+    var cfg: config_mod.Config = undefined;
+    cfg.action_loop_consecutive_cap = 5;
+    cfg.action_loop_window_cap = 8;
+    cfg.action_loop_readonly_warn_cap = 10;
+    cfg.action_loop_readonly_trip_cap = 20;
+    cfg.action_loop_macro_cycle_cap = 2;
+    cfg.action_loop_orbit_cap = 4;
+
+    var agent: AgentLoop = undefined;
+    agent.alloc = alloc;
+    agent.config = &cfg;
+    agent.turn_tool_records = .empty;
+    agent.turn_tool_trajectory = .empty;
+    agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
+    agent.action_loop_tripped = false;
+    defer agent.deinitTurnToolRecords();
+
+    // Real-world scenario from session 63448:
+    // Cycle 1: bash -> grep -> file_read
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"zig build test\"}");
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"TurnRenderer\"}");
+    _ = try agent.checkActionLoop("file_read", "{\"path\":\"src/ui/chat_stream.zig\"}");
+
+    // Cycle 2: bash -> grep -> file_read (distinct query & path arguments)
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"zig build test-unit\"}");
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"deduplication\"}");
+
+    // 6th step: completes 2 full cycles of [bash, grep, file_read] -> warn!
+    const res6 = try agent.checkActionLoop("file_read", "{\"path\":\"testcases/test_backend.zig\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.warn, res6);
+    try std.testing.expectEqual(AgentLoop.LoopReason.macro_cycle_3, agent.last_loop_reason);
+    try std.testing.expect(!agent.action_loop_tripped);
+
+    // Cycle 3: bash -> grep -> file_read
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"./test_run\"}");
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"assert\"}");
+    const res9 = try agent.checkActionLoop("file_read", "{\"path\":\"src/main.zig\"}");
+    // 3 full cycles -> trip circuit breaker!
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.trip, res9);
+    try std.testing.expectEqual(AgentLoop.LoopReason.macro_cycle_3, agent.last_loop_reason);
+    try std.testing.expect(agent.action_loop_tripped);
+}
+
+test "agent - checkActionLoop read-only exploratory budget and mutation reset" {
+    const alloc = std.testing.allocator;
+    var cfg: config_mod.Config = undefined;
+    cfg.action_loop_consecutive_cap = 5;
+    cfg.action_loop_window_cap = 8;
+    cfg.action_loop_readonly_warn_cap = 3;
+    cfg.action_loop_readonly_trip_cap = 5;
+    cfg.action_loop_macro_cycle_cap = 4;
+    cfg.action_loop_orbit_cap = 4;
+
+    var agent: AgentLoop = undefined;
+    agent.alloc = alloc;
+    agent.config = &cfg;
+    agent.turn_tool_records = .empty;
+    agent.turn_tool_trajectory = .empty;
+    agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
+    agent.action_loop_tripped = false;
+    defer agent.deinitTurnToolRecords();
+
+    // Read 1: allow
+    _ = try agent.checkActionLoop("file_read", "{\"path\":\"a.txt\"}");
+    try std.testing.expectEqual(@as(usize, 1), agent.consecutive_readonly_count);
+
+    // Read 2: allow
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"foo\"}");
+    try std.testing.expectEqual(@as(usize, 2), agent.consecutive_readonly_count);
+
+    // Read 3: hits readonly_warn_cap (3) -> warn!
+    const res3 = try agent.checkActionLoop("glob", "{\"pattern\":\"*.zig\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.warn, res3);
+    try std.testing.expectEqual(AgentLoop.LoopReason.readonly_budget, agent.last_loop_reason);
+    try std.testing.expectEqual(@as(usize, 3), agent.consecutive_readonly_count);
+    try std.testing.expect(!agent.action_loop_tripped);
+
+    // Mutating action: file_edit -> resets consecutive_readonly_count to 0!
+    const res_edit = try agent.checkActionLoop("file_edit", "{\"path\":\"a.txt\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.allow, res_edit);
+    try std.testing.expectEqual(@as(usize, 0), agent.consecutive_readonly_count);
+
+    // Read-only counter increments again
+    _ = try agent.checkActionLoop("file_read", "{\"path\":\"b.txt\"}");
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"bar\"}");
+    _ = try agent.checkActionLoop("glob", "{\"pattern\":\"*.zig\"}");
+    _ = try agent.checkActionLoop("list_dir", "{\"path\":\"src\"}");
+    // 5th read-only tool in a row -> hits readonly_trip_cap (5) -> trip!
+    const res_trip = try agent.checkActionLoop("session_diagnostics", "{}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.trip, res_trip);
+    try std.testing.expectEqual(AgentLoop.LoopReason.readonly_budget, agent.last_loop_reason);
+    try std.testing.expect(agent.action_loop_tripped);
+}
+
+test "agent - checkActionLoop 3D procedural map orbit detection and checkpoint trip" {
+    const alloc = std.testing.allocator;
+    var cfg: config_mod.Config = undefined;
+    cfg.action_loop_consecutive_cap = 10;
+    cfg.action_loop_window_cap = 10;
+    cfg.action_loop_readonly_warn_cap = 10;
+    cfg.action_loop_readonly_trip_cap = 20;
+    cfg.action_loop_macro_cycle_cap = 5;
+    cfg.action_loop_orbit_cap = 2;
+
+    var agent: AgentLoop = undefined;
+    agent.alloc = alloc;
+    agent.config = &cfg;
+    agent.turn_tool_records = .empty;
+    agent.turn_tool_trajectory = .empty;
+    agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
+    agent.action_loop_tripped = false;
+    defer agent.deinitTurnToolRecords();
+
+    // Orbit 1: bash -> grep -> file_read
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"zig build test\"}");
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"foo\"}");
+    _ = try agent.checkActionLoop("file_read", "{\"path\":\"a.zig\"}");
+
+    // Orbit 1 closes: bash (matches bash 3 steps ago) -> orbit detected (rev 1) -> warn!
+    const res_orbit1 = try agent.checkActionLoop("bash", "{\"command\":\"zig build test-unit\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.warn, res_orbit1);
+    try std.testing.expectEqual(AgentLoop.LoopReason.orbit_cycle, agent.last_loop_reason);
+    try std.testing.expect(!agent.action_loop_tripped);
+
+    // Orbit 2 continues: grep -> file_read
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"bar\"}");
+    _ = try agent.checkActionLoop("file_read", "{\"path\":\"b.zig\"}");
+
+    // Orbit 2 closes: bash -> revolutions = 2 reaches action_loop_orbit_cap (2) -> trip!
+    const res_orbit2 = try agent.checkActionLoop("bash", "{\"command\":\"zig build test\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.trip, res_orbit2);
+    try std.testing.expectEqual(AgentLoop.LoopReason.orbit_cycle, agent.last_loop_reason);
+    try std.testing.expect(agent.action_loop_tripped);
+}
+
+test "agent - action loop recovery via plan and execute" {
+    const alloc = std.testing.allocator;
+    var cfg: config_mod.Config = undefined;
+    cfg.action_loop_consecutive_cap = 2;
+    cfg.action_loop_window_cap = 10;
+    cfg.action_loop_readonly_warn_cap = 10;
+    cfg.action_loop_readonly_trip_cap = 20;
+    cfg.action_loop_macro_cycle_cap = 5;
+    cfg.action_loop_orbit_cap = 5;
+
+    var agent: AgentLoop = undefined;
+    agent.alloc = alloc;
+    agent.config = &cfg;
+    agent.turn_tool_records = .empty;
+    agent.turn_tool_trajectory = .empty;
+    agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
+    agent.action_loop_tripped = false;
+    agent.loop_plan_retries = 0;
+    agent.plan_execution_pending = false;
+    defer agent.deinitTurnToolRecords();
+
+    // Call 1: first time
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"ls\"}");
+    try std.testing.expectEqual(@as(usize, 0), agent.loop_plan_retries);
+
+    // Call 2: reaches cap -> trip
+    const res = try agent.checkActionLoop("bash", "{\"command\":\"ls\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.trip, res);
+    try std.testing.expect(agent.action_loop_tripped);
+
+    // Simulate recovery logic in executeTools:
+    // First trip: request plan & execution instead of halting
+    if (agent.loop_plan_retries < 2) {
+        agent.loop_plan_retries += 1;
+        agent.plan_execution_pending = true;
+        agent.action_loop_tripped = false; // Turn continues!
+        agent.consecutive_dup_tool_count = 0;
+    }
+    try std.testing.expectEqual(@as(usize, 1), agent.loop_plan_retries);
+    try std.testing.expect(agent.plan_execution_pending);
+    try std.testing.expect(!agent.action_loop_tripped);
+
+    // Model executes mutation tool (file_edit) -> recovery succeeds!
+    agent.loop_plan_retries = 0;
+    agent.plan_execution_pending = false;
+    try std.testing.expectEqual(@as(usize, 0), agent.loop_plan_retries);
+    try std.testing.expect(!agent.plan_execution_pending);
 }
 
 

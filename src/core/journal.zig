@@ -37,6 +37,8 @@ pub const ActEventType = enum {
     task_interrupted,
     /// RFC-003 §4.6: MemAct compaction completed (observable & reversible via Act model).
     memact_compacted,
+    /// Progress Checkpoint & Recap created upon orbit/loop detection or act limit.
+    checkpoint_created,
 };
 
 pub const FileSnapshot = struct {

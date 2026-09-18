@@ -54,7 +54,7 @@ testcases/            — all test files (standalone, integration, benchmarks, .
 - **Procedural Graph (RFC-010)**: Procedural knowledge stored as event-sourced directed graph in `~/.mini/memory/<project_hash>/pgraph.jsonl`. Dynamically localizes active tool nodes, extracts 2-hop neighborhood, injects ephemeral guidance blocks, and automatically learns frequent tool transitions (N >= 3).
 - **Dual-Protocol Auto-Negotiation**: Automatically switch and remember protocol between Chat Completions API and Responses API for OpenAI-compatible endpoints.
 - **Provider Abstraction Layer (RFC-012)**: Normalizes wire protocol differences across OpenAI-compatible endpoints (`OPENAI_COMPAT_PROVIDER` or auto-detect from URL). Manages protocol selection (Chat Completions vs Responses API), reasoning parameter format, reasoning echo policy (DeepSeek assistant history), and Chinese thinking tag filtering (`<思考>`, `<推理>`, etc.).
-- **Execution & Stopping Rules**: The agent strictly follows 4 stopping rules (Stop on Completion, Confirm Before Mutation, Avoid Action Loops, Progress Checkpoint).
+- **Execution Rules**: The agent strictly follows core execution rules (Stop on Completion, Confirm Before Mutation, Avoid Action Loops & Plan Ahead, Cognitive Efficiency).
 - Backends conform to `core/protocol.zig`; do not make direct HTTP calls in the agent loop.
 - Editor (`ui/editor.zig`) supports incremental bracketed paste parser (`ui/paste.zig`), UTF-8 width, single-line byte-based editing (multiline composer FSM roadmap at `docs/rfc_008_user_input_state_machine_proposal.md`).
 - History persistence is planned using SQLite (libsqlite3 reserved in `build.zig`).

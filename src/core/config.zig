@@ -176,6 +176,14 @@ pub const Config = struct {
     action_loop_consecutive_cap: usize = 3,
     /// Maximum occurrences of identical tool call within sliding window before circuit breaker trips (default: 4).
     action_loop_window_cap: usize = 4,
+    /// Maximum consecutive read-only exploratory actions before warning (default: 5).
+    action_loop_readonly_warn_cap: usize = 5,
+    /// Maximum consecutive read-only exploratory actions before tripping circuit breaker (default: 10).
+    action_loop_readonly_trip_cap: usize = 10,
+    /// Macro-cycle repetition threshold for alternating tools before tripping circuit breaker (default: 2).
+    action_loop_macro_cycle_cap: usize = 2,
+    /// 3D procedural map orbit repetition threshold before tripping action loop circuit breaker (default: 2).
+    action_loop_orbit_cap: usize = 2,
 
     // MCP
     /// Path to mcp.json file. Null = default ~/.mini/mcp.json.
@@ -253,12 +261,11 @@ pub const Config = struct {
         \\2. Immediately after closing the ``` tag you MUST STOP (yield turn) for the system to execute and return results in the next turn.
         \\3. Absolutely DO NOT fabricate outputs, DO NOT self-monologue or speculate results, and DO NOT write multiple code blocks in the same turn.
         \\
-        \\## Execution & Stopping Rules:
+        \\## Execution Rules:
         \\1. Stop on Completion: As soon as enough evidence is gathered, the answer is determined, or the goal is completed: STOP CALLING TOOLS/CODE IMMEDIATELY to respond to the user. Do not perform extraneous actions beyond the scope requested.
         \\2. Confirm Before Mutation: While investigating/diagnosing, absolutely DO NOT modify files, configuration, or system state unless explicitly requested by the user. Always present findings and propose options first.
-        \\3. Avoid Action Loops: If an approach does not yield results after 2-3 attempts, stop to re-evaluate hypotheses rather than repeating similar failed operations.
-        \\4. Progress Checkpoint: If a complex task requires multiple steps and initial exploration does not conclude it, stop to summarize progress and request direction from the user.
-        \\5. Cognitive Efficiency: Minimize thinking latency on simple inspection or routine tool executions by self-modulating with `mini.setThinking("low")`; reserve high thinking effort for architecture design, complex debugging, or error recovery.
+        \\3. Avoid Action Loops & Plan Ahead: If an approach does not yield results after 2-3 attempts or an exploratory loop occurs, do not repeat similar failed operations. Formulate a structured execution plan and proceed immediately with executing the next steps using an alternate strategy.
+        \\4. Cognitive Efficiency: Minimize thinking latency on simple inspection or routine tool executions by self-modulating with `mini.setThinking("low")`; reserve high thinking effort for architecture design, complex debugging, or error recovery.
         \\
         \\Please answer concisely, accurately, and effectively in English.
     ;
@@ -404,6 +411,26 @@ pub const Config = struct {
         const action_loop_window_cap: usize = blk: {
             const s = env_map.get("MINI_LOOP_WINDOW_CAP") orelse break :blk 4;
             break :blk std.fmt.parseInt(usize, s, 10) catch 4;
+        };
+
+        const action_loop_readonly_warn_cap: usize = blk: {
+            const s = env_map.get("MINI_LOOP_READONLY_WARN") orelse break :blk 5;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 5;
+        };
+
+        const action_loop_readonly_trip_cap: usize = blk: {
+            const s = env_map.get("MINI_LOOP_READONLY_TRIP") orelse break :blk 10;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 10;
+        };
+
+        const action_loop_macro_cycle_cap: usize = blk: {
+            const s = env_map.get("MINI_LOOP_MACRO_CYCLE_CAP") orelse break :blk 2;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 2;
+        };
+
+        const action_loop_orbit_cap: usize = blk: {
+            const s = env_map.get("MINI_LOOP_ORBIT_CAP") orelse break :blk 2;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 2;
         };
 
         // System prompt: from file or default
@@ -568,6 +595,10 @@ pub const Config = struct {
             .max_acts_per_turn = max_acts_per_turn,
             .action_loop_consecutive_cap = action_loop_consecutive_cap,
             .action_loop_window_cap = action_loop_window_cap,
+            .action_loop_readonly_warn_cap = action_loop_readonly_warn_cap,
+            .action_loop_readonly_trip_cap = action_loop_readonly_trip_cap,
+            .action_loop_macro_cycle_cap = action_loop_macro_cycle_cap,
+            .action_loop_orbit_cap = action_loop_orbit_cap,
             .mcp_config_path = env_map.get("MINI_MCP_CONFIG"),
             .history_enabled = history_enabled,
             .hook_command = hook_cmd,
