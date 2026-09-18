@@ -9,3 +9,4 @@ pub const kimi = @import("kimi.zig");
 pub const xai = @import("xai.zig");
 pub const vllm = @import("vllm.zig");
 pub const generic = @import("generic.zig");
+pub const agnes = @import("agnes.zig");

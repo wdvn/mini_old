@@ -90,6 +90,7 @@ pub const profiles = [_]struct { key: []const u8, profile: ProviderProfile }{
     .{ .key = providers.xai.key, .profile = providers.xai.profile },
     .{ .key = providers.vllm.key, .profile = providers.vllm.profile },
     .{ .key = providers.generic.key, .profile = providers.generic.profile },
+    .{ .key = providers.agnes.key, .profile = providers.agnes.profile },
 };
 
 /// Lookup profile by key. Returns generic if not found.
@@ -110,6 +111,7 @@ pub fn detectFromUrl(url: []const u8) []const u8 {
     if (providers.xai.matchesUrl(url)) return providers.xai.key;
     if (providers.openai.matchesUrl(url)) return providers.openai.key;
     if (providers.vllm.matchesUrl(url)) return providers.vllm.key;
+    if (providers.agnes.matchesUrl(url)) return providers.agnes.key;
     return providers.generic.key;
 }
 

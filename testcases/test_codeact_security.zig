@@ -29,6 +29,7 @@ test {
     _ = @import("test_media_gen.zig");
     _ = @import("test_provider_profiles.zig");
     _ = @import("test_js_provider.zig");
+    _ = @import("test_editor_multiline.zig");
 }
 
 // ---------------------------------------------------------------------------

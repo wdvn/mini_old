@@ -186,9 +186,89 @@ EOF
 echo -e "  ${GREEN}✓ Created:${NC} $MCP_EXAMPLE"
 echo ""
 
+# 6. Configure VS Code / Antigravity / Cursor / Trae terminal keybindings for Shift+Enter & Ctrl+Enter
+echo -e "${BLUE}[6/6] Checking VS Code / Antigravity / Cursor terminal configuration...${NC}"
+python3 -c '
+import os, json
+
+ide_dirs = [
+    os.path.expanduser("~/.config/Antigravity IDE/User"),
+    os.path.expanduser("~/.config/Antigravity/User"),
+    os.path.expanduser("~/.config/Cursor/User"),
+    os.path.expanduser("~/.config/Code/User"),
+    os.path.expanduser("~/.config/Trae/User"),
+    os.path.expanduser("~/.config/VSCodium/User"),
+]
+
+for user_dir in ide_dirs:
+    if not os.path.isdir(user_dir):
+        continue
+    ide_name = os.path.basename(os.path.dirname(user_dir))
+    kb_file = os.path.join(user_dir, "keybindings.json")
+    st_file = os.path.join(user_dir, "settings.json")
+
+    # 1. Keybindings
+    bindings = []
+    if os.path.exists(kb_file):
+        try:
+            with open(kb_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    bindings = json.loads(content)
+                    if not isinstance(bindings, list):
+                        bindings = []
+        except Exception:
+            bindings = []
+
+    has_shift = any(isinstance(b, dict) and b.get("key", "").lower() == "shift+enter" and "terminal" in b.get("command", "").lower() for b in bindings)
+    if not has_shift:
+        bindings.append({
+            "key": "shift+enter",
+            "command": "workbench.action.terminal.sendSequence",
+            "args": { "text": "\u001b[13;2u" },
+            "when": "terminalFocus"
+        })
+
+    has_ctrl = any(isinstance(b, dict) and b.get("key", "").lower() == "ctrl+enter" and "terminal" in b.get("command", "").lower() for b in bindings)
+    if not has_ctrl:
+        bindings.append({
+            "key": "ctrl+enter",
+            "command": "workbench.action.terminal.sendSequence",
+            "args": { "text": "\u001b[13;5u" },
+            "when": "terminalFocus"
+        })
+
+    with open(kb_file, "w", encoding="utf-8") as f:
+        json.dump(bindings, f, indent=2)
+        f.write("\n")
+    print(f"  \033[0;32m✓\033[0m Configured Shift+Enter & Ctrl+Enter in: {kb_file}")
+
+    # 2. Settings (Kitty keyboard protocol)
+    settings = {}
+    if os.path.exists(st_file):
+        try:
+            with open(st_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    settings = json.loads(content)
+                    if not isinstance(settings, dict):
+                        settings = {}
+        except Exception:
+            settings = {}
+
+    settings["terminal.integrated.enableKittyKeyboardProtocol"] = True
+    with open(st_file, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=4)
+        f.write("\n")
+    print(f"  \033[0;32m✓\033[0m Enabled Kitty keyboard protocol in: {st_file}")
+' 2>/dev/null || true
+
+echo ""
+
 echo -e "${GREEN}========================================================${NC}"
 echo -e "${GREEN}✓ ~/.mini SETUP COMPLETED SUCCESSFULLY!                 ${NC}"
 echo -e "${GREEN}========================================================${NC}"
 echo -e "To start using mini-agent across your system:"
 echo -e "  1. Configure your API keys in: ${CYAN}${MINI_HOME}/.env${NC}"
 echo -e "  2. Run the agent: ${CYAN}mini${NC} (or ${CYAN}mini -e \"...\"${NC})"
+

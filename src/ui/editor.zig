@@ -281,7 +281,7 @@ pub const LineEditor = struct {
     }
 
     /// Insert '\n' at cursor position (manual newline, RFC-008 §5B).
-    fn insertNewlineAtCursor(self: *LineEditor, io: std.Io, prompt: []const u8) void {
+    pub fn insertNewlineAtCursor(self: *LineEditor, io: std.Io, prompt: []const u8) void {
         if (self.buf.items.len + 1 > MAX_INPUT_BYTES) {
             self.limit_msg = true;
             self.redraw(io, prompt);
@@ -461,6 +461,7 @@ pub const LineEditor = struct {
             } else {
                 w.writeAll("\r\n") catch return;
                 w.writeAll(indent) catch return;
+                total_rows += 1;
             }
             w.writeAll(line) catch return;
 
@@ -473,12 +474,7 @@ pub const LineEditor = struct {
                 cursor_placed = true;
             }
 
-            // Extra rows: first line only counts wrapping, subsequent lines count newlines as well
-            if (line_idx == 0) {
-                total_rows += lw / cols;
-            } else {
-                total_rows += 1 + lw / cols;
-            }
+            total_rows += lw / cols;
 
             if (at_end) break;
             line_start = k + 1;
@@ -526,21 +522,21 @@ pub const LineEditor = struct {
 
         try std.posix.tcsetattr(stdin_fd, .FLUSH, raw);
         defer {
-            stdout_file.writeStreamingAll(io, "\x1b[?2004l\x1b[>4;0m") catch {};
+            stdout_file.writeStreamingAll(io, "\x1b[?2004l\x1b[<u\x1b[>4;0m") catch {};
             std.posix.tcsetattr(stdin_fd, .FLUSH, orig_termios) catch {};
         }
 
         // Bracketed paste mode + enhanced keyboard reporting so that
         // Shift/Ctrl+Enter arrive as a distinguishable sequence instead of
         // a plain '\r' (13):
-        //   - xterm modifyOtherKeys level 1:  Shift+Enter -> ESC[27;2;13~
-        //   - kitty protocol (flag 1):       Shift+Enter -> ESC[13;2u
+        //   - kitty protocol (flag 1: disambiguate escape codes): Shift+Enter -> ESC[13;2u
+        //   - xterm modifyOtherKeys level 1:                      Shift+Enter -> ESC[27;2;13~
         // Level 1 only re-encodes keys whose legacy encoding is ambiguous
         // (Shift+Enter and plain Enter both legacy-encode as '\r'), so
         // Ctrl/Alt+letter keep their legacy bytes and existing bindings are
         // unaffected. Unknown terminals ignore the request (no-op), plain
         // Enter still sends '\r'.
-        stdout_file.writeStreamingAll(io, "\x1b[>4;1m\x1b[?2004h") catch {};
+        stdout_file.writeStreamingAll(io, "\x1b[>4;1m\x1b[>1u\x1b[?2004h") catch {};
 
         self.buf.clearRetainingCapacity();
         self.pos = 0;
@@ -666,6 +662,24 @@ pub const LineEditor = struct {
                         i += 1;
                     },
                     13 => { // Enter -> submit (entire buffer, including multiline)
+                        // Backslash line continuation (RFC-008 §5B):
+                        // If buffer ends with an unescaped backslash '\' at cursor/end,
+                        // treat Enter as multiline continuation: strip '\' and insert '\n'.
+                        if (self.pos == self.buf.items.len) {
+                            var k = self.buf.items.len;
+                            while (k > 0 and (self.buf.items[k - 1] == ' ' or self.buf.items[k - 1] == '\t')) : (k -= 1) {}
+                            if (k > 0 and self.buf.items[k - 1] == '\\') {
+                                const is_escaped = (k >= 2 and self.buf.items[k - 2] == '\\');
+                                if (!is_escaped) {
+                                    self.buf.items.len = k - 1;
+                                    self.pos = self.buf.items.len;
+                                    self.insertNewlineAtCursor(io, prompt);
+                                    i += 1;
+                                    continue;
+                                }
+                            }
+                        }
+
                         if (self.rendered_rows > self.cursor_row) {
                             var move_down_buf: [32]u8 = undefined;
                             const seq = std.fmt.bufPrint(&move_down_buf, "\x1b[{d}B", .{self.rendered_rows - self.cursor_row}) catch "";
@@ -804,247 +818,46 @@ pub const LineEditor = struct {
         }
     }
 
-    /// Handle escape sequences: arrow keys, Alt+key, Home/End, Delete, bracketed paste.
-    fn handleEscapeSlice(self: *LineEditor, io: std.Io, stdin_file: std.Io.File, prompt: []const u8, slice: []const u8) usize {
-        var seq_buf: [8]u8 = undefined;
-        var seq_len: usize = 0;
+    /// Handle escape sequences: arrow keys, Alt+key, Home/End, Delete, bracketed paste,
+    /// Kitty CSI-u (Shift/Ctrl/Alt+Enter), xterm modifyOtherKeys, CSI-tilde.
+    pub fn handleEscapeSlice(self: *LineEditor, io: std.Io, stdin_file: std.Io.File, prompt: []const u8, slice: []const u8) usize {
+        var seq_buf: [64]u8 = undefined;
+        var slen: usize = 0;
 
         const copy_len = @min(slice.len, seq_buf.len);
         @memcpy(seq_buf[0..copy_len], slice[0..copy_len]);
-        seq_len = copy_len;
+        slen = copy_len;
 
-        if (seq_len < 3) {
-            while (seq_len < 3) {
+        // If only bare ESC in slice, poll stdin to see if more bytes arrive immediately.
+        if (slen == 1) {
+            var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&fds, 30) catch 0;
+            if (ready > 0) {
                 var b: [1]u8 = undefined;
-                if ((stdin_file.readStreaming(io, &.{&b}) catch 0) == 0) break;
-                seq_buf[seq_len] = b[0];
-                seq_len += 1;
-            }
-        }
-
-        // Digit-led CSI (kitty CSI-u / xterm modifyOtherKeys), e.g.
-        //   ESC [ 13 ; 2 u       Shift+Enter (kitty keyboard protocol)
-        //   ESC [ 27 ; 2 ; 13 ~  Shift+Enter (xterm modifyOtherKeys=1)
-        // Enter (code 13) with modifier -> insert newline (RFC-008 §5B).
-        // Ctrl+C delivered as CSI-u (code 3, or 99 with ctrl modifier)
-        // cancels the line / exits REPL. NOTE: the exact bracketed-paste
-        // START marker "ESC[200~" is excluded here — it must fall through
-        // to the paste handler below (any other '2xx...' digit sequence,
-        // including modifyOtherKeys "27;...", is parsed as CSI-u).
-        if (seq_len >= 3 and seq_buf[0] == 0x1b and seq_buf[1] == '[' and
-            seq_buf[2] >= '1' and seq_buf[2] <= '9' and
-            !std.mem.startsWith(u8, seq_buf[0..@min(seq_len, 6)], "\x1b[200~"))
-        {
-            var seq: [32]u8 = undefined;
-            var slen: usize = 0;
-            const take = @min(slice.len, seq.len);
-            @memcpy(seq[0..take], slice[0..take]);
-            slen = take;
-
-            // Locate terminator 'u' (CSI-u) or '~' (modifyOtherKeys). If the
-            // sequence is incomplete (chunk boundary), read the rest from stdin.
-            var t: usize = 2;
-            while (t < slen) : (t += 1) {
-                const b = seq[t];
-                if (b == 'u' or b == '~') break;
-                if (!std.ascii.isDigit(b) and b != ';') break;
-            }
-            if (t >= slen or (seq[t] != 'u' and seq[t] != '~')) {
-                while (slen < seq.len) {
-                    var b: [1]u8 = undefined;
-                    if ((stdin_file.readStreaming(io, &.{&b}) catch 0) == 0) break;
-                    seq[slen] = b[0];
-                    slen += 1;
-                    if (seq[slen - 1] == 'u' or seq[slen - 1] == '~') break;
-                }
-                t = slen;
-            }
-
-            // Parse parameters "13;2" / "27;2;13".
-            var params: [4]usize = .{ 0, 0, 0, 0 };
-            var n_params: usize = 0;
-            var val: usize = 0;
-            var have_val = false;
-            for (seq[2..@min(t, slen)]) |b| {
-                if (b >= '0' and b <= '9') {
-                    val = val * 10 + (b - '0');
-                    have_val = true;
-                } else if (b == ';') {
-                    if (n_params < 4) params[n_params] = val;
-                    n_params += 1;
-                    val = 0;
-                    have_val = false;
-                }
-            }
-            if (have_val and n_params < 4) {
-                params[n_params] = val;
-                n_params += 1;
-            }
-
-            const term_ch: u8 = if (slen > 0) seq[@min(t, slen - 1)] else 0;
-            var code: usize = params[0];
-            var modv: usize = 1;
-            if (term_ch == '~') {
-                // modifyOtherKeys encoding: ESC [ 27 ; <mod> ; <code> ~
-                if (params[0] == 27 and n_params >= 3) {
-                    modv = params[1];
-                    code = params[2];
-                } else {
-                    // Unrelated '~' sequence (F5, PageUp, ...) — consume, no action.
-                    return @min(t + 1, slice.len);
+                if ((stdin_file.readStreaming(io, &.{&b}) catch 0) > 0) {
+                    seq_buf[1] = b[0];
+                    slen = 2;
                 }
             } else {
-                modv = if (n_params > 1) params[1] else 1;
+                // Bare ESC key alone — do not block
+                return 1;
             }
-
-            if (code == 13) { // Enter + modifier (Shift/Ctrl/Alt) -> newline
-                self.insertNewlineAtCursor(io, prompt);
-                return @min(t + 1, slice.len);
-            }
-            if (code == 3 or (code == 99 and modv >= 5)) { // Ctrl+C as CSI-u
-                const now_ms = utils.milliTimestamp();
-                const out = std.Io.File.stdout();
-                if (self.buf.items.len > 0) {
-                    out.writeStreamingAll(io, "^C\r\n") catch {};
-                    self.buf.clearRetainingCapacity();
-                    self.pos = 0;
-                    self.rendered_rows = 0;
-                    self.cursor_row = 0;
-                    self.last_ctrl_c_ms = now_ms;
-                    self.redraw(io, prompt);
-                } else if (now_ms - self.last_ctrl_c_ms <= 2000 and self.last_ctrl_c_ms > 0) {
-                    out.writeStreamingAll(io, "^C\r\n") catch {};
-                    self.exit_pending = true; // exit REPL on next loop iteration
-                } else {
-                    self.last_ctrl_c_ms = now_ms;
-                    out.writeStreamingAll(io, "^C\r\n") catch {};
-                    self.rendered_rows = 0;
-                    self.cursor_row = 0;
-                    self.redraw(io, prompt);
-                }
-                return @min(t + 1, slice.len);
-            }
-            // Unknown CSI-u sequence: consume entirely, no action.
-            return @min(t + 1, slice.len);
         }
 
-        if (seq_len >= 3 and seq_buf[0] == 0x1b and seq_buf[1] == '[') {
-            switch (seq_buf[2]) {
-                'A' => { // ↑ history
-                    self.loadHistoryEntry(-1);
-                    self.redraw(io, prompt);
-                    return @min(3, slice.len);
-                },
-                'B' => { // ↓ history
-                    self.loadHistoryEntry(1);
-                    self.redraw(io, prompt);
-                    return @min(3, slice.len);
-                },
-                'C' => { // →
-                    self.moveRight();
-                    self.redraw(io, prompt);
-                    return @min(3, slice.len);
-                },
-                'D' => { // ←
-                    self.moveLeft();
-                    self.redraw(io, prompt);
-                    return @min(3, slice.len);
-                },
-                'H' => { // Home
-                    self.pos = 0;
-                    self.redraw(io, prompt);
-                    return @min(3, slice.len);
-                },
-                'F' => { // End
-                    self.pos = self.buf.items.len;
-                    self.redraw(io, prompt);
-                    return @min(3, slice.len);
-                },
-                '1' => { // ESC [ 1 ~ or ESC [ 1 ; 3 C (Alt+→)
-                    if (seq_len >= 4 and seq_buf[3] == '~') {
-                        self.pos = 0;
-                        self.redraw(io, prompt);
-                        return @min(4, slice.len);
-                    }
-                    if (seq_len >= 6 and seq_buf[3] == ';' and seq_buf[4] == '3') {
-                        if (seq_buf[5] == 'C') {
-                            self.pos = self.wordRight();
-                            self.redraw(io, prompt);
-                        } else if (seq_buf[5] == 'D') {
-                            self.pos = self.wordLeft();
-                            self.redraw(io, prompt);
-                        }
-                        return @min(6, slice.len);
-                    }
-                    self.consumeTildeOrModifier(io, stdin_file, prompt);
-                    return @min(3, slice.len);
-                },
-                '2' => { // Bracketed paste start: ESC [ 2 0 0 ~
-                    if (seq_len >= 6 and std.mem.eql(u8, seq_buf[0..6], "\x1b[200~")) {
-                        self.beginPaste();
-                        return @min(6, slice.len);
-                    }
-                    var marker: [3]u8 = undefined;
-                    var got: usize = 0;
-                    while (got < 3) : (got += 1) {
-                        if ((stdin_file.readStreaming(io, &.{marker[got .. got + 1]}) catch 0) == 0) break;
-                    }
-                    if (got == 3 and std.mem.eql(u8, &marker, "00~")) {
-                        self.beginPaste();
-                    }
-                    return @min(3, slice.len);
-                },
-                '3' => { // Delete
-                    if (seq_len >= 4 and seq_buf[3] == '~') {
-                        if (self.pos < self.buf.items.len) {
-                            self.pushUndo();
-                            const end = self.pos + self.clusterLenAt(self.pos);
-                            if (self.deleteRange(self.pos, end)) |rem| self.alloc.free(rem);
-                            self.redraw(io, prompt);
-                        }
-                        return @min(4, slice.len);
-                    }
-                    var tilde: [1]u8 = undefined;
-                    _ = stdin_file.readStreaming(io, &.{&tilde}) catch 0;
-                    if (tilde[0] == '~' and self.pos < self.buf.items.len) {
-                        self.pushUndo();
-                        const end = self.pos + self.clusterLenAt(self.pos);
-                        if (self.deleteRange(self.pos, end)) |rem| self.alloc.free(rem);
-                        self.redraw(io, prompt);
-                    }
-                    return @min(3, slice.len);
-                },
-                else => {},
-            }
-        } else if (seq_len >= 3 and seq_buf[0] == 0x1b and seq_buf[1] == 'O') {
-            switch (seq_buf[2]) {
-                'H' => {
-                    self.pos = 0;
-                    self.redraw(io, prompt);
-                    return @min(3, slice.len);
-                },
-                'F' => {
-                    self.pos = self.buf.items.len;
-                    self.redraw(io, prompt);
-                    return @min(3, slice.len);
-                },
-                else => {},
-            }
-        } else if (seq_len >= 2 and seq_buf[0] == 0x1b) {
+        // Two-byte ESC sequence: ESC + character (Alt/Meta key combinations)
+        // If 2nd byte is neither '[' (CSI) nor 'O' (SS3), it's strictly a 2-byte sequence.
+        if (slen >= 2 and seq_buf[1] != '[' and seq_buf[1] != 'O') {
             switch (seq_buf[1]) {
-                '\r', '\n' => { // Alt+Enter (legacy ESC-prefixed) -> newline (RFC-008 §5B)
+                '\r', '\n' => { // Alt+Enter / Meta+Enter -> newline (RFC-008 §5B)
                     self.insertNewlineAtCursor(io, prompt);
-                    return @min(2, slice.len);
                 },
                 'b', 'B' => {
                     self.pos = self.wordLeft();
                     self.redraw(io, prompt);
-                    return @min(2, slice.len);
                 },
                 'f', 'F' => {
                     self.pos = self.wordRight();
                     self.redraw(io, prompt);
-                    return @min(2, slice.len);
                 },
                 'd', 'D' => {
                     const end = self.wordRight();
@@ -1053,7 +866,6 @@ pub const LineEditor = struct {
                         if (self.deleteRange(self.pos, end)) |rem| self.alloc.free(rem);
                         self.redraw(io, prompt);
                     }
-                    return @min(2, slice.len);
                 },
                 127, 8 => {
                     const start = self.wordLeft();
@@ -1065,50 +877,229 @@ pub const LineEditor = struct {
                         }
                         self.redraw(io, prompt);
                     }
-                    return @min(2, slice.len);
                 },
                 else => {},
             }
+            return @min(2, slice.len);
         }
 
-        return @max(1, @min(seq_len, slice.len));
-    }
-
-    /// ESC [ 1 ... — consume up to '~' (Home variant) or ';<mod><key>' (modifier combo).
-    fn consumeTildeOrModifier(self: *LineEditor, io: std.Io, stdin_file: std.Io.File, prompt: []const u8) void {
-        var extra: [8]u8 = undefined;
-        var got: usize = 0;
-        while (got < extra.len) : (got += 1) {
-            if ((stdin_file.readStreaming(io, &.{extra[got .. got + 1]}) catch 0) == 0) return;
-            const c = extra[got];
-            if (c == '~') {
-                // ESC [ 1 ~ = Home
-                self.pos = 0;
-                self.redraw(io, prompt);
-                return;
-            }
-            if (c == ';') {
-                // ESC [ 1 ; 3 <C|D> — Alt+→ / Alt+←
-                var modkey: [2]u8 = undefined;
-                var k: usize = 0;
-                while (k < 2) : (k += 1) {
-                    if ((stdin_file.readStreaming(io, &.{modkey[k .. k + 1]}) catch 0) == 0) return;
+        // SS3 sequence: ESC O <char> (e.g. Home/End/Keypad)
+        if (slen >= 2 and seq_buf[1] == 'O') {
+            if (slen < 3) {
+                var b: [1]u8 = undefined;
+                if ((stdin_file.readStreaming(io, &.{&b}) catch 0) > 0) {
+                    seq_buf[2] = b[0];
+                    slen = 3;
                 }
-                switch (modkey[1]) {
-                    'C' => {
-                        self.pos = self.wordRight();
+            }
+            if (slen >= 3) {
+                switch (seq_buf[2]) {
+                    'H' => {
+                        self.pos = 0;
                         self.redraw(io, prompt);
                     },
-                    'D' => {
-                        self.pos = self.wordLeft();
+                    'F' => {
+                        self.pos = self.buf.items.len;
                         self.redraw(io, prompt);
                     },
                     else => {},
                 }
-                return;
             }
-            if (!std.ascii.isDigit(c)) return;
+            return @min(3, slice.len);
         }
+
+        // CSI sequence: ESC [ ...
+        if (slen >= 2 and seq_buf[1] == '[') {
+            // Check for bracketed paste START marker: ESC [ 2 0 0 ~
+            if (slen >= 6 and std.mem.startsWith(u8, seq_buf[0..6], "\x1b[200~")) {
+                self.beginPaste();
+                return @min(6, slice.len);
+            }
+            if (slen < 6 and std.mem.startsWith(u8, "\x1b[200~", seq_buf[0..slen])) {
+                while (slen < 6) {
+                    var b: [1]u8 = undefined;
+                    if ((stdin_file.readStreaming(io, &.{&b}) catch 0) == 0) break;
+                    seq_buf[slen] = b[0];
+                    slen += 1;
+                }
+                if (slen >= 6 and std.mem.startsWith(u8, seq_buf[0..6], "\x1b[200~")) {
+                    self.beginPaste();
+                    return @min(6, slice.len);
+                }
+            }
+
+            // Find terminator byte for CSI (final byte in ASCII 0x40..0x7E)
+            var term_idx: ?usize = null;
+            var t: usize = 2;
+            while (t < slen) : (t += 1) {
+                if (seq_buf[t] >= 0x40 and seq_buf[t] <= 0x7E) {
+                    term_idx = t;
+                    break;
+                }
+            }
+
+            // Read remaining bytes if terminator not in buffer yet
+            while (term_idx == null and slen < seq_buf.len) {
+                var fds_csi = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
+                const r = std.posix.poll(&fds_csi, 50) catch 0;
+                if (r == 0) break;
+                var b: [1]u8 = undefined;
+                if ((stdin_file.readStreaming(io, &.{&b}) catch 0) == 0) break;
+                seq_buf[slen] = b[0];
+                if (seq_buf[slen] >= 0x40 and seq_buf[slen] <= 0x7E) {
+                    term_idx = slen;
+                    slen += 1;
+                    break;
+                }
+                slen += 1;
+            }
+
+            if (term_idx) |t_pos| {
+                const term_ch = seq_buf[t_pos];
+                const consumed_from_slice = @min(t_pos + 1, slice.len);
+
+                // Parse numeric parameters in seq_buf[2..t_pos], separated by ';' or ':'
+                var params: [6]usize = .{ 0, 0, 0, 0, 0, 0 };
+                var n_params: usize = 0;
+                var val: usize = 0;
+                var have_val = false;
+                for (seq_buf[2..t_pos]) |b| {
+                    if (b >= '0' and b <= '9') {
+                        val = val * 10 + (b - '0');
+                        have_val = true;
+                    } else if (b == ';' or b == ':') {
+                        if (n_params < params.len) params[n_params] = val;
+                        n_params += 1;
+                        val = 0;
+                        have_val = false;
+                    }
+                }
+                if (have_val and n_params < params.len) {
+                    params[n_params] = val;
+                    n_params += 1;
+                }
+
+                // Check CSI-u ('u')
+                if (term_ch == 'u') {
+                    // Kitty keyboard protocol: ESC [ <code> ; <mod> u
+                    const code = params[0];
+                    const modv = if (n_params > 1) params[1] else 1;
+                    if (code == 13) {
+                        // Enter with modifier (Shift=2, Alt=3, Ctrl=5, etc.) -> newline
+                        self.insertNewlineAtCursor(io, prompt);
+                        return consumed_from_slice;
+                    }
+                    if (code == 3 or (code == 99 and modv >= 5)) {
+                        // Ctrl+C as CSI-u
+                        const now_ms = utils.milliTimestamp();
+                        const out = std.Io.File.stdout();
+                        if (self.buf.items.len > 0) {
+                            out.writeStreamingAll(io, "^C\r\n") catch {};
+                            self.buf.clearRetainingCapacity();
+                            self.pos = 0;
+                            self.rendered_rows = 0;
+                            self.cursor_row = 0;
+                            self.last_ctrl_c_ms = now_ms;
+                            self.redraw(io, prompt);
+                        } else if (now_ms - self.last_ctrl_c_ms <= 2000 and self.last_ctrl_c_ms > 0) {
+                            out.writeStreamingAll(io, "^C\r\n") catch {};
+                            self.exit_pending = true;
+                        } else {
+                            self.last_ctrl_c_ms = now_ms;
+                            out.writeStreamingAll(io, "^C\r\n") catch {};
+                            self.rendered_rows = 0;
+                            self.cursor_row = 0;
+                            self.redraw(io, prompt);
+                        }
+                        return consumed_from_slice;
+                    }
+                    return consumed_from_slice;
+                }
+
+                // Check CSI '~' (modifyOtherKeys, CSI-tilde, Delete, Home, End)
+                if (term_ch == '~') {
+                    if (params[0] == 27 and n_params >= 3) {
+                        // modifyOtherKeys: ESC [ 27 ; <mod> ; <code> ~
+                        const code = params[2];
+                        if (code == 13) {
+                            self.insertNewlineAtCursor(io, prompt);
+                            return consumed_from_slice;
+                        }
+                    } else if (params[0] == 13) {
+                        // CSI tilde: ESC [ 13 ; <mod> ~ (Shift+Enter or Ctrl+Enter)
+                        self.insertNewlineAtCursor(io, prompt);
+                        return consumed_from_slice;
+                    } else if (params[0] == 3) {
+                        // Delete: ESC [ 3 ~
+                        if (self.pos < self.buf.items.len) {
+                            self.pushUndo();
+                            const end = self.pos + self.clusterLenAt(self.pos);
+                            if (self.deleteRange(self.pos, end)) |rem| self.alloc.free(rem);
+                            self.redraw(io, prompt);
+                        }
+                        return consumed_from_slice;
+                    } else if (params[0] == 1) {
+                        // Home: ESC [ 1 ~
+                        self.pos = 0;
+                        self.redraw(io, prompt);
+                        return consumed_from_slice;
+                    } else if (params[0] == 4) {
+                        // End: ESC [ 4 ~
+                        self.pos = self.buf.items.len;
+                        self.redraw(io, prompt);
+                        return consumed_from_slice;
+                    }
+                    return consumed_from_slice;
+                }
+
+                // Standard letter CSI sequences
+                switch (term_ch) {
+                    'A' => { // ↑ history
+                        self.loadHistoryEntry(-1);
+                        self.redraw(io, prompt);
+                        return consumed_from_slice;
+                    },
+                    'B' => { // ↓ history
+                        self.loadHistoryEntry(1);
+                        self.redraw(io, prompt);
+                        return consumed_from_slice;
+                    },
+                    'C' => { // → or Alt+→
+                        if (n_params >= 2 and params[0] == 1 and params[1] == 3) {
+                            self.pos = self.wordRight();
+                        } else {
+                            self.moveRight();
+                        }
+                        self.redraw(io, prompt);
+                        return consumed_from_slice;
+                    },
+                    'D' => { // ← or Alt+←
+                        if (n_params >= 2 and params[0] == 1 and params[1] == 3) {
+                            self.pos = self.wordLeft();
+                        } else {
+                            self.moveLeft();
+                        }
+                        self.redraw(io, prompt);
+                        return consumed_from_slice;
+                    },
+                    'H' => { // Home
+                        self.pos = 0;
+                        self.redraw(io, prompt);
+                        return consumed_from_slice;
+                    },
+                    'F' => { // End
+                        self.pos = self.buf.items.len;
+                        self.redraw(io, prompt);
+                        return consumed_from_slice;
+                    },
+                    else => {
+                        return consumed_from_slice;
+                    },
+                }
+            }
+        }
+
+        return @max(1, @min(slen, slice.len));
     }
 
     /// Begin paste mode (START marker received).
@@ -1499,3 +1490,120 @@ test "paste ending mid-chunk: bytes after END marker are not swallowed" {
     try std.testing.expectEqualStrings("abc", e.buf.items);
     // "xyz" (returned offset) must remain for caller to process as regular input.
 }
+
+test "Shift+Enter / Ctrl+Enter: Kitty CSI-u escapes insert newline" {
+    const alloc = std.testing.allocator;
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+
+    try e.buf.appendSlice(alloc, "first line");
+    e.pos = e.buf.items.len;
+
+    // Kitty Shift+Enter: \x1b[13;2u
+    const seq_shift = "\x1b[13;2u";
+    const consumed1 = e.handleEscapeSlice(undefined, undefined, "", seq_shift);
+    try std.testing.expectEqual(seq_shift.len, consumed1);
+    try std.testing.expectEqualStrings("first line\n", e.buf.items);
+
+    // Kitty Shift+Enter with event type (press :1): \x1b[13;2:1u
+    const seq_shift_press = "\x1b[13;2:1u";
+    const consumed2 = e.handleEscapeSlice(undefined, undefined, "", seq_shift_press);
+    try std.testing.expectEqual(seq_shift_press.len, consumed2);
+    try std.testing.expectEqualStrings("first line\n\n", e.buf.items);
+
+    // Kitty Ctrl+Enter: \x1b[13;5u
+    const seq_ctrl = "\x1b[13;5u";
+    const consumed3 = e.handleEscapeSlice(undefined, undefined, "", seq_ctrl);
+    try std.testing.expectEqual(seq_ctrl.len, consumed3);
+    try std.testing.expectEqualStrings("first line\n\n\n", e.buf.items);
+}
+
+test "Shift+Enter / Ctrl+Enter: xterm modifyOtherKeys escapes insert newline" {
+    const alloc = std.testing.allocator;
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+
+    try e.buf.appendSlice(alloc, "hello");
+    e.pos = e.buf.items.len;
+
+    // xterm Shift+Enter: \x1b[27;2;13~
+    const seq_shift = "\x1b[27;2;13~";
+    const consumed1 = e.handleEscapeSlice(undefined, undefined, "", seq_shift);
+    try std.testing.expectEqual(seq_shift.len, consumed1);
+    try std.testing.expectEqualStrings("hello\n", e.buf.items);
+
+    // xterm Ctrl+Enter: \x1b[27;5;13~
+    const seq_ctrl = "\x1b[27;5;13~";
+    const consumed2 = e.handleEscapeSlice(undefined, undefined, "", seq_ctrl);
+    try std.testing.expectEqual(seq_ctrl.len, consumed2);
+    try std.testing.expectEqualStrings("hello\n\n", e.buf.items);
+}
+
+test "Shift+Enter / Ctrl+Enter: CSI-tilde escapes insert newline" {
+    const alloc = std.testing.allocator;
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+
+    try e.buf.appendSlice(alloc, "line");
+    e.pos = e.buf.items.len;
+
+    // CSI tilde Shift+Enter: \x1b[13;2~
+    const seq_shift = "\x1b[13;2~";
+    const consumed1 = e.handleEscapeSlice(undefined, undefined, "", seq_shift);
+    try std.testing.expectEqual(seq_shift.len, consumed1);
+    try std.testing.expectEqualStrings("line\n", e.buf.items);
+
+    // CSI tilde Ctrl+Enter: \x1b[13;5~
+    const seq_ctrl = "\x1b[13;5~";
+    const consumed2 = e.handleEscapeSlice(undefined, undefined, "", seq_ctrl);
+    try std.testing.expectEqual(seq_ctrl.len, consumed2);
+    try std.testing.expectEqualStrings("line\n\n", e.buf.items);
+}
+
+test "Alt+Enter: ESC-prefixed sequences insert newline without blocking" {
+    const alloc = std.testing.allocator;
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+
+    try e.buf.appendSlice(alloc, "item");
+    e.pos = e.buf.items.len;
+
+    const consumed1 = e.handleEscapeSlice(undefined, undefined, "", "\x1b\r");
+    try std.testing.expectEqual(@as(usize, 2), consumed1);
+    try std.testing.expectEqualStrings("item\n", e.buf.items);
+
+    const consumed2 = e.handleEscapeSlice(undefined, undefined, "", "\x1b\n");
+    try std.testing.expectEqual(@as(usize, 2), consumed2);
+    try std.testing.expectEqualStrings("item\n\n", e.buf.items);
+}
+
+test "Backslash line continuation: trailing backslash stripped and newline inserted" {
+    const alloc = std.testing.allocator;
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+
+    try e.buf.appendSlice(alloc, "first line \\");
+    e.pos = e.buf.items.len;
+
+    // Simulate Enter when line ends with backslash
+    if (e.pos == e.buf.items.len) {
+        var k = e.buf.items.len;
+        while (k > 0 and (e.buf.items[k - 1] == ' ' or e.buf.items[k - 1] == '\t')) : (k -= 1) {}
+        if (k > 0 and e.buf.items[k - 1] == '\\') {
+            const is_escaped = (k >= 2 and e.buf.items[k - 2] == '\\');
+            if (!is_escaped) {
+                e.buf.items.len = k - 1;
+                e.pos = e.buf.items.len;
+                e.insertNewlineAtCursor(undefined, "");
+            }
+        }
+    }
+    try std.testing.expectEqualStrings("first line \n", e.buf.items);
+}
+
+

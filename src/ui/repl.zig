@@ -172,6 +172,7 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
             \\  /config reasoning <auto|low|med|high|none> Set reasoning effort
             \\  /artifact [list]    View session artifacts list
             \\  /artifact show <fn> Read an artifact content
+            \\  /terminal-setup     Inspect & configure Shift+Enter / multiline terminal support
             \\  /quit, /exit, /q    Exit
             \\  /help               Show this help guide
             \\
@@ -181,6 +182,29 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
             \\## Available Tools
             \\  bash, file_read, file_write, file_edit, artifact_write, artifact_read, artifact_list
             \\  glob, grep, http_request, skills, invoke_subagent, batch_invoke_subagents
+            \\
+        ) catch {};
+        return true;
+    }
+
+    if (std.mem.eql(u8, input, "/terminal-setup") or std.mem.eql(u8, input, "/terminal")) {
+        std.Io.File.stdout().writeStreamingAll(io,
+            \\
+            \\## Terminal Multiline Input Setup & Capabilities
+            \\
+            \\mini-agent supports 4 distinct ways to insert newlines without submitting:
+            \\  1. Shift + Enter:
+            \\     - Native in Kitty, Ghostty, WezTerm, Foot, and modern xterm.
+            \\     - In VS Code / Cursor: Enabled via Kitty protocol or keybinding:
+            \\       "terminal.integrated.enableKittyKeyboardProtocol": true
+            \\       Or add to keybindings.json:
+            \\       { "key": "shift+enter", "command": "workbench.action.terminal.sendSequence", "args": { "text": "\u001b[13;2u" }, "when": "terminalFocus" }
+            \\  2. Alt + Enter / Option + Enter:
+            \\     - Instant newline across all terminals (sends ESC+Enter).
+            \\  3. Ctrl + J:
+            \\     - Standard ASCII linefeed (0x0A), 100% universal across all environments.
+            \\  4. Backslash (\) + Enter:
+            \\     - Line continuation: type \ at the end of a line and press Enter to continue on the next line.
             \\
         ) catch {};
         return true;
