@@ -216,6 +216,8 @@ pub const Config = struct {
     video_gen_enabled: bool = false,
     /// Video gen model: "sora-2", "sora-2-pro", etc.
     video_gen_model: []const u8 = "sora-2",
+    /// Video gen provider: "openai" | "openai_compat".
+    video_gen_provider: []const u8 = "openai",
     /// Media output directory. Null = "<workspace>/media".
     media_output_dir: ?[]const u8 = null,
     /// Video job polling timeout in seconds (default: 600).
@@ -503,6 +505,7 @@ pub const Config = struct {
         };
 
         const video_gen_model = env_map.get("MINI_VIDEO_GEN_MODEL") orelse "sora-2";
+        const video_gen_provider = env_map.get("MINI_VIDEO_GEN_PROVIDER") orelse "openai";
         const media_output_dir = env_map.get("MINI_MEDIA_OUTPUT_DIR");
 
         const video_poll_timeout_secs: u32 = blk: {
@@ -580,6 +583,7 @@ pub const Config = struct {
             .image_gen_size = image_gen_size,
             .video_gen_enabled = video_gen_enabled,
             .video_gen_model = video_gen_model,
+            .video_gen_provider = video_gen_provider,
             .media_output_dir = media_output_dir,
             .video_poll_timeout_secs = video_poll_timeout_secs,
         };

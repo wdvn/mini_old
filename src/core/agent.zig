@@ -294,6 +294,7 @@ pub const AgentLoop = struct {
             .image_gen_size = config.image_gen_size,
             .video_gen_enabled = config.video_gen_enabled,
             .video_gen_model = config.video_gen_model,
+            .video_gen_provider = config.video_gen_provider,
             .media_output_dir = config.media_output_dir,
             .video_poll_timeout_secs = config.video_poll_timeout_secs,
             .openai_compat_url = config.openai_compat_url,
