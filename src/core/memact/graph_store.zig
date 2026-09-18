@@ -302,12 +302,26 @@ pub const PGraphStore = struct {
                 return .mutate;
             }
             if (std.mem.eql(u8, name, "subagent") or
-                std.mem.eql(u8, name, "codeact"))
+                std.mem.eql(u8, name, "codeact") or
+                std.mem.eql(u8, name, "batch_subagent"))
             {
                 return .meta;
             }
-            if (std.mem.eql(u8, name, "bash")) {
+            if (std.mem.eql(u8, name, "bash") or
+                std.mem.eql(u8, name, "http"))
+            {
                 return .verify;
+            }
+            // Explicit explore tools
+            if (std.mem.eql(u8, name, "grep") or
+                std.mem.eql(u8, name, "glob") or
+                std.mem.eql(u8, name, "list_dir") or
+                std.mem.eql(u8, name, "session_diagnostics") or
+                std.mem.eql(u8, name, "file_read") or
+                std.mem.eql(u8, name, "artifact") or
+                std.mem.eql(u8, name, "media_gen"))
+            {
+                return .explore;
             }
             return .explore;
         }
