@@ -4,7 +4,8 @@
 //! 1. Act Observation: inspects what the active act is doing in real-time.
 //! 2. 10s Act Tracking: emits progress tracking notifications every 10 seconds of active execution.
 //! 3. Timeout Intervention: detects unresponsive or hung acts (> act_timeout_secs) and interrupts them.
-//! 4. 3-Act Trajectory Recap: every 3 completed acts, analyzes tool trajectory for loops and hallucinations,
+//! 4. 10-Act Trajectory Recap: every 10 completed acts (configurable via
+//!    recap_interval_acts), analyzes tool trajectory for loops and hallucinations,
 //!    generating a structured checkpoint advisory injected into the next act.
 //!    (Loop detection only warns via advisory — it never force-terminates the turn.)
 
@@ -26,8 +27,8 @@ pub const WatchdogConfig = struct {
     tracking_interval_s: u32 = 10,
     /// Seconds before an act is declared hung/timed out (default: 120s).
     act_timeout_secs: u32 = 120,
-    /// Number of completed acts between trajectory recap evaluations (default: 3).
-    recap_interval_acts: usize = 3,
+    /// Number of completed acts between trajectory recap evaluations (default: 10).
+    recap_interval_acts: usize = 10,
     /// Watchdog polling interval in milliseconds (default: 200ms).
     poll_interval_ms: u32 = 200,
     /// If true, print notifications to stderr (default: true).
@@ -139,7 +140,7 @@ pub const Watchdog = struct {
             }
         }
 
-        // 2. 3-Act Trajectory Recap Evaluation (every 3 completed acts)
+        // 2. 10-Act Trajectory Recap Evaluation (every recap_interval_acts completed acts)
         const completed = state.completed_acts;
         if (completed >= self.config.recap_interval_acts and
             completed % self.config.recap_interval_acts == 0 and
@@ -298,7 +299,7 @@ test "Watchdog: timeout intervention" {
     try std.testing.expect(signals.isInterrupted());
 }
 
-test "Watchdog: 3-act recap analysis and advisory injection" {
+test "Watchdog: recap analysis and advisory injection (10-act interval)" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 

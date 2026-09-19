@@ -240,7 +240,7 @@ pub const Config = struct {
     // 3-Thread Watchdog & Act Coordinator (RFC-015)
     act_timeout_secs: u32 = 120,
     watchdog_tracking_interval_s: u32 = 10,
-    watchdog_recap_interval: usize = 3,
+    watchdog_recap_interval: usize = 10,
     watchdog_interval_ms: u32 = 200,
 
     /// Default system prompt when MINI_SYSTEM_FILE is not configured.
@@ -585,8 +585,8 @@ pub const Config = struct {
             break :blk std.fmt.parseInt(u32, s, 10) catch 10;
         };
         const watchdog_recap_interval: usize = blk: {
-            const s = env_map.get("MINI_WATCHDOG_RECAP_INTERVAL") orelse break :blk 3;
-            break :blk std.fmt.parseInt(usize, s, 10) catch 3;
+            const s = env_map.get("MINI_WATCHDOG_RECAP_INTERVAL") orelse break :blk 10;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 10;
         };
         const watchdog_interval_ms: u32 = blk: {
             const s = env_map.get("MINI_WATCHDOG_INTERVAL_MS") orelse break :blk 200;

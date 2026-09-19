@@ -21,7 +21,7 @@ This RFC refactors mini-agent's execution model from a single-threaded sequentia
    - **Act Observation**: Tracks what each act is currently doing (LLM call, CodeAct JS eval, tool execution).
    - **10s Act Tracking**: Emits status notifications every 10 seconds of active execution to keep the user informed.
    - **Timeout Intervention**: Detects hung or unresponsive acts exceeding `act_timeout_secs` (default 120s) and triggers execution interrupts.
-   - **3-Act Recap & Checkpoint**: Every 3 acts completed, evaluates the trajectory across the last 3 acts for circular loops, duplicate calls, and hallucinations (similar to the rule checkpoint), injecting an advisory prompt into the agent's context.
+   - **10-Act Recap & Checkpoint**: Every 10 acts completed (configurable), evaluates the trajectory across the last 10 acts for circular loops, duplicate calls, and hallucinations (similar to the rule checkpoint), injecting an advisory prompt into the agent's context.
 3. **Thread 3 (Act Executor)**: A dedicated worker thread executing the act loop (backend LLM calls, QuickJS evaluation, tool execution) and continuously reporting heartbeat/status to Thread 2.
 
 Simultaneously, this RFC strips out all redundant and obsolete features from `src/core/act_queue.zig` (such as 5 priority levels, priority queues, multi-worker pools, batch execution, subagent fork flags, and deprecated `std.Thread.Condition`), replacing them with a lean, thread-safe `ActCoordinator`.
@@ -75,7 +75,7 @@ None of these were used in the interactive REPL or single-shot modes. They intro
 │                                              │  - Inspects active act    │  │
 │                                              │  - 10s progress tracking  │  │
 │                                              │  - Timeout intervention   │  │
-│                                              │  - 3-Act Recap & Loop     │  │
+│                                              │  - Recap & Loop     │  │
 │                                              │    Checkpoint Advisory    │  │
 │                                              └───────────────────────────┘  │
 │                                                                             │
@@ -110,9 +110,9 @@ None of these were used in the interactive REPL or single-shot modes. They intro
        - Requests QuickJS VM interrupt via `quickjs_engine.requestInterrupt()`.
        - Sets signal interrupt flag to abort HTTP stream or child process.
        - Logs timeout intervention.
-  4. **3-Act Recap & Checkpoint Advisory**:
+  4. **Recap & Checkpoint Advisory (default interval: 10 acts)**:
      - Monitored at act boundaries (`completed_acts % 3 == 0`).
-     - Analyzes trajectory across the last 3 acts:
+     - Analyzes trajectory across the last recap_interval_acts (default: 10) acts:
        - Checks for duplicate tool invocations with identical parameters.
        - Checks for cycling tool loops (e.g. A ↔ B, A → B → C).
        - Checks for read-only exploration budget exhaustion (e.g. repeated grep/read without code modification).
@@ -165,7 +165,7 @@ pub const ActMonitorState = struct {
 };
 ```
 
-### 4.2 Trajectory Record for 3-Act Recap
+### 4.2 Trajectory Record for Recap & Checkpoint
 
 ```zig
 pub const ToolRecord = struct {
@@ -191,7 +191,7 @@ pub const ToolRecord = struct {
 | `act_timeout_secs` | `MINI_ACT_TIMEOUT_SECS` | `120` | Max seconds before Watchdog aborts an act |
 | `watchdog_interval_ms` | `MINI_WATCHDOG_INTERVAL_MS` | `500` | Watchdog polling frequency in ms |
 | `watchdog_tracking_interval_s` | `MINI_WATCHDOG_TRACKING_S` | `10` | Frequency of act progress notifications |
-| `watchdog_recap_interval` | `MINI_WATCHDOG_RECAP_INTERVAL` | `3` | Number of acts between trajectory recap checks |
+| `watchdog_recap_interval` | `MINI_WATCHDOG_RECAP_INTERVAL` | `10` | Number of acts between trajectory recap checks |
 
 ---
 
@@ -201,6 +201,6 @@ pub const ToolRecord = struct {
    - Deprecated: `ActPriority`, `PriorityQueue`, `QueueWorker`, `std.Thread.Condition`.
    - New: `ActCoordinator`, `ActMonitorState`, `ToolRecord`.
 2. `src/core/agent.zig`:
-   - Fragmented `plan_watchdog_retries` is superseded by Watchdog's 3-act recap and checkpoint advisory.
+   - Fragmented `plan_watchdog_retries` is superseded by Watchdog's 10-act recap and checkpoint advisory.
 3. Backward compatibility:
    - CLI flags `-e`, `--single`, `--acp`, and interactive REPL continue to function seamlessly.
