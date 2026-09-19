@@ -945,6 +945,12 @@ pub const AgentLoop = struct {
         var ephemeral_blocks: ?[]proto.ContentBlock = null;
         defer if (ephemeral_blocks) |b| self.alloc.free(b);
 
+        var progress_text: ?[]u8 = null;
+        defer if (progress_text) |t| self.alloc.free(t);
+
+        var progress_blocks: ?[]proto.ContentBlock = null;
+        defer if (progress_blocks) |b| self.alloc.free(b);
+
         if (self.pg_store) |pg| {
             // Only inject procedural guidance if advisory is enabled
             if (self.config.memact_pg_advisory) {
@@ -976,14 +982,14 @@ pub const AgentLoop = struct {
 
         // Progress Tracking: inject summary of previous act's work
         if (self.progress_summary_len > 0 and act_id > 1) {
-            const progress_text = try std.fmt.allocPrint(
+            progress_text = try std.fmt.allocPrint(
                 self.alloc,
                 "[Progress Checkpoint]\nThe previous act ({d}) completed with the following progress:\n{s}\n\nBefore proceeding, please assess: what has been accomplished, what remains, and whether you should continue or conclude.",
                 .{ act_id - 1, self.progress_summary_buf[0..self.progress_summary_len] },
             );
-            defer self.alloc.free(progress_text);
             const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
-            blocks[0] = .{ .text = progress_text };
+            blocks[0] = .{ .text = progress_text.? };
+            progress_blocks = blocks;
             try temp_input_msgs.append(self.alloc, .{
                 .role = .user,
                 .content = blocks,
