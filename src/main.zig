@@ -129,10 +129,19 @@ pub fn main(init: std.process.Init) !void {
     if (agent_folder_mod.resolveOrInitAgentFolder(alloc, init.io, init.environ_map)) |folder| {
         agent_folder_opt = folder;
         init.environ_map.put("MINI_AGENT_FOLDER", folder.path) catch {};
+        if (std.fs.path.dirname(folder.path)) |ws_root| {
+            init.environ_map.put("MINI_WORKSPACE_ROOT", ws_root) catch {};
+        }
     } else |err| {
         stderrPrint("[main] Error finding .agent: {any}\n", .{err});
     }
     defer if (agent_folder_opt) |*f| f.deinit();
+
+    if (init.environ_map.get("MINI_WORKSPACE_ROOT") == null) {
+        if (init.environ_map.get("PWD")) |pwd| {
+            init.environ_map.put("MINI_WORKSPACE_ROOT", pwd) catch {};
+        }
+    }
 
     // Load environment variables from .env and config.json
     config_mod.loadDotEnv(alloc, init.environ_map, init.io);

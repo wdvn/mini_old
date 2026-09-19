@@ -52,7 +52,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const utils = @import("utils.zig");
-const skills_mod = @import("skills.zig");
+pub const skills_mod = @import("skills.zig");
 const main = @import("../main.zig");
 const provider_mod = @import("../backends/provider.zig");
 
@@ -682,7 +682,163 @@ pub const Config = struct {
 
 const SpResult = struct { buf: ?[]u8, text: []const u8 };
 
-fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, io: std.Io) SpResult {
+/// Scans the workspace directory to build a dynamic context block informing the
+/// model about the current environment (working directory, project name, detected
+/// project stack, git branch, and top-level files/directories).
+pub fn buildWorkspaceContext(alloc: Allocator, env_map: *const std.process.Environ.Map, io: std.Io) ?[]u8 {
+    const ws_root: ?[]const u8 = blk: {
+        if (env_map.get("MINI_WORKSPACE_ROOT")) |r| break :blk r;
+        if (env_map.get("MINI_AGENT_FOLDER")) |agent_dir| {
+            if (std.fs.path.dirname(agent_dir)) |parent| break :blk parent;
+        }
+        if (env_map.get("PWD")) |pwd| break :blk pwd;
+        break :blk null;
+    };
+    const root = ws_root orelse return null;
+
+    var prj_name = std.fs.path.basename(root);
+    if (std.mem.eql(u8, prj_name, ".") or prj_name.len == 0) {
+        if (env_map.get("PWD")) |pwd| {
+            const b = std.fs.path.basename(pwd);
+            if (b.len > 0 and !std.mem.eql(u8, b, ".")) prj_name = b;
+        }
+    }
+
+    const cwd = std.Io.Dir.cwd();
+    var dir = cwd.openDir(io, root, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+
+    // 1. Detect project types via marker files
+    const Marker = struct {
+        file: []const u8,
+        name: []const u8,
+    };
+    const MARKERS = [_]Marker{
+        .{ .file = "go.mod", .name = "Go" },
+        .{ .file = "package.json", .name = "Node.js / Web" },
+        .{ .file = "Cargo.toml", .name = "Rust" },
+        .{ .file = "build.zig", .name = "Zig" },
+        .{ .file = "build.zig.zon", .name = "Zig" },
+        .{ .file = "pyproject.toml", .name = "Python" },
+        .{ .file = "requirements.txt", .name = "Python" },
+        .{ .file = "setup.py", .name = "Python" },
+        .{ .file = "pom.xml", .name = "Java (Maven)" },
+        .{ .file = "build.gradle", .name = "Java/Kotlin (Gradle)" },
+        .{ .file = "CMakeLists.txt", .name = "C/C++" },
+        .{ .file = "Makefile", .name = "Make" },
+    };
+
+    var detected_types = std.ArrayList([]const u8).empty;
+    defer detected_types.deinit(alloc);
+
+    for (MARKERS) |marker| {
+        if (dir.statFile(io, marker.file, .{})) |_| {
+            var already = false;
+            for (detected_types.items) |existing| {
+                if (std.mem.eql(u8, existing, marker.name)) {
+                    already = true;
+                    break;
+                }
+            }
+            if (!already) {
+                detected_types.append(alloc, marker.name) catch {};
+            }
+        } else |_| {}
+    }
+
+    // 2. Detect Git Branch from .git/HEAD
+    var git_branch: ?[]const u8 = null;
+    var head_buf: [128]u8 = undefined;
+    if (dir.openFile(io, ".git/HEAD", .{})) |head_file| {
+        defer head_file.close(io);
+        if (utils.readAll(io, head_file, &head_buf)) |n| {
+            const head_content = std.mem.trim(u8, head_buf[0..n], " \t\r\n");
+            if (std.mem.startsWith(u8, head_content, "ref: refs/heads/")) {
+                git_branch = head_content["ref: refs/heads/".len..];
+            } else if (head_content.len >= 7) {
+                git_branch = head_content[0..7];
+            }
+        } else |_| {}
+    } else |_| {}
+
+    // 3. Collect top-level workspace entries (directories with '/', files without)
+    var entries_list = std.ArrayList([]const u8).empty;
+    defer {
+        for (entries_list.items) |item| alloc.free(item);
+        entries_list.deinit(alloc);
+    }
+
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        if (std.mem.eql(u8, entry.name, "node_modules") or
+            std.mem.eql(u8, entry.name, "zig-cache") or
+            std.mem.eql(u8, entry.name, "zig-out") or
+            std.mem.eql(u8, entry.name, "__pycache__") or
+            std.mem.eql(u8, entry.name, "target") or
+            std.mem.eql(u8, entry.name, "dist") or
+            std.mem.eql(u8, entry.name, "build"))
+        {
+            continue;
+        }
+
+        if (entry.kind == .directory) {
+            const dname = std.fmt.allocPrint(alloc, "{s}/", .{entry.name}) catch continue;
+            entries_list.append(alloc, dname) catch {
+                alloc.free(dname);
+                continue;
+            };
+        } else {
+            const fname = alloc.dupe(u8, entry.name) catch continue;
+            entries_list.append(alloc, fname) catch {
+                alloc.free(fname);
+                continue;
+            };
+        }
+        if (entries_list.items.len >= 35) break;
+    }
+
+    std.mem.sort([]const u8, entries_list.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+
+    var bw = utils.BufWriter.init(alloc);
+    defer bw.deinit();
+
+    bw.print("<workspace_context>\n", .{}) catch return null;
+    bw.print("- Working Directory: {s}\n", .{root}) catch return null;
+    bw.print("- Project Name: {s}\n", .{prj_name}) catch return null;
+
+    if (detected_types.items.len > 0) {
+        bw.print("- Project Type: ", .{}) catch return null;
+        for (detected_types.items, 0..) |t, idx| {
+            if (idx > 0) bw.print(", ", .{}) catch return null;
+            bw.print("{s}", .{t}) catch return null;
+        }
+        bw.print("\n", .{}) catch return null;
+    }
+
+    if (git_branch) |branch| {
+        bw.print("- Git Branch: {s}\n", .{branch}) catch return null;
+    }
+
+    if (entries_list.items.len > 0) {
+        bw.print("- Workspace Entries: ", .{}) catch return null;
+        for (entries_list.items, 0..) |item, idx| {
+            if (idx > 0) bw.print(", ", .{}) catch return null;
+            bw.print("{s}", .{item}) catch return null;
+        }
+        bw.print("\n", .{}) catch return null;
+    }
+
+    bw.print("</workspace_context>\n", .{}) catch return null;
+
+    return bw.toOwnedSlice() catch null;
+}
+
+pub fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, io: std.Io) SpResult {
     var base_buf: ?[]u8 = null;
     var base_text: []const u8 = Config.default_system_prompt;
 
@@ -710,10 +866,81 @@ fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, i
 
     var result = SpResult{ .buf = base_buf, .text = base_text };
 
+    // 1. Dynamic Workspace Context
+    if (buildWorkspaceContext(alloc, env_map, io)) |ws_ctx| {
+        defer alloc.free(ws_ctx);
+        const combined = std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ result.text, ws_ctx }) catch null;
+        if (combined) |c| {
+            if (result.buf) |b| alloc.free(b);
+            result = .{ .buf = c, .text = c };
+            if (!utils.isSubagent()) main.stderrPrint("[config] Injected workspace context into system prompt\n", .{});
+        }
+    }
+
     var agents_text_accum = std.ArrayList(u8).empty;
     defer agents_text_accum.deinit(alloc);
 
-    // 1. Global AGENTS.md (~/.mini/AGENTS.md)
+    const ws_root: ?[]const u8 = blk: {
+        if (env_map.get("MINI_WORKSPACE_ROOT")) |r| break :blk r;
+        if (env_map.get("MINI_AGENT_FOLDER")) |agent_dir| {
+            if (std.fs.path.dirname(agent_dir)) |parent| break :blk parent;
+        }
+        if (env_map.get("PWD")) |pwd| break :blk pwd;
+        break :blk null;
+    };
+
+    var loaded_root_agents = false;
+
+    // 2. Project AGENTS.md (Workspace Root)
+    if (ws_root) |root| {
+        const root_path = std.fmt.allocPrint(alloc, "{s}/AGENTS.md", .{root}) catch null;
+        if (root_path) |rp| {
+            defer alloc.free(rp);
+            if (readAgentFile(alloc, io, rp)) |text| {
+                defer alloc.free(text);
+                agents_text_accum.appendSlice(alloc, text) catch {};
+                agents_text_accum.appendSlice(alloc, "\n\n") catch {};
+                loaded_root_agents = true;
+                if (!utils.isSubagent()) main.stderrPrint("[config] Loaded workspace AGENTS.md ({d} bytes)\n", .{text.len});
+            }
+        }
+        // Fallback: CLAUDE.md if no AGENTS.md in workspace root
+        if (!loaded_root_agents) {
+            const claude_path = std.fmt.allocPrint(alloc, "{s}/CLAUDE.md", .{root}) catch null;
+            if (claude_path) |cp| {
+                defer alloc.free(cp);
+                if (readAgentFile(alloc, io, cp)) |text| {
+                    defer alloc.free(text);
+                    agents_text_accum.appendSlice(alloc, text) catch {};
+                    agents_text_accum.appendSlice(alloc, "\n\n") catch {};
+                    loaded_root_agents = true;
+                    if (!utils.isSubagent()) main.stderrPrint("[config] Loaded workspace CLAUDE.md ({d} bytes)\n", .{text.len});
+                }
+            }
+        }
+    }
+
+    // 3. Agent Folder AGENTS.md (MINI_AGENT_FOLDER/AGENTS.md)
+    if (env_map.get("MINI_AGENT_FOLDER")) |agent_dir| {
+        const project_path = std.fmt.allocPrint(alloc, "{s}/AGENTS.md", .{agent_dir}) catch null;
+        if (project_path) |pp| {
+            defer alloc.free(pp);
+            var is_same = false;
+            if (ws_root) |root| {
+                if (std.mem.eql(u8, root, agent_dir)) is_same = true;
+            }
+            if (!is_same) {
+                if (readAgentFile(alloc, io, pp)) |text| {
+                    defer alloc.free(text);
+                    agents_text_accum.appendSlice(alloc, text) catch {};
+                    agents_text_accum.appendSlice(alloc, "\n\n") catch {};
+                    if (!utils.isSubagent()) main.stderrPrint("[config] Loaded .agent AGENTS.md ({d} bytes)\n", .{text.len});
+                }
+            }
+        }
+    }
+
+    // 4. Global AGENTS.md (~/.mini/AGENTS.md)
     if (env_map.get("HOME")) |home| {
         const global_path = std.fmt.allocPrint(alloc, "{s}/.mini/AGENTS.md", .{home}) catch null;
         if (global_path) |gp| {
@@ -723,20 +950,6 @@ fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, i
                 agents_text_accum.appendSlice(alloc, text) catch {};
                 agents_text_accum.appendSlice(alloc, "\n\n") catch {};
                 if (!utils.isSubagent()) main.stderrPrint("[config] Loaded global AGENTS.md ({d} bytes)\n", .{text.len});
-            }
-        }
-    }
-
-    // 2. Project AGENTS.md (MINI_AGENT_FOLDER/AGENTS.md)
-    if (env_map.get("MINI_AGENT_FOLDER")) |agent_dir| {
-        const project_path = std.fmt.allocPrint(alloc, "{s}/AGENTS.md", .{agent_dir}) catch null;
-        if (project_path) |pp| {
-            defer alloc.free(pp);
-            if (readAgentFile(alloc, io, pp)) |text| {
-                defer alloc.free(text);
-                agents_text_accum.appendSlice(alloc, text) catch {};
-                agents_text_accum.appendSlice(alloc, "\n\n") catch {};
-                if (!utils.isSubagent()) main.stderrPrint("[config] Loaded project AGENTS.md ({d} bytes)\n", .{text.len});
             }
         }
     }

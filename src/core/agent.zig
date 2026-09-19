@@ -1096,8 +1096,12 @@ pub const AgentLoop = struct {
         }
 
         if (response.stop_reason == .tool_use or has_tool_use_blocks) {
-            self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "tool_call" });
-            try self.executeTools(act_id, &response);
+            const exec_summary = try self.executeTools(act_id, &response);
+            self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{
+                .exec_type = "tool_call",
+                .is_error = exec_summary.any_tool_err,
+                .duration_ms = exec_summary.total_dur_ms,
+            });
             main.stderrPrint("\n", .{});
             if (self.action_loop_tripped) {
                 return .exit_loop;
@@ -1356,8 +1360,12 @@ pub const AgentLoop = struct {
                 return .continue_loop;
             },
             .tool_use => {
-                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "tool_call" });
-                try self.executeTools(act_id, &response);
+                const exec_summary = try self.executeTools(act_id, &response);
+                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{
+                    .exec_type = "tool_call",
+                    .is_error = exec_summary.any_tool_err,
+                    .duration_ms = exec_summary.total_dur_ms,
+                });
                 main.stderrPrint("\n", .{});
                 if (self.action_loop_tripped) {
                     return .exit_loop;
@@ -1383,7 +1391,12 @@ pub const AgentLoop = struct {
                 }
                 if (has_tool_use) {
                     self.last_act_failed = true;
-                    try self.executeTools(act_id, &response);
+                    const exec_summary = try self.executeTools(act_id, &response);
+                    self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{
+                        .exec_type = "tool_call",
+                        .is_error = exec_summary.any_tool_err,
+                        .duration_ms = exec_summary.total_dur_ms,
+                    });
                     if (self.action_loop_tripped) {
                         return .exit_loop;
                     }
@@ -2210,18 +2223,28 @@ pub const AgentLoop = struct {
         }
     }
 
-    /// Executes all tool_use blocks in response.
+    /// Execution summary returned by executeTools for act debug logging.
+    pub const ToolExecSummary = struct {
+        any_tool_err: bool,
+        total_dur_ms: u64,
+        tool_count: usize,
+    };
 
-    fn executeTools(self: *AgentLoop, act_id: usize, response: *const proto.Response) !void {
+    /// Executes all tool_use blocks in response.
+    /// Returns execution summary for act debug logging.
+
+    fn executeTools(self: *AgentLoop, act_id: usize, response: *const proto.Response) !ToolExecSummary {
         var any_tool_err = false;
         var results = ArrayList(proto.ToolResult).empty;
         defer results.deinit(self.alloc);
-        
+
         var allocated_strings = ArrayList([]u8).empty;
         defer {
             for (allocated_strings.items) |s| self.alloc.free(s);
             allocated_strings.deinit(self.alloc);
         }
+        var total_dur_ms: u64 = 0;
+        var tool_count: usize = 0;
 
         for (response.content.items) |block| {
             if (signals.isInterrupted()) return error.Interrupted;
@@ -2450,6 +2473,8 @@ pub const AgentLoop = struct {
 
                     const end_tool_ms = utils.milliTimestamp();
                     const dur_ms = if (end_tool_ms >= start_tool_ms) @as(u64, @intCast(end_tool_ms - start_tool_ms)) else 0;
+                    total_dur_ms += dur_ms;
+                    tool_count += 1;
 
                     if (main.ui_repl.current_renderer) |r| {
                         var patch_path: ?[]const u8 = null;
@@ -2481,6 +2506,11 @@ pub const AgentLoop = struct {
             }
         }
         self.last_act_failed = any_tool_err;
+        return ToolExecSummary{
+            .any_tool_err = any_tool_err,
+            .total_dur_ms = total_dur_ms,
+            .tool_count = tool_count,
+        };
     }
 };
 
