@@ -1518,13 +1518,12 @@ pub const AgentLoop = struct {
             snapshot_mod.setTracker(if (self.snapshot_tracker != null) &self.snapshot_tracker.? else null);
         }
 
-        const max_acts = self.config.max_acts_per_turn;
         var act_id: usize = 1;
         var rate_limit_retries: usize = 0;
         const max_retries = 3;
 
-        // Bounded acts — model decides when to stop (exit_loop) or max_acts cap reached.
-        while (act_id <= max_acts) : (act_id += 1) {
+        // Act loop — model decides when to stop (exit_loop). No hard cap on acts.
+        while (true) {
             self.last_turn_acts = act_id;
             var try_count: usize = 0;
 
@@ -1747,16 +1746,7 @@ pub const AgentLoop = struct {
                 main.stderrPrint("\n\x1b[31m[agent] ⛔ Act {d} failed after {d} unrecoverable attempts. Terminating task.\x1b[0m\n", .{ act_id, max_retries + 1 });
                 return error.ActRetryExhausted;
             }
-        }
-
-        if (act_id > max_acts) {
-            main.stderrPrint(
-                "\n\x1b[33m[agent] ⚠️ Turn act limit ({d}) reached. Pausing turn to request direction.\x1b[0m\n",
-                .{max_acts},
-            );
-            if (self.journal) |*j| j.recordEvent(self.io, act_id - 1, .checkpoint_created, "Max acts reached") catch {};
-            try self.history.addSystemErrorObservation("[System]: Maximum acts limit reached for this turn. Pausing to request direction from the user.");
-            return;
+            act_id += 1;
         }
     }
 
