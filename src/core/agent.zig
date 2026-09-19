@@ -228,6 +228,9 @@ pub const AgentLoop = struct {
     plan_procrastination_count: usize = 0,
     plan_procrastination_cap: usize = 2,
     current_user_request: ?[]const u8 = null,
+    /// Progress summary from last act (injected as advisory before each new act).
+    progress_summary_buf: [512]u8 = undefined,
+    progress_summary_len: usize = 0,
 
     pub fn setPlan(self: *AgentLoop, summary: []const u8) void {
         if (!self.plan_active) {
@@ -249,6 +252,18 @@ pub const AgentLoop = struct {
     pub fn getPlanSummary(self: *const AgentLoop) []const u8 {
         if (self.plan_summary_len > 0) return self.plan_summary_buf[0..self.plan_summary_len];
         return "active implementation plan";
+    }
+
+    /// Update progress summary after an act completes. Caps at progress_summary_buf.
+    pub fn updateProgress(self: *AgentLoop, summary: []const u8) void {
+        const len = @min(summary.len, self.progress_summary_buf.len);
+        @memcpy(self.progress_summary_buf[0..len], summary[0..len]);
+        self.progress_summary_len = len;
+    }
+
+    /// Clear progress summary (call at start of each turn).
+    pub fn clearProgress(self: *AgentLoop) void {
+        self.progress_summary_len = 0;
     }
 
     pub const ToolCallRecord = struct {
@@ -918,6 +933,22 @@ pub const AgentLoop = struct {
             }
         }
 
+        // Progress Tracking: inject summary of previous act's work
+        if (self.progress_summary_len > 0 and act_id > 1) {
+            const progress_text = try std.fmt.allocPrint(
+                self.alloc,
+                "[Progress Checkpoint]\nThe previous act ({d}) completed with the following progress:\n{s}\n\nBefore proceeding, please assess: what has been accomplished, what remains, and whether you should continue or conclude.",
+                .{ act_id - 1, self.progress_summary_buf[0..self.progress_summary_len] },
+            );
+            defer self.alloc.free(progress_text);
+            const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+            blocks[0] = .{ .text = progress_text };
+            try temp_input_msgs.append(self.alloc, .{
+                .role = .user,
+                .content = blocks,
+            });
+        }
+
         // Dynamic Thinking / Reasoning Effort modulation
         if (!self.config.reasoning_effort_disabled) {
             var effective_effort: ?[]const u8 = self.config.reasoning_effort;
@@ -1504,6 +1535,7 @@ pub const AgentLoop = struct {
         self.plan_execution_pending = false;
         self.plan_watchdog_retries = 0;
         self.clearPlan();
+        self.clearProgress();
         self.current_user_request = user_text;
 
         // Retrieve relevant tool definitions for user message based on execution_mode
@@ -1750,16 +1782,44 @@ pub const AgentLoop = struct {
                     if (self.journal) |*j| {
                         j.recordActComplete(self.io, act_id, .{
                             .act_id = act_id,
-                            .file_snapshots = &.{}, 
+                            .file_snapshots = &.{},
                         }) catch {};
                     }
+                }
+
+                // Build progress summary from act results
+                {
+                    var pb = std.ArrayList(u8).init(self.alloc);
+                    defer pb.deinit();
+                    // File changes
+                    if (self.snapshot_tracker) |*t| {
+                        for (t.tracked.items) |tf| {
+                            if (tf.previous_content_hash) |_| {
+                                try pb.print("Modified: {s}\n", .{tf.path});
+                            }
+                        }
+                        t.reset();
+                    }
+                    // Tool summary (last 5 unique tools used)
+                    if (self.turn_tool_records.items.len > 0) {
+                        var seen = std.AutoHashMapUnmanaged([]const u8, void){};
+                        defer seen.deinit(self.alloc);
+                        const limit = @min(self.turn_tool_records.items.len, 5);
+                        for (self.turn_tool_records.items[self.turn_tool_records.items.len - limit ..]) |rec| {
+                            if (seen.insert(self.alloc, rec.name, {}).isDuplicate) continue;
+                            try pb.print("Tool: {s}\n", .{rec.name});
+                        }
+                    }
+                    const summary = pb.toOwnedSlice();
+                    self.updateProgress(summary);
+                    self.alloc.free(summary);
                 }
 
                 if (result == .exit_loop) {
                     if (self.journal) |*j| j.recordEvent(self.io, act_id, .task_completed, "Task completed") catch {};
                     return;
                 }
-                break; 
+                break;
             } else {
                 main.stderrPrint("\n\x1b[31m[agent] ⛔ Act {d} failed after {d} unrecoverable attempts. Terminating task.\x1b[0m\n", .{ act_id, max_retries + 1 });
                 return error.ActRetryExhausted;
