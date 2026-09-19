@@ -712,10 +712,35 @@ pub fn postStream(
     else
         null;
 
+    // Wall-clock deadline: absolute max stream duration from response headers receipt.
+    // Prevents extended-thinking models (e.g. reasoning_effort=high) from hanging
+    // indefinitely when TCP keepalive/TLS heartbeat fools the poll-based idle watchdog.
+    const deadline_ms: i64 = blk: {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+        const start_ms = @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1000000);
+        // Use the smaller of total timeout or 6x idle timeout as absolute ceiling.
+        // This handles: idle=60s → deadline=120s (matches timeout_secs default),
+        // idle=15s → deadline=90s, etc. Prevents 3h+ hangs from extended thinking.
+        const abs_max: u32 = @min(opts.timeout_secs, @max(opts.idle_timeout_secs, 1) * 6);
+        break :blk start_ms + @as(i64, @intCast(abs_max)) * 1000;
+    };
+
     var got_any = false;
     const read_result: anyerror!void = blk: {
         while (true) {
             if (signals.isInterrupted()) break :blk error.Interrupted;
+            // Wall-clock check: abort if total stream duration exceeded.
+            {
+                var ts_now: std.os.linux.timespec = undefined;
+                _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts_now);
+                const now_ms = @as(i64, @intCast(ts_now.sec)) * 1000 + @divTrunc(ts_now.nsec, 1000000);
+                if (now_ms >= deadline_ms) {
+                    if (opts.out_idle_aborted) |flag| flag.* = true;
+                    if (!got_any) return error.StreamIdleTimeout;
+                    break :blk error.StreamIdleTimeout;
+                }
+            }
             // Stream Stall Watchdog: poll with idle timeout before each blocked
             // read. If the server goes silent for > idle_timeout_secs, abort
             // instead of blocking until the total timeout (120s) elapses.
@@ -747,6 +772,7 @@ pub fn postStream(
     if (read_result) |_| {} else |e| {
         if (e == error.Interrupted) return error.Interrupted;
         if (e == error.StreamIdleTimeout) return error.StreamIdleTimeout;
+        
         return e;
     }
 
