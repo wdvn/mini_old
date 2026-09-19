@@ -103,7 +103,6 @@ pub const TurnStats = struct {
     max_context_tokens: usize = 128 * 1024,
     duration_ms: u64 = 0,
     acts_count: usize = 1,
-    files_modified: usize = 0,
 };
 
 /// Lifecycle events emitted from LLM streaming

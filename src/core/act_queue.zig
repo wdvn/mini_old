@@ -117,10 +117,12 @@ pub const ActHandle = struct {
 // Priority Queue Comparator
 // ---------------------------------------------------------------------------
 
-fn lessThan(ctx: void, a: ActQueueItem, b: ActQueueItem) bool {
+fn lessThan(ctx: void, a: ActQueueItem, b: ActQueueItem) std.math.Order {
     _ = ctx;
     // Lower enum value = higher priority = should come first
-    return @intFromEnum(a.priority) < @intFromEnum(b.priority);
+    return if (@intFromEnum(a.priority) < @intFromEnum(b.priority)) .lt
+    else if (@intFromEnum(a.priority) > @intFromEnum(b.priority)) .gt
+    else .eq;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,21 +136,8 @@ pub const QueueMetrics = struct {
     completed: usize = 0,
     failed: usize = 0,
     cancelled: usize = 0,
-    total_wait_time_ms: u64 = 0,
-    total_execution_time_ms: u64 = 0,
     current_queue_size: usize = 0,
     current_running_count: usize = 0,
-
-    pub fn avgWaitTime(self: *const QueueMetrics) u64 {
-        if (self.enqueued == 0) return 0;
-        return self.total_wait_time_ms / @as(u64, @intCast(self.enqueued));
-    }
-
-    pub fn avgExecutionTime(self: *const QueueMetrics) u64 {
-        const done = self.completed + self.failed;
-        if (done == 0) return 0;
-        return self.total_execution_time_ms / @as(u64, @intCast(done));
-    }
 };
 
 // ---------------------------------------------------------------------------
@@ -159,7 +148,7 @@ pub const QueueMetrics = struct {
 pub const ActQueue = struct {
     alloc: Allocator,
     /// Priority queue of pending acts.
-    pq: std.heap.PriorityQueue(ActQueueItem, void),
+    pq: std.PriorityQueue(ActQueueItem, void, lessThan),
     /// Map from act ID to act info (for running/completed).
     acts: std.AutoHashMap(u64, ActQueueItem),
     /// Map from act ID to result (for completed acts).
@@ -180,11 +169,7 @@ pub const ActQueue = struct {
     pub fn init(alloc: Allocator) ActQueue {
         return ActQueue{
             .alloc = alloc,
-            .pq = std.heap.PriorityQueue(ActQueueItem, void).init(
-                alloc,
-                {},
-                lessThan,
-            ),
+            .pq = std.PriorityQueue(ActQueueItem, void, lessThan).initContext({}),
             .acts = std.AutoHashMap(u64, ActQueueItem).init(alloc),
             .results = std.AutoHashMap(u64, ActResult).init(alloc),
             .signal = .{},
@@ -198,11 +183,11 @@ pub const ActQueue = struct {
 
     pub fn deinit(self: *ActQueue) void {
         // Drain remaining items
-        while (self.pq.popOrNull()) |item| {
+        while (self.pq.pop()) |item| {
             self.alloc.free(item.prompt);
             self.alloc.free(item.session_id);
         }
-        self.pq.deinit();
+        self.pq.deinit(self.alloc);
         self.acts.deinit();
         self.results.deinit();
     }
@@ -223,7 +208,7 @@ pub const ActQueue = struct {
         self.acts.put(actual_item.id, actual_item) catch unreachable;
 
         // Add to priority queue
-        self.pq.add(actual_item);
+        try self.pq.push(self.alloc, actual_item) catch unreachable;
 
         // Update metrics
         self.metrics.enqueued += 1;
@@ -245,7 +230,7 @@ pub const ActQueue = struct {
 
         if (self.pq.items.len == 0) return null;
 
-        const item = self.pq.remove();
+        const item = self.pq.pop().?;
         self.metrics.current_queue_size -= 1;
         self.metrics.dequeued += 1;
 
@@ -417,11 +402,11 @@ pub const ActQueue = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        while (self.pq.popOrNull()) |item| {
+        while (self.pq.pop()) |item| {
             self.alloc.free(item.prompt);
             self.alloc.free(item.session_id);
         }
-        self.pq.clearAndDeinit();
+        self.pq.clearAndFree(self.alloc);
         self.metrics.current_queue_size = 0;
     }
 
@@ -440,16 +425,6 @@ pub const ActQueue = struct {
         return self.shutting_down;
     }
 };
-
-// ---------------------------------------------------------------------------
-// Helper Functions
-// ---------------------------------------------------------------------------
-
-fn lessThan(ctx: void, a: ActQueueItem, b: ActQueueItem) bool {
-    _ = ctx;
-    // Lower enum value = higher priority = should come first
-    return @intFromEnum(a.priority) < @intFromEnum(b.priority);
-}
 
 // ---------------------------------------------------------------------------
 // Thread-safe Queue Iterator
@@ -558,19 +533,21 @@ test "act_queue: wait for completion" {
     const handle = queue.enqueue(ActQueueItem{ .id = 0, .priority = .normal, .session_id = "s", .prompt = "complete me", .subagent = false, .timeout_s = 0, .callback = null, .created_at = 0 });
 
     // Simulate completion in another thread
-    std.Thread.spawn(.{}, () => {
-        std.time.sleep(10 * std.time.ms_per_s);
-        queue.complete(handle.id, ActResult{
-            .ok = true,
-            .output = "done",
-            .duration_ms = 100,
-            .error_msg = null,
-            .act_id = handle.id,
-            .priority = .normal,
-            .tool_calls_count = 2,
-            .tokens_used = 100,
-        });
-    }).detach();
+    const handle_id = handle.id;
+    std.Thread.spawn(.{}, struct {
+        fn run(ctx: *struct { queue: *ActQueue, handle_id: u64 }) void {
+            ctx.queue.complete(ctx.handle_id, ActResult{
+                .ok = true,
+                .output = "done",
+                .duration_ms = 100,
+                .error_msg = null,
+                .act_id = ctx.handle_id,
+                .priority = .normal,
+                .tool_calls_count = 2,
+                .tokens_used = 100,
+            });
+        }
+    }.run, .{ .queue = &queue, .handle_id = handle_id }).detach();
 
     const result = queue.waitFor(handle, 1000) catch unreachable;
     try std.testing.expect(result.ok);

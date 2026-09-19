@@ -1789,28 +1789,43 @@ pub const AgentLoop = struct {
 
                 // Build progress summary from act results
                 {
-                    var pb = std.ArrayList(u8).init(self.alloc);
-                    defer pb.deinit();
+                    var pb = std.ArrayListUnmanaged(u8).empty;
+                    defer pb.deinit(self.alloc);
                     // File changes
                     if (self.snapshot_tracker) |*t| {
                         for (t.tracked.items) |tf| {
                             if (tf.previous_content_hash) |_| {
-                                try pb.print("Modified: {s}\n", .{tf.path});
+                                const line = try std.fmt.allocPrint(self.alloc, "Modified: {s}\n", .{tf.path});
+                                defer self.alloc.free(line);
+                                pb.appendSlice(self.alloc, line) catch {};
                             }
                         }
                         t.reset();
                     }
                     // Tool summary (last 5 unique tools used)
                     if (self.turn_tool_records.items.len > 0) {
-                        var seen = std.AutoHashMapUnmanaged([]const u8, void){};
-                        defer seen.deinit(self.alloc);
+                        var seen_tools: [5][]const u8 = undefined;
+                        var seen_count: usize = 0;
                         const limit = @min(self.turn_tool_records.items.len, 5);
                         for (self.turn_tool_records.items[self.turn_tool_records.items.len - limit ..]) |rec| {
-                            if (seen.insert(self.alloc, rec.name, {}).isDuplicate) continue;
-                            try pb.print("Tool: {s}\n", .{rec.name});
+                            var is_dup = false;
+                            for (seen_tools[0..seen_count]) |st| {
+                                if (std.mem.eql(u8, st, rec.name)) {
+                                    is_dup = true;
+                                    break;
+                                }
+                            }
+                            if (is_dup) continue;
+                            if (seen_count < seen_tools.len) {
+                                seen_tools[seen_count] = rec.name;
+                                seen_count += 1;
+                            }
+                            const line = try std.fmt.allocPrint(self.alloc, "Tool: {s}\n", .{rec.name});
+                            defer self.alloc.free(line);
+                            pb.appendSlice(self.alloc, line) catch {};
                         }
                     }
-                    const summary = pb.toOwnedSlice();
+                    const summary = try pb.toOwnedSlice(self.alloc);
                     self.updateProgress(summary);
                     self.alloc.free(summary);
                 }
