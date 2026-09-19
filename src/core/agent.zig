@@ -218,6 +218,8 @@ pub const AgentLoop = struct {
     loop_plan_retries: usize = 0,
     /// Flag indicating that a plan has been requested to break an action loop; if the model returns text without tool execution, prompts the model to execute step 1.
     plan_execution_pending: bool = false,
+    /// Consecutive watchdog directives injected while model keeps answering in text. Caps at 2 to prevent infinite looping.
+    plan_watchdog_retries: usize = 0,
 
     // Plan Watchdog: Enforces execution of committed plans and prevents action procrastination
     plan_active: bool = false,
@@ -1217,6 +1219,26 @@ pub const AgentLoop = struct {
                 self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "none" });
                 if ((self.plan_active or self.plan_execution_pending) and !isPlanOnlyRequest(self.current_user_request)) {
                     self.plan_execution_pending = false;
+                    self.plan_watchdog_retries += 1;
+                    const watchdog_max = 2;
+                    if (self.plan_watchdog_retries >= watchdog_max) {
+                        main.stderrPrint(
+                            "\n\x1b[31m[watchdog] ⛔ Plan Watchdog giving up after {d} consecutive directive injections without tool execution. Forcing exit.\x1b[0m\n",
+                            .{watchdog_max},
+                        );
+                        if (main.ui_repl.current_renderer) |r| {
+                            r.ensureNewline();
+                            r.write(" \x1b[31m[Plan Watchdog: Forcing exit after repeated non-compliance]\x1b[0m\n");
+                        }
+                        const intervention_msg = try std.fmt.allocPrint(self.alloc,
+                            "[Plan Watchdog Intervention]: The model has ignored {d} consecutive directive injections to execute its plan. Synthesize your findings and answer the user now.",
+                            .{watchdog_max},
+                        );
+                        defer self.alloc.free(intervention_msg);
+                        try self.history.addUser(intervention_msg);
+                        self.clearPlan();
+                        return .exit_loop;
+                    }
                     main.stderrPrint(
                         "\n\x1b[33m[watchdog] ⚠️ Model emitted text without tool execution while an implementation plan is active. Commanding immediate execution of Step 1...\x1b[0m\n",
                         .{},
@@ -1485,6 +1507,7 @@ pub const AgentLoop = struct {
         self.action_loop_tripped = false;
         self.loop_plan_retries = 0;
         self.plan_execution_pending = false;
+        self.plan_watchdog_retries = 0;
         self.clearPlan();
         self.current_user_request = user_text;
 
