@@ -25,6 +25,7 @@ pub const backends = struct {
 pub const tools_mod = @import("tooling/registry.zig");
 pub const session_diagnostics = @import("tools/session_diagnostics.zig");
 pub const act_logger_mod = @import("core/act_logger.zig");
+pub const act_queue_mod = @import("core/act_queue.zig");
 pub const mcp_mod = @import("tooling/mcp.zig");
 pub const utils = @import("core/utils.zig");
 pub const cron_mod = @import("core/cron.zig");
@@ -562,7 +563,7 @@ test {
     _ = @import("ui/spinner.zig");
     _ = @import("ui/diff_renderer.zig");
     _ = @import("ui/markdown.zig");
-    _ = @import("ui/chat_stream.zig");
+    _ = @import("core/act_queue.zig");
     _ = quickjs_engine;
     _ = js_bindings;
     _ = process_manager;

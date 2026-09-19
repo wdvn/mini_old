@@ -89,7 +89,7 @@ pub const ActResult = struct {
     /// Duration in milliseconds.
     duration_ms: u64,
     /// Error message if failed.
-    error: ?[]const u8,
+    error_msg: ?[]const u8,
     /// Act ID that produced this result.
     act_id: u64,
     /// Priority of the act.
@@ -376,7 +376,7 @@ pub const ActQueue = struct {
             .ok = false,
             .output = "",
             .duration_ms = duration_ms,
-            .error = error_msg,
+            .error_msg = error_msg,
             .act_id = id,
             .priority = .normal,
             .tool_calls_count = 0,
@@ -564,7 +564,7 @@ test "act_queue: wait for completion" {
             .ok = true,
             .output = "done",
             .duration_ms = 100,
-            .error = null,
+            .error_msg = null,
             .act_id = handle.id,
             .priority = .normal,
             .tool_calls_count = 2,
