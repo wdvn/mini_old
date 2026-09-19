@@ -130,12 +130,12 @@ Instructions:
 4. Ensure code style and conventions are maintained.
 5. Conclude your turn with a brief summary of the fix once completed."
 
-    echo "  Executing mini on task (timeout: 300s)..." | tee -a "$REPORT_FILE"
+    echo "  Executing mini on task (no timeout, runs until completion)..." | tee -a "$REPORT_FILE"
     start_time=$(date +%s%3N)
     
-    # Run mini inside the target workspace directory with hard 300s timeout against infinite loops
+    # Run mini inside the target workspace directory — no timeout, mini is a heavy-task agent.
     # grep, file_read, file_write are temporarily blocked to force model to use bash
-    (cd "$task_dir" && MINI_TOOL_BLOCKLIST="grep,file_read,file_write,read_file,write_file,read,write" timeout --kill-after=10s 300s "$MINI_BIN" -e "$prompt" >> "$REPORT_FILE" 2>&1 || true)
+    (cd "$task_dir" && MINI_TOOL_BLOCKLIST="grep,file_read,file_write,read_file,write_file,read,write" "$MINI_BIN" -e "$prompt" >> "$REPORT_FILE" 2>&1 || true)
     
     end_time=$(date +%s%3N)
     duration=$((end_time - start_time))
