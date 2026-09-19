@@ -65,9 +65,9 @@ fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
 
 var g_active_agent: ?*AgentLoop = null;
 
-fn agentToolListener(tool_name: []const u8, is_error: bool) void {
+fn agentToolListener(tool_name: []const u8, input_json: ?[]const u8, is_error: bool) void {
     if (g_active_agent) |agent| {
-        agent.onToolCompleted(tool_name, is_error);
+        agent.onToolCompleted(tool_name, input_json, is_error);
     }
 }
 
@@ -1487,7 +1487,7 @@ pub const AgentLoop = struct {
 
     /// Processes user input through agentic loop.
     /// Handle tool completion lifecycle event (RFC-010 Procedural Graph tracking)
-    pub fn onToolCompleted(self: *AgentLoop, tool_name: []const u8, is_error: bool) void {
+    pub fn onToolCompleted(self: *AgentLoop, tool_name: []const u8, input_json: ?[]const u8, is_error: bool) void {
         if (self.pg_store) |pg| {
             if (self.last_executed_tool) |prev_tool| {
                 pg.recordTransition(self.io, prev_tool, tool_name) catch {};
@@ -1511,9 +1511,14 @@ pub const AgentLoop = struct {
         } else |_| {}
 
         self.last_act_failed = is_error;
+        const args_hash: u64 = if (input_json) |ij|
+            std.hash.Wyhash.hash(0, std.mem.trim(u8, ij, " \t\r\n"))
+        else
+            0;
+
         self.coordinator.recordToolExecution(
             tool_name,
-            std.hash.Fnv1a_64.hash(tool_name),
+            args_hash,
             isReadOnlyTool(tool_name),
         );
     }
@@ -2397,14 +2402,6 @@ pub const AgentLoop = struct {
                         }
                     }
 
-                    // Dispatch pre-tool-use hook
-                    hooks_mod.dispatch(self.alloc, self.io, .{
-                        .event = "pre-tool-use",
-                        .tool_id = tu.id,
-                        .tool_name = tu.name,
-                        .input_json = tu.input_json,
-                    });
-
                     // Snapshot file if editing tool
                     if (std.mem.eql(u8, tu.name, "file_edit") or std.mem.eql(u8, tu.name, "file_write")) {
                         if (json_mod.findString(tu.input_json, "path")) |path| {
@@ -2438,16 +2435,6 @@ pub const AgentLoop = struct {
                         break :blk merged;
                     } else truncated;
 
-                    // Dispatch post-tool-use hook
-                    hooks_mod.dispatch(self.alloc, self.io, .{
-                        .event = "post-tool-use",
-                        .tool_id = tu.id,
-                        .tool_name = tu.name,
-                        .input_json = tu.input_json,
-                        .tool_result = final_content,
-                        .is_error = is_err,
-                    });
-
                     try results.append(self.alloc, .{
                         .tool_use_id = tu.id,
                         .content = final_content,
@@ -2456,6 +2443,9 @@ pub const AgentLoop = struct {
                     if (!is_err) {
                         self.loop_plan_retries = 0;
                         self.plan_execution_pending = false;
+                        if (!isExploratoryToolCall(tu.name, tu.input_json)) {
+                            self.clearPlan();
+                        }
                     }
 
                     const end_tool_ms = utils.milliTimestamp();
