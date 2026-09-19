@@ -468,6 +468,7 @@ pub const LineEditor = struct {
             if (!cursor_placed and self.pos <= k) {
                 const in_w = unicode.displayWidth(self.buf.items[line_start..@min(self.pos, k)]);
                 const coff = prefix_w + in_w;
+                // Use rows BEFORE this line's wraps for correct cursor row calc
                 cur_row = total_rows + coff / cols;
                 cur_col = coff % cols;
                 cursor_placed = true;
