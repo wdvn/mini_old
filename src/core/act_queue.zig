@@ -52,6 +52,9 @@ pub const ActMonitorState = struct {
     last_reported_10s: u32 = 0,
     completed_acts: usize = 0,
     is_timed_out: bool = false,
+    /// Monotonic byte counter of execution output appended this act.
+    /// Used by Watchdog to detect whether the act is still producing output.
+    act_log_total: usize = 0,
 
     pub fn getActionDesc(self: *const ActMonitorState) []const u8 {
         return self.action_desc_buf[0..self.action_desc_len];
@@ -78,6 +81,8 @@ pub const ToolRecord = struct {
 /// Coordinates turn lifecycle and shared state across the 3 threads.
 pub const ActCoordinator = struct {
     pub const MAX_TRAJECTORY: usize = 32;
+    /// Capacity of the bounded per-act execution log tail (8 KB).
+    pub const ACT_LOG_CAP: usize = 8 * 1024;
 
     alloc: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
@@ -92,6 +97,15 @@ pub const ActCoordinator = struct {
 
     // Watchdog recap advisory queue
     pending_recap_advisory: ?[]u8 = null,
+
+    // Bounded per-act execution log ring buffer (Thread 3 writes, Thread 2 reads on timeout).
+    act_log: [ACT_LOG_CAP]u8 = undefined,
+    act_log_len: usize = 0,
+    act_log_truncated: bool = false,
+
+    // Timeout intervention context (populated by Watchdog on timeout,
+    // consumed by Thread 3 to ask the model how to proceed).
+    pending_timeout_context: ?[]u8 = null,
 
     // Turn completion tracking
     turn_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -110,6 +124,10 @@ pub const ActCoordinator = struct {
         if (self.pending_recap_advisory) |adv| {
             self.alloc.free(adv);
             self.pending_recap_advisory = null;
+        }
+        if (self.pending_timeout_context) |ctx| {
+            self.alloc.free(ctx);
+            self.pending_timeout_context = null;
         }
         self.unlock();
         self.alloc.destroy(self);
@@ -138,9 +156,12 @@ pub const ActCoordinator = struct {
         self.state.last_reported_10s = 0;
         self.state.completed_acts = 0;
         self.state.is_timed_out = false;
+        self.state.act_log_total = 0;
 
         self.trajectory_len = 0;
         self.trajectory_head = 0;
+        self.act_log_len = 0;
+        self.act_log_truncated = false;
 
         if (self.pending_recap_advisory) |adv| {
             self.alloc.free(adv);
@@ -175,6 +196,48 @@ pub const ActCoordinator = struct {
         self.lock();
         defer self.unlock();
         self.state.last_heartbeat_ms = utils.milliTimestamp();
+    }
+
+    /// Append execution output (stdout/stderr/log chunks) to the bounded
+    /// per-act log tail. Called by Thread 3 (Act Executor) as output streams in.
+    /// Keeps only the most recent ACT_LOG_CAP bytes; older bytes are dropped
+    /// and act_log_truncated is set. Also renews the heartbeat.
+    pub fn appendActLog(self: *ActCoordinator, chunk: []const u8) void {
+        self.lock();
+        defer self.unlock();
+
+        const now = utils.milliTimestamp();
+        self.state.last_heartbeat_ms = now;
+        self.state.act_log_total += chunk.len;
+
+        for (chunk) |byte| {
+            if (self.act_log_len < ACT_LOG_CAP) {
+                self.act_log[self.act_log_len] = byte;
+                self.act_log_len += 1;
+            } else {
+                // Shift-left compaction to make room, drop oldest half.
+                if (!self.act_log_truncated) {
+                    self.act_log_truncated = true;
+                }
+                const keep_from = ACT_LOG_CAP / 2;
+                const keep_len = ACT_LOG_CAP - keep_from - 1;
+                std.mem.copyForwards(u8, self.act_log[0..keep_len], self.act_log[keep_from..][0..keep_len]);
+                self.act_log_len = keep_len;
+                self.act_log[self.act_log_len] = byte;
+                self.act_log_len += 1;
+            }
+        }
+    }
+
+    /// Copy the per-act log tail into `out` (Thread 2 Watchdog reads on timeout).
+    /// Returns the copied slice and whether the log was truncated.
+    pub fn getActLogTail(self: *ActCoordinator, out: []u8) struct { data: []u8, truncated: bool } {
+        self.lock();
+        defer self.unlock();
+
+        const count = @min(out.len, self.act_log_len);
+        @memcpy(out[0..count], self.act_log[0..count]);
+        return .{ .data = out[0..count], .truncated = self.act_log_truncated };
     }
 
     /// Record a tool execution into the trajectory history.
@@ -261,6 +324,28 @@ pub const ActCoordinator = struct {
         const adv = self.pending_recap_advisory;
         self.pending_recap_advisory = null;
         return adv;
+    }
+
+    /// Store the timeout intervention context (Watchdog -> Thread 3).
+    pub fn setPendingTimeoutContext(self: *ActCoordinator, context: []const u8) !void {
+        self.lock();
+        defer self.unlock();
+
+        if (self.pending_timeout_context) |old| {
+            self.alloc.free(old);
+        }
+        self.pending_timeout_context = try self.alloc.dupe(u8, context);
+    }
+
+    /// Thread 3 consumes the timeout context to consult the model about
+    /// whether the act has finished or should be force-stopped.
+    pub fn popPendingTimeoutContext(self: *ActCoordinator) ?[]u8 {
+        self.lock();
+        defer self.unlock();
+
+        const ctx = self.pending_timeout_context;
+        self.pending_timeout_context = null;
+        return ctx;
     }
 
     /// Get current monitor state snapshot (Thread 2 Watchdog reads this).
