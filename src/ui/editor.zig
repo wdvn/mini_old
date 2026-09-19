@@ -461,7 +461,6 @@ pub const LineEditor = struct {
             } else {
                 w.writeAll("\r\n") catch return;
                 w.writeAll(indent) catch return;
-                total_rows += 1;
             }
             w.writeAll(line) catch return;
 
