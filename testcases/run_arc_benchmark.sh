@@ -62,7 +62,7 @@ Instructions:
 4. Output the final predicted 2D array inside a \`\`\`json\n[[...]]\n\`\`\` code block."
 
     start_time=$(date +%s%3N)
-    raw_output=$($MINI_BIN -e "$prompt" 2>&1 || true)
+    raw_output=$(timeout --kill-after=10s 180s "$MINI_BIN" -e "$prompt" 2>&1 || true)
     end_time=$(date +%s%3N)
     duration=$((end_time - start_time))
 

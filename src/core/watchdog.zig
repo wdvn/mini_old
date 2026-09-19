@@ -42,6 +42,7 @@ pub const Watchdog = struct {
     thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     last_evaluated_act_count: usize = 0,
+    consecutive_loop_warnings: usize = 0,
 
     /// Optional external interrupt hook (e.g. QuickJS requestInterrupt).
     interrupt_fn: ?*const fn () void = null,
@@ -197,6 +198,30 @@ pub const Watchdog = struct {
             "Exploration saturation: multiple consecutive read-only operations without code mutation."
         else
             "Normal progression: actions are advancing across the workspace.";
+
+        if (has_dup or has_cycle) {
+            self.consecutive_loop_warnings += 1;
+        } else {
+            self.consecutive_loop_warnings = 0;
+        }
+
+        // Circuit Breaker: If the agent is stuck in repetitive loops for 3 consecutive
+        // recap intervals (9 acts), force-abort turn to protect against infinite loops.
+        if (self.consecutive_loop_warnings >= 3) {
+            self.coordinator.setTimedOut(true);
+            signals.setInterrupted(true);
+            if (self.interrupt_fn) |int_fn| {
+                int_fn();
+            }
+            if (self.config.verbose_stderr) {
+                printStderr(
+                    self.io,
+                    "\n\x1b[31m[watchdog] 🛑 Circuit Breaker: 3 consecutive loop warnings ({d} acts trapped)! Terminating turn to prevent infinite loop.\x1b[0m\n",
+                    .{completed_acts},
+                );
+            }
+            return;
+        }
 
         const advisory = if (has_dup or has_cycle)
             "⚠️ Trajectory Warning: You appear to be repeating actions without forward progress. Re-assess findings, break out of this loop, and proceed to modify files or respond to the user."
