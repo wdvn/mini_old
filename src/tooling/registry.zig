@@ -15,7 +15,8 @@
 //!   - Allowlist takes precedence over blocklist
 //!
 //! ## Core tools (always sent to API)
-//! bash, file_read, file_write, file_edit, glob, grep, http_request, skills
+//! bash, file_write, file_edit, http_request, skills
+//! (file_read, glob, grep: internal dispatch only, not exposed to the model)
 //!
 //! ## Extended tools (sent conditionally on keyword matches)
 //! See `extended_triggers` below.
@@ -205,12 +206,8 @@ pub const definitions = [_]proto.ToolDefinition{
         .input_schema_json = \\{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"}},"required":["command"]}
         ,
     },
-    .{
-        .name = "file_read",
-        .description = "Read file contents. Supports line-based offset and limit. Relative paths are resolved against project root.",
-        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"File path to read"},"offset":{"type":"integer","description":"Starting line (1-indexed, default: 1)"},"limit":{"type":"integer","description":"Number of lines to read (default: all, max 2000 lines)"}},"required":["path"]}
-        ,
-    },
+    // NOTE: file_read removed from exposed tool list — force the model to use
+    // bash (cat/sed/awk) or CodeAct (mini.read) instead. Internal dispatch is kept.
     .{
         .name = "file_write",
         .description = "Write or overwrite entire file content. Automatically creates parent directories if needed. Do NOT use for small partial edits (use file_edit).",
@@ -223,18 +220,9 @@ pub const definitions = [_]proto.ToolDefinition{
         .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"File path to edit"},"old_string":{"type":"string","description":"Exact substring to replace"},"new_string":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace all occurrences (default: false)"}},"required":["path","old_string","new_string"]}
         ,
     },
-    .{
-        .name = "glob",
-        .description = "Find files by wildcard pattern (e.g. \"**/*.zig\", \"src/*.ts\"). Returns list of relative paths. Automatically skips .git, zig-cache, node_modules.",
-        .input_schema_json = \\{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern to search"},"path":{"type":"string","description":"Base directory (default: project root)"}},"required":["pattern"]}
-        ,
-    },
-    .{
-        .name = "grep",
-        .description = "Search for regex or raw text within file contents. Returns file path, line numbers, and matching lines.",
-        .input_schema_json = \\{"type":"object","properties":{"pattern":{"type":"string","description":"Search pattern or regex"},"path":{"type":"string","description":"Directory or file to search (default: project root)"},"case_insensitive":{"type":"boolean","description":"Case-insensitive search"},"max_results":{"type":"integer","description":"Max results to return (default: 50)"}},"required":["pattern"]}
-        ,
-    },
+    // NOTE: glob and grep removed from exposed tool list — force the model to
+    // use bash (find/rg) or CodeAct (mini.glob/mini.grep) instead. Internal
+    // dispatch is kept.
     .{
         .name = "http_request",
         .description = "Send HTTP/HTTPS requests. Supports GET, POST, PUT, DELETE, PATCH. Returns status code, headers, and response body.",
@@ -304,9 +292,12 @@ pub const definitions = [_]proto.ToolDefinition{
 };
 
 /// Core tool names (always sent to API).
+/// file_read / glob / grep intentionally excluded: the model must use bash
+/// (cat/sed/find/rg) or CodeAct (mini.read/mini.glob/mini.grep) instead.
+/// Internal dispatch for these names is still supported in executeTool().
 const core_tools = [_][]const u8{
-    "bash", "file_read", "file_write", "file_edit",
-    "glob", "grep", "http_request", "invoke_subagent", "batch_invoke_subagents", "skills",
+    "bash", "file_write", "file_edit",
+    "http_request", "invoke_subagent", "batch_invoke_subagents", "skills",
     "session_diagnostics", "artifact_write", "artifact_read", "artifact_list",
     "generate_image", "generate_video", "image_attach",
 };
