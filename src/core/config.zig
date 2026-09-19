@@ -237,6 +237,12 @@ pub const Config = struct {
     /// Video job polling timeout in seconds (default: 600).
     video_poll_timeout_secs: u32 = 600,
 
+    // 3-Thread Watchdog & Act Coordinator (RFC-015)
+    act_timeout_secs: u32 = 120,
+    watchdog_tracking_interval_s: u32 = 10,
+    watchdog_recap_interval: usize = 3,
+    watchdog_interval_ms: u32 = 200,
+
     /// Default system prompt when MINI_SYSTEM_FILE is not configured.
     pub const default_system_prompt =
         \\You are mini-agent, a powerful AI assistant running in the terminal.
@@ -570,6 +576,23 @@ pub const Config = struct {
             }
         }
 
+        const act_timeout_secs: u32 = blk: {
+            const s = env_map.get("MINI_ACT_TIMEOUT_SECS") orelse env_map.get("MINI_ACT_TIMEOUT") orelse break :blk 120;
+            break :blk std.fmt.parseInt(u32, s, 10) catch 120;
+        };
+        const watchdog_tracking_s: u32 = blk: {
+            const s = env_map.get("MINI_WATCHDOG_TRACKING_S") orelse break :blk 10;
+            break :blk std.fmt.parseInt(u32, s, 10) catch 10;
+        };
+        const watchdog_recap_interval: usize = blk: {
+            const s = env_map.get("MINI_WATCHDOG_RECAP_INTERVAL") orelse break :blk 3;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 3;
+        };
+        const watchdog_interval_ms: u32 = blk: {
+            const s = env_map.get("MINI_WATCHDOG_INTERVAL_MS") orelse break :blk 200;
+            break :blk std.fmt.parseInt(u32, s, 10) catch 200;
+        };
+
         return .{
             .execution_mode = exec_mode,
             .openai_protocol = openai_proto,
@@ -635,6 +658,10 @@ pub const Config = struct {
             .video_gen_provider = video_gen_provider,
             .media_output_dir = media_output_dir,
             .video_poll_timeout_secs = video_poll_timeout_secs,
+            .act_timeout_secs = act_timeout_secs,
+            .watchdog_tracking_interval_s = watchdog_tracking_s,
+            .watchdog_recap_interval = watchdog_recap_interval,
+            .watchdog_interval_ms = watchdog_interval_ms,
         };
     }
 

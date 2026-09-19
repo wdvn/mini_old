@@ -49,6 +49,8 @@ const cas_mod = @import("cas.zig");
 pub const journal_mod = @import("journal.zig");
 pub const act_logger_mod = @import("act_logger.zig");
 pub const signals = @import("signals.zig");
+pub const act_queue = @import("act_queue.zig");
+pub const watchdog_mod = @import("watchdog.zig");
 const chat_stream = @import("../ui/chat_stream.zig");
 const term = @import("../ui/terminal.zig");
 const spinner_mod = @import("../ui/spinner.zig");
@@ -66,6 +68,12 @@ var g_active_agent: ?*AgentLoop = null;
 fn agentToolListener(tool_name: []const u8, is_error: bool) void {
     if (g_active_agent) |agent| {
         agent.onToolCompleted(tool_name, is_error);
+    }
+}
+
+fn watchdogInterruptHandler() void {
+    if (g_active_agent) |agent| {
+        agent.engine.requestInterrupt();
     }
 }
 
@@ -231,6 +239,11 @@ pub const AgentLoop = struct {
     /// Progress summary from last act (injected as advisory before each new act).
     progress_summary_buf: [512]u8 = undefined,
     progress_summary_len: usize = 0,
+
+    /// 3-Thread Coordinator & State Monitor (RFC-015)
+    coordinator: *act_queue.ActCoordinator,
+    /// Thread 2 Watchdog Monitor
+    watchdog: ?*watchdog_mod.Watchdog = null,
 
     pub fn setPlan(self: *AgentLoop, summary: []const u8) void {
         if (!self.plan_active) {
@@ -408,6 +421,19 @@ pub const AgentLoop = struct {
             }
         }
 
+        const coordinator = act_queue.ActCoordinator.init(alloc);
+        const watchdog = watchdog_mod.Watchdog.init(alloc, io, coordinator, .{
+            .tracking_interval_s = config.watchdog_tracking_interval_s,
+            .act_timeout_secs = config.act_timeout_secs,
+            .recap_interval_acts = config.watchdog_recap_interval,
+            .poll_interval_ms = config.watchdog_interval_ms,
+            .verbose_stderr = config.action_loop_display,
+        });
+        watchdog.interrupt_fn = &watchdogInterruptHandler;
+        watchdog.start() catch |e| {
+            if (!utils.isSubagent()) main.stderrPrint("[agent] Warning: Failed to start Watchdog thread: {s}\n", .{@errorName(e)});
+        };
+
         return .{
             .alloc = alloc,
             .io = io,
@@ -425,11 +451,18 @@ pub const AgentLoop = struct {
             .pg_store = pg_store_ptr,
             .last_executed_tool = null,
             .recent_tools = .empty,
+            .coordinator = coordinator,
+            .watchdog = watchdog,
         };
     }
 
     /// Releases memory.
     pub fn deinit(self: *AgentLoop) void {
+        if (self.watchdog) |wd| {
+            wd.deinit();
+            self.watchdog = null;
+        }
+        self.coordinator.deinit();
         if (self.snapshot_tracker) |*t| {
             snapshot_mod.setTracker(null);
             t.deinit();
@@ -876,7 +909,15 @@ pub const AgentLoop = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !StepResult {
-        if (signals.isInterrupted()) return error.Interrupted;
+        if (signals.isInterrupted() or self.coordinator.isTimedOut()) return error.Interrupted;
+
+        // Check for Watchdog 3-act recap advisory
+        if (self.coordinator.popPendingRecapAdvisory()) |advisory| {
+            defer self.alloc.free(advisory);
+            try self.history.addUser(advisory);
+        }
+
+        self.coordinator.updateStatus(act_id, .calling_llm, "Calling LLM backend");
 
         if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
             if (act_id > 1) {
@@ -1140,6 +1181,7 @@ pub const AgentLoop = struct {
 
                 signals.registerActiveEngine(self.engine);
                 defer signals.registerActiveEngine(null);
+                self.coordinator.updateStatus(act_id, .executing_codeact, "Running QuickJS script");
 
                 var res = self.engine.eval(js_code, "agent_codeact.js") catch |e| {
                     media_gen_tool.clearTurnAttachments(self.alloc);
@@ -1463,6 +1505,11 @@ pub const AgentLoop = struct {
         } else |_| {}
 
         self.last_act_failed = is_error;
+        self.coordinator.recordToolExecution(
+            tool_name,
+            std.hash.Fnv1a_64.hash(tool_name),
+            isReadOnlyTool(tool_name),
+        );
     }
 
     /// `text_cb`: invoked with each text chunk as AI streams.
@@ -1475,8 +1522,56 @@ pub const AgentLoop = struct {
         return self.processInputWithImages(user_text, &.{}, text_cb, think_cb);
     }
 
-    /// Process user input with optional attached image blocks (RFC-011 Media Ingestion).
+    const TurnWorkerContext = struct {
+        agent: *AgentLoop,
+        user_text: []const u8,
+        images: []const proto.ImageBlock,
+        text_cb: ?*const fn ([]const u8) void,
+        think_cb: ?*const fn ([]const u8) void,
+        result: anyerror!void = {},
+    };
+
+    fn turnWorkerThreadEntry(ctx: *TurnWorkerContext) void {
+        ctx.result = ctx.agent.executeTurnWorker(
+            ctx.user_text,
+            ctx.images,
+            ctx.text_cb,
+            ctx.think_cb,
+        );
+    }
+
+    /// Process user input with optional attached image blocks (RFC-011 Media Ingestion, RFC-015 3-Thread Architecture).
     pub fn processInputWithImages(
+        self: *AgentLoop,
+        user_text: []const u8,
+        images: []const proto.ImageBlock,
+        text_cb: ?*const fn ([]const u8) void,
+        think_cb: ?*const fn ([]const u8) void,
+    ) !void {
+        self.coordinator.resetTurn();
+        defer self.coordinator.notifyTurnComplete();
+
+        // If inside subagent thread or child execution: execute directly
+        if (utils.isSubagent()) {
+            return self.executeTurnWorker(user_text, images, text_cb, think_cb);
+        }
+
+        var ctx = TurnWorkerContext{
+            .agent = self,
+            .user_text = user_text,
+            .images = images,
+            .text_cb = text_cb,
+            .think_cb = think_cb,
+        };
+
+        const worker_thread = try std.Thread.spawn(.{}, turnWorkerThreadEntry, .{&ctx});
+        worker_thread.join();
+
+        return ctx.result;
+    }
+
+    /// Concrete act execution running on Thread 3 (Act Executor).
+    pub fn executeTurnWorker(
         self: *AgentLoop,
         user_text: []const u8,
         images: []const proto.ImageBlock,
@@ -1832,11 +1927,15 @@ pub const AgentLoop = struct {
 
                 if (result == .exit_loop) {
                     if (self.journal) |*j| j.recordEvent(self.io, act_id, .task_completed, "Task completed") catch {};
+                    self.coordinator.finishAct(act_id, !self.last_act_failed);
+                    self.coordinator.notifyTurnComplete();
                     return;
                 }
+                self.coordinator.finishAct(act_id, !self.last_act_failed);
                 break;
             } else {
                 main.stderrPrint("\n\x1b[31m[agent] ⛔ Act {d} failed after {d} unrecoverable attempts. Terminating task.\x1b[0m\n", .{ act_id, max_retries + 1 });
+                self.coordinator.finishAct(act_id, false);
                 return error.ActRetryExhausted;
             }
             act_id += 1;
@@ -2266,6 +2365,7 @@ pub const AgentLoop = struct {
                     }
 
                     const start_tool_ms = utils.milliTimestamp();
+                    self.coordinator.updateStatus(act_id, .executing_tool, tu.name);
                     if (main.ui_repl.current_renderer) |r| {
                         r.startTool(tu.name, tu.input_json);
                     } else {

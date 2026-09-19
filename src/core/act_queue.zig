@@ -1,471 +1,289 @@
-//! act_queue.zig — Act Queue System for mini-agent.
+//! act_queue.zig — 3-Thread Act Coordinator & State Monitor (RFC-015).
 //!
-//! Provides priority-based queueing for agent acts, enabling:
-//! - Parallel execution of independent tasks
-//! - Priority-based scheduling (critical > high > normal > low)
-//! - Background execution with job handles
-//! - Session persistence for long-running tasks
+//! Provides thread-safe coordination and state observation between:
+//! - Thread 1: REPL Chat (Main Thread)
+//! - Thread 2: Watchdog Monitor (Timeout Guardian & 3-Act Trajectory Recap)
+//! - Thread 3: Act Executor (Worker Thread)
 //!
-//! ## Architecture
-//! ```
-//! User Prompt → ActQueue.enqueue() → QueueWorker.process() → ActResult
-//!                                         ↑
-//!                              Priority-based scheduling
-//! ```
-//!
-//! ## Usage
-//! ```zig
-//! var queue = ActQueue.init(allocator);
-//! defer queue.deinit();
-//!
-//! const handle = try queue.enqueue(.{
-//!     .priority = .normal,
-//!     .prompt = "Analyze this code",
-//!     .session_id = session_id,
-//! });
-//!
-//! // Later...
-//! const result = queue.waitFor(handle, timeout_ms);
-//! ```
+//! Replaces legacy multi-worker/priority queue bloat from RFC-013 with a lean,
+//! thread-safe coordinator tailored for single-turn code-centric execution.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const utils = @import("utils.zig");
 
 // ---------------------------------------------------------------------------
-// Priority Levels
+// Act Status & Monitor State
 // ---------------------------------------------------------------------------
 
-/// Act priority levels. Lower value = higher priority.
-pub const ActPriority = enum(u8) {
-    /// Critical: System alerts, plan enforcement, rate limit recovery
-    critical = 0,
-    /// High: User direct commands, urgent requests
-    high = 1,
-    /// Normal: Regular agent operations
-    normal = 2,
-    /// Low: Background tasks, prefetches, housekeeping
-    low = 3,
-    /// Idle: Cleanup, compaction, non-urgent work
-    idle = 4,
+/// Execution phase of the current act.
+pub const ActStatus = enum {
+    idle,
+    preparing,
+    calling_llm,
+    executing_codeact,
+    executing_tool,
+    recap,
+    completed,
+    failed,
+
+    pub fn asString(self: ActStatus) []const u8 {
+        return switch (self) {
+            .idle => "idle",
+            .preparing => "preparing",
+            .calling_llm => "calling_llm",
+            .executing_codeact => "executing_codeact",
+            .executing_tool => "executing_tool",
+            .recap => "recap",
+            .completed => "completed",
+            .failed => "failed",
+        };
+    }
+};
+
+/// Snapshot of the running act's status, inspected by Thread 2 (Watchdog).
+pub const ActMonitorState = struct {
+    act_id: usize = 0,
+    status: ActStatus = .idle,
+    action_desc_buf: [128]u8 = [_]u8{0} ** 128,
+    action_desc_len: usize = 0,
+    act_start_ms: i64 = 0,
+    last_heartbeat_ms: i64 = 0,
+    last_reported_10s: u32 = 0,
+    completed_acts: usize = 0,
+    is_timed_out: bool = false,
+
+    pub fn getActionDesc(self: *const ActMonitorState) []const u8 {
+        return self.action_desc_buf[0..self.action_desc_len];
+    }
+};
+
+/// Record of a tool execution for trajectory recap analysis.
+pub const ToolRecord = struct {
+    tool_name_buf: [48]u8 = [_]u8{0} ** 48,
+    tool_name_len: usize = 0,
+    args_hash: u64 = 0,
+    is_read_only: bool = false,
+    timestamp_ms: i64 = 0,
+
+    pub fn toolName(self: *const ToolRecord) []const u8 {
+        return self.tool_name_buf[0..self.tool_name_len];
+    }
 };
 
 // ---------------------------------------------------------------------------
-// Queue Item
+// Act Coordinator
 // ---------------------------------------------------------------------------
 
-/// A single act to be executed by the agent.
-pub const ActQueueItem = struct {
-    /// Unique identifier for this act.
-    id: u64,
-    /// Priority level.
-    priority: ActPriority,
-    /// Session ID this act belongs to.
-    session_id: []const u8,
-    /// User prompt/text for this act.
-    prompt: []const u8,
-    /// If true, run in isolated subagent context.
-    subagent: bool,
-    /// Timeout in seconds (0 = no timeout).
-    timeout_s: u32,
-    /// Optional callback for result notification.
-    callback: ?*const fn (*ActQueue, u64, ActResult) void,
-    /// Timestamp when this act was created.
-    created_at: i64,
-    /// Parent act ID (for chaining dependencies).
-    parent_id: ?u64 = null,
-};
+/// Coordinates turn lifecycle and shared state across the 3 threads.
+pub const ActCoordinator = struct {
+    pub const MAX_TRAJECTORY: usize = 32;
 
-// ---------------------------------------------------------------------------
-// Act Result
-// ---------------------------------------------------------------------------
-
-/// Result of executing an act.
-pub const ActResult = struct {
-    /// Whether the act completed successfully.
-    ok: bool,
-    /// Output text from the act.
-    output: []const u8,
-    /// Duration in milliseconds.
-    duration_ms: u64,
-    /// Error message if failed.
-    error_msg: ?[]const u8,
-    /// Act ID that produced this result.
-    act_id: u64,
-    /// Priority of the act.
-    priority: ActPriority,
-    /// Number of tool calls made.
-    tool_calls_count: usize,
-    /// Number of tokens used.
-    tokens_used: usize,
-};
-
-// ---------------------------------------------------------------------------
-// Act Handle
-// ---------------------------------------------------------------------------
-
-/// Handle returned when enqueuing an act.
-/// Used to poll status, wait for completion, or cancel.
-pub const ActHandle = struct {
-    /// The act ID.
-    id: u64,
-    /// Reference to the queue (for polling).
-    queue: *ActQueue,
-};
-
-// ---------------------------------------------------------------------------
-// Priority Queue Comparator
-// ---------------------------------------------------------------------------
-
-fn lessThan(ctx: void, a: ActQueueItem, b: ActQueueItem) std.math.Order {
-    _ = ctx;
-    // Lower enum value = higher priority = should come first
-    return if (@intFromEnum(a.priority) < @intFromEnum(b.priority)) .lt
-    else if (@intFromEnum(a.priority) > @intFromEnum(b.priority)) .gt
-    else .eq;
-}
-
-// ---------------------------------------------------------------------------
-// Queue Metrics
-// ---------------------------------------------------------------------------
-
-/// Metrics for monitoring queue performance.
-pub const QueueMetrics = struct {
-    enqueued: usize = 0,
-    dequeued: usize = 0,
-    completed: usize = 0,
-    failed: usize = 0,
-    cancelled: usize = 0,
-    current_queue_size: usize = 0,
-    current_running_count: usize = 0,
-};
-
-// ---------------------------------------------------------------------------
-// Act Queue
-// ---------------------------------------------------------------------------
-
-/// Priority queue for managing agent acts.
-pub const ActQueue = struct {
     alloc: Allocator,
-    /// Priority queue of pending acts.
-    pq: std.PriorityQueue(ActQueueItem, void, lessThan),
-    /// Map from act ID to act info (for running/completed).
-    acts: std.AutoHashMap(u64, ActQueueItem),
-    /// Map from act ID to result (for completed acts).
-    results: std.AutoHashMap(u64, ActResult),
-    /// Condition variable for waiting on completion.
-    signal: std.Thread.Condition,
-    /// Mutex for protecting shared state.
-    mutex: std.Thread.Mutex,
-    /// Next act ID counter.
-    next_id: u64,
-    /// Queue metrics.
-    metrics: QueueMetrics,
-    /// Maximum concurrent acts (0 = unlimited).
-    max_concurrent: usize,
-    /// Whether the queue is shutting down.
-    shutting_down: bool,
+    mutex: std.atomic.Mutex = .unlocked,
 
-    pub fn init(alloc: Allocator) ActQueue {
-        return ActQueue{
+    // Current state snapshot
+    state: ActMonitorState = .{},
+
+    // Trajectory circular buffer for 3-act recap
+    trajectory: [MAX_TRAJECTORY]ToolRecord = undefined,
+    trajectory_len: usize = 0,
+    trajectory_head: usize = 0,
+
+    // Watchdog recap advisory queue
+    pending_recap_advisory: ?[]u8 = null,
+
+    // Turn completion tracking
+    turn_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    turn_completed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    pub fn init(alloc: Allocator) *ActCoordinator {
+        const self = alloc.create(ActCoordinator) catch @panic("OOM init ActCoordinator");
+        self.* = ActCoordinator{
             .alloc = alloc,
-            .pq = std.PriorityQueue(ActQueueItem, void, lessThan).initContext({}),
-            .acts = std.AutoHashMap(u64, ActQueueItem).init(alloc),
-            .results = std.AutoHashMap(u64, ActResult).init(alloc),
-            .signal = .{},
-            .mutex = .{},
-            .next_id = 1,
-            .metrics = .{},
-            .max_concurrent = 0,
-            .shutting_down = false,
         };
+        return self;
     }
 
-    pub fn deinit(self: *ActQueue) void {
-        // Drain remaining items
-        while (self.pq.pop()) |item| {
-            self.alloc.free(item.prompt);
-            self.alloc.free(item.session_id);
+    pub fn deinit(self: *ActCoordinator) void {
+        self.lock();
+        if (self.pending_recap_advisory) |adv| {
+            self.alloc.free(adv);
+            self.pending_recap_advisory = null;
         }
-        self.pq.deinit(self.alloc);
-        self.acts.deinit();
-        self.results.deinit();
+        self.unlock();
+        self.alloc.destroy(self);
     }
 
-    /// Enqueue a new act. Returns ActHandle for tracking.
-    pub fn enqueue(self: *ActQueue, item: ActQueueItem) ActHandle {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn lock(self: *ActCoordinator) void {
+        while (!self.mutex.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
+    }
 
-        // Assign ID if not set
-        var actual_item = item;
-        if (actual_item.id == 0) {
-            actual_item.id = self.next_id;
-            self.next_id += 1;
+    pub fn unlock(self: *ActCoordinator) void {
+        self.mutex.unlock();
+    }
+
+    /// Reset state at the start of a new turn (Thread 1 / Thread 3).
+    pub fn resetTurn(self: *ActCoordinator) void {
+        self.lock();
+        defer self.unlock();
+
+        self.state.act_id = 0;
+        self.state.status = .preparing;
+        self.state.action_desc_len = 0;
+        self.state.act_start_ms = utils.milliTimestamp();
+        self.state.last_heartbeat_ms = self.state.act_start_ms;
+        self.state.last_reported_10s = 0;
+        self.state.completed_acts = 0;
+        self.state.is_timed_out = false;
+
+        self.trajectory_len = 0;
+        self.trajectory_head = 0;
+
+        if (self.pending_recap_advisory) |adv| {
+            self.alloc.free(adv);
+            self.pending_recap_advisory = null;
         }
 
-        // Store the act
-        self.acts.put(actual_item.id, actual_item) catch unreachable;
+        self.turn_active.store(true, .seq_cst);
+        self.turn_completed.store(false, .seq_cst);
+    }
 
-        // Add to priority queue
-        try self.pq.push(self.alloc, actual_item) catch unreachable;
+    /// Update status of the current act (called by Thread 3 Act Executor).
+    pub fn updateStatus(self: *ActCoordinator, act_id: usize, status: ActStatus, action_desc: []const u8) void {
+        self.lock();
+        defer self.unlock();
 
-        // Update metrics
-        self.metrics.enqueued += 1;
-        self.metrics.current_queue_size += 1;
+        const now = utils.milliTimestamp();
+        if (self.state.act_id != act_id) {
+            self.state.act_id = act_id;
+            self.state.act_start_ms = now;
+            self.state.last_reported_10s = 0;
+        }
+        self.state.status = status;
+        self.state.last_heartbeat_ms = now;
 
-        // Notify waiting threads
-        self.signal.notify();
+        const copy_len = @min(action_desc.len, self.state.action_desc_buf.len);
+        @memcpy(self.state.action_desc_buf[0..copy_len], action_desc[0..copy_len]);
+        self.state.action_desc_len = copy_len;
+    }
 
-        return ActHandle{
-            .id = actual_item.id,
-            .queue = self,
+    /// Extend heartbeat during long streaming or tool execution.
+    pub fn renewHeartbeat(self: *ActCoordinator) void {
+        self.lock();
+        defer self.unlock();
+        self.state.last_heartbeat_ms = utils.milliTimestamp();
+    }
+
+    /// Record a tool execution into the trajectory history.
+    pub fn recordToolExecution(self: *ActCoordinator, tool_name: []const u8, args_hash: u64, is_read_only: bool) void {
+        self.lock();
+        defer self.unlock();
+
+        var rec: ToolRecord = .{
+            .args_hash = args_hash,
+            .is_read_only = is_read_only,
+            .timestamp_ms = utils.milliTimestamp(),
         };
-    }
+        const name_len = @min(tool_name.len, rec.tool_name_buf.len);
+        @memcpy(rec.tool_name_buf[0..name_len], tool_name[0..name_len]);
+        rec.tool_name_len = name_len;
 
-    /// Dequeue the highest priority act. Returns null if queue is empty.
-    pub fn dequeue(self: *ActQueue) ?ActQueueItem {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.pq.items.len == 0) return null;
-
-        const item = self.pq.pop().?;
-        self.metrics.current_queue_size -= 1;
-        self.metrics.dequeued += 1;
-
-        return item;
-    }
-
-    /// Wait for an act to complete. Returns ActResult or error.Timeout.
-    pub fn waitFor(self: *ActQueue, handle: ActHandle, timeout_ms: u64) !ActResult {
-        const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        while (true) {
-            // Check if completed
-            if (self.results.get(handle.id)) |result| {
-                return result;
-            }
-
-            // Check timeout
-            const now = std.time.milliTimestamp();
-            if (now >= deadline) {
-                return error.Timeout;
-            }
-
-            // Wait with timeout
-            const remaining = deadline - now;
-            if (!self.signal.timedWait(&self.mutex, remaining)) {
-                // Check again after wakeup
-                if (self.results.get(handle.id)) |result| {
-                    return result;
-                }
-                return error.Timeout;
-            }
+        const idx = (self.trajectory_head + self.trajectory_len) % MAX_TRAJECTORY;
+        self.trajectory[idx] = rec;
+        if (self.trajectory_len < MAX_TRAJECTORY) {
+            self.trajectory_len += 1;
+        } else {
+            self.trajectory_head = (self.trajectory_head + 1) % MAX_TRAJECTORY;
         }
     }
 
-    /// Cancel an act. Returns true if cancelled, false if not found or already running.
-    pub fn cancel(self: *ActQueue, id: u64) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    /// Mark current act finished.
+    pub fn finishAct(self: *ActCoordinator, act_id: usize, is_success: bool) void {
+        self.lock();
+        defer self.unlock();
 
-        // Try to remove from queue
-        var found = false;
+        _ = act_id;
+        self.state.status = if (is_success) .completed else .failed;
+        self.state.completed_acts += 1;
+        self.state.last_heartbeat_ms = utils.milliTimestamp();
+    }
+
+    /// Mark turn completed.
+    pub fn notifyTurnComplete(self: *ActCoordinator) void {
+        self.lock();
+        self.state.status = .idle;
+        self.unlock();
+
+        self.turn_active.store(false, .seq_cst);
+        self.turn_completed.store(true, .seq_cst);
+    }
+
+    /// Flag timeout intervention by Watchdog (Thread 2).
+    pub fn setTimedOut(self: *ActCoordinator, timed_out: bool) void {
+        self.lock();
+        defer self.unlock();
+        self.state.is_timed_out = timed_out;
+    }
+
+    /// Check if current act timed out.
+    pub fn isTimedOut(self: *ActCoordinator) bool {
+        self.lock();
+        defer self.unlock();
+        return self.state.is_timed_out;
+    }
+
+    /// Thread 2 (Watchdog) updates the 10s reporting milestone.
+    pub fn updateLastReported10s(self: *ActCoordinator, bucket: u32) void {
+        self.lock();
+        defer self.unlock();
+        self.state.last_reported_10s = bucket;
+    }
+
+    /// Store a Watchdog 3-act recap advisory to be injected into the next act.
+    pub fn setPendingRecapAdvisory(self: *ActCoordinator, advisory: []const u8) !void {
+        self.lock();
+        defer self.unlock();
+
+        if (self.pending_recap_advisory) |old| {
+            self.alloc.free(old);
+        }
+        self.pending_recap_advisory = try self.alloc.dupe(u8, advisory);
+    }
+
+    /// Thread 3 (Act Executor) consumes any pending recap advisory before starting an act.
+    pub fn popPendingRecapAdvisory(self: *ActCoordinator) ?[]u8 {
+        self.lock();
+        defer self.unlock();
+
+        const adv = self.pending_recap_advisory;
+        self.pending_recap_advisory = null;
+        return adv;
+    }
+
+    /// Get current monitor state snapshot (Thread 2 Watchdog reads this).
+    pub fn getMonitorState(self: *ActCoordinator) ActMonitorState {
+        self.lock();
+        defer self.unlock();
+        return self.state;
+    }
+
+    /// Retrieve copy of recent tool records for trajectory analysis.
+    pub fn getRecentToolRecords(self: *ActCoordinator, out: []ToolRecord) usize {
+        self.lock();
+        defer self.unlock();
+
+        const count = @min(out.len, self.trajectory_len);
         var i: usize = 0;
-        while (i < self.pq.items.len) {
-            if (self.pq.items[i].id == id) {
-                // Swap with last and remove
-                const last = self.pq.items.len - 1;
-                if (i != last) {
-                    self.pq.items[i] = self.pq.items[last];
-                    self.pq.siftUp(i);
-                    self.pq.siftDown(i);
-                } else {
-                    _ = self.pq.remove();
-                }
-                found = true;
-                break;
-            }
-            i += 1;
+        while (i < count) : (i += 1) {
+            // Read in chronological order starting from oldest in window
+            const start_offset = self.trajectory_len - count;
+            const ring_idx = (self.trajectory_head + start_offset + i) % MAX_TRAJECTORY;
+            out[i] = self.trajectory[ring_idx];
         }
-
-        if (found) {
-            self.metrics.current_queue_size -= 1;
-            self.metrics.cancelled += 1;
-            return true;
-        }
-
-        // Check if already running/completed
-        return self.acts.get(id) != null and self.results.get(id) == null;
-    }
-
-    /// Get status of an act.
-    pub fn getStatus(self: *const ActQueue, id: u64) ?enum { pending, running, completed, failed, cancelled } {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.results.get(id)) |_| {
-            return .completed;
-        }
-        if (self.acts.get(id)) |_| {
-            // Check if still in queue
-            for (self.pq.items) |item| {
-                if (item.id == id) return .pending;
-            }
-            return .running;
-        }
-        return null;
-    }
-
-    /// Get next act without removing from queue (peek).
-    pub fn peek(self: *const ActQueue) ?ActQueueItem {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.pq.items.len == 0) return null;
-        return self.pq.items[0];
-    }
-
-    /// Get current queue size.
-    pub fn size(self: *const ActQueue) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.pq.items.len;
-    }
-
-    /// Get metrics snapshot.
-    pub fn getMetrics(self: *const ActQueue) QueueMetrics {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.metrics;
-    }
-
-    /// Signal completion of an act. Called by executor.
-    pub fn complete(self: *ActQueue, id: u64, result: ActResult) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        self.results.put(id, result) catch {};
-        self.metrics.completed += 1;
-        self.metrics.current_running_count -= 1;
-        self.signal.notify();
-    }
-
-    /// Signal failure of an act.
-    pub fn fail(self: *ActQueue, id: u64, error_msg: []const u8, duration_ms: u64) void {
-        const result = ActResult{
-            .ok = false,
-            .output = "",
-            .duration_ms = duration_ms,
-            .error_msg = error_msg,
-            .act_id = id,
-            .priority = .normal,
-            .tool_calls_count = 0,
-            .tokens_used = 0,
-        };
-        self.complete(id, result);
-        self.metrics.failed += 1;
-    }
-
-    /// Wait until queue is empty or timeout.
-    pub fn waitEmpty(self: *ActQueue, timeout_ms: u64) bool {
-        const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        while (self.pq.items.len > 0 or self.metrics.current_running_count > 0) {
-            const now = std.time.milliTimestamp();
-            if (now >= deadline) return false;
-
-            const remaining = deadline - now;
-            if (!self.signal.timedWait(&self.mutex, remaining)) {
-                return self.pq.items.len == 0 and self.metrics.current_running_count == 0;
-            }
-        }
-        return true;
-    }
-
-    /// Check if queue is empty.
-    pub fn isEmpty(self: *const ActQueue) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.pq.items.len == 0;
-    }
-
-    /// Clear all pending acts.
-    pub fn clear(self: *ActQueue) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        while (self.pq.pop()) |item| {
-            self.alloc.free(item.prompt);
-            self.alloc.free(item.session_id);
-        }
-        self.pq.clearAndFree(self.alloc);
-        self.metrics.current_queue_size = 0;
-    }
-
-    /// Start shutdown sequence.
-    pub fn startShutdown(self: *ActQueue) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.shutting_down = true;
-        self.signal.notifyAll();
-    }
-
-    /// Check if shutting down.
-    pub fn isShuttingDown(self: *const ActQueue) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.shutting_down;
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Thread-safe Queue Iterator
-// ---------------------------------------------------------------------------
-
-/// Iterator for processing queue items.
-pub const QueueIterator = struct {
-    queue: *ActQueue,
-    stopped: bool,
-
-    pub fn init(queue: *ActQueue) QueueIterator {
-        return .{ .queue = queue, .stopped = false };
-    }
-
-    /// Get next item, blocking until available or stopped.
-    pub fn next(self: *QueueIterator, timeout_ms: u64) ?ActQueueItem {
-        const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-
-        while (true) {
-            if (self.stopped) return null;
-
-            self.queue.mutex.lock();
-            const item = self.queue.pq.popOrNull();
-            if (item != null) {
-                self.queue.mutex.unlock();
-                return item.?;
-            }
-            self.queue.mutex.unlock();
-
-            // Check timeout
-            const now = std.time.milliTimestamp();
-            if (now >= deadline) return null;
-
-            // Wait for notification
-            std.time.sleep(10 * std.time.ms_per_s); // 10ms poll interval
-        }
-    }
-
-    /// Stop the iterator.
-    pub fn stop(self: *QueueIterator) void {
-        self.stopped = true;
+        return count;
     }
 };
 
@@ -473,98 +291,47 @@ pub const QueueIterator = struct {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "act_queue: basic enqueue/dequeue" {
-    var queue = ActQueue.init(std.testing.allocator);
-    defer queue.deinit();
+test "ActCoordinator: turn lifecycle and state updates" {
+    const alloc = std.testing.allocator;
+    var coord = ActCoordinator.init(alloc);
+    defer coord.deinit();
 
-    const item = ActQueueItem{
-        .id = 0,
-        .priority = .normal,
-        .session_id = "test-session",
-        .prompt = "Test prompt",
-        .subagent = false,
-        .timeout_s = 0,
-        .callback = null,
-        .created_at = 0,
-    };
+    coord.resetTurn();
+    var state = coord.getMonitorState();
+    try std.testing.expectEqual(ActStatus.preparing, state.status);
+    try std.testing.expectEqual(@as(usize, 0), state.completed_acts);
 
-    const handle = queue.enqueue(item);
-    try std.testing.expectEqual(@as(u64, 1), handle.id);
-    try std.testing.expectEqual(@as(usize, 1), queue.size());
+    coord.updateStatus(1, .calling_llm, "Calling OpenAI GPT-4o");
+    state = coord.getMonitorState();
+    try std.testing.expectEqual(ActStatus.calling_llm, state.status);
+    try std.testing.expectEqualStrings("Calling OpenAI GPT-4o", state.getActionDesc());
 
-    const dequeued = queue.dequeue() orelse unreachable;
-    try std.testing.expectEqualSlices(u8, "Test prompt", dequeued.prompt);
-    try std.testing.expectEqual(@as(usize, 0), queue.size());
+    coord.recordToolExecution("file_read", 12345, true);
+    coord.recordToolExecution("grep", 67890, true);
+    coord.finishAct(1, true);
+
+    state = coord.getMonitorState();
+    try std.testing.expectEqual(ActStatus.completed, state.status);
+    try std.testing.expectEqual(@as(usize, 1), state.completed_acts);
+
+    var tools: [4]ToolRecord = undefined;
+    const n = coord.getRecentToolRecords(&tools);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("file_read", tools[0].toolName());
+    try std.testing.expectEqualStrings("grep", tools[1].toolName());
 }
 
-test "act_queue: priority ordering" {
-    var queue = ActQueue.init(std.testing.allocator);
-    defer queue.deinit();
+test "ActCoordinator: pending recap advisory queue" {
+    const alloc = std.testing.allocator;
+    var coord = ActCoordinator.init(alloc);
+    defer coord.deinit();
 
-    // Enqueue in reverse priority order
-    _ = queue.enqueue(ActQueueItem{ .id = 0, .priority = .low, .session_id = "s", .prompt = "low", .subagent = false, .timeout_s = 0, .callback = null, .created_at = 0 });
-    _ = queue.enqueue(ActQueueItem{ .id = 0, .priority = .critical, .session_id = "s", .prompt = "critical", .subagent = false, .timeout_s = 0, .callback = null, .created_at = 0 });
-    _ = queue.enqueue(ActQueueItem{ .id = 0, .priority = .high, .session_id = "s", .prompt = "high", .subagent = false, .timeout_s = 0, .callback = null, .created_at = 0 });
+    try coord.setPendingRecapAdvisory("[Watchdog Recap]: Checkpoint triggered");
+    const adv_opt = coord.popPendingRecapAdvisory();
+    try std.testing.expect(adv_opt != null);
+    defer alloc.free(adv_opt.?);
+    try std.testing.expectEqualStrings("[Watchdog Recap]: Checkpoint triggered", adv_opt.?);
 
-    // Should dequeue in priority order: critical, high, low
-    const first = queue.dequeue() orelse unreachable;
-    try std.testing.expectEqualStrings("critical", first.prompt);
-
-    const second = queue.dequeue() orelse unreachable;
-    try std.testing.expectEqualStrings("high", second.prompt);
-
-    const third = queue.dequeue() orelse unreachable;
-    try std.testing.expectEqualStrings("low", third.prompt);
-}
-
-test "act_queue: cancel" {
-    var queue = ActQueue.init(std.testing.allocator);
-    defer queue.deinit();
-
-    const handle = queue.enqueue(ActQueueItem{ .id = 0, .priority = .normal, .session_id = "s", .prompt = "cancel me", .subagent = false, .timeout_s = 0, .callback = null, .created_at = 0 });
-    try std.testing.expect(queue.cancel(handle.id));
-    try std.testing.expectEqual(@as(usize, 0), queue.size());
-}
-
-test "act_queue: wait for completion" {
-    var queue = ActQueue.init(std.testing.allocator);
-    defer queue.deinit();
-
-    const handle = queue.enqueue(ActQueueItem{ .id = 0, .priority = .normal, .session_id = "s", .prompt = "complete me", .subagent = false, .timeout_s = 0, .callback = null, .created_at = 0 });
-
-    // Simulate completion in another thread
-    const handle_id = handle.id;
-    std.Thread.spawn(.{}, struct {
-        fn run(ctx: *struct { queue: *ActQueue, handle_id: u64 }) void {
-            ctx.queue.complete(ctx.handle_id, ActResult{
-                .ok = true,
-                .output = "done",
-                .duration_ms = 100,
-                .error_msg = null,
-                .act_id = ctx.handle_id,
-                .priority = .normal,
-                .tool_calls_count = 2,
-                .tokens_used = 100,
-            });
-        }
-    }.run, .{ .queue = &queue, .handle_id = handle_id }).detach();
-
-    const result = queue.waitFor(handle, 1000) catch unreachable;
-    try std.testing.expect(result.ok);
-    try std.testing.expectEqualStrings("done", result.output);
-}
-
-test "act_queue: timeout" {
-    var queue = ActQueue.init(std.testing.allocator);
-    defer queue.deinit();
-
-    const handle = queue.enqueue(ActQueueItem{ .id = 0, .priority = .normal, .session_id = "s", .prompt = "timeout me", .subagent = false, .timeout_s = 0, .callback = null, .created_at = 0 });
-
-    // Never complete — should timeout
-    const result = queue.waitFor(handle, 50) catch |err| {
-        try std.testing.expectEqual(error.Timeout, err);
-        return;
-    };
-    try std.testing.expect(false); // Should not reach here
-    _ = result;
+    // Popping again should yield null
+    try std.testing.expect(coord.popPendingRecapAdvisory() == null);
 }

@@ -405,7 +405,13 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
 
     // --- Collect headers using std HeaderIterator ---
     var header_list = std.ArrayList(Response.Header).empty;
-    defer header_list.deinit(alloc);
+    defer {
+        for (header_list.items) |h| {
+            alloc.free(h.name);
+            alloc.free(h.value);
+        }
+        header_list.deinit(alloc);
+    }
     if (response.head.bytes.len > 0) {
         var it = response.head.iterateHeaders();
         while (it.next()) |h| {
@@ -453,11 +459,7 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
     const base = try alloc.alloc(u8, total_len);
     errdefer alloc.free(base);
 
-    // Once copied, free temporary duplicates in header_list (avoid leaks).
-    defer for (header_list.items) |h| {
-        alloc.free(h.name);
-        alloc.free(h.value);
-    };
+
 
     var off: usize = 0;
     // reason
