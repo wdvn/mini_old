@@ -1150,36 +1150,13 @@ pub const AgentLoop = struct {
                     }
                 }
 
+                // Plan completion: mutating CodeAct script means the model is executing its plan.
                 if (self.plan_active and !isPlanOnlyRequest(self.current_user_request)) {
                     if (std.mem.indexOf(u8, js_code, "file_edit") != null or
                         std.mem.indexOf(u8, js_code, "file_write") != null or
                         std.mem.indexOf(u8, js_code, "write") != null)
                     {
                         self.clearPlan();
-                    } else if (std.mem.indexOf(u8, js_code, "file_read") != null or
-                        std.mem.indexOf(u8, js_code, "grep") != null or
-                        std.mem.indexOf(u8, js_code, "glob") != null or
-                        std.mem.indexOf(u8, js_code, "list_dir") != null)
-                    {
-                        self.plan_procrastination_count += 1;
-                        if (self.plan_procrastination_count >= self.plan_procrastination_cap) {
-                            main.stderrPrint(
-                                "\n\x1b[31m[watchdog] ⛔ CodeAct Plan Procrastination Blocked: Active plan must be executed immediately.\x1b[0m\n",
-                                .{},
-                            );
-                            if (main.ui_repl.current_renderer) |r| {
-                                r.ensureNewline();
-                                r.write(" \x1b[31m[Plan Watchdog: CodeAct script blocked. Plan execution required]\x1b[0m\n");
-                            }
-                            var err_buf = utils.BufWriter.init(self.alloc);
-                            defer err_buf.deinit();
-                            try err_buf.print(
-                                "[Plan Watchdog Intercept]: CodeAct execution denied. You declared an active plan ('{s}') but have performed {d} consecutive read-only/exploratory calls in JavaScript instead of executing it. Stop inspecting. You MUST immediately execute your plan using mini.file_edit or modifying code.",
-                                .{ self.getPlanSummary(), self.plan_procrastination_count },
-                            );
-                            try self.history.addUser(err_buf.list.items);
-                            return .continue_loop;
-                        }
                     }
                 }
 
@@ -2357,46 +2334,11 @@ pub const AgentLoop = struct {
                         };
                     }
 
-                    // Plan Watchdog enforcement:
-                    var watchdog_suffix: ?[]u8 = null;
-                    defer if (watchdog_suffix) |ws| self.alloc.free(ws);
-
-                    if (self.plan_active and !isPlanOnlyRequest(self.current_user_request)) {
-                        if (isExploratoryToolCall(tu.name, tu.input_json)) {
-                            self.plan_procrastination_count += 1;
-                            if (self.plan_procrastination_count >= self.plan_procrastination_cap) {
-                                main.stderrPrint(
-                                    "\n\x1b[31m[watchdog] ⛔ Plan Procrastination Blocked: Tool '{s}' denied. Active plan must be executed immediately.\x1b[0m\n",
-                                    .{tu.name},
-                                );
-                                if (main.ui_repl.current_renderer) |r| {
-                                    r.ensureNewline();
-                                    r.write(" \x1b[31m[Plan Watchdog: Tool blocked. Plan execution required]\x1b[0m\n");
-                                }
-                                const block_msg = try std.fmt.allocPrint(
-                                    self.alloc,
-                                    "[Plan Watchdog Intercept]: Action denied. You declared an active plan ('{s}') but have performed {d} consecutive read-only/exploratory calls instead of executing it. Stop inspecting or searching. You MUST immediately execute the next step of your plan (e.g. modify files using file_edit or run implementation commands).",
-                                    .{ self.getPlanSummary(), self.plan_procrastination_count },
-                                );
-                                try allocated_strings.append(self.alloc, block_msg);
-                                try results.append(self.alloc, .{
-                                    .tool_use_id = tu.id,
-                                    .content = block_msg,
-                                    .is_error = true,
-                                });
-                                any_tool_err = true;
-                                continue;
-                            } else if (self.plan_procrastination_count == 1) {
-                                watchdog_suffix = std.fmt.allocPrint(
-                                    self.alloc,
-                                    "\n\n[Plan Watchdog Warning]: You previously committed to an implementation plan ('{s}'). You are performing an exploratory read-only tool call ({d}/{d}). You must begin executing your plan (e.g. file_edit or implementation commands) in the next act; further exploratory tool calls will be hard-blocked.",
-                                    .{ self.getPlanSummary(), self.plan_procrastination_count, self.plan_procrastination_cap },
-                                ) catch null;
-                            }
-                        } else {
-                            // Non-exploratory tool call: model is executing its plan
-                            self.clearPlan();
-                        }
+                    // Plan completion: non-exploratory tool call means the model is executing its plan.
+                    if (self.plan_active and !isPlanOnlyRequest(self.current_user_request) and
+                        !isExploratoryToolCall(tu.name, tu.input_json))
+                    {
+                        self.clearPlan();
                     }
 
                     const start_tool_ms = utils.milliTimestamp();
@@ -2451,7 +2393,6 @@ pub const AgentLoop = struct {
                     var merged_suffix = utils.BufWriter.init(self.alloc);
                     defer merged_suffix.deinit();
                     if (warn_suffix) |ws| try merged_suffix.writeAll(ws);
-                    if (watchdog_suffix) |wds| try merged_suffix.writeAll(wds);
 
                     const final_content = if (merged_suffix.list.items.len > 0) blk: {
                         const merged = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ truncated, merged_suffix.list.items });
