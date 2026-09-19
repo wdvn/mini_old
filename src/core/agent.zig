@@ -212,6 +212,9 @@ pub const AgentLoop = struct {
     recent_tools: std.ArrayListUnmanaged([]u8) = .empty,
     /// Action Loop Guard: tool signatures executed in current turn.
     turn_tool_records: std.ArrayListUnmanaged(ToolCallRecord) = .empty,
+    /// Hard dedupe cache: recent read-only tool results served on exact repeat
+    /// instead of re-execution (mechanical replay-loop barrier).
+    tool_cache: std.ArrayListUnmanaged(ToolCacheEntry) = .empty,
     /// 3D Procedural Map trajectory tracking for orbit detection and Checkpoint & Recap.
     turn_tool_trajectory: std.ArrayListUnmanaged([]u8) = .empty,
     /// Consecutive identical tool call counter.
@@ -282,6 +285,13 @@ pub const AgentLoop = struct {
     pub const ToolCallRecord = struct {
         name: []u8,
         args_hash: u64,
+    };
+
+    /// Cached result of a previously executed read-only tool call (per turn).
+    pub const ToolCacheEntry = struct {
+        name: []u8,
+        args_hash: u64,
+        result: []u8,
     };
 
     pub const LoopReason = enum {
@@ -655,7 +665,9 @@ pub const AgentLoop = struct {
     /// macro-cycle alternating sequence, or read-only exploratory budget exceeded).
     pub fn checkActionLoop(self: *AgentLoop, tool_name: []const u8, input_json: []const u8) !LoopCheckResult {
         const trimmed = std.mem.trim(u8, input_json, " \t\r\n");
-        const args_hash = std.hash.Wyhash.hash(0, trimmed);
+        // Whitespace-insensitive hash: replays after truncation often re-serialize
+        // the same JSON with different formatting; treat them as identical calls.
+        const args_hash = fuzzyArgsHash(trimmed);
 
         // 1. Update read-only exploratory counter
         if (isReadOnlyTool(tool_name)) {
@@ -777,6 +789,7 @@ pub const AgentLoop = struct {
             self.alloc.free(rec.name);
         }
         self.turn_tool_records.clearRetainingCapacity();
+        self.clearToolCache();
         for (self.turn_tool_trajectory.items) |t| {
             self.alloc.free(t);
         }
@@ -790,6 +803,81 @@ pub const AgentLoop = struct {
         self.clearTurnToolRecords();
         self.turn_tool_records.deinit(self.alloc);
         self.turn_tool_trajectory.deinit(self.alloc);
+        self.clearToolCache();
+        self.tool_cache.deinit(self.alloc);
+    }
+
+    /// Frees all cached tool results (called on turn reset and deinit).
+    pub fn clearToolCache(self: *AgentLoop) void {
+        for (self.tool_cache.items) |entry| {
+            self.alloc.free(entry.name);
+            self.alloc.free(entry.result);
+        }
+        self.tool_cache.clearRetainingCapacity();
+    }
+
+    /// Whitespace-insensitive args hash: collapses runs of whitespace outside of
+    /// nothing (JSON args are compact strings; escaping keeps structure intact) so
+    /// that a replayed tool call with re-serialized JSON still matches the original
+    /// signature. Falls back to exact bytes when normalization is unnecessary.
+    pub fn fuzzyArgsHash(input_json: []const u8) u64 {
+        var h = std.hash.Wyhash.init(0);
+        var i: usize = 0;
+        var in_string = false;
+        var prev_space = false;
+        while (i < input_json.len) : (i += 1) {
+            const c = input_json[i];
+            if (in_string) {
+                h.update(&[_]u8{c});
+                if (c == '\\' and i + 1 < input_json.len) {
+                    i += 1;
+                    h.update(&[_]u8{input_json[i]});
+                } else if (c == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                in_string = true;
+                prev_space = false;
+                h.update(&[_]u8{c});
+                continue;
+            }
+            if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+                // Collapse whitespace runs outside strings into a single marker.
+                if (!prev_space) h.update(&[_]u8{' '});
+                prev_space = true;
+                continue;
+            }
+            prev_space = false;
+            h.update(&[_]u8{c});
+        }
+        return h.final();
+    }
+
+    /// Looks up a cached result for a read-only tool call with matching args.
+    /// Returns the cached result slice (owned by tool_cache, valid until clearToolCache).
+    fn lookupToolCache(self: *AgentLoop, tool_name: []const u8, args_hash: u64) ?[]const u8 {
+        for (self.tool_cache.items) |entry| {
+            if (entry.args_hash == args_hash and std.mem.eql(u8, entry.name, tool_name)) {
+                return entry.result;
+            }
+        }
+        return null;
+    }
+
+    /// Stores a tool result in the per-turn dedupe cache (cap 8 entries, FIFO eviction).
+    fn storeToolCache(self: *AgentLoop, tool_name: []const u8, args_hash: u64, result: []const u8) !void {
+        if (self.tool_cache.items.len >= 8) {
+            const oldest = self.tool_cache.orderedRemove(0);
+            self.alloc.free(oldest.name);
+            self.alloc.free(oldest.result);
+        }
+        try self.tool_cache.append(self.alloc, .{
+            .name = try self.alloc.dupe(u8, tool_name),
+            .args_hash = args_hash,
+            .result = try self.alloc.dupe(u8, result),
+        });
     }
 
     /// Saves the latest backend error context for subsequent journal recordError.
@@ -1328,6 +1416,11 @@ pub const AgentLoop = struct {
                     return .exit_loop;
                 }
                 main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response truncated (max_tokens), requesting continuation ({d}/5)...\x1b[0m\n", .{self.max_tokens_continues});
+                // Close out orphaned tool_use blocks: any tool call present in the
+                // truncated response was recorded in history but never executed.
+                // Synthesizing a tool_result tells the model the call is already
+                // "answered", preventing mechanical replay of the same call.
+                try self.closeOrphanedToolUses(&response);
                 var buf = utils.BufWriter.init(self.alloc);
                 defer buf.deinit();
                 try buf.print(
@@ -1388,6 +1481,8 @@ pub const AgentLoop = struct {
                 // Partial text present: treat like truncation — ask model to continue.
                 self.last_act_failed = true;
                 main.stderrPrint("\n\x1b[33m[agent] ⚠️ Stream stalled mid-response, requesting continuation...\x1b[0m\n", .{});
+                // Close out orphaned tool_use blocks (same rationale as max_tokens).
+                try self.closeOrphanedToolUses(&response);
                 const note = "[System] The previous response was interrupted because the model stream went silent (idle watchdog). Continue EXACTLY from where it stopped — do not repeat already written content.";
                 try self.history.addUser(note);
                 return .continue_loop;
@@ -2208,6 +2303,43 @@ pub const AgentLoop = struct {
         tool_count: usize,
     };
 
+    /// Synthesizes `tool_result` blocks (is_error=true) for tool_use blocks present
+    /// in a truncated/aborted response. Those tool calls were recorded in history
+    /// via addAssistantResponse but will never be executed — without a matching
+    /// result the model tends to replay the entire call from scratch. Marking them
+    /// as "interrupted" closes the protocol loop and steers the model to continue
+    /// from where it stopped instead.
+    fn closeOrphanedToolUses(self: *AgentLoop, response: *const proto.Response) !void {
+        var results = ArrayList(proto.ToolResult).empty;
+        defer results.deinit(self.alloc);
+        var allocated = ArrayList([]u8).empty;
+        defer {
+            for (allocated.items) |s| self.alloc.free(s);
+            allocated.deinit(self.alloc);
+        }
+        for (response.content.items) |block| {
+            switch (block) {
+                .tool_use => |tu| {
+                    const msg = try std.fmt.allocPrint(
+                        self.alloc,
+                        "[interrupted: this tool call was truncated before execution — do NOT re-issue it; continue from where the response stopped]",
+                        .{},
+                    );
+                    try allocated.append(self.alloc, msg);
+                    try results.append(self.alloc, .{
+                        .tool_use_id = tu.id,
+                        .content = msg,
+                        .is_error = true,
+                    });
+                },
+                else => {},
+            }
+        }
+        if (results.items.len > 0) {
+            try self.history.addToolResults(results.items);
+        }
+    }
+
     /// Executes all tool_use blocks in response.
     /// Returns execution summary for act debug logging.
 
@@ -2341,6 +2473,32 @@ pub const AgentLoop = struct {
                         self.clearPlan();
                     }
 
+                    // Hard dedupe barrier: serve cached result for repeated read-only
+                    // calls instead of re-executing (prevents mechanical replay loops;
+                    // model sees identical data without redundant execution).
+                    if (isReadOnlyTool(tu.name)) {
+                        const cache_hash = fuzzyArgsHash(tu.input_json);
+                        if (self.lookupToolCache(tu.name, cache_hash)) |cached| {
+                            main.stderrPrint(
+                                "\x1b[33m[duplicate: serving cached result]\x1b[0m\n",
+                                .{},
+                            );
+                            const note = try std.fmt.allocPrint(
+                                self.alloc,
+                                "[duplicate: identical call already executed this turn — cached result below]\n{s}",
+                                .{cached},
+                            );
+                            try allocated_strings.append(self.alloc, note);
+                            try results.append(self.alloc, .{
+                                .tool_use_id = tu.id,
+                                .content = note,
+                                .is_error = false,
+                            });
+                            tool_count += 1;
+                            continue;
+                        }
+                    }
+
                     const start_tool_ms = utils.milliTimestamp();
                     self.coordinator.updateStatus(act_id, .executing_tool, tu.name);
                     if (main.ui_repl.current_renderer) |r| {
@@ -2405,6 +2563,10 @@ pub const AgentLoop = struct {
                         .content = final_content,
                         .is_error = is_err,
                     });
+                    // Cache successful read-only results for the dedupe barrier.
+                    if (!is_err and isReadOnlyTool(tu.name)) {
+                        self.storeToolCache(tu.name, fuzzyArgsHash(tu.input_json), truncated) catch {};
+                    }
                     if (!is_err) {
                         self.loop_plan_retries = 0;
                         self.plan_execution_pending = false;
@@ -2648,6 +2810,7 @@ test "agent - checkActionLoop consecutive identical tool calls" {
     agent.alloc = alloc;
     agent.config = &cfg;
     agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
     agent.turn_tool_trajectory = .empty;
     agent.consecutive_dup_tool_count = 0;
     agent.consecutive_readonly_count = 0;
@@ -2688,6 +2851,7 @@ test "agent - checkActionLoop different commands reset consecutive count" {
     agent.alloc = alloc;
     agent.config = &cfg;
     agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
     agent.turn_tool_trajectory = .empty;
     agent.consecutive_dup_tool_count = 0;
     agent.consecutive_readonly_count = 0;
@@ -2720,6 +2884,7 @@ test "agent - checkActionLoop windowed repetition detection" {
     agent.alloc = alloc;
     agent.config = &cfg;
     agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
     agent.turn_tool_trajectory = .empty;
     agent.consecutive_dup_tool_count = 0;
     agent.consecutive_readonly_count = 0;
@@ -2761,6 +2926,7 @@ test "agent - checkActionLoop 2-cycle alternating tool names detection" {
     agent.alloc = alloc;
     agent.config = &cfg;
     agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
     agent.turn_tool_trajectory = .empty;
     agent.consecutive_dup_tool_count = 0;
     agent.consecutive_readonly_count = 0;
@@ -2803,6 +2969,7 @@ test "agent - checkActionLoop 3-cycle macro sequence detection" {
     agent.alloc = alloc;
     agent.config = &cfg;
     agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
     agent.turn_tool_trajectory = .empty;
     agent.consecutive_dup_tool_count = 0;
     agent.consecutive_readonly_count = 0;
@@ -2850,6 +3017,7 @@ test "agent - checkActionLoop read-only exploratory budget and mutation reset" {
     agent.alloc = alloc;
     agent.config = &cfg;
     agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
     agent.turn_tool_trajectory = .empty;
     agent.consecutive_dup_tool_count = 0;
     agent.consecutive_readonly_count = 0;
@@ -2908,6 +3076,7 @@ test "agent - checkActionLoop 3D procedural map orbit detection and checkpoint t
     agent.alloc = alloc;
     agent.config = &cfg;
     agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
     agent.turn_tool_trajectory = .empty;
     agent.consecutive_dup_tool_count = 0;
     agent.consecutive_readonly_count = 0;
@@ -2951,6 +3120,7 @@ test "agent - action loop recovery via plan and execute" {
     agent.alloc = alloc;
     agent.config = &cfg;
     agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
     agent.turn_tool_trajectory = .empty;
     agent.consecutive_dup_tool_count = 0;
     agent.consecutive_readonly_count = 0;
@@ -3002,6 +3172,7 @@ test "agent - plan watchdog enforcement and procrastination intercept" {
     agent.alloc = alloc;
     agent.config = &cfg;
     agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
     agent.turn_tool_trajectory = .empty;
     agent.consecutive_dup_tool_count = 0;
     agent.consecutive_readonly_count = 0;
