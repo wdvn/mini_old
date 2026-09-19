@@ -169,17 +169,25 @@ pub const Watchdog = struct {
             try traj_writer.writeAll(rec.toolName());
 
             if (rec.is_read_only) read_only_count += 1;
+        }
 
+        // Evaluate loop detection on the recent activity window (last recap interval)
+        const recent_window = @min(count, self.config.recap_interval_acts + 1);
+        const recent_start = if (count > recent_window) count - recent_window else 0;
+
+        for (eval_slice[recent_start..], 0..) |rec, rel_i| {
+            const abs_i = recent_start + rel_i;
             // Check duplicate consecutive tool with same args hash
-            if (i > 0 and rec.args_hash != 0 and rec.args_hash == eval_slice[i - 1].args_hash and
-                std.mem.eql(u8, rec.toolName(), eval_slice[i - 1].toolName()))
+            if (abs_i > 0 and rec.args_hash != 0 and rec.args_hash == eval_slice[abs_i - 1].args_hash and
+                std.mem.eql(u8, rec.toolName(), eval_slice[abs_i - 1].toolName()))
             {
                 has_dup = true;
             }
 
-            // Check cycle A -> B -> A
-            if (i >= 2 and std.mem.eql(u8, rec.toolName(), eval_slice[i - 2].toolName()) and
-                !std.mem.eql(u8, rec.toolName(), eval_slice[i - 1].toolName()))
+            // Check cycle A(args1) -> B(args2) -> A(args1) with identical args hash
+            if (abs_i >= 2 and rec.args_hash != 0 and rec.args_hash == eval_slice[abs_i - 2].args_hash and
+                std.mem.eql(u8, rec.toolName(), eval_slice[abs_i - 2].toolName()) and
+                rec.args_hash != eval_slice[abs_i - 1].args_hash)
             {
                 has_cycle = true;
             }

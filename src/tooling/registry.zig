@@ -103,9 +103,9 @@ fn executeToolInternal(alloc: Allocator, io: std.Io, name: []const u8, input_jso
     if (std.mem.eql(u8, name, "codeact"))               return executeCodeActTool(alloc, io, input_json);
 
     // Common LLM alias fallback normalization
-    if (std.mem.eql(u8, name, "read"))                  return file_tool.readTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "write"))                 return file_tool.writeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "edit"))                  return file_tool.editTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "read") or std.mem.eql(u8, name, "read_file"))                  return file_tool.readTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "write_file"))                return file_tool.writeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "edit") or std.mem.eql(u8, name, "edit_file"))                  return file_tool.editTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "sh") or std.mem.eql(u8, name, "shell") or std.mem.eql(u8, name, "terminal")) return bash_tool.executeTool(alloc, io, input_json);
 
     // MCP fallback: names follow "server__toolname" format
@@ -397,6 +397,14 @@ fn matchesEntry(entry_trimmed: []const u8, name: []const u8) bool {
     return std.mem.eql(u8, entry_trimmed, name);
 }
 
+pub fn normalizeToolName(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "read") or std.mem.eql(u8, name, "read_file")) return "file_read";
+    if (std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "write_file")) return "file_write";
+    if (std.mem.eql(u8, name, "edit") or std.mem.eql(u8, name, "edit_file")) return "file_edit";
+    if (std.mem.eql(u8, name, "sh") or std.mem.eql(u8, name, "shell") or std.mem.eql(u8, name, "terminal")) return "bash";
+    return name;
+}
+
 pub fn isPermitted(name: []const u8) bool {
     // Block subagent calls if depth limit reached to avoid infinite recursion (Leaf Worker Pattern)
     if (std.mem.eql(u8, name, "invoke_subagent") or std.mem.eql(u8, name, "batch_invoke_subagents")) {
@@ -416,18 +424,24 @@ pub fn isPermitted(name: []const u8) bool {
         if (!g_image_input_enabled) return false;
     }
 
+    const norm_name = normalizeToolName(name);
+
     if (g_allowlist) |list| {
         // Allowlist: ONLY allow listed tools
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |entry| {
-            if (matchesEntry(std.mem.trim(u8, entry, " \t"), name)) return true;
+            const tr = std.mem.trim(u8, entry, " \t");
+            const norm_entry = normalizeToolName(tr);
+            if (matchesEntry(tr, name) or matchesEntry(norm_entry, norm_name)) return true;
         }
         return false; // not in allowlist
     }
     if (g_blocklist) |list| {
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |entry| {
-            if (matchesEntry(std.mem.trim(u8, entry, " \t"), name)) return false;
+            const tr = std.mem.trim(u8, entry, " \t");
+            const norm_entry = normalizeToolName(tr);
+            if (matchesEntry(tr, name) or matchesEntry(norm_entry, norm_name)) return false;
         }
     }
     return true;

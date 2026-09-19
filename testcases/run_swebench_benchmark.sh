@@ -124,9 +124,9 @@ Issue Description:
 $problem_statement
 
 Instructions:
-1. Use glob or grep to locate where the issue occurs in the codebase.
-2. Read the relevant source files.
-3. Use file_edit to make the minimal, precise fix required to solve the issue.
+1. Use bash commands (e.g. grep -n, cat, sed, python3) to locate, inspect, and understand where the issue occurs in the codebase.
+2. Use bash or file_edit to make the minimal, precise fix required to solve the issue.
+3. Verify your fix using python3 in bash if appropriate.
 4. Ensure code style and conventions are maintained.
 5. Conclude your turn with a brief summary of the fix once completed."
 
@@ -134,7 +134,8 @@ Instructions:
     start_time=$(date +%s%3N)
     
     # Run mini inside the target workspace directory with hard 300s timeout against infinite loops
-    (cd "$task_dir" && timeout --kill-after=10s 300s "$MINI_BIN" -e "$prompt" >> "$REPORT_FILE" 2>&1 || true)
+    # grep, file_read, file_write are temporarily blocked to force model to use bash
+    (cd "$task_dir" && MINI_TOOL_BLOCKLIST="grep,file_read,file_write,read_file,write_file,read,write" timeout --kill-after=10s 300s "$MINI_BIN" -e "$prompt" >> "$REPORT_FILE" 2>&1 || true)
     
     end_time=$(date +%s%3N)
     duration=$((end_time - start_time))
