@@ -843,13 +843,17 @@ pub const AgentLoop = struct {
     fn logActDebug(
         self: *AgentLoop,
         act_id: usize,
-        input_msgs: []const proto.Message,
+        input_msgs_count: usize,
         tool_defs: []const proto.ToolDefinition,
         response: *const proto.Response,
         js_code_opt: ?[]const u8,
         exec_info: act_logger_mod.ActExecutionInfo,
     ) void {
         const logger = if (self.act_logger != null) &self.act_logger.? else return;
+
+        const msgs = self.history.messages();
+        const safe_count = @min(input_msgs_count, msgs.len);
+        const input_msgs = msgs[0..safe_count];
 
         var text_acc: ?[]const u8 = null;
         var think_acc: ?[]const u8 = null;
@@ -1063,9 +1067,6 @@ pub const AgentLoop = struct {
         // Append response to history (if has content)
         _ = try self.history.addAssistantResponse(&response);
 
-        // Retrieve safe slice after history may have reallocated
-        const valid_input_msgs = self.history.messages()[0..input_msgs_count];
-
         // Accumulate completion tokens and detect plan commitments
         for (response.content.items) |block| {
             switch (block) {
@@ -1097,7 +1098,7 @@ pub const AgentLoop = struct {
 
         if (response.stop_reason == .tool_use or has_tool_use_blocks) {
             const exec_summary = try self.executeTools(act_id, &response);
-            self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{
+            self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{
                 .exec_type = "tool_call",
                 .is_error = exec_summary.any_tool_err,
                 .duration_ms = exec_summary.total_dur_ms,
@@ -1198,7 +1199,7 @@ pub const AgentLoop = struct {
                     self.last_act_failed = true;
                     const end_err_ms = utils.milliTimestamp();
                     const dur_ms = if (end_err_ms >= start_codeact_ms) @as(u64, @intCast(end_err_ms - start_codeact_ms)) else 0;
-                    self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, js_code, .{
+                    self.logActDebug(act_id, input_msgs_count, tool_defs, &response, js_code, .{
                         .exec_type = "codeact",
                         .is_error = true,
                         .duration_ms = dur_ms,
@@ -1220,7 +1221,7 @@ pub const AgentLoop = struct {
                 const end_codeact_ms = utils.milliTimestamp();
                 const dur_ms = if (end_codeact_ms >= start_codeact_ms) @as(u64, @intCast(end_codeact_ms - start_codeact_ms)) else 0;
 
-                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, js_code, .{
+                self.logActDebug(act_id, input_msgs_count, tool_defs, &response, js_code, .{
                     .exec_type = "codeact",
                     .stdout = res.stdout,
                     .return_value_json = res.return_value_json,
@@ -1299,7 +1300,7 @@ pub const AgentLoop = struct {
 
         switch (response.stop_reason) {
             .end_turn, .stop_sequence => {
-                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "none" });
+                self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{ .exec_type = "none" });
                 if ((self.plan_active or self.plan_execution_pending) and !isPlanOnlyRequest(self.current_user_request)) {
                     // Don't clear pending yet — keep it true while we decide what to do
                     self.plan_watchdog_retries += 1;
@@ -1340,7 +1341,7 @@ pub const AgentLoop = struct {
                 return .exit_loop;
             },
             .max_tokens => {
-                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "max_tokens" });
+                self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{ .exec_type = "max_tokens" });
                 // Response truncated mid-stream. DO NOT exit — insert observation
                 // requesting model to continue EXACTLY from where it stopped (without repeating
                 // already output content) to finish the incomplete block (JS block / tool_use / text).
@@ -1361,7 +1362,7 @@ pub const AgentLoop = struct {
             },
             .tool_use => {
                 const exec_summary = try self.executeTools(act_id, &response);
-                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{
+                self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{
                     .exec_type = "tool_call",
                     .is_error = exec_summary.any_tool_err,
                     .duration_ms = exec_summary.total_dur_ms,
@@ -1377,7 +1378,7 @@ pub const AgentLoop = struct {
             // call was received, execute it normally; otherwise inject an
             // observation so the governor escalates effort on retry.
             .stream_aborted => {
-                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{
+                self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{
                     .exec_type = "stream_idle_timeout",
                     .is_error = true,
                     .error_message = "stream aborted by idle watchdog",
@@ -1392,7 +1393,7 @@ pub const AgentLoop = struct {
                 if (has_tool_use) {
                     self.last_act_failed = true;
                     const exec_summary = try self.executeTools(act_id, &response);
-                    self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{
+                    self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{
                         .exec_type = "tool_call",
                         .is_error = exec_summary.any_tool_err,
                         .duration_ms = exec_summary.total_dur_ms,
@@ -1415,7 +1416,7 @@ pub const AgentLoop = struct {
                 return .continue_loop;
             },
             .unknown => {
-                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{
+                self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{
                     .exec_type = "error",
                     .is_error = true,
                     .error_message = response.raw_debug_info,
