@@ -541,6 +541,11 @@ fn executeSkills(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     return buf.toOwnedSlice();
 }
 
+/// Interrupt active bash process (called on Watchdog timeout or SIGINT).
+pub fn interruptActiveBash() void {
+    bash_tool.interruptCurrent();
+}
+
 test "codeact as native tool: codeact in registry" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;

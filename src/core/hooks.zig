@@ -53,6 +53,27 @@ pub fn getToolListener() ?ToolListener {
     return g_tool_listener;
 }
 
+/// Callback type for execution output chunks (Thread 3 tool/codeact execution -> ActCoordinator).
+pub const OutputListener = *const fn (chunk: []const u8) void;
+var g_output_listener: ?OutputListener = null;
+
+/// Set in-memory execution output chunk listener.
+pub fn setOutputListener(listener: ?OutputListener) void {
+    g_output_listener = listener;
+}
+
+/// Get current in-memory execution output chunk listener.
+pub fn getOutputListener() ?OutputListener {
+    return g_output_listener;
+}
+
+/// Forward an execution output chunk (stdout/stderr) to the active output listener.
+pub fn appendExecutionOutput(chunk: []const u8) void {
+    if (g_output_listener) |listener| {
+        listener(chunk);
+    }
+}
+
 /// Struct holding payload data emitted by hook events.
 pub const HookPayload = struct {
     event: []const u8,

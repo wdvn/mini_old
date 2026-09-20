@@ -206,3 +206,98 @@ test "Concurrent 3-Thread Architecture: Main, Watchdog, and Worker threads" {
     try testing.expect(!coordinator.turn_active.load(.seq_cst));
     try testing.expect(coordinator.turn_completed.load(.seq_cst));
 }
+
+fn mockDecisionWait(ctx: watchdog_mod.DecisionContext) watchdog_mod.TimeoutDecision {
+    _ = ctx;
+    var d = watchdog_mod.TimeoutDecision{
+        .should_kill = false,
+        .extend_seconds = 10,
+    };
+    const r = "Compilation in progress";
+    @memcpy(d.reason_buf[0..r.len], r);
+    d.reason_len = r.len;
+    return d;
+}
+
+fn mockDecisionKill(ctx: watchdog_mod.DecisionContext) watchdog_mod.TimeoutDecision {
+    _ = ctx;
+    var d = watchdog_mod.TimeoutDecision{
+        .should_kill = true,
+        .extend_seconds = 0,
+    };
+    const r = "Hung waiting for stdin";
+    @memcpy(d.reason_buf[0..r.len], r);
+    d.reason_len = r.len;
+    return d;
+}
+
+test "Watchdog: decision function choosing WAIT extends timeout without interrupt" {
+    defer signals.setInterrupted(false);
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var coordinator = act_queue.ActCoordinator.init(alloc);
+    defer coordinator.deinit();
+
+    var watchdog = watchdog_mod.Watchdog.init(alloc, io, coordinator, .{
+        .tracking_interval_s = 10,
+        .act_timeout_secs = 5,
+        .verbose_stderr = false,
+    });
+    defer watchdog.deinit();
+    watchdog.decision_fn = &mockDecisionWait;
+
+    coordinator.resetTurn();
+    coordinator.updateStatus(1, .executing_tool, "bash: compile");
+
+    // Exceed initial 5s timeout
+    coordinator.lock();
+    coordinator.state.act_start_ms -= 6000;
+    coordinator.unlock();
+
+    watchdog.tick();
+
+    // Must NOT be timed out or interrupted because decision was WAIT (+10s)
+    const state = coordinator.getMonitorState();
+    try testing.expect(!state.is_timed_out);
+    try testing.expect(!signals.isInterrupted());
+    try testing.expectEqual(@as(u32, 16), watchdog.current_act_timeout_s);
+}
+
+test "Watchdog: decision function choosing KILL triggers interrupt and sets timeout context" {
+    defer signals.setInterrupted(false);
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var coordinator = act_queue.ActCoordinator.init(alloc);
+    defer coordinator.deinit();
+
+    var watchdog = watchdog_mod.Watchdog.init(alloc, io, coordinator, .{
+        .tracking_interval_s = 10,
+        .act_timeout_secs = 5,
+        .verbose_stderr = false,
+    });
+    defer watchdog.deinit();
+    watchdog.decision_fn = &mockDecisionKill;
+
+    coordinator.resetTurn();
+    coordinator.updateStatus(1, .executing_tool, "bash: hung");
+
+    // Exceed initial 5s timeout
+    coordinator.lock();
+    coordinator.state.act_start_ms -= 6000;
+    coordinator.unlock();
+
+    watchdog.tick();
+
+    // Must be timed out and interrupted because decision was KILL
+    const state = coordinator.getMonitorState();
+    try testing.expect(state.is_timed_out);
+    try testing.expect(signals.isInterrupted());
+
+    // Verify pending timeout context was populated
+    const timeout_ctx = coordinator.popPendingTimeoutContext();
+    try testing.expect(timeout_ctx != null);
+    defer alloc.free(timeout_ctx.?);
+    try testing.expectEqualStrings("Hung waiting for stdin", timeout_ctx.?);
+}

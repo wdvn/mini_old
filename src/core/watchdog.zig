@@ -35,6 +35,29 @@ pub const WatchdogConfig = struct {
     verbose_stderr: bool = true,
 };
 
+/// Decision returned by the 1-call LLM decision handler on timeout.
+pub const TimeoutDecision = struct {
+    should_kill: bool,
+    extend_seconds: u32 = 60,
+    reason_buf: [256]u8 = [_]u8{0} ** 256,
+    reason_len: usize = 0,
+
+    pub fn reason(self: *const TimeoutDecision) []const u8 {
+        return self.reason_buf[0..self.reason_len];
+    }
+};
+
+/// Context passed to the timeout decision handler.
+pub const DecisionContext = struct {
+    act_id: usize,
+    elapsed_s: u32,
+    timeout_s: u32,
+    action_desc: []const u8,
+    log_tail: []const u8,
+};
+
+pub const DecisionFn = *const fn (ctx: DecisionContext) TimeoutDecision;
+
 pub const Watchdog = struct {
     alloc: Allocator,
     io: std.Io,
@@ -48,6 +71,14 @@ pub const Watchdog = struct {
     /// Optional external interrupt hook (e.g. QuickJS requestInterrupt).
     interrupt_fn: ?*const fn () void = null,
 
+    /// Optional 1-call LLM timeout decision handler.
+    decision_fn: ?DecisionFn = null,
+
+    current_act_id: usize = 0,
+    current_act_timeout_s: u32 = 0,
+    extension_count: usize = 0,
+    is_consulting_decision: bool = false,
+
     pub fn init(alloc: Allocator, io: std.Io, coordinator: *act_queue.ActCoordinator, config: WatchdogConfig) *Watchdog {
         const self = alloc.create(Watchdog) catch @panic("OOM init Watchdog");
         self.* = Watchdog{
@@ -55,6 +86,7 @@ pub const Watchdog = struct {
             .io = io,
             .coordinator = coordinator,
             .config = config,
+            .current_act_timeout_s = config.act_timeout_secs,
         };
         return self;
     }
@@ -102,6 +134,12 @@ pub const Watchdog = struct {
 
         // 1. Act Progress Tracking & Timeout Check (for running acts)
         if (state.status != .idle and state.status != .completed and state.status != .failed) {
+            if (state.act_id != self.current_act_id) {
+                self.current_act_id = state.act_id;
+                self.current_act_timeout_s = self.config.act_timeout_secs;
+                self.extension_count = 0;
+            }
+
             const now = utils.milliTimestamp();
             const elapsed_ms = if (now >= state.act_start_ms) now - state.act_start_ms else 0;
             const elapsed_s: u32 = @intCast(@divFloor(elapsed_ms, 1000));
@@ -122,19 +160,58 @@ pub const Watchdog = struct {
             }
 
             // Timeout check
-            if (self.config.act_timeout_secs > 0 and elapsed_s >= self.config.act_timeout_secs) {
+            const effective_timeout = if (self.current_act_timeout_s > 0) self.current_act_timeout_s else self.config.act_timeout_secs;
+            if (effective_timeout > 0 and elapsed_s >= effective_timeout and !self.is_consulting_decision) {
                 if (!state.is_timed_out) {
-                    self.coordinator.setTimedOut(true);
-                    signals.setInterrupted(true);
-                    if (self.interrupt_fn) |int_fn| {
-                        int_fn();
+                    var decision = TimeoutDecision{ .should_kill = true };
+                    if (self.decision_fn) |dec_fn| {
+                        self.is_consulting_decision = true;
+                        defer self.is_consulting_decision = false;
+
+                        if (self.config.verbose_stderr) {
+                            printStderr(
+                                self.io,
+                                "\n\x1b[33m[watchdog] ⚠️ Act {d} elapsed {d}s (limit {d}s, action: {s}). Consulting LLM for decision...\x1b[0m\n",
+                                .{ state.act_id, elapsed_s, effective_timeout, state.getActionDesc() },
+                            );
+                        }
+                        var log_buf: [act_queue.ActCoordinator.ACT_LOG_CAP]u8 = undefined;
+                        const tail_res = self.coordinator.getActLogTail(&log_buf);
+                        decision = dec_fn(.{
+                            .act_id = state.act_id,
+                            .elapsed_s = elapsed_s,
+                            .timeout_s = effective_timeout,
+                            .action_desc = state.getActionDesc(),
+                            .log_tail = tail_res.data,
+                        });
                     }
-                    if (self.config.verbose_stderr) {
-                        printStderr(
-                            self.io,
-                            "\n\x1b[31m[watchdog] ⚠️ Act {d} TIMEOUT ({d}s exceeded limit of {d}s)! Current action: {s}. Triggering interrupt.\x1b[0m\n",
-                            .{ state.act_id, elapsed_s, self.config.act_timeout_secs, state.getActionDesc() },
-                        );
+
+                    if (!decision.should_kill and self.extension_count < 5) {
+                        self.extension_count += 1;
+                        const ext = if (decision.extend_seconds > 0) decision.extend_seconds else 60;
+                        self.current_act_timeout_s = elapsed_s + ext;
+                        if (self.config.verbose_stderr) {
+                            printStderr(
+                                self.io,
+                                "\x1b[36m[watchdog]\x1b[0m ⏳ LLM decided to WAIT (+{d}s, new limit: {d}s): {s}\n",
+                                .{ ext, self.current_act_timeout_s, decision.reason() },
+                            );
+                        }
+                    } else {
+                        self.coordinator.setTimedOut(true);
+                        signals.setInterrupted(true);
+                        const reason_str = if (decision.reason_len > 0) decision.reason() else "Timed out";
+                        self.coordinator.setPendingTimeoutContext(reason_str) catch {};
+                        if (self.interrupt_fn) |int_fn| {
+                            int_fn();
+                        }
+                        if (self.config.verbose_stderr) {
+                            printStderr(
+                                self.io,
+                                "\n\x1b[31m[watchdog] 🛑 LLM decided to KILL Act {d} action: {s}. Triggering interrupt.\x1b[0m\n",
+                                .{ state.act_id, reason_str },
+                            );
+                        }
                     }
                 }
             }

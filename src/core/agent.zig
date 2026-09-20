@@ -71,10 +71,24 @@ fn agentToolListener(tool_name: []const u8, input_json: ?[]const u8, is_error: b
     }
 }
 
+fn agentOutputListener(chunk: []const u8) void {
+    if (g_active_agent) |agent| {
+        agent.coordinator.appendActLog(chunk);
+    }
+}
+
 fn watchdogInterruptHandler() void {
     if (g_active_agent) |agent| {
         agent.engine.requestInterrupt();
     }
+    tools_mod.interruptActiveBash();
+}
+
+fn watchdogDecisionHandler(ctx: watchdog_mod.DecisionContext) watchdog_mod.TimeoutDecision {
+    if (g_active_agent) |agent| {
+        return agent.consultLlmOnTimeout(ctx);
+    }
+    return .{ .should_kill = false, .extend_seconds = 60 };
 }
 
 /// Maximum retries on rate limit.
@@ -440,6 +454,7 @@ pub const AgentLoop = struct {
             .verbose_stderr = config.action_loop_display,
         });
         watchdog.interrupt_fn = &watchdogInterruptHandler;
+        watchdog.decision_fn = &watchdogDecisionHandler;
         watchdog.start() catch |e| {
             if (!utils.isSubagent()) main.stderrPrint("[agent] Warning: Failed to start Watchdog thread: {s}\n", .{@errorName(e)});
         };
@@ -1677,9 +1692,11 @@ pub const AgentLoop = struct {
     ) !void {
         g_active_agent = self;
         hooks_mod.setToolListener(&agentToolListener);
+        hooks_mod.setOutputListener(&agentOutputListener);
         defer {
             g_active_agent = null;
             hooks_mod.setToolListener(null);
+            hooks_mod.setOutputListener(null);
         }
 
         // Clear turn-level tool attachments
@@ -1777,6 +1794,31 @@ pub const AgentLoop = struct {
                 const result = self.executeStep(act_id, tool_defs, text_cb, think_cb) catch |e| {
                     switch (e) {
                         error.Interrupted => {
+                            if (self.coordinator.isTimedOut()) {
+                                const timeout_ctx = self.coordinator.popPendingTimeoutContext();
+                                defer if (timeout_ctx) |ctx| self.alloc.free(ctx);
+                                const reason = if (timeout_ctx) |ctx| ctx else "Action timed out and was killed by Watchdog";
+
+                                if (main.ui_repl.current_renderer) |r| {
+                                    r.stopWaiting();
+                                    if (r.is_thinking) r.endThinking();
+                                    r.clearInplaceLine();
+                                    r.ensureNewline();
+                                    r.write(" \x1b[31m[Watchdog Timeout: Action terminated by LLM decision]\x1b[0m\n");
+                                } else {
+                                    main.stderrPrint("\n\x1b[31m[Watchdog Timeout: Action terminated by LLM decision: {s}]\x1b[0m\n", .{reason});
+                                }
+                                signals.setInterrupted(false);
+                                self.coordinator.setTimedOut(false);
+                                self.last_act_failed = true;
+
+                                const err_msg = try std.fmt.allocPrint(self.alloc, "[Watchdog Timeout]: The previous action timed out and was terminated (LLM decision: KILL). Reason: {s}. Please adjust your strategy or command.", .{reason});
+                                defer self.alloc.free(err_msg);
+                                try self.history.addUser(err_msg);
+                                self.coordinator.finishAct(act_id, false);
+                                break;
+                            }
+
                             if (main.ui_repl.current_renderer) |r| {
                                 r.stopWaiting();
                                 if (r.is_thinking) r.endThinking();
@@ -2209,6 +2251,86 @@ pub const AgentLoop = struct {
             }
             return e;
         }
+    }
+
+    /// 1-call LLM consultation invoked by Thread 2 Watchdog on timeout.
+    /// Evaluates whether the long-running action is making valid progress (WAIT) or stuck/hung (KILL).
+    pub fn consultLlmOnTimeout(self: *AgentLoop, ctx: watchdog_mod.DecisionContext) watchdog_mod.TimeoutDecision {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const system_prompt =
+            \\You are the Watchdog Supervisor for mini-agent.
+            \\An action is taking longer than the configured timeout limit.
+            \\Your job is to analyze the action and output to decide if it is legitimately working (e.g. compiling, downloading, running a long test suite) or hung/frozen/waiting for input.
+        ;
+
+        var prompt_buf = utils.BufWriter.init(alloc);
+        prompt_buf.print(
+            \\Act {d} has been running action '{s}' for {d}s (timeout limit is {d}s).
+            \\
+            \\Recent execution output tail ({d} bytes):
+            \\```
+            \\{s}
+            \\```
+            \\
+            \\Determine whether this action is making legitimate forward progress that needs more time, OR is stuck, deadlocked, idling, or waiting on user input.
+            \\
+            \\Respond on the first line strictly with:
+            \\DECISION: WAIT <seconds> (e.g., DECISION: WAIT 60)
+            \\or
+            \\DECISION: KILL
+            \\
+            \\On the second line, provide a short 1-sentence reason:
+            \\REASON: <explanation>
+        , .{
+            ctx.act_id,
+            ctx.action_desc,
+            ctx.elapsed_s,
+            ctx.timeout_s,
+            ctx.log_tail.len,
+            ctx.log_tail,
+        }) catch {
+            return .{ .should_kill = false, .extend_seconds = 60 };
+        };
+
+        const blocks = [_]proto.ContentBlock{
+            .{ .text = prompt_buf.list.items },
+        };
+        const msgs = [_]proto.Message{
+            .{
+                .role = .user,
+                .content = &blocks,
+            },
+        };
+
+        var resp = self.backend.send(
+            system_prompt,
+            &msgs,
+            &[_]proto.ToolDefinition{},
+            null,
+            null,
+        ) catch |e| {
+            var fallback = watchdog_mod.TimeoutDecision{
+                .should_kill = false,
+                .extend_seconds = 30,
+            };
+            const err_msg = std.fmt.bufPrint(&fallback.reason_buf, "LLM decision call failed: {s}, safety wait 30s", .{@errorName(e)}) catch "LLM decision failed";
+            fallback.reason_len = err_msg.len;
+            return fallback;
+        };
+        defer resp.deinit();
+
+        var full_text = utils.BufWriter.init(alloc);
+        for (resp.content.items) |block| {
+            switch (block) {
+                .text => |t| full_text.writeAll(t) catch {},
+                else => {},
+            }
+        }
+
+        return parseTimeoutDecision(full_text.list.items);
     }
 
     /// Performs context compaction (MemAct compaction) when model returns context limit error.
@@ -2761,6 +2883,85 @@ pub fn findJsCodeInResponse(alloc: Allocator, response: *const proto.Response) ?
     return null;
 }
 
+/// Parses LLM response into a structured TimeoutDecision.
+pub fn parseTimeoutDecision(text: []const u8) watchdog_mod.TimeoutDecision {
+    var decision = watchdog_mod.TimeoutDecision{
+        .should_kill = false,
+        .extend_seconds = 60,
+    };
+
+    var line_it = std.mem.splitScalar(u8, text, '\n');
+    var found_decision = false;
+
+    while (line_it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \r\t*#_`");
+        if (line.len == 0) continue;
+
+        if (!found_decision) {
+            // Check for KILL
+            if (std.ascii.indexOfIgnoreCase(line, "KILL") != null) {
+                // Ensure it's not saying "DO NOT KILL" or "DON'T KILL"
+                if (std.ascii.indexOfIgnoreCase(line, "NOT KILL") == null and
+                    std.ascii.indexOfIgnoreCase(line, "DON'T KILL") == null and
+                    std.ascii.indexOfIgnoreCase(line, "DONT KILL") == null)
+                {
+                    decision.should_kill = true;
+                    found_decision = true;
+                    continue;
+                }
+            }
+
+            // Check for WAIT
+            if (std.ascii.indexOfIgnoreCase(line, "WAIT") != null) {
+                decision.should_kill = false;
+                found_decision = true;
+
+                // Look for optional seconds after WAIT
+                var word_it = std.mem.tokenizeAny(u8, line, " :,\t*#_`");
+                while (word_it.next()) |w| {
+                    if (std.ascii.eqlIgnoreCase(w, "wait")) {
+                        if (word_it.next()) |num_str| {
+                            const digits_end = for (num_str, 0..) |c, i| {
+                                if (c < '0' or c > '9') break i;
+                            } else num_str.len;
+                            if (digits_end > 0) {
+                                if (std.fmt.parseInt(u32, num_str[0..digits_end], 10)) |secs| {
+                                    decision.extend_seconds = std.math.clamp(secs, 10, 300);
+                                } else |_| {}
+                            }
+                        }
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+
+        // Check for REASON
+        if (std.ascii.startsWithIgnoreCase(line, "REASON:") or std.ascii.startsWithIgnoreCase(line, "REASON :")) {
+            const colon_idx = std.mem.indexOfScalar(u8, line, ':') orelse 0;
+            const r = std.mem.trim(u8, line[colon_idx + 1 ..], " \t*#_`");
+            const copy_len = @min(r.len, decision.reason_buf.len);
+            @memcpy(decision.reason_buf[0..copy_len], r[0..copy_len]);
+            decision.reason_len = copy_len;
+            break;
+        } else if (found_decision and decision.reason_len == 0) {
+            const copy_len = @min(line.len, decision.reason_buf.len);
+            @memcpy(decision.reason_buf[0..copy_len], line[0..copy_len]);
+            decision.reason_len = copy_len;
+        }
+    }
+
+    if (decision.reason_len == 0) {
+        const default_reason = if (decision.should_kill) "Action declared hung by LLM supervisor" else "Action granted extended execution time by LLM supervisor";
+        const copy_len = @min(default_reason.len, decision.reason_buf.len);
+        @memcpy(decision.reason_buf[0..copy_len], default_reason[0..copy_len]);
+        decision.reason_len = copy_len;
+    }
+
+    return decision;
+}
+
 
 test "agent - extractJsCodeBlock" {
     const alloc = std.testing.allocator;
@@ -3220,6 +3421,46 @@ test "agent - plan watchdog enforcement and procrastination intercept" {
     try std.testing.expect(AgentLoop.isPlanOnlyRequest("Lập kế hoạch, không sửa file"));
     try std.testing.expect(AgentLoop.isPlanOnlyRequest("please provide plan only"));
     try std.testing.expect(!AgentLoop.isPlanOnlyRequest("hãy sửa bug này và chạy test"));
+}
+
+test "agent - parseTimeoutDecision" {
+    // 1. Explicit WAIT with seconds and reason
+    const text1 =
+        \\DECISION: WAIT 120
+        \\REASON: Long compilation of Zig packages in progress.
+    ;
+    const d1 = parseTimeoutDecision(text1);
+    try std.testing.expect(!d1.should_kill);
+    try std.testing.expectEqual(@as(u32, 120), d1.extend_seconds);
+    try std.testing.expectEqualStrings("Long compilation of Zig packages in progress.", d1.reason());
+
+    // 2. Simple WAIT without explicit seconds (defaults to 60)
+    const text2 =
+        \\WAIT
+        \\REASON: npm install downloading tarballs.
+    ;
+    const d2 = parseTimeoutDecision(text2);
+    try std.testing.expect(!d2.should_kill);
+    try std.testing.expectEqual(@as(u32, 60), d2.extend_seconds);
+    try std.testing.expectEqualStrings("npm install downloading tarballs.", d2.reason());
+
+    // 3. Explicit KILL
+    const text3 =
+        \\DECISION: KILL
+        \\REASON: Process is hung waiting on stdin.
+    ;
+    const d3 = parseTimeoutDecision(text3);
+    try std.testing.expect(d3.should_kill);
+    try std.testing.expectEqualStrings("Process is hung waiting on stdin.", d3.reason());
+
+    // 4. Markdown formatted decision
+    const text4 =
+        \\**DECISION**: `KILL`
+        \\**REASON**: Deadlock detected in worker process.
+    ;
+    const d4 = parseTimeoutDecision(text4);
+    try std.testing.expect(d4.should_kill);
+    try std.testing.expect(std.mem.indexOf(u8, d4.reason(), "Deadlock detected") != null);
 }
 
 
