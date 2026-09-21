@@ -1220,7 +1220,7 @@ pub const AgentLoop = struct {
             try progress_buf.writeAll("\n\n");
 
             // Directive: ask model to continue with next step
-            try progress_buf.writeAll("Next step directive: Proceed with executing the active step using appropriate tools. You may briefly explain your rationale, but ensure you execute the tool in a ```js block.");
+            try progress_buf.writeAll("Next step directive: Proceed with executing the active step using the ReAct cycle (Thought -> Action in ```js block). State your rationale, then execute the tool.");
 
             progress_text = try progress_buf.toOwnedSlice();
             const blocks = try self.alloc.alloc(proto.ContentBlock, 1);

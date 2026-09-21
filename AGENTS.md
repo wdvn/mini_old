@@ -166,11 +166,16 @@ This document complements the sections above, focusing on **analysis, root cause
 - **Memory & History**: `src/core/history.zig`, `src/core/memact/`.
 - **Tools & Registry**: `src/tooling/registry.zig` (15 built-in tools + MCP dispatcher), `src/tools/session_diagnostics.zig`, `src/core/skills.zig`.
 
-## 4. Structured Planning & Deliberation Guidelines (RFC-019)
+## 4. ReAct Mode & Structured Planning Guidelines (RFC-019)
 
-1. **Complexity Self-Assessment**:
-   - For multi-step tasks (>= 2 steps, architectural refactors, or cross-file edits), formulate a structured implementation plan using JSON or Markdown checklist before mutating code.
-   - Structure plans with step IDs, explicit descriptions, prerequisite dependencies, and preferred tool hints.
+1. **Dual Execution Modes**:
+   - **ReAct Mode (Reactive Execution — Default)**: For simple queries, exploratory searches, single-step commands, or quick inspections. Directly follow the ReAct loop:
+     - `Thought`: Concise reasoning about the situation, analysis of previous observation, and immediate intent.
+     - `Action`: Executable JavaScript (`mini.*`) inside a single ```js block.
+     - `Observation`: Real data returned by QuickJS (`[CodeAct Execution Output]`). Never fabricate observations.
+     - `Final Answer`: When done, output the final answer directly without code blocks.
+     - *Zero planning overhead*: Do not emit multi-step plans for simple, single-action tasks.
+   - **Proactive Planning Mode (RFC-019)**: For complex or multi-step tasks (>= 2 steps, architectural refactors, multi-file edits). Formulate a structured JSON DAG plan or numbered checklist on turn 1, then execute each step sequentially via the ReAct cycle with progress tracking.
 2. **Grounding in Active Code**:
    - Always verify facts against the active codebase using `mini.read`, `mini.grep`, or `mini.glob`.
    - Never guess file contents, function signatures, types, or configuration keys.
