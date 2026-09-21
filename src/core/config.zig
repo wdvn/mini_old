@@ -1242,85 +1242,53 @@ fn loadActiveProviderConfig(alloc: Allocator, env_map: *std.process.Environ.Map,
     };
     if (provider_key.len == 0) return;
 
-    var dir_buf: [12][512]u8 = undefined;
-    var dir_lens: [12]usize = undefined;
-    var dir_count: usize = 0;
+    // Strictly search only in $MINI_HOME/providers (or ~/.mini/providers)
+    var dir_buf: [512]u8 = undefined;
+    const providers_dir: []const u8 = if (env_map.get("MINI_HOME")) |mh| blk: {
+        if (mh.len == 0) break :blk "";
+        break :blk std.fmt.bufPrint(&dir_buf, "{s}/providers", .{mh}) catch "";
+    } else if (env_map.get("HOME")) |h| blk: {
+        if (h.len == 0) break :blk "";
+        break :blk std.fmt.bufPrint(&dir_buf, "{s}/.mini/providers", .{h}) catch "";
+    } else "";
 
-    const appendDir = struct {
-        fn add(dirs: *[12][512]u8, lens: *[12]usize, count: *usize, d: []const u8) void {
-            if (count.* >= 12 or d.len == 0 or d.len >= 512) return;
-            @memcpy(dirs[count.*][0..d.len], d);
-            lens[count.*] = d.len;
-            count.* += 1;
-        }
-    }.add;
-
-    // 1. Workspace / Project candidates
-    if (env_map.get("MINI_AGENT_FOLDER")) |agent_dir| {
-        if (agent_dir.len > 0) {
-            var b: [512]u8 = undefined;
-            if (std.fmt.bufPrint(&b, "{s}/providers", .{agent_dir})) |s| appendDir(&dir_buf, &dir_lens, &dir_count, s) else |_| {}
-            if (std.fmt.bufPrint(&b, "{s}/provider", .{agent_dir})) |s| appendDir(&dir_buf, &dir_lens, &dir_count, s) else |_| {}
-        }
-    }
-    appendDir(&dir_buf, &dir_lens, &dir_count, ".agent/providers");
-    appendDir(&dir_buf, &dir_lens, &dir_count, ".agent/provider");
-    appendDir(&dir_buf, &dir_lens, &dir_count, "providers");
-    appendDir(&dir_buf, &dir_lens, &dir_count, "provider");
-
-    // 2. Global candidates ($MINI_HOME or ~/.mini)
-    if (env_map.get("MINI_HOME")) |mh| {
-        if (mh.len > 0) {
-            var b: [512]u8 = undefined;
-            if (std.fmt.bufPrint(&b, "{s}/providers", .{mh})) |s| appendDir(&dir_buf, &dir_lens, &dir_count, s) else |_| {}
-            if (std.fmt.bufPrint(&b, "{s}/provider", .{mh})) |s| appendDir(&dir_buf, &dir_lens, &dir_count, s) else |_| {}
-        }
-    } else if (env_map.get("HOME")) |h| {
-        var b: [512]u8 = undefined;
-        if (std.fmt.bufPrint(&b, "{s}/.mini/providers", .{h})) |s| appendDir(&dir_buf, &dir_lens, &dir_count, s) else |_| {}
-        if (std.fmt.bufPrint(&b, "{s}/.mini/provider", .{h})) |s| appendDir(&dir_buf, &dir_lens, &dir_count, s) else |_| {}
-    }
+    if (providers_dir.len == 0) return;
 
     const cwd = std.Io.Dir.cwd();
-    for (0..dir_count) |i| {
-        const d = dir_buf[i][0..dir_lens[i]];
-        var json_buf: [512]u8 = undefined;
-        var js_buf: [512]u8 = undefined;
+    var json_buf: [512]u8 = undefined;
+    var js_buf: [512]u8 = undefined;
 
-        const json_path = std.fmt.bufPrint(&json_buf, "{s}/{s}.json", .{ d, provider_key }) catch continue;
-        const js_path = std.fmt.bufPrint(&js_buf, "{s}/{s}.js", .{ d, provider_key }) catch continue;
+    const json_path = std.fmt.bufPrint(&json_buf, "{s}/{s}.json", .{ providers_dir, provider_key }) catch return;
+    const js_path = std.fmt.bufPrint(&js_buf, "{s}/{s}.js", .{ providers_dir, provider_key }) catch return;
 
-        const has_json = if (cwd.openFile(io, json_path, .{})) |f| blk: {
-            f.close(io);
-            break :blk true;
-        } else |_| false;
+    const has_json = if (cwd.openFile(io, json_path, .{})) |f| blk: {
+        f.close(io);
+        break :blk true;
+    } else |_| false;
 
-        const has_js = if (cwd.openFile(io, js_path, .{})) |f| blk: {
-            f.close(io);
-            break :blk true;
-        } else |_| false;
+    const has_js = if (cwd.openFile(io, js_path, .{})) |f| blk: {
+        f.close(io);
+        break :blk true;
+    } else |_| false;
 
-        if (has_json) {
-            _ = tryLoadProviderJson(alloc, env_map, io, json_path);
-            _ = setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER", provider_key);
-            if (env_map.get("OPENAI_COMPAT_PROVIDER_JS") == null) {
-                if (has_js) {
-                    _ = setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER_JS", js_path);
-                } else {
-                    _ = setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER_JS", json_path);
-                }
+    if (has_json) {
+        _ = tryLoadProviderJson(alloc, env_map, io, json_path);
+        _ = setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER", provider_key);
+        if (env_map.get("OPENAI_COMPAT_PROVIDER_JS") == null) {
+            if (has_js) {
+                _ = setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER_JS", js_path);
+            } else {
+                _ = setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER_JS", json_path);
             }
-            if (!utils.isSubagent()) {
-                main.stderrPrint("[config] Provider profile: auto-loaded {s}\n", .{json_path});
-            }
-            break;
-        } else if (has_js) {
-            _ = setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER", provider_key);
-            _ = setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER_JS", js_path);
-            if (!utils.isSubagent()) {
-                main.stderrPrint("[config] Provider adapter: auto-loaded {s}\n", .{js_path});
-            }
-            break;
+        }
+        if (!utils.isSubagent()) {
+            main.stderrPrint("[config] Provider profile: auto-loaded {s}\n", .{json_path});
+        }
+    } else if (has_js) {
+        _ = setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER", provider_key);
+        _ = setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER_JS", js_path);
+        if (!utils.isSubagent()) {
+            main.stderrPrint("[config] Provider adapter: auto-loaded {s}\n", .{js_path});
         }
     }
 }

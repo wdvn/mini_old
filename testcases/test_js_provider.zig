@@ -187,18 +187,18 @@ test "js_provider: load JSON provider profile as adapter" {
     try testing.expect(adapter.profile.use_completion_tokens);
 }
 
-test "config: auto-detects $MINI_HOME/provider/<provider>.json" {
+test "config: auto-detects $MINI_HOME/providers/<provider>.json" {
     const alloc = testing.allocator;
     const io = mini.getIo();
 
-    // Create temporary directory structure: /tmp/test_mini_home/provider/testmodel.json
-    const tmp_home = "/tmp/test_mini_home_provider_json";
-    const tmp_provider_dir = "/tmp/test_mini_home_provider_json/provider";
+    // Create temporary directory structure: /tmp/test_mini_home_providers_json/providers/testmodel.json
+    const tmp_home = "/tmp/test_mini_home_providers_json";
+    const tmp_providers_dir = "/tmp/test_mini_home_providers_json/providers";
     const cwd = std.Io.Dir.cwd();
-    cwd.createDirPath(io, tmp_provider_dir) catch {};
+    cwd.createDirPath(io, tmp_providers_dir) catch {};
     defer cwd.deleteTree(io, tmp_home) catch {};
 
-    const json_file_path = "/tmp/test_mini_home_provider_json/provider/testmodel.json";
+    const json_file_path = "/tmp/test_mini_home_providers_json/providers/testmodel.json";
     const test_json =
         \\{
         \\    "name": "TestModelAI",
