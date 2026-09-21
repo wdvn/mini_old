@@ -440,6 +440,32 @@ pub const JsProviderAdapter = struct {
         }
     }
 
+    /// Parses a JSON buffer with QuickJS, ensuring null-termination as required by QuickJS.
+    /// QuickJS requires `buf[buf_len] == 0`; passing a non-null-terminated slice causes
+    /// QuickJS to read past buf_len and fail with SyntaxError on trailing bytes (e.g. 0xAA).
+    fn parseJsonZeroTerminated(ctx: *c.JSContext, alloc: Allocator, json_bytes: []const u8, filename: [*:0]const u8) ?c.JSValue {
+        const trimmed = std.mem.trim(u8, json_bytes, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[0] != '{') return null;
+
+        var stack_buf: [4096]u8 = undefined;
+        const val = if (trimmed.len < stack_buf.len) blk: {
+            @memcpy(stack_buf[0..trimmed.len], trimmed);
+            stack_buf[trimmed.len] = 0;
+            break :blk c.JS_ParseJSON(ctx, &stack_buf, trimmed.len, filename);
+        } else blk: {
+            const z = alloc.dupeZ(u8, trimmed) catch return null;
+            defer alloc.free(z);
+            break :blk c.JS_ParseJSON(ctx, z.ptr, z.len, filename);
+        };
+
+        if (isException(val)) {
+            const exc = c.JS_GetException(ctx);
+            c.JS_FreeValue(ctx, exc);
+            return null;
+        }
+        return val;
+    }
+
     /// Extract reasoning tokens from raw SSE JSON chunk.
     /// Returns allocated slice owned by caller if reasoning was found, or null.
     pub fn extractReasoning(self: *JsProviderAdapter, alloc: Allocator, raw_chunk_json: []const u8) ?[]const u8 {
@@ -447,11 +473,7 @@ pub const JsProviderAdapter = struct {
         const fn_hook = self.fn_extract_reasoning orelse return null;
         if (raw_chunk_json.len == 0) return null;
 
-        const chunk_val = c.JS_ParseJSON(self.ctx, raw_chunk_json.ptr, raw_chunk_json.len, "<chunk>");
-        if (isException(chunk_val)) {
-            logJsException(self.ctx, "extractReasoning JSON parse error");
-            return null;
-        }
+        const chunk_val = parseJsonZeroTerminated(self.ctx, alloc, raw_chunk_json, "<chunk>") orelse return null;
         defer c.JS_FreeValue(self.ctx, chunk_val);
 
         var args = [_]c.JSValue{chunk_val};
@@ -459,7 +481,8 @@ pub const JsProviderAdapter = struct {
         defer c.JS_FreeValue(self.ctx, ret_val);
 
         if (isException(ret_val)) {
-            logJsException(self.ctx, "extractReasoning hook execution failed");
+            const exc = c.JS_GetException(self.ctx);
+            c.JS_FreeValue(self.ctx, exc);
             return null;
         }
 
@@ -483,11 +506,7 @@ pub const JsProviderAdapter = struct {
         const fn_hook = self.fn_extract_content orelse return null;
         if (raw_chunk_json.len == 0) return null;
 
-        const chunk_val = c.JS_ParseJSON(self.ctx, raw_chunk_json.ptr, raw_chunk_json.len, "<chunk>");
-        if (isException(chunk_val)) {
-            logJsException(self.ctx, "extractContent JSON parse error");
-            return null;
-        }
+        const chunk_val = parseJsonZeroTerminated(self.ctx, alloc, raw_chunk_json, "<chunk>") orelse return null;
         defer c.JS_FreeValue(self.ctx, chunk_val);
 
         var args = [_]c.JSValue{chunk_val};
@@ -495,7 +514,8 @@ pub const JsProviderAdapter = struct {
         defer c.JS_FreeValue(self.ctx, ret_val);
 
         if (isException(ret_val)) {
-            logJsException(self.ctx, "extractContent hook execution failed");
+            const exc = c.JS_GetException(self.ctx);
+            c.JS_FreeValue(self.ctx, exc);
             return null;
         }
 
@@ -520,11 +540,7 @@ pub const JsProviderAdapter = struct {
         const fn_hook = self.fn_transform_request orelse return try alloc.dupe(u8, raw_request_json);
         if (raw_request_json.len == 0) return try alloc.dupe(u8, raw_request_json);
 
-        const req_val = c.JS_ParseJSON(self.ctx, raw_request_json.ptr, raw_request_json.len, "<req>");
-        if (isException(req_val)) {
-            logJsException(self.ctx, "transformRequest JSON parse error");
-            return error.InvalidRequestJson;
-        }
+        const req_val = parseJsonZeroTerminated(self.ctx, alloc, raw_request_json, "<req>") orelse return error.InvalidRequestJson;
         defer c.JS_FreeValue(self.ctx, req_val);
 
         var args = [_]c.JSValue{req_val};

@@ -140,3 +140,22 @@ test "js_provider: syntax error logs cleanly and returns JsEvaluationFailed" {
     try testing.expectError(error.JsEvaluationFailed, res);
 }
 
+test "js_provider: non-null-terminated buffer with 0xAA suffix" {
+    const alloc = testing.allocator;
+    const path = "providers/agnes.js";
+    var adapter = try js_provider.JsProviderAdapter.initFromFile(alloc, path);
+    defer adapter.deinit();
+
+    const json_str = "{\"choices\":[{\"delta\":{\"detail\":{\"reasoning_content\":\"Hello\"}}}]}";
+    var buf: [256]u8 = undefined;
+    @memset(&buf, 0xaa);
+    @memcpy(buf[0..json_str.len], json_str);
+    const non_null_term_slice = buf[0..json_str.len];
+
+    const reasoning = adapter.extractReasoning(alloc, non_null_term_slice);
+    try testing.expect(reasoning != null);
+    defer alloc.free(reasoning.?);
+    try testing.expectEqualStrings("Hello", reasoning.?);
+}
+
+
