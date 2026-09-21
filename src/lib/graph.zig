@@ -67,8 +67,8 @@ pub const applyEventJson = serialization.applyEventJson;
 // ---------------------------------------------------------------------------
 
 fn getMonotonicTimeNs() i128 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(i128, @intCast(ts.sec)) * 1_000_000_000 + ts.nsec;
 }
 

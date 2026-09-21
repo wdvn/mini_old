@@ -55,38 +55,45 @@ const chat_stream = @import("../ui/chat_stream.zig");
 const term = @import("../ui/terminal.zig");
 const spinner_mod = @import("../ui/spinner.zig");
 
-extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
-    if (getenv(name)) |ptr| {
-        return std.mem.span(ptr);
-    }
-    return null;
-}
+/// Mutex protecting g_active_agent.
+pub var g_agent_mutex = std.atomic.Mutex.unlocked;
 
 var g_active_agent: ?*AgentLoop = null;
 
 fn agentToolListener(tool_name: []const u8, input_json: ?[]const u8, is_error: bool) void {
-    if (g_active_agent) |agent| {
-        agent.onToolCompleted(tool_name, input_json, is_error);
+    while (!g_agent_mutex.tryLock()) {}
+    const agent = g_active_agent;
+    g_agent_mutex.unlock();
+    if (agent) |a| {
+        a.onToolCompleted(tool_name, input_json, is_error);
     }
 }
 
 fn agentOutputListener(chunk: []const u8) void {
-    if (g_active_agent) |agent| {
-        agent.coordinator.appendActLog(chunk);
+    while (!g_agent_mutex.tryLock()) {}
+    const agent = g_active_agent;
+    g_agent_mutex.unlock();
+    if (agent) |a| {
+        a.coordinator.appendActLog(chunk);
     }
 }
 
 fn watchdogInterruptHandler() void {
-    if (g_active_agent) |agent| {
-        agent.engine.requestInterrupt();
+    while (!g_agent_mutex.tryLock()) {}
+    const agent = g_active_agent;
+    g_agent_mutex.unlock();
+    if (agent) |a| {
+        a.engine.requestInterrupt();
     }
     tools_mod.interruptActiveBash();
 }
 
 fn watchdogDecisionHandler(ctx: watchdog_mod.DecisionContext) watchdog_mod.TimeoutDecision {
-    if (g_active_agent) |agent| {
-        return agent.consultLlmOnTimeout(ctx);
+    while (!g_agent_mutex.tryLock()) {}
+    const agent = g_active_agent;
+    g_agent_mutex.unlock();
+    if (agent) |a| {
+        return a.consultLlmOnTimeout(ctx);
     }
     return .{ .should_kill = false, .extend_seconds = 60 };
 }
@@ -408,7 +415,7 @@ pub const AgentLoop = struct {
         });
 
         var path_buf: [256]u8 = undefined;
-        const home_dir = getEnvVar("HOME") orelse ".";
+        const home_dir = utils.getEnvSlice("HOME") orelse ".";
         const cas_path = try std.fmt.bufPrint(&path_buf, "{s}/.mini/cas", .{home_dir});
         const cas = try cas_mod.CAS.init(alloc, io, cas_path);
 
@@ -423,7 +430,7 @@ pub const AgentLoop = struct {
             const prj_hash = std.hash.Fnv1a_64.hash(cur_cwd);
 
             var mem_path_buf: [512]u8 = undefined;
-            const mem_base = config.memory_dir orelse (getEnvVar("MINI_HOME") orelse (std.fmt.bufPrint(&mem_path_buf, "{s}/.mini/memory", .{home_dir}) catch ".mini/memory"));
+            const mem_base = config.memory_dir orelse (utils.getEnvSlice("MINI_HOME") orelse (std.fmt.bufPrint(&mem_path_buf, "{s}/.mini/memory", .{home_dir}) catch ".mini/memory"));
 
             const prj_mem_dir = std.fmt.allocPrint(alloc, "{s}/{x}", .{ mem_base, prj_hash }) catch null;
             if (prj_mem_dir) |pmd| {
@@ -983,7 +990,7 @@ pub const AgentLoop = struct {
             }
         }
 
-        const pid: u32 = @intCast(std.os.linux.getpid());
+        const pid: u32 = @intCast(std.c.getpid());
         logger.logAct(self.io, .{
             .session_pid = pid,
             .act_id = act_id,
@@ -1690,11 +1697,15 @@ pub const AgentLoop = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !void {
+        while (!g_agent_mutex.tryLock()) {}
         g_active_agent = self;
+        g_agent_mutex.unlock();
         hooks_mod.setToolListener(&agentToolListener);
         hooks_mod.setOutputListener(&agentOutputListener);
         defer {
+            while (!g_agent_mutex.tryLock()) {}
             g_active_agent = null;
+            g_agent_mutex.unlock();
             hooks_mod.setToolListener(null);
             hooks_mod.setOutputListener(null);
         }
@@ -1766,8 +1777,8 @@ pub const AgentLoop = struct {
 
         if (self.journal == null) {
             var path_buf: [256]u8 = undefined;
-            const home_dir = getEnvVar("HOME") orelse ".";
-            const journal_path = std.fmt.bufPrint(&path_buf, "{s}/.mini/sessions/journal_{d}.jsonl", .{ home_dir, std.os.linux.getpid() }) catch "/tmp/mini_journal.jsonl";
+            const home_dir = utils.getEnvSlice("HOME") orelse ".";
+            const journal_path = std.fmt.bufPrint(&path_buf, "{s}/.mini/sessions/journal_{d}.jsonl", .{ home_dir, std.c.getpid() }) catch "/tmp/mini_journal.jsonl";
             self.journal = journal_mod.ActJournal.init(self.alloc, self.io, journal_path) catch null;
         }
 

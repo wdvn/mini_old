@@ -718,8 +718,8 @@ pub fn postStream(
     // Prevents extended-thinking models (e.g. reasoning_effort=high) from hanging
     // indefinitely when TCP keepalive/TLS heartbeat fools the poll-based idle watchdog.
     const deadline_ms: i64 = blk: {
-        var ts: std.os.linux.timespec = undefined;
-        _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.REALTIME, &ts);
         const start_ms = @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1000000);
         // Use the smaller of total timeout or 6x idle timeout as absolute ceiling.
         // This handles: idle=60s → deadline=120s (matches timeout_secs default),
@@ -734,8 +734,8 @@ pub fn postStream(
             if (signals.isInterrupted()) break :blk error.Interrupted;
             // Wall-clock check: abort if total stream duration exceeded.
             {
-                var ts_now: std.os.linux.timespec = undefined;
-                _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts_now);
+                var ts_now: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.REALTIME, &ts_now);
                 const now_ms = @as(i64, @intCast(ts_now.sec)) * 1000 + @divTrunc(ts_now.nsec, 1000000);
                 if (now_ms >= deadline_ms) {
                     if (opts.out_idle_aborted) |flag| flag.* = true;
@@ -1276,8 +1276,8 @@ test "postStream: SSE stream receives all chunks + status" {
 
 /// Epoch milliseconds via raw clock (Zig 0.16 moved std.time.milliTimestamp).
 fn testMilliTimestamp() i64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
     return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1000000);
 }
 
@@ -1312,8 +1312,8 @@ const SilentServerCtx = struct {
         try s_writer.interface.writeAll(self.response);
         try s_writer.interface.flush();
         // Hold the connection open well past the client's idle window (1s).
-        var ts: std.os.linux.timespec = .{ .sec = 3, .nsec = 0 };
-        _ = std.os.linux.nanosleep(&ts, &ts);
+        var ts: std.c.timespec = .{ .sec = 3, .nsec = 0 };
+        _ = std.c.nanosleep(&ts, &ts);
     }
 };
 

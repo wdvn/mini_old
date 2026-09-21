@@ -30,7 +30,6 @@ const JS_UNDEFINED = quickjs.JS_UNDEFINED;
 const JS_NULL = quickjs.JS_NULL;
 const JS_EXCEPTION = quickjs.JS_EXCEPTION;
 
-extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 const bash_tool = @import("../tools/bash.zig");
 const file_tool = @import("../tools/file.zig");
@@ -69,7 +68,7 @@ fn jsStringSlice(ctx: ?*c.JSContext, val: c.JSValue, alloc: Allocator) ?[]u8 {
     const c_str = c.JS_ToCString(ctx, val);
     if (c_str == null) return null;
     defer c.JS_FreeCString(ctx, c_str);
-    return alloc.dupe(u8, std.mem.span(c_str)) catch null;
+    return alloc.dupe(u8, if (c_str) |p| std.mem.sliceTo(p, 0) else "") catch null;
 }
 
 // ---------------------------------------------------------------------------
@@ -779,9 +778,9 @@ fn jsMiniEnv(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.J
     const var_name_z = engine.alloc.dupeZ(u8, var_name) catch return JS_EXCEPTION;
     defer engine.alloc.free(var_name_z);
 
-    const val = getenv(var_name_z.ptr);
+    const val = utils.getEnvSlice(var_name_z.ptr);
     if (val) |v| {
-        const slice = std.mem.span(v);
+        const slice = v;
         return c.JS_NewStringLen(ctx, slice.ptr, slice.len);
     }
     return JS_NULL;
@@ -864,16 +863,23 @@ pub const ThinkingOverride = struct {
     budget_tokens: ?u32 = null,
 };
 
+/// Mutex protecting g_pending_thinking.
+pub var g_thinking_mutex = std.atomic.Mutex.unlocked;
+
 var g_pending_thinking: ?ThinkingOverride = null;
 
 pub fn consumePendingThinkingOverride() ?ThinkingOverride {
+    while (!g_thinking_mutex.tryLock()) {}
     const val = g_pending_thinking;
     g_pending_thinking = null;
+    g_thinking_mutex.unlock();
     return val;
 }
 
 pub fn setPendingThinkingOverride(override: ?ThinkingOverride) void {
+    while (!g_thinking_mutex.tryLock()) {}
     g_pending_thinking = override;
+    g_thinking_mutex.unlock();
 }
 
 // ---------------------------------------------------------------------------
@@ -890,11 +896,15 @@ fn jsMiniSetThinking(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv:
         var budget: i32 = 0;
         if (c.JS_ToInt32(ctx, &budget, argv[0]) == 0) {
             if (budget <= 0) {
-                g_pending_thinking = .{ .effort = "none", .budget_tokens = 0 };
+                while (!g_thinking_mutex.tryLock()) {}
+g_pending_thinking = .{ .effort = "none", .budget_tokens = 0 };
+    g_thinking_mutex.unlock();
             } else {
                 const b: u32 = @intCast(budget);
                 const eff: []const u8 = if (b <= 1024) "low" else if (b <= 4096) "medium" else "high";
-                g_pending_thinking = .{ .effort = eff, .budget_tokens = b };
+                while (!g_thinking_mutex.tryLock()) {}
+g_pending_thinking = .{ .effort = eff, .budget_tokens = b };
+    g_thinking_mutex.unlock();
             }
             return c.JS_NewBool(ctx, 1);
         }
@@ -906,15 +916,25 @@ fn jsMiniSetThinking(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv:
         defer engine.alloc.free(str);
 
         if (std.mem.eql(u8, str, "low")) {
-            g_pending_thinking = .{ .effort = "low", .budget_tokens = 1024 };
+            while (!g_thinking_mutex.tryLock()) {}
+g_pending_thinking = .{ .effort = "low", .budget_tokens = 1024 };
+    g_thinking_mutex.unlock();
         } else if (std.mem.eql(u8, str, "medium")) {
-            g_pending_thinking = .{ .effort = "medium", .budget_tokens = 4096 };
+            while (!g_thinking_mutex.tryLock()) {}
+g_pending_thinking = .{ .effort = "medium", .budget_tokens = 4096 };
+    g_thinking_mutex.unlock();
         } else if (std.mem.eql(u8, str, "high")) {
-            g_pending_thinking = .{ .effort = "high", .budget_tokens = 8192 };
+            while (!g_thinking_mutex.tryLock()) {}
+g_pending_thinking = .{ .effort = "high", .budget_tokens = 8192 };
+    g_thinking_mutex.unlock();
         } else if (std.mem.eql(u8, str, "none") or std.mem.eql(u8, str, "off")) {
-            g_pending_thinking = .{ .effort = "none", .budget_tokens = 0 };
+            while (!g_thinking_mutex.tryLock()) {}
+g_pending_thinking = .{ .effort = "none", .budget_tokens = 0 };
+    g_thinking_mutex.unlock();
         } else if (std.mem.eql(u8, str, "minimal")) {
-            g_pending_thinking = .{ .effort = "minimal", .budget_tokens = 512 };
+            while (!g_thinking_mutex.tryLock()) {}
+g_pending_thinking = .{ .effort = "minimal", .budget_tokens = 512 };
+    g_thinking_mutex.unlock();
         } else {
             return c.JS_ThrowTypeError(ctx, "level must be 'low', 'medium', 'high', 'none', or a token budget number");
         }
@@ -1052,8 +1072,8 @@ pub fn registerBindings(engine: *Engine) !void {
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "media", c.JS_NewCFunction(ctx, jsMiniMedia, "media", 3));
 
     // 4. metadata props
-    const pwd_val = getenv("PWD");
-    const cwd_str = if (pwd_val) |p| std.mem.span(p) else ".";
+    const pwd_val = utils.getEnvSlice("PWD");
+    const cwd_str = if (pwd_val) |p| p else ".";
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "workspaceRoot", c.JS_NewStringLen(ctx, cwd_str.ptr, cwd_str.len));
 
     const session_id = artifacts_mod.getSessionId();

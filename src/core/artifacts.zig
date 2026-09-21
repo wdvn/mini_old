@@ -13,15 +13,6 @@ const utils = @import("utils.zig");
 const main = @import("../main.zig");
 const hooks = @import("hooks.zig");
 
-extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-
-fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
-    if (getenv(name)) |ptr| {
-        return std.mem.span(ptr);
-    }
-    return null;
-}
-
 var g_session_id: ?[]const u8 = null;
 
 /// Set the current Session ID.
@@ -42,7 +33,7 @@ pub fn resolveArtifactsDir(alloc: Allocator, io: std.Io) ![]u8 {
     const sid = getSessionId();
 
     var dir_path: []u8 = undefined;
-    if (getEnvVar("MINI_ARTIFACTS_DIR")) |custom_dir| {
+    if (utils.getEnvSlice("MINI_ARTIFACTS_DIR")) |custom_dir| {
         if (custom_dir.len > 0) {
             dir_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ custom_dir, sid });
         } else {
@@ -60,10 +51,10 @@ pub fn resolveArtifactsDir(alloc: Allocator, io: std.Io) ![]u8 {
 }
 
 fn defaultArtifactsDir(alloc: Allocator, sid: []const u8) ![]u8 {
-    if (getEnvVar("MINI_HOME")) |mh| {
+    if (utils.getEnvSlice("MINI_HOME")) |mh| {
         if (mh.len > 0) return std.fmt.allocPrint(alloc, "{s}/artifacts/{s}", .{ mh, sid });
     }
-    if (getEnvVar("HOME")) |home| {
+    if (utils.getEnvSlice("HOME")) |home| {
         if (home.len > 0) return std.fmt.allocPrint(alloc, "{s}/.mini/artifacts/{s}", .{ home, sid });
     }
     return std.fmt.allocPrint(alloc, "./.mini/artifacts/{s}", .{sid});
@@ -218,8 +209,8 @@ fn updateMetadata(
     const meta_path = try std.fmt.allocPrint(alloc, "{s}/metadata.json", .{art_dir});
     defer alloc.free(meta_path);
 
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
     const now = ts.sec;
 
     // Read existing metadata if present

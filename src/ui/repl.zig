@@ -18,6 +18,8 @@ pub const chat_stream = @import("chat_stream.zig");
 pub const PROMPT_PREFIX = "\x1b[1;34mYou\x1b[0m > ";
 
 /// Global renderer for current turn (if processing).
+/// Mutex protecting current_renderer.
+pub var g_renderer_mutex = std.atomic.Mutex.unlocked;
 pub var current_renderer: ?*chat_stream.TurnRenderer = null;
 
 /// Run interactive REPL loop.
@@ -75,8 +77,14 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
         var renderer = chat_stream.TurnRenderer.init(alloc, io);
         renderer.parser.thinking_tags = main.backends.provider_mod.getProfile(agent.config.openai_provider).thinking_tags;
         defer renderer.deinit();
-        current_renderer = &renderer;
-        defer current_renderer = null;
+        while (!g_renderer_mutex.tryLock()) {}
+    current_renderer = &renderer;
+    g_renderer_mutex.unlock();
+        defer {
+        while (!g_renderer_mutex.tryLock()) {}
+        current_renderer = null;
+        g_renderer_mutex.unlock();
+    }
 
         renderer.startTurn(media_res.clean_text);
         const start_ms = utils.milliTimestamp();
@@ -178,8 +186,11 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
                 },
             }
             // Update renderer's thinking tags to match new provider
-            if (main.ui_repl.current_renderer) |r| {
-                r.parser.thinking_tags = main.backends.provider_mod.getProfile(provider_key).thinking_tags;
+            while (!g_renderer_mutex.tryLock()) {}
+    const r = main.ui_repl.current_renderer;
+    g_renderer_mutex.unlock();
+    if (r) |renderer| {
+                renderer.parser.thinking_tags = main.backends.provider_mod.getProfile(provider_key).thinking_tags;
             }
             main.stdoutPrint("Provider set to: {s}\n", .{provider_key});
         }
@@ -503,14 +514,6 @@ fn printConfigHelp(io: std.Io) void {
     ) catch {};
 }
 
-extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
-    if (getenv(name)) |ptr| {
-        return std.mem.span(ptr);
-    }
-    return null;
-}
-
 fn tryExecuteCustomSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, input: []const u8) !bool {
     if (!std.mem.startsWith(u8, input, "/")) return false;
 
@@ -521,7 +524,7 @@ fn tryExecuteCustomSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.
 
     const args_str = if (space_idx < cmd_line.len) std.mem.trim(u8, cmd_line[space_idx..], " \t") else "";
 
-    const agent_dir = getEnvVar("MINI_AGENT_FOLDER") orelse ".agent";
+    const agent_dir = utils.getEnvSlice("MINI_AGENT_FOLDER") orelse ".agent";
     const cmd_path = std.fmt.allocPrint(alloc, "{s}/commands/{s}.md", .{ agent_dir, cmd_name }) catch return false;
     defer alloc.free(cmd_path);
 
@@ -546,8 +549,14 @@ fn tryExecuteCustomSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.
     var renderer = chat_stream.TurnRenderer.init(alloc, io);
     renderer.parser.thinking_tags = main.backends.provider_mod.getProfile(agent.config.openai_provider).thinking_tags;
     defer renderer.deinit();
+    while (!g_renderer_mutex.tryLock()) {}
     current_renderer = &renderer;
-    defer current_renderer = null;
+    g_renderer_mutex.unlock();
+    defer {
+        while (!g_renderer_mutex.tryLock()) {}
+        current_renderer = null;
+        g_renderer_mutex.unlock();
+    }
 
     renderer.startTurn(expanded);
     const start_ms = utils.milliTimestamp();
@@ -623,8 +632,11 @@ test "expandCommandTemplate positional and arguments substitution" {
 // ---------------------------------------------------------------------------
 
 pub fn printThinkText(text: []const u8) void {
-    if (current_renderer) |r| {
-        r.streamThinking(text);
+    while (!g_renderer_mutex.tryLock()) {}
+    const r = current_renderer;
+    g_renderer_mutex.unlock();
+    if (r) |renderer| {
+        renderer.streamThinking(text);
     } else {
         const io = main.getIo();
         std.Io.File.stderr().writeStreamingAll(io, "\x1b[90m") catch {};
@@ -634,7 +646,10 @@ pub fn printThinkText(text: []const u8) void {
 }
 
 pub fn printRawText(text: []const u8) void {
-    if (current_renderer) |r| {
+    while (!g_renderer_mutex.tryLock()) {}
+    const r = current_renderer;
+    g_renderer_mutex.unlock();
+    if (r) {
         r.streamResponse(text);
     } else {
         const io = main.getIo();
@@ -643,8 +658,11 @@ pub fn printRawText(text: []const u8) void {
 }
 
 pub fn printText(text: []const u8) void {
-    if (current_renderer) |r| {
-        r.processTextChunk(text);
+    while (!g_renderer_mutex.tryLock()) {}
+    const r = current_renderer;
+    g_renderer_mutex.unlock();
+    if (r) |renderer| {
+        renderer.processTextChunk(text);
     } else {
         const io = main.getIo();
         std.Io.File.stdout().writeStreamingAll(io, text) catch {};
@@ -652,13 +670,16 @@ pub fn printText(text: []const u8) void {
 }
 
 pub fn resetThinkState() void {
-    if (current_renderer) |r| {
-        if (r.ui_state == .thinking or r.is_thinking) {
-            r.endThinking();
+    while (!g_renderer_mutex.tryLock()) {}
+    const r = current_renderer;
+    g_renderer_mutex.unlock();
+    if (r) |renderer| {
+        if (renderer.ui_state == .thinking or renderer.is_thinking) {
+            renderer.endThinking();
         }
-        if (r.ui_state == .codeact_live or r.ui_state == .codeact_ready or r.is_codeact) {
-            r.endCodeAct();
+        if (renderer.ui_state == .codeact_live or renderer.ui_state == .codeact_ready or renderer.is_codeact) {
+            renderer.endCodeAct();
         }
-        r.parser.resetAct();
+        renderer.parser.resetAct();
     }
 }

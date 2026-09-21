@@ -104,7 +104,7 @@ pub const MemoryStore = struct {
         return std.fmt.allocPrint(self.alloc, "mem_{x}_{x}_{x}", .{
             utils.milliTimestamp(),
             self.id_counter,
-            std.os.linux.getpid(),
+            std.c.getpid(),
         });
     }
 
@@ -360,7 +360,7 @@ test "append → loadIndex round-trip with all fields" {
     const io = std.testing.io;
 
     var buf: [128]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_memstore_test_{d}", .{std.os.linux.getpid()});
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_memstore_test_{d}", .{std.c.getpid()});
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
     var store = try MemoryStore.init(alloc, io, dir);
@@ -404,7 +404,7 @@ test "supersedes replaces old entry in index, file preserves audit trail" {
     const io = std.testing.io;
 
     var buf: [128]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_memstore_test_{d}_sup", .{std.os.linux.getpid()});
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_memstore_test_{d}_sup", .{std.c.getpid()});
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
     var store = try MemoryStore.init(alloc, io, dir);
@@ -458,7 +458,7 @@ test "touch increments access_count and last_access, unknown id returns false" {
     const io = std.testing.io;
 
     var buf: [128]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_memstore_test_{d}_touch", .{std.os.linux.getpid()});
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_memstore_test_{d}_touch", .{std.c.getpid()});
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
     var store = try MemoryStore.init(alloc, io, dir);
@@ -496,7 +496,7 @@ test "2 appends → JSONL file has exactly 2 lines" {
     const io = std.testing.io;
 
     var buf: [128]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_memstore_test_{d}_jsonl", .{std.os.linux.getpid()});
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_memstore_test_{d}_jsonl", .{std.c.getpid()});
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
     var store = try MemoryStore.init(alloc, io, dir);

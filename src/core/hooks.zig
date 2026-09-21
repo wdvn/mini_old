@@ -12,6 +12,9 @@ const json = @import("json.zig");
 const utils = @import("utils.zig");
 const main = @import("../main.zig");
 
+/// Mutex protecting all global hook state.
+pub var g_hooks_mutex = std.atomic.Mutex.unlocked;
+
 /// Global shell command for hook. Null = disabled.
 var g_hook_cmd: ?[]const u8 = null;
 
@@ -21,21 +24,25 @@ var g_hook_listener: ?HookListener = null;
 
 /// Set global hook command.
 pub fn setHookCommand(cmd: ?[]const u8) void {
+    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
     g_hook_cmd = cmd;
 }
 
 /// Get current hook command.
 pub fn getHookCommand() ?[]const u8 {
+    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
     return g_hook_cmd;
 }
 
 /// Set in-memory hook listener.
 pub fn setHookListener(listener: ?HookListener) void {
+    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
     g_hook_listener = listener;
 }
 
 /// Get current in-memory hook listener.
 pub fn getHookListener() ?HookListener {
+    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
     return g_hook_listener;
 }
 
@@ -45,11 +52,13 @@ var g_tool_listener: ?ToolListener = null;
 
 /// Set in-memory tool lifecycle listener.
 pub fn setToolListener(listener: ?ToolListener) void {
+    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
     g_tool_listener = listener;
 }
 
 /// Get current in-memory tool lifecycle listener.
 pub fn getToolListener() ?ToolListener {
+    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
     return g_tool_listener;
 }
 
@@ -59,18 +68,23 @@ var g_output_listener: ?OutputListener = null;
 
 /// Set in-memory execution output chunk listener.
 pub fn setOutputListener(listener: ?OutputListener) void {
+    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
     g_output_listener = listener;
 }
 
 /// Get current in-memory execution output chunk listener.
 pub fn getOutputListener() ?OutputListener {
+    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
     return g_output_listener;
 }
 
 /// Forward an execution output chunk (stdout/stderr) to the active output listener.
 pub fn appendExecutionOutput(chunk: []const u8) void {
-    if (g_output_listener) |listener| {
-        listener(chunk);
+    while (!g_hooks_mutex.tryLock()) {}
+    const listener = g_output_listener;
+    g_hooks_mutex.unlock();
+    if (listener) |ln| {
+        ln(chunk);
     }
 }
 
@@ -119,9 +133,9 @@ pub fn dispatch(alloc: Allocator, io: std.Io, payload: HookPayload) void {
     const cmd = g_hook_cmd orelse return;
     if (cmd.len == 0) return;
 
-    const pid = std.os.linux.getpid();
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+    const pid = std.c.getpid();
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
     const timestamp = ts.sec;
 
     // 1. Build JSON payload on stdin

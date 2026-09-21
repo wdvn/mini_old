@@ -46,6 +46,9 @@ const quickjs = @import("../runtime/quickjs_engine.zig");
 // Global state (single-threaded)
 // ---------------------------------------------------------------------------
 
+/// Mutex protecting registry globals.
+pub var g_registry_mutex = std.atomic.Mutex.unlocked;
+
 /// MCP manager — set by main.zig after MCP initialization.
 var g_mcp: ?*mcp_mod.McpClientManager = null;
 
@@ -61,21 +64,27 @@ var g_video_gen_enabled: bool = false;
 var g_image_input_enabled: bool = true;
 
 pub fn setMediaConfig(image_gen: bool, video_gen: bool, image_input: bool) void {
+    while (!g_registry_mutex.tryLock()) {}
     g_image_gen_enabled = image_gen;
     g_video_gen_enabled = video_gen;
     g_image_input_enabled = image_input;
+    g_registry_mutex.unlock();
 }
 
 /// Configure MCP manager fallback when no built-in tool matches.
 pub fn setMcpManager(m: ?*mcp_mod.McpClientManager) void {
+    while (!g_registry_mutex.tryLock()) {}
     g_mcp = m;
+    g_registry_mutex.unlock();
 }
 
 /// Set policy for tool execution.
 /// allowlist and blocklist are pointers to config strings (not copied).
 pub fn setPolicy(allowlist: ?[]const u8, blocklist: ?[]const u8) void {
+    while (!g_registry_mutex.tryLock()) {}
     g_allowlist = allowlist;
     g_blocklist = blocklist;
+    g_registry_mutex.unlock();
 }
 
 // ---------------------------------------------------------------------------
@@ -110,8 +119,11 @@ fn executeToolInternal(alloc: Allocator, io: std.Io, name: []const u8, input_jso
     if (std.mem.eql(u8, name, "sh") or std.mem.eql(u8, name, "shell") or std.mem.eql(u8, name, "terminal")) return bash_tool.executeTool(alloc, io, input_json);
 
     // MCP fallback: names follow "server__toolname" format
-    if (g_mcp) |mgr| {
-        if (mgr.callTool(name, input_json)) |result| return result;
+    while (!g_registry_mutex.tryLock()) {}
+    const mgr = g_mcp;
+    g_registry_mutex.unlock();
+    if (mgr) |m| {
+        if (m.callTool(name, input_json)) |result| return result;
     }
 
     return std.fmt.allocPrint(alloc,
@@ -357,8 +369,11 @@ pub fn getRelevantDefinitions(alloc: Allocator, user_text: []const u8) []const p
     }
 
     // MCP tools
-    if (g_mcp) |mgr| {
-        const mcp_tools = mgr.getToolDefinitions(alloc);
+    while (!g_registry_mutex.tryLock()) {}
+    const mgr = g_mcp;
+    g_registry_mutex.unlock();
+    if (mgr) |m| {
+        const mcp_tools = m.getToolDefinitions(alloc);
         defer if (mcp_tools.len > 0) alloc.free(mcp_tools);
         for (mcp_tools) |mt| {
             if (count >= filtered_buf.len) break;
@@ -417,9 +432,12 @@ pub fn isPermitted(name: []const u8) bool {
 
     const norm_name = normalizeToolName(name);
 
-    if (g_allowlist) |list| {
+    while (!g_registry_mutex.tryLock()) {}
+    const allow_list = g_allowlist;
+    g_registry_mutex.unlock();
+    if (allow_list) |l| {
         // Allowlist: ONLY allow listed tools
-        var it = std.mem.splitScalar(u8, list, ',');
+        var it = std.mem.splitScalar(u8, l, ',');
         while (it.next()) |entry| {
             const tr = std.mem.trim(u8, entry, " \t");
             const norm_entry = normalizeToolName(tr);
@@ -427,8 +445,11 @@ pub fn isPermitted(name: []const u8) bool {
         }
         return false; // not in allowlist
     }
-    if (g_blocklist) |list| {
-        var it = std.mem.splitScalar(u8, list, ',');
+    while (!g_registry_mutex.tryLock()) {}
+    const block_list = g_blocklist;
+    g_registry_mutex.unlock();
+    if (block_list) |bl| {
+        var it = std.mem.splitScalar(u8, bl, ',');
         while (it.next()) |entry| {
             const tr = std.mem.trim(u8, entry, " \t");
             const norm_entry = normalizeToolName(tr);
@@ -528,10 +549,13 @@ fn executeSkills(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         const status = if (permitted) "✓" else "✗";
         try w.print("  {s} **{s}** — {s}\n", .{ status, td.name, td.description });
     }
-    if (g_mcp) |mgr| {
-        if (mgr.servers.items.len > 0) {
+    while (!g_registry_mutex.tryLock()) {}
+    const mgr = g_mcp;
+    g_registry_mutex.unlock();
+    if (mgr) |m| {
+        if (m.servers.items.len > 0) {
             try w.writeAll("\n## MCP Tools\n\n");
-            for (mgr.servers.items) |*server| {
+            for (m.servers.items) |*server| {
                 for (server.tools.items) |t| {
                     try w.print("  ✓ **{s}** — {s}\n", .{ t.prefixed_name, t.description });
                 }

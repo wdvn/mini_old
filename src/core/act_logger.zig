@@ -8,15 +8,6 @@ const proto = @import("protocol.zig");
 const utils = @import("utils.zig");
 const journal = @import("journal.zig");
 
-extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-
-fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
-    if (getenv(name)) |ptr| {
-        return std.mem.span(ptr);
-    }
-    return null;
-}
-
 pub const ActExecutionInfo = struct {
     exec_type: []const u8 = "none", // "codeact", "tool_call", "none"
     stdout: ?[]const u8 = null,
@@ -114,7 +105,7 @@ pub const ActLogger = struct {
         defer dir.close(io);
 
         const max_keep = blk: {
-            const s = getEnvVar("MINI_ACTS_KEEP") orelse getEnvVar("MINI_ACT_KEEP") orelse break :blk default_max_act_files;
+            const s = utils.getEnvSlice("MINI_ACTS_KEEP") orelse utils.getEnvSlice("MINI_ACT_KEEP") orelse break :blk default_max_act_files;
             const v = std.fmt.parseInt(usize, s, 10) catch break :blk default_max_act_files;
             break :blk if (v == 0) default_max_act_files else v;
         };

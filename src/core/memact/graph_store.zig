@@ -68,7 +68,7 @@ pub const PGraphStore = struct {
             prefix,
             utils.milliTimestamp(),
             self.id_counter,
-            std.os.linux.getpid(),
+            std.c.getpid(),
         });
     }
 

@@ -11,13 +11,13 @@ extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 /// Check whether the current process is a subagent (spawned from parent) or in quiet mode.
 pub fn isSubagent() bool {
     if (getenv("MINI_SUBAGENT_DEPTH")) |ptr| {
-        const span = std.mem.span(ptr);
+        const span = std.mem.sliceTo(ptr, 0);
         if (span.len > 0 and !std.mem.eql(u8, span, "0")) {
             return true;
         }
     }
     if (getenv("MINI_QUIET")) |ptr| {
-        const span = std.mem.span(ptr);
+        const span = std.mem.sliceTo(ptr, 0);
         if (std.mem.eql(u8, span, "1") or std.mem.eql(u8, span, "true")) {
             return true;
         }
@@ -28,7 +28,7 @@ pub fn isSubagent() bool {
 /// Read an environment variable as an optional slice (process lifetime).
 pub fn getEnvSlice(name: [*:0]const u8) ?[]const u8 {
     if (getenv(name)) |ptr| {
-        const span = std.mem.span(ptr);
+        const span = std.mem.sliceTo(ptr, 0);
         if (span.len > 0) return span;
     }
     return null;
@@ -128,8 +128,8 @@ pub fn drainPipe(io: std.Io, pipe: std.Io.File, buf: []u8) usize {
 
 /// Get epoch timestamp in milliseconds.
 pub fn milliTimestamp() i64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
     return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1000000);
 }
 

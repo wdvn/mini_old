@@ -67,8 +67,8 @@ pub const JsProviderAdapter = struct {
     deadline_ms: i64 = 0,
 
     fn nowMs() i64 {
-        var ts: std.os.linux.timespec = undefined;
-        if (std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts) != 0) return std.math.maxInt(i64);
+        var ts: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return std.math.maxInt(i64);
         return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1000000);
     }
 

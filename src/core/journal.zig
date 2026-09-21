@@ -12,16 +12,8 @@ const json_mod = @import("json.zig");
 
 // Zig 0.16: std.posix.getenv removed — extern libc getenv (build links libc),
 // matching pattern in agent.zig / artifacts.zig.
-extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn unsetenv(name: [*:0]const u8) c_int;
-
-fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
-    if (getenv(name)) |ptr| {
-        return std.mem.span(ptr);
-    }
-    return null;
-}
 
 pub const ActEventType = enum {
     act_started,
@@ -124,7 +116,7 @@ pub const ActJournal = struct {
         // Cache parent journal path (subagent merge). Only mirror when valid:
         // env exists, non-empty, and different from this journal (avoid self-loop).
         var parent_path: ?[]u8 = null;
-        if (getEnvVar("MINI_PARENT_JOURNAL")) |pp| {
+        if (utils.getEnvSlice("MINI_PARENT_JOURNAL")) |pp| {
             if (pp.len > 0 and !std.mem.eql(u8, pp, path_dup)) {
                 parent_path = try alloc.dupe(u8, pp);
             }
@@ -152,7 +144,7 @@ pub const ActJournal = struct {
         defer dir.close(io);
 
         const max_keep = blk: {
-            const s = getEnvVar("MINI_JOURNAL_KEEP") orelse break :blk default_max_journal_files;
+            const s = utils.getEnvSlice("MINI_JOURNAL_KEEP") orelse break :blk default_max_journal_files;
             const v = std.fmt.parseInt(usize, s, 10) catch break :blk default_max_journal_files;
             break :blk if (v == 0) default_max_journal_files else v;
         };
@@ -422,7 +414,7 @@ test "pruneOldJournals keeps N newest files, preserves current file" {
 
     // Dedicated test directory — do not touch actual ~/.mini/sessions
     var buf: [128]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_journal_prune_test_{d}", .{std.os.linux.getpid()});
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_journal_prune_test_{d}", .{std.posix.getpid()});
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, dir);

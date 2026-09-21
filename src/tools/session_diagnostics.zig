@@ -10,17 +10,14 @@ const Allocator = std.mem.Allocator;
 const json = @import("../core/json.zig");
 const utils = @import("../core/utils.zig");
 
-extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern fn kill(pid: std.c.pid_t, sig: c_int) c_int;
 
 fn getSessionsDir(alloc: Allocator) ![]u8 {
-    if (getenv("MINI_HOME")) |mh| {
-        const span = std.mem.span(mh);
-        if (span.len > 0) return std.fmt.allocPrint(alloc, "{s}/sessions", .{span});
+    if (utils.getEnvSlice("MINI_HOME")) |mh| {
+        if (mh.len > 0) return std.fmt.allocPrint(alloc, "{s}/sessions", .{mh});
     }
-    if (getenv("HOME")) |h| {
-        const span = std.mem.span(h);
-        return std.fmt.allocPrint(alloc, "{s}/.mini/sessions", .{span});
+    if (utils.getEnvSlice("HOME")) |h| {
+        return std.fmt.allocPrint(alloc, "{s}/.mini/sessions", .{h});
     }
     return alloc.dupe(u8, "./.mini/sessions");
 }

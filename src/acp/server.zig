@@ -228,8 +228,8 @@ pub const AcpServer = struct {
             try self.alloc.dupe(u8, sid)
         else blk: {
             self.session_counter += 1;
-            var ts: std.os.linux.timespec = undefined;
-            _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(.REALTIME, &ts);
             break :blk try std.fmt.allocPrint(self.alloc, "sess_{d}_{d}", .{ ts.sec, self.session_counter });
         };
         if (self.current_session_id) |old| self.alloc.free(old);
@@ -520,12 +520,12 @@ pub const AcpServer = struct {
     }
 
     fn resolveSessionFilePath(self: *AcpServer, session_id: []const u8) ![]u8 {
-        const dir_path = if (getEnvVar("MINI_HOME")) |mh| blk: {
+        const dir_path = if (utils.getEnvSlice("MINI_HOME")) |mh| blk: {
             if (mh.len > 0) break :blk try std.fmt.allocPrint(self.alloc, "{s}/sessions", .{mh});
-            const home = getEnvVar("HOME") orelse ".";
+            const home = utils.getEnvSlice("HOME") orelse ".";
             break :blk try std.fmt.allocPrint(self.alloc, "{s}/.mini/sessions", .{home});
         } else blk: {
-            const home = getEnvVar("HOME") orelse ".";
+            const home = utils.getEnvSlice("HOME") orelse ".";
             break :blk try std.fmt.allocPrint(self.alloc, "{s}/.mini/sessions", .{home});
         };
         defer self.alloc.free(dir_path);
@@ -536,15 +536,6 @@ pub const AcpServer = struct {
         return try std.fmt.allocPrint(self.alloc, "{s}/{s}.json", .{ dir_path, session_id });
     }
 };
-
-extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-
-fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
-    if (getenv(name)) |ptr| {
-        return std.mem.sliceTo(ptr, 0);
-    }
-    return null;
-}
 
 // ---------------------------------------------------------------------------
 // Helpers

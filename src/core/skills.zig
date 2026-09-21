@@ -43,21 +43,29 @@ pub const SkillInfo = struct {
 };
 
 /// Loaded skills list (arena-allocated, freed via `deinitSkills`).
+/// Mutex protecting g_skills and g_skills_arena.
+pub var g_skills_mutex = std.atomic.Mutex.unlocked;
+
 var g_skills: ?[]SkillInfo = null;
 var g_skills_arena: ?std.heap.ArenaAllocator = null;
 
 /// Free skills memory.
 pub fn deinitSkills() void {
+    while (!g_skills_mutex.tryLock()) {}
     if (g_skills_arena) |*arena| {
         arena.deinit();
         g_skills_arena = null;
     }
     g_skills = null;
+    g_skills_mutex.unlock();
 }
 
 /// Return loaded skills list (null if loadSkills not called or no skills).
 pub fn getSkills() ?[]const SkillInfo {
-    return g_skills;
+    while (!g_skills_mutex.tryLock()) {}
+    const s = g_skills;
+    g_skills_mutex.unlock();
+    return s;
 }
 
 const main = @import("../main.zig");
@@ -91,8 +99,10 @@ pub fn loadSkills(alloc: Allocator, io: std.Io, env_map: *const std.process.Envi
     // Transfer ownership to global state
     deinitSkills();
     const owned = skills.toOwnedSlice(arena.allocator()) catch return 0;
+    while (!g_skills_mutex.tryLock()) {}
     g_skills_arena = arena;
     g_skills = owned;
+    g_skills_mutex.unlock();
     transferred = true;
     return owned.len;
 }
@@ -212,7 +222,9 @@ fn resolveSkillsDir(alloc: Allocator, env_map: *const std.process.Environ.Map) !
 /// Returns null if no skills (injects nothing).
 /// Caller frees result.
 pub fn buildSkillsBlock(alloc: Allocator) !?[]u8 {
+    while (!g_skills_mutex.tryLock()) {}
     const skills = g_skills orelse return null;
+    g_skills_mutex.unlock();
     if (skills.len == 0) return null;
 
     var buf = utils.BufWriter.init(alloc);
