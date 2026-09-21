@@ -368,12 +368,12 @@ test "pg: serializeGuidance generates 2-hop markdown guidance block" {
     try store.loadIndex(io);
 
     // Guidance for file_edit should suggest bash
-    const guidance_opt = try store.serializeGuidance(alloc, "file_edit", &.{}, false, 2);
+    const guidance_opt = try store.serializeGuidance(alloc, "file_edit", &.{}, false, 2, null);
     try testing.expect(guidance_opt != null);
     const guidance = guidance_opt.?;
     defer alloc.free(guidance);
 
-    try testing.expect(std.mem.indexOf(u8, guidance, "[Procedural Graph Guidance]") != null);
+    try testing.expect(std.mem.indexOf(u8, guidance, "[Procedural Advisory") != null);
     try testing.expect(std.mem.indexOf(u8, guidance, "Current Action: `file_edit`") != null);
     try testing.expect(std.mem.indexOf(u8, guidance, "`bash`") != null);
 }
@@ -410,3 +410,148 @@ test "pg: recordTransition frequency gate promotes candidate edge at N >= 3" {
     try store2.loadIndex(io);
     try testing.expectEqual(initial_edges + 1, store2.graph.active_edge_count);
 }
+
+test "pg: recordTransition rejects cycle and generic observational pairs" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+
+    var buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_pgstore_test_{d}_4", .{std.os.linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var store = try PGraphStore.init(alloc, io, dir);
+    defer store.deinit();
+    try store.loadIndex(io);
+
+    const initial_edges = store.graph.active_edge_count;
+
+    // 1. Generic observational pair (bash <-> file_read) should never be promoted
+    try store.recordTransition(io, "bash", "file_read");
+    try store.recordTransition(io, "bash", "file_read");
+    try store.recordTransition(io, "bash", "file_read");
+    try testing.expectEqual(initial_edges, store.graph.active_edge_count);
+
+    // 2. Add valid edge list_dir -> glob
+    try store.recordTransition(io, "list_dir", "glob");
+    try store.recordTransition(io, "list_dir", "glob");
+    try store.recordTransition(io, "list_dir", "glob");
+    try testing.expectEqual(initial_edges + 1, store.graph.active_edge_count);
+
+    // 3. Attempting reverse edge glob -> list_dir must be rejected by cycle guard
+    try store.recordTransition(io, "glob", "list_dir");
+    try store.recordTransition(io, "glob", "list_dir");
+    try store.recordTransition(io, "glob", "list_dir");
+    try testing.expectEqual(initial_edges + 1, store.graph.active_edge_count);
+}
+
+test "pg: serializeGuidance suppresses recent actions in trajectory window" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+
+    var buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_pgstore_test_{d}_5", .{std.os.linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var store = try PGraphStore.init(alloc, io, dir);
+    defer store.deinit();
+    try store.loadIndex(io);
+
+    // Default for file_edit leads to bash.
+    // If bash was NOT recently run, it is suggested:
+    const g_normal = try store.serializeGuidance(alloc, "file_edit", &.{}, false, 2, null);
+    try testing.expect(g_normal != null);
+    defer alloc.free(g_normal.?);
+    try testing.expect(std.mem.indexOf(u8, g_normal.?, "`bash`") != null);
+
+    // If bash WAS recently run, it is suppressed to prevent ping-pong:
+    const g_suppressed = try store.serializeGuidance(alloc, "file_edit", &.{ "bash" }, false, 2, null);
+    try testing.expect(g_suppressed == null);
+
+    // If previous act failed, suppression is STILL enforced to prevent infinite ping-pong loops.
+    // Instead of re-suggesting recently executed bash, it emits an anti-loop advisory:
+    const g_retry = try store.serializeGuidance(alloc, "file_edit", &.{ "bash" }, true, 2, null);
+    try testing.expect(g_retry != null);
+    defer alloc.free(g_retry.?);
+    try testing.expect(std.mem.indexOf(u8, g_retry.?, "`bash` →") == null); // bash is NOT suggested as next step
+    try testing.expect(std.mem.indexOf(u8, g_retry.?, "No new untried recovery steps found") != null);
+    try testing.expect(std.mem.indexOf(u8, g_retry.?, "Do NOT repeat previous searches") != null);
+}
+
+test "pg: detectTrajectoryOrbit identifies 3D exploratory loops and respects mutation displacement" {
+    // Case 1: Closed orbit of period 3 (bash -> grep -> file_read -> bash)
+    const traj_orbit1: []const []const u8 = &.{ "bash", "grep", "file_read", "bash" };
+    const res1 = PGraphStore.detectTrajectoryOrbit(traj_orbit1, "bash");
+    try testing.expect(res1 != null);
+    try testing.expectEqual(@as(usize, 3), res1.?.period);
+    try testing.expectEqual(@as(usize, 1), res1.?.revolutions);
+
+    // Case 2: Trajectory containing mutation tool (file_edit) has ΔZ > 0 -> not an exploratory orbit!
+    const traj_mutate: []const []const u8 = &.{ "bash", "grep", "file_read", "file_edit", "bash" };
+    const res_mutate = PGraphStore.detectTrajectoryOrbit(traj_mutate, "bash");
+    try testing.expect(res_mutate == null);
+
+    // Case 3: Degenerate self-loops (consecutive bash) are not simple orbits
+    const traj_self: []const []const u8 = &.{ "bash", "bash", "bash", "bash" };
+    const res_self = PGraphStore.detectTrajectoryOrbit(traj_self, "bash");
+    try testing.expect(res_self == null);
+
+    // Case 4: Multi-revolution orbit (2 full cycles of bash -> grep -> file_read)
+    const traj_orbit2: []const []const u8 = &.{ "bash", "grep", "file_read", "bash", "grep", "file_read" };
+    const res2 = PGraphStore.detectTrajectoryOrbit(traj_orbit2, "file_read");
+    try testing.expect(res2 != null);
+    try testing.expectEqual(@as(usize, 3), res2.?.period);
+    try testing.expectEqual(@as(usize, 2), res2.?.revolutions);
+}
+
+test "pg: serializeGuidance generates 3D Map Checkpoint & Recap on orbit" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+
+    var buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_pgstore_test_{d}_6", .{std.os.linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var store = try PGraphStore.init(alloc, io, dir);
+    defer store.deinit();
+    try store.loadIndex(io);
+
+    // Provide trajectory with closed orbit: bash -> grep -> file_read -> bash
+    const traj: []const []const u8 = &.{ "bash", "grep", "file_read", "bash" };
+    const g_orbit = try store.serializeGuidance(alloc, "bash", traj, false, 2, null);
+    try testing.expect(g_orbit != null);
+    defer alloc.free(g_orbit.?);
+
+    // Verify Checkpoint & Recap formatting
+    try testing.expect(std.mem.indexOf(u8, g_orbit.?, "[Procedural 3D Map Checkpoint & Trajectory Recap]") != null);
+    try testing.expect(std.mem.indexOf(u8, g_orbit.?, "3D Trajectory Orbit Detected") != null);
+    try testing.expect(std.mem.indexOf(u8, g_orbit.?, "Explored Territory Recap") != null);
+    try testing.expect(std.mem.indexOf(u8, g_orbit.?, "Orbit Break Directive") != null);
+    try testing.expect(std.mem.indexOf(u8, g_orbit.?, "DIRECT PROGRESS on the task") != null);
+    try testing.expect(std.mem.indexOf(u8, g_orbit.?, "Execute the first concrete step NOW") != null);
+
+    // Crucial: regular forward step suggestion is suppressed during orbit!
+    try testing.expect(std.mem.indexOf(u8, g_orbit.?, "Observed Pattern Suggestions") == null);
+}
+
+test "pg: serializeGuidance anchors to user_request prompt" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+
+    var buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_pgstore_test_{d}_7", .{std.os.linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var store = try PGraphStore.init(alloc, io, dir);
+    defer store.deinit();
+    try store.loadIndex(io);
+
+    const traj: []const []const u8 = &.{ "bash", "grep", "file_read", "bash" };
+    const task_text = "implement subagent sandbox runner";
+    const g_orbit = try store.serializeGuidance(alloc, "bash", traj, false, 2, task_text);
+    try testing.expect(g_orbit != null);
+    defer alloc.free(g_orbit.?);
+
+    try testing.expect(std.mem.indexOf(u8, g_orbit.?, "Your task: \"implement subagent sandbox runner\"") != null);
+}
+
+

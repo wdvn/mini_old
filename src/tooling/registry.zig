@@ -15,7 +15,8 @@
 //!   - Allowlist takes precedence over blocklist
 //!
 //! ## Core tools (always sent to API)
-//! bash, file_read, file_write, file_edit, glob, grep, http_request, skills
+//! bash, file_write, file_edit, http_request, skills
+//! (file_read, glob, grep: internal dispatch only, not exposed to the model)
 //!
 //! ## Extended tools (sent conditionally on keyword matches)
 //! See `extended_triggers` below.
@@ -101,6 +102,12 @@ fn executeToolInternal(alloc: Allocator, io: std.Io, name: []const u8, input_jso
     if (std.mem.eql(u8, name, "image_attach"))          return media_gen_tool.attachImageTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "skills"))                return executeSkills(alloc, io, input_json);
     if (std.mem.eql(u8, name, "codeact"))               return executeCodeActTool(alloc, io, input_json);
+
+    // Common LLM alias fallback normalization
+    if (std.mem.eql(u8, name, "read") or std.mem.eql(u8, name, "read_file"))                  return file_tool.readTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "write_file"))                return file_tool.writeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "edit") or std.mem.eql(u8, name, "edit_file"))                  return file_tool.editTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "sh") or std.mem.eql(u8, name, "shell") or std.mem.eql(u8, name, "terminal")) return bash_tool.executeTool(alloc, io, input_json);
 
     // MCP fallback: names follow "server__toolname" format
     if (g_mcp) |mgr| {
@@ -199,12 +206,8 @@ pub const definitions = [_]proto.ToolDefinition{
         .input_schema_json = \\{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"}},"required":["command"]}
         ,
     },
-    .{
-        .name = "file_read",
-        .description = "Read file contents. Supports line-based offset and limit. Relative paths are resolved against project root.",
-        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"File path to read"},"offset":{"type":"integer","description":"Starting line (1-indexed, default: 1)"},"limit":{"type":"integer","description":"Number of lines to read (default: all, max 2000 lines)"}},"required":["path"]}
-        ,
-    },
+    // NOTE: file_read removed from exposed tool list — force the model to use
+    // bash (cat/sed/awk) or CodeAct (mini.read) instead. Internal dispatch is kept.
     .{
         .name = "file_write",
         .description = "Write or overwrite entire file content. Automatically creates parent directories if needed. Do NOT use for small partial edits (use file_edit).",
@@ -217,18 +220,9 @@ pub const definitions = [_]proto.ToolDefinition{
         .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"File path to edit"},"old_string":{"type":"string","description":"Exact substring to replace"},"new_string":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace all occurrences (default: false)"}},"required":["path","old_string","new_string"]}
         ,
     },
-    .{
-        .name = "glob",
-        .description = "Find files by wildcard pattern (e.g. \"**/*.zig\", \"src/*.ts\"). Returns list of relative paths. Automatically skips .git, zig-cache, node_modules.",
-        .input_schema_json = \\{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern to search"},"path":{"type":"string","description":"Base directory (default: project root)"}},"required":["pattern"]}
-        ,
-    },
-    .{
-        .name = "grep",
-        .description = "Search for regex or raw text within file contents. Returns file path, line numbers, and matching lines.",
-        .input_schema_json = \\{"type":"object","properties":{"pattern":{"type":"string","description":"Search pattern or regex"},"path":{"type":"string","description":"Directory or file to search (default: project root)"},"case_insensitive":{"type":"boolean","description":"Case-insensitive search"},"max_results":{"type":"integer","description":"Max results to return (default: 50)"}},"required":["pattern"]}
-        ,
-    },
+    // NOTE: glob and grep removed from exposed tool list — force the model to
+    // use bash (find/rg) or CodeAct (mini.glob/mini.grep) instead. Internal
+    // dispatch is kept.
     .{
         .name = "http_request",
         .description = "Send HTTP/HTTPS requests. Supports GET, POST, PUT, DELETE, PATCH. Returns status code, headers, and response body.",
@@ -298,9 +292,12 @@ pub const definitions = [_]proto.ToolDefinition{
 };
 
 /// Core tool names (always sent to API).
+/// file_read / glob / grep intentionally excluded: the model must use bash
+/// (cat/sed/find/rg) or CodeAct (mini.read/mini.glob/mini.grep) instead.
+/// Internal dispatch for these names is still supported in executeTool().
 const core_tools = [_][]const u8{
-    "bash", "file_read", "file_write", "file_edit",
-    "glob", "grep", "http_request", "invoke_subagent", "batch_invoke_subagents", "skills",
+    "bash", "file_write", "file_edit",
+    "http_request", "invoke_subagent", "batch_invoke_subagents", "skills",
     "session_diagnostics", "artifact_write", "artifact_read", "artifact_list",
     "generate_image", "generate_video", "image_attach",
 };
@@ -391,6 +388,14 @@ fn matchesEntry(entry_trimmed: []const u8, name: []const u8) bool {
     return std.mem.eql(u8, entry_trimmed, name);
 }
 
+pub fn normalizeToolName(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "read") or std.mem.eql(u8, name, "read_file")) return "file_read";
+    if (std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "write_file")) return "file_write";
+    if (std.mem.eql(u8, name, "edit") or std.mem.eql(u8, name, "edit_file")) return "file_edit";
+    if (std.mem.eql(u8, name, "sh") or std.mem.eql(u8, name, "shell") or std.mem.eql(u8, name, "terminal")) return "bash";
+    return name;
+}
+
 pub fn isPermitted(name: []const u8) bool {
     // Block subagent calls if depth limit reached to avoid infinite recursion (Leaf Worker Pattern)
     if (std.mem.eql(u8, name, "invoke_subagent") or std.mem.eql(u8, name, "batch_invoke_subagents")) {
@@ -410,18 +415,24 @@ pub fn isPermitted(name: []const u8) bool {
         if (!g_image_input_enabled) return false;
     }
 
+    const norm_name = normalizeToolName(name);
+
     if (g_allowlist) |list| {
         // Allowlist: ONLY allow listed tools
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |entry| {
-            if (matchesEntry(std.mem.trim(u8, entry, " \t"), name)) return true;
+            const tr = std.mem.trim(u8, entry, " \t");
+            const norm_entry = normalizeToolName(tr);
+            if (matchesEntry(tr, name) or matchesEntry(norm_entry, norm_name)) return true;
         }
         return false; // not in allowlist
     }
     if (g_blocklist) |list| {
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |entry| {
-            if (matchesEntry(std.mem.trim(u8, entry, " \t"), name)) return false;
+            const tr = std.mem.trim(u8, entry, " \t");
+            const norm_entry = normalizeToolName(tr);
+            if (matchesEntry(tr, name) or matchesEntry(norm_entry, norm_name)) return false;
         }
     }
     return true;
@@ -528,6 +539,11 @@ fn executeSkills(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         }
     }
     return buf.toOwnedSlice();
+}
+
+/// Interrupt active bash process (called on Watchdog timeout or SIGINT).
+pub fn interruptActiveBash() void {
+    bash_tool.interruptCurrent();
 }
 
 test "codeact as native tool: codeact in registry" {

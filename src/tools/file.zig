@@ -63,15 +63,19 @@ pub fn writeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
 pub fn editTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     const path = (try json.findStringOwned(alloc, input_json, "path")) orelse
         return std.fmt.allocPrint(alloc, "Error: missing 'path' parameter", .{});
-    defer alloc.free(path);
     const old_str = (try json.findStringOwned(alloc, input_json, "old_string")) orelse
         return std.fmt.allocPrint(alloc, "Error: missing 'old_string' parameter", .{});
-    defer alloc.free(old_str);
     const new_str = (try json.findStringOwned(alloc, input_json, "new_string")) orelse
         return std.fmt.allocPrint(alloc, "Error: missing 'new_string' parameter", .{});
-    defer alloc.free(new_str);
+    errdefer alloc.free(path);
+    errdefer alloc.free(old_str);
+    errdefer alloc.free(new_str);
 
-    return editFile(alloc, io, path, old_str, new_str);
+    const result = try editFile(alloc, io, path, old_str, new_str);
+    alloc.free(path);
+    alloc.free(old_str);
+    alloc.free(new_str);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -176,23 +180,30 @@ pub fn editFile(alloc: Allocator, io: std.Io, path: []const u8, old_str: []const
         );
     }
 
-    // Build result
-    var result = std.ArrayListUnmanaged(u8).empty;
-    errdefer result.deinit(alloc);
-    try result.appendSlice(alloc, content[0..first]);
-    try result.appendSlice(alloc, new_str);
-    try result.appendSlice(alloc, content[first + old_str.len ..]);
+    // Build result in a new buffer
+    const new_size = content.len - old_str.len + new_str.len;
+    const result_buf = try alloc.alloc(u8, new_size);
+    errdefer alloc.free(result_buf);
 
-    // Write back
+    // Copy: prefix + new_str + suffix
+    @memcpy(result_buf[0..first], content[0..first]);
+    @memcpy(result_buf[first..first + new_str.len], new_str);
+    @memcpy(result_buf[first + new_str.len..], content[first + old_str.len..]);
+
+    // Write back to same file (truncate then write full new content)
     const file_w = cwd.createFile(io, path, .{ .truncate = true }) catch |e| {
         return std.fmt.allocPrint(alloc, "Error writing '{s}': {s}", .{ path, @errorName(e) });
     };
     defer file_w.close(io);
-    file_w.writeStreamingAll(io, result.items) catch |e| {
+    file_w.writeStreamingAll(io, result_buf) catch |e| {
+        alloc.free(result_buf);
         return std.fmt.allocPrint(alloc, "Error writing '{s}': {s}", .{ path, @errorName(e) });
     };
 
-    return std.fmt.allocPrint(alloc, "Modified '{s}': replaced {d} characters with {d} characters.", .{
+    // Return success message (caller must free)
+    const msg = try std.fmt.allocPrint(alloc, "Modified '{s}': replaced {d} characters with {d} characters.", .{
         path, old_str.len, new_str.len,
     });
+    alloc.free(result_buf);
+    return msg;
 }

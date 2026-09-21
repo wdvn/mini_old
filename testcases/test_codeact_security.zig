@@ -27,6 +27,10 @@ test {
     _ = @import("test_dynamic_thinking.zig");
     _ = @import("test_media_ingest.zig");
     _ = @import("test_media_gen.zig");
+    _ = @import("test_provider_profiles.zig");
+    _ = @import("test_js_provider.zig");
+    _ = @import("test_editor_multiline.zig");
+    _ = @import("test_three_threads_watchdog.zig");
 }
 
 // ---------------------------------------------------------------------------
@@ -276,3 +280,5 @@ test "security: per-act VM isolation — global variables do not leak across 2 e
     try std.testing.expect(!res2.is_error);
     try std.testing.expectEqualStrings("leaked: undefined", std.mem.trim(u8, res2.stdout, "\n"));
 }
+
+// ---------------------------------------------------------------------------

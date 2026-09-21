@@ -169,3 +169,59 @@ test "media_gen: CodeAct JS VM binding mini.media policy enforcement" {
     try testing.expect(res.error_message != null);
     try testing.expect(std.mem.indexOf(u8, res.error_message.?, "Security Policy Error") != null);
 }
+
+test "media_gen: CodeAct mini.media attach integrates with turn attachments" {
+    const alloc = testing.allocator;
+    const cwd = std.Io.Dir.cwd();
+    const test_dir = "zig-cache/tmp_test_media_codeact";
+    cwd.createDirPath(testing.io, test_dir) catch {};
+    defer cwd.deleteTree(testing.io, test_dir) catch {};
+
+    const test_img = "zig-cache/tmp_test_media_codeact/sample.png";
+    const f = try cwd.createFile(testing.io, test_img, .{});
+    defer f.close(testing.io);
+    try f.writeStreamingAll(testing.io, "\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89");
+
+    media_gen_tool.clearTurnAttachments(alloc);
+    defer media_gen_tool.clearTurnAttachments(alloc);
+
+    media_gen_tool.setConfig(.{
+        .image_input_max_bytes = 10 * 1024 * 1024,
+        .image_input_max_per_turn = 2,
+    });
+
+    const engine = try quickjs.Engine.init(alloc, testing.io);
+    defer engine.deinit();
+
+    try js_bindings.registerBindings(engine);
+    registry.setPolicy(null, null);
+    registry.setMediaConfig(false, false, true);
+
+    const code = try std.fmt.allocPrint(alloc, "const r = mini.media('attach', '{s}'); r.ok;", .{test_img});
+    defer alloc.free(code);
+
+    var res = try engine.eval(code, "test_attach.js");
+    defer res.deinit();
+
+    try testing.expect(!res.is_error);
+    try testing.expectEqual(@as(usize, 1), media_gen_tool.getTurnAttachments().len);
+
+    // Simulate agent recording execution output to history
+    var history = mini.history_mod.History.init(alloc);
+    defer history.deinit();
+
+    const turn_attached = media_gen_tool.getTurnAttachments();
+    if (turn_attached.len > 0) {
+        try history.addUserWithImages("[CodeAct Output]", turn_attached);
+        media_gen_tool.clearTurnAttachments(alloc);
+    }
+
+    try testing.expectEqual(@as(usize, 0), media_gen_tool.getTurnAttachments().len);
+    try testing.expectEqual(@as(usize, 1), history.len());
+    const msg = history.messages()[0];
+    try testing.expectEqual(@as(usize, 2), msg.content.len);
+    try testing.expectEqualStrings("[CodeAct Output]", msg.content[0].text);
+    try testing.expect(msg.content[1] == .image);
+    try testing.expectEqualStrings("image/png", msg.content[1].image.media_type);
+}
+

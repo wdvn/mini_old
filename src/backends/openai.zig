@@ -30,6 +30,9 @@ const json = @import("../core/json.zig");
 const http_lib = @import("../lib/http_request.zig");
 const main = @import("../main.zig");
 const utils = @import("../core/utils.zig");
+const provider = @import("provider.zig");
+const JsProviderAdapter = @import("js_provider.zig").JsProviderAdapter;
+const ThinkingFilter = @import("thinking_filter.zig").Filter;
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -91,23 +94,22 @@ pub const Client = struct {
     cached_protocol: ?ProtocolMode,
     /// Dynamic reasoning effort override for next request ("minimal" | "low" | "medium" | "high" | "none" | null).
     active_reasoning_effort: ?[]const u8,
+    /// Provider key for wire protocol quirks normalization (RFC-012).
+    provider_key: []const u8 = "generic",
+    /// Explicit trusted adapter source; never loaded from model output.
+    provider_js: ?[]const u8 = null,
+
+    fn loadAdapter(self: *const Client) !?*JsProviderAdapter {
+        return if (self.provider_js) |source| try JsProviderAdapter.initFromSource(self.alloc, source) else null;
+    }
+
+    fn transformBody(self: *const Client, adapter: ?*JsProviderAdapter, body: []const u8) ![]const u8 {
+        return if (adapter) |a| try a.transformRequest(self.alloc, body) else try self.alloc.dupe(u8, body);
+    }
 
     /// Initialize client.
     pub fn init(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32) Client {
-        return .{
-            .alloc = alloc,
-            .base_url = base_url,
-            .api_key = api_key,
-            .api_header = api_header,
-            .model = model,
-            .max_tokens = max_tokens,
-            .use_completion_tokens = false,
-            .disable_reasoning_effort = false,
-            .disable_stream_options = false,
-            .protocol_mode = .auto,
-            .cached_protocol = null,
-            .active_reasoning_effort = null,
-        };
+        return initWithProvider(alloc, base_url, api_key, api_header, model, max_tokens, .auto, "generic");
     }
 
     /// Set dynamic reasoning effort override.
@@ -118,6 +120,11 @@ pub const Client = struct {
     /// Idle watchdog timeout scaled by active reasoning effort (RFC-009 Phase 5).
     /// low/minimal → tight window (routine acts finish fast); high → generous.
     fn effectiveIdleTimeout(self: *const Client) u32 {
+        // Disabled? Return 0 to skip idle polling entirely.
+        if (utils.getEnvSlice("MINI_WATCHDOG_ENABLED")) |s| {
+            const v = std.mem.trim(u8, s, " \t");
+            if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "off")) return 0;
+        }
         if (utils.getEnvSlice("MINI_STREAM_IDLE_TIMEOUT")) |s| {
             return std.fmt.parseInt(u32, std.mem.trim(u8, s, " \t"), 10) catch 0;
         }
@@ -129,6 +136,11 @@ pub const Client = struct {
 
     /// Initialize client with explicit protocol mode.
     pub fn initWithProtocol(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32, protocol_mode: ProtocolMode) Client {
+        return initWithProvider(alloc, base_url, api_key, api_header, model, max_tokens, protocol_mode, "generic");
+    }
+
+    /// Initialize client with explicit provider key and protocol mode (RFC-012).
+    pub fn initWithProvider(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32, protocol_mode: ProtocolMode, provider_key: []const u8) Client {
         return .{
             .alloc = alloc,
             .base_url = base_url,
@@ -142,6 +154,7 @@ pub const Client = struct {
             .protocol_mode = protocol_mode,
             .cached_protocol = null,
             .active_reasoning_effort = null,
+            .provider_key = provider_key,
         };
     }
 
@@ -156,21 +169,31 @@ pub const Client = struct {
         think_cb: ?*const fn ([]const u8) void,
     ) !proto.Response {
         const root_url = getRootApiUrl(self.base_url);
+        const adapter = try self.loadAdapter();
+        defer if (adapter) |a| a.deinit();
+        const profile = if (adapter) |a| a.profile else provider.resolveProfile(self.provider_key, self.base_url);
         var active_protocol: ProtocolMode = blk: {
+            // RFC-012 §7 priority: explicit OPENAI_PROTOCOL > ProviderProfile.protocol > cached auto-negotiate.
             if (self.protocol_mode == .chat_completions) break :blk .chat_completions;
             if (self.protocol_mode == .responses) break :blk .responses;
-            if (self.cached_protocol) |p| break :blk p;
-            // Auto mode: default to prioritizing Responses API. Backend not supporting it
-            // (404/400 "not found") will automatically fallback to chat_completions in Tier 2.
-            break :blk .responses;
+            switch (profile.protocol) {
+                .chat_completions => break :blk .chat_completions,
+                .responses => break :blk .responses,
+                .auto => {
+                    if (self.cached_protocol) |p| break :blk p;
+                    break :blk .responses; // existing auto-negotiate default
+                },
+            }
         };
 
         var retry_count: u32 = 0;
         while (retry_count < 4) : (retry_count += 1) {
-            const body = if (active_protocol == .responses)
-                try buildResponsesRequestBody(self.alloc, self.model, self.max_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, system_prompt, msgs, tools)
+            const native_body = if (active_protocol == .responses)
+                try buildResponsesRequestBody(self.alloc, self.model, self.max_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, system_prompt, msgs, tools, profile)
             else
-                try buildRequestBody(self.alloc, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, self.disable_stream_options, system_prompt, msgs, tools);
+                try buildRequestBodyWithProfile(self.alloc, profile, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, self.disable_stream_options, system_prompt, msgs, tools);
+            defer self.alloc.free(native_body);
+            const body = try self.transformBody(adapter, native_body);
             defer self.alloc.free(body);
 
             // Build URL according to active protocol
@@ -190,6 +213,8 @@ pub const Client = struct {
             var ctx = StreamCtx{
                 .alloc = self.alloc,
                 .response = proto.Response.init(self.alloc),
+                .adapter = adapter,
+                .filter = .{ .tags = profile.thinking_tags },
                 .text_cb = text_cb,
                 .think_cb = think_cb,
                 .line_buf = .empty,
@@ -230,9 +255,11 @@ pub const Client = struct {
             // Auto-Negotiation & Adaptive Cross-Protocol Fallback (Tier 2)
             if (self.protocol_mode == .auto and ctx.raw_accum_init) {
                 const raw_resp = ctx.raw_accum.items;
-                
+
                 // Fallback 1: Chat Completions -> Responses API on 400 error due to lack of support or tools/reasoning conflict
-                if (active_protocol == .chat_completions and req_http_code == 400) {
+                // RFC-012 §3.6: profile-pinned protocol (e.g. deepseek/qwen/minimax/glm/kimi/vllm) must NOT cross-fallback;
+                // only profiles with .auto wire protocol are allowed to negotiate up.
+                if (active_protocol == .chat_completions and profile.protocol == .auto and req_http_code == 400) {
                     if (std.mem.indexOf(u8, raw_resp, "responses") != null or
                         std.mem.indexOf(u8, raw_resp, "unsupported_model") != null or
                         (std.mem.indexOf(u8, raw_resp, "reasoning") != null and tools.len > 0))
@@ -250,12 +277,10 @@ pub const Client = struct {
                 //   - Server returns 400 + "not found" (endpoint exists but model not found), OR
                 //   - Server returns 400 + json_parse_error / ResponseInput (endpoint exists but does not
                 //     understand Responses API JSON format — e.g. OpenAI-compat proxies like agnes).
-                const responses_format_rejected = req_http_code == 400 and (
-                    std.mem.indexOf(u8, raw_resp, "not found") != null or
+                const responses_format_rejected = req_http_code == 400 and (std.mem.indexOf(u8, raw_resp, "not found") != null or
                     std.mem.indexOf(u8, raw_resp, "json_parse_error") != null or
-                    std.mem.indexOf(u8, raw_resp, "ResponseInput") != null
-                );
-                if (active_protocol == .responses and (req_http_code == 404 or responses_format_rejected)) {
+                    std.mem.indexOf(u8, raw_resp, "ResponseInput") != null);
+                if (active_protocol == .responses and profile.protocol == .auto and (req_http_code == 404 or responses_format_rejected)) {
                     active_protocol = .chat_completions;
                     self.cached_protocol = .chat_completions;
                     if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
@@ -268,13 +293,14 @@ pub const Client = struct {
             if (req_http_code == 400 and ctx.raw_accum_init) {
                 const raw_resp = ctx.raw_accum.items;
                 var should_retry = false;
-                
+
                 if (std.mem.indexOf(u8, raw_resp, "unsupported_parameter") != null and
-                    (std.mem.indexOf(u8, raw_resp, "max_tokens") != null or std.mem.indexOf(u8, raw_resp, "max_completion_tokens") != null)) {
+                    (std.mem.indexOf(u8, raw_resp, "max_tokens") != null or std.mem.indexOf(u8, raw_resp, "max_completion_tokens") != null))
+                {
                     self.use_completion_tokens = !self.use_completion_tokens;
                     should_retry = true;
                 }
-                
+
                 if (std.mem.indexOf(u8, raw_resp, "reasoning_effort") != null) {
                     self.disable_reasoning_effort = true;
                     should_retry = true;
@@ -282,11 +308,12 @@ pub const Client = struct {
 
                 // RFC-006 §3.6: stream_options not supported by older compat APIs
                 if (std.mem.indexOf(u8, raw_resp, "stream_options") != null or
-                    std.mem.indexOf(u8, raw_resp, "include_usage") != null) {
+                    std.mem.indexOf(u8, raw_resp, "include_usage") != null)
+                {
                     self.disable_stream_options = true;
                     should_retry = true;
                 }
-                
+
                 if (should_retry) {
                     if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
                     ctx.response.deinit();
@@ -326,6 +353,7 @@ pub fn buildResponsesRequestBody(
     system_prompt: []const u8,
     msgs: []const proto.Message,
     tools: []const proto.ToolDefinition,
+    profile: provider.ProviderProfile,
 ) ![]u8 {
     var buf = utils.BufWriter.init(alloc);
     errdefer buf.deinit();
@@ -336,12 +364,16 @@ pub fn buildResponsesRequestBody(
     try w.print("{{\"model\":\"{s}\",\"stream\":true", .{model});
 
     if (!disable_reasoning_effort) {
-        if (reasoning_effort) |effort| {
-            if (!std.mem.eql(u8, effort, "none")) {
-                try w.print(",\"reasoning\":{{\"effort\":\"{s}\"}}", .{effort});
+        // RFC-012: providers with unsupported reasoning_param (deepseek/minimax/glm)
+        // must never emit any reasoning field, even when forced onto the Responses API.
+        if (profile.reasoning_param != .unsupported) {
+            if (reasoning_effort) |effort| {
+                if (!std.mem.eql(u8, effort, "none")) {
+                    try w.print(",\"reasoning\":{{\"effort\":\"{s}\"}}", .{effort});
+                }
+            } else {
+                try w.writeAll(",\"reasoning\":{\"effort\":\"medium\"}");
             }
-        } else {
-            try w.writeAll(",\"reasoning\":{\"effort\":\"medium\"}");
         }
     }
 
@@ -415,8 +447,10 @@ pub fn buildResponsesRequestBody(
 // Chat Completions Request building
 // ---------------------------------------------------------------------------
 
-pub fn buildRequestBody(
+/// Build request body for OpenAI Chat Completions API with a specific ProviderProfile (RFC-012).
+pub fn buildRequestBodyWithProfile(
     alloc: Allocator,
+    profile: provider.ProviderProfile,
     model: []const u8,
     max_tokens: u32,
     use_completion_tokens: bool,
@@ -434,16 +468,23 @@ pub fn buildRequestBody(
     var reasoning_buf: [64]u8 = undefined;
     const reasoning_effort_str: []const u8 = blk: {
         if (disable_reasoning_effort) break :blk "";
+        if (profile.reasoning_param == .unsupported) break :blk "";
         if (reasoning_effort) |effort| {
             if (std.mem.eql(u8, effort, "none")) break :blk "";
-            break :blk std.fmt.bufPrint(&reasoning_buf, "\"reasoning_effort\":\"{s}\",", .{effort}) catch "";
+            if (profile.reasoning_param == .top_level_effort) {
+                break :blk std.fmt.bufPrint(&reasoning_buf, "\"reasoning_effort\":\"{s}\",", .{effort}) catch "";
+            } else if (profile.reasoning_param == .nested_reasoning_object) {
+                break :blk std.fmt.bufPrint(&reasoning_buf, "\"reasoning\":{{\"effort\":\"{s}\"}},", .{effort}) catch "";
+            }
         }
         break :blk "";
     };
-    // RFC-006 §3.6: adaptive stream_options — omit if compat API does not support it
-    const stream_options_str = if (disable_stream_options) "" else ",\"stream_options\":{\"include_usage\":true}";
+    // RFC-006 §3.6: adaptive stream_options — omit if compat API or provider does not support it
+    const effective_stream_opts = !disable_stream_options and profile.supports_stream_options;
+    const stream_options_str = if (effective_stream_opts) ",\"stream_options\":{\"include_usage\":true}" else "";
 
-    if (use_completion_tokens) {
+    const effective_use_completion_tokens = use_completion_tokens or profile.use_completion_tokens;
+    if (effective_use_completion_tokens) {
         try w.print(
             \\{{"model":"{s}","max_completion_tokens":{d},{s}"stream":true{s}
         , .{ model, max_tokens, reasoning_effort_str, stream_options_str });
@@ -515,10 +556,12 @@ pub fn buildRequestBody(
         try w.print("{{\"role\":\"{s}\",", .{msg.role.toJson()});
 
         var has_images = false;
+        var reasoning_text: ?[]const u8 = null;
         for (msg.content) |block| {
             if (block == .image) {
                 has_images = true;
-                break;
+            } else if (block == .thinking) {
+                reasoning_text = block.thinking.thinking;
             }
         }
 
@@ -528,6 +571,7 @@ pub fn buildRequestBody(
             for (msg.content) |block| {
                 switch (block) {
                     .text => |t| {
+                        if (t.len == 0) continue;
                         if (!first_cb) try w.writeByte(',');
                         first_cb = false;
                         const escaped = try json.escape(alloc, t);
@@ -562,6 +606,15 @@ pub fn buildRequestBody(
                 try w.print("\"content\":\"{s}\"", .{escaped});
             } else {
                 try w.print("\"content\":null", .{});
+            }
+        }
+
+        // Echo reasoning_content for providers requiring it in assistant history (DeepSeek)
+        if (msg.role == .assistant and reasoning_text != null) {
+            if (profile.echo_policy == .echo_required or profile.echo_policy == .echo_optional) {
+                const escaped_rt = try json.escape(alloc, reasoning_text.?);
+                defer alloc.free(escaped_rt);
+                try w.print(",\"reasoning_content\":\"{s}\"", .{escaped_rt});
             }
         }
 
@@ -600,6 +653,34 @@ pub fn buildRequestBody(
     return buf.toOwnedSlice();
 }
 
+/// Backward compatible wrapper defaulting to generic profile.
+pub fn buildRequestBody(
+    alloc: Allocator,
+    model: []const u8,
+    max_tokens: u32,
+    use_completion_tokens: bool,
+    disable_reasoning_effort: bool,
+    reasoning_effort: ?[]const u8,
+    disable_stream_options: bool,
+    system_prompt: []const u8,
+    msgs: []const proto.Message,
+    tools: []const proto.ToolDefinition,
+) ![]u8 {
+    return buildRequestBodyWithProfile(
+        alloc,
+        provider.getProfile("generic"),
+        model,
+        max_tokens,
+        use_completion_tokens,
+        disable_reasoning_effort,
+        reasoning_effort,
+        disable_stream_options,
+        system_prompt,
+        msgs,
+        tools,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Streaming parser
 // ---------------------------------------------------------------------------
@@ -626,8 +707,11 @@ const PartialToolCall = struct {
 const StreamCtx = struct {
     alloc: Allocator,
     response: proto.Response,
-    text_cb: ?*const fn ([]const u8) void,
-    think_cb: ?*const fn ([]const u8) void,
+    adapter: ?*JsProviderAdapter = null,
+    filter: ThinkingFilter = .{},
+
+    text_cb: ?*const fn ([]const u8) void = null,
+    think_cb: ?*const fn ([]const u8) void = null,
     line_buf: ArrayList(u8),
     tool_calls: ArrayList(PartialToolCall),
     text_accum: ArrayList(u8) = undefined,
@@ -638,6 +722,26 @@ const StreamCtx = struct {
     raw_accum_init: bool = false,
     event_type: [64]u8 = undefined,
     event_type_len: usize = 0,
+    finish_reason_received: bool = false,
+
+    pub fn emitNormalized(self: *StreamCtx, text: []const u8, thinking: bool) !void {
+        if (text.len == 0) return;
+        if (thinking) {
+            if (!self.think_accum_init) {
+                self.think_accum = .empty;
+                self.think_accum_init = true;
+            }
+            try self.think_accum.appendSlice(self.alloc, text);
+            if (self.think_cb) |cb| cb(text);
+        } else {
+            if (!self.text_accum_init) {
+                self.text_accum = .empty;
+                self.text_accum_init = true;
+            }
+            try self.text_accum.appendSlice(self.alloc, text);
+            if (self.text_cb) |cb| cb(text);
+        }
+    }
 
     fn onChunk(chunk: []const u8, userdata: *anyopaque) void {
         const self: *StreamCtx = @ptrCast(@alignCast(userdata));
@@ -723,6 +827,7 @@ const StreamCtx = struct {
                 }
             }
 
+            try self.filter.finish(self);
             // Save accumulated thinking
             if (self.think_accum_init and self.think_accum.items.len > 0) {
                 const think_text = try self.alloc.dupe(u8, self.think_accum.items);
@@ -736,11 +841,20 @@ const StreamCtx = struct {
                 self.text_accum.clearRetainingCapacity();
             }
             // Only set to end_turn if tool_use or max_tokens not already set
-            if (self.response.stop_reason == .unknown) {
+            if (self.response.stop_reason == .unknown and !self.finish_reason_received) {
                 self.response.stop_reason = .end_turn;
             }
             return;
         }
+
+        // Adapter overrides are evaluated once per JSON event. Null/failed extraction
+        // falls back to native fields; tool calls and usage always use native parsing.
+        const custom_text = if (self.adapter) |a| a.extractContent(self.alloc, data) else null;
+        defer if (custom_text) |s| self.alloc.free(s);
+        const custom_reasoning = if (self.adapter) |a| a.extractReasoning(self.alloc, data) else null;
+        defer if (custom_reasoning) |s| self.alloc.free(s);
+        if (custom_text) |s| try self.filter.feed(s, self);
+        if (custom_reasoning) |s| try self.emitNormalized(s, true);
 
         // Responses API event handlers
         if (std.mem.eql(u8, ev, "response.output_text.delta") or std.mem.eql(u8, ev, "response.text.delta")) {
@@ -752,8 +866,7 @@ const StreamCtx = struct {
                         self.text_accum = .empty;
                         self.text_accum_init = true;
                     }
-                    try self.text_accum.appendSlice(self.alloc, unescaped);
-                    if (self.text_cb) |cb| cb(unescaped);
+                    if (custom_text == null) try self.filter.feed(unescaped, self);
                 }
             }
             return;
@@ -768,8 +881,7 @@ const StreamCtx = struct {
                         self.think_accum = .empty;
                         self.think_accum_init = true;
                     }
-                    try self.think_accum.appendSlice(self.alloc, unescaped);
-                    if (self.think_cb) |cb| cb(unescaped);
+                    if (custom_reasoning == null) try self.emitNormalized(unescaped, true);
                 }
             }
             return;
@@ -833,7 +945,6 @@ const StreamCtx = struct {
         // All other Responses API events (e.g. response.created, response.in_progress, response.content_part.added, etc.)
         if (std.mem.startsWith(u8, ev, "response.")) return;
 
-
         // RFC-006 §3.1: Usage JSON parse struct (nested optional)
         const UsagePromptDetails = struct {
             cached_tokens: ?u64 = null,
@@ -862,11 +973,18 @@ const StreamCtx = struct {
                 type: ?[]const u8 = null,
                 function: ?ChoiceDeltaToolCallFunction = null,
             };
+            const ChoiceDeltaDetail = struct {
+                reasoning_content: ?[]const u8 = null,
+                reasoning: ?[]const u8 = null,
+            };
             const ChoiceDelta = struct {
                 content: ?[]const u8 = null,
                 reasoning_content: ?[]const u8 = null,
                 // RFC-006 §3.3: OpenAI o-series/GPT-5.x uses field "reasoning"
                 reasoning: ?[]const u8 = null,
+                // Nested proxy/aggregator wrappers: delta.detail.reasoning_content or delta.details
+                detail: ?ChoiceDeltaDetail = null,
+                details: ?ChoiceDeltaDetail = null,
                 tool_calls: ?[]ChoiceDeltaToolCall = null,
             };
             const Choice = struct {
@@ -890,11 +1008,18 @@ const StreamCtx = struct {
         if (chunk.choices) |choices| {
             for (choices) |choice| {
                 if (choice.delta) |delta| {
-                    // RFC-006 §3.3: receive reasoning from both variants
-                    // DeepSeek-style: delta.reasoning_content
-                    // OpenAI o-series/GPT-5.x: delta.reasoning
-                    const reasoning = delta.reasoning_content orelse delta.reasoning;
-                    if (reasoning) |r| {
+                    // Receive reasoning from variants:
+                    // 1. DeepSeek-style: delta.reasoning_content
+                    // 2. OpenAI o-series/GPT-5.x: delta.reasoning
+                    // 3. Nested proxy/aggregator wrappers: delta.detail.reasoning_content / delta.details
+                    const detail_reasoning = if (delta.detail) |d|
+                        (d.reasoning_content orelse d.reasoning)
+                    else if (delta.details) |d|
+                        (d.reasoning_content orelse d.reasoning)
+                    else
+                        null;
+                    const reasoning = delta.reasoning_content orelse delta.reasoning orelse detail_reasoning;
+                    if (if (custom_reasoning == null) reasoning else null) |r| {
                         if (r.len > 0) {
                             if (!self.think_accum_init) {
                                 self.think_accum = .empty;
@@ -904,14 +1029,13 @@ const StreamCtx = struct {
                             if (self.think_cb) |cb| cb(r);
                         }
                     }
-                    if (delta.content) |text| {
+                    if (if (custom_text == null) delta.content else null) |text| {
                         if (text.len > 0) {
                             if (!self.text_accum_init) {
                                 self.text_accum = .empty;
                                 self.text_accum_init = true;
                             }
-                            try self.text_accum.appendSlice(self.alloc, text);
-                            if (self.text_cb) |cb| cb(text);
+                            try self.filter.feed(text, self);
                         }
                     }
                     if (delta.tool_calls) |tool_calls| {
@@ -926,6 +1050,7 @@ const StreamCtx = struct {
                     }
                 }
                 if (choice.finish_reason) |reason| {
+                    self.finish_reason_received = true;
                     // RFC-006 §3.4: fully map OpenAI finish_reason
                     if (std.mem.eql(u8, reason, "tool_calls")) {
                         self.response.stop_reason = .tool_use;
@@ -1051,6 +1176,7 @@ const StreamCtx = struct {
     }
 
     fn finalizeToolCalls(self: *StreamCtx) !void {
+        try self.filter.finish(self);
         // Fallback: if server closed stream without [DONE] or response.completed
         if (self.think_accum_init and self.think_accum.items.len > 0) {
             const think_text = try self.alloc.dupe(u8, self.think_accum.items);
@@ -1062,20 +1188,21 @@ const StreamCtx = struct {
             try self.response.content.append(self.alloc, .{ .text = text });
             self.text_accum.clearRetainingCapacity();
         }
-        if (self.response.content.items.len > 0 and self.response.stop_reason == .unknown) {
+        if (self.response.content.items.len > 0 and self.response.stop_reason == .unknown and !self.finish_reason_received) {
             self.response.stop_reason = .end_turn;
         }
 
         for (self.tool_calls.items, 0..) |*tc, ti| {
             defer tc.deinit(self.alloc);
             if (tc.name.items.len == 0) continue;
+            const clean_name = sanitizeToolName(tc.name.items) orelse continue;
             // Provider did not send id (some compat/proxies) → generate fallback id
             // so tool_result always matches tool_call_id (avoiding 400 from API).
             const id = if (tc.id.items.len > 0)
                 try self.alloc.dupe(u8, tc.id.items)
             else
                 try std.fmt.allocPrint(self.alloc, "call_{d}", .{ti});
-            const name = try self.alloc.dupe(u8, tc.name.items);
+            const name = try self.alloc.dupe(u8, clean_name);
             const args = if (tc.args.items.len > 0)
                 try self.alloc.dupe(u8, tc.args.items)
             else
@@ -1084,7 +1211,7 @@ const StreamCtx = struct {
                 .id = id,
                 .name = name,
                 .input_json = args,
-            }});
+            } });
         }
         if (self.tool_calls.items.len > 0 and self.response.stop_reason != .tool_use) {
             self.response.stop_reason = .tool_use;
@@ -1094,11 +1221,43 @@ const StreamCtx = struct {
     }
 };
 
+/// Sanitize raw tool name from streaming chunks:
+/// Strips trailing XML/DSML tags (`<...`), newlines, and non-identifier characters.
+/// Returns null if name is empty or completely malformed.
+pub fn sanitizeToolName(raw: []const u8) ?[]const u8 {
+    var name = raw;
+    if (std.mem.indexOfScalar(u8, name, '<')) |idx| {
+        name = name[0..idx];
+    }
+    if (std.mem.indexOfScalar(u8, name, '\n')) |idx| {
+        name = name[0..idx];
+    }
+    name = std.mem.trim(u8, name, " \t\r");
+    if (name.len == 0) return null;
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return null;
+    }
+    return name;
+}
+
 // ---------------------------------------------------------------------------
 // Unit Tests
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "js_provider: client loads configured adapter and transforms outgoing body" {
+    var client = Client.init(testing.allocator, "http://localhost/v1", "", "Authorization", "mock", 100);
+    client.provider_js =
+        \\export default { protocol: "chat_completions", transformRequest(req) { req.model = "adapted"; return req; } };
+    ;
+    const adapter = (try client.loadAdapter()).?;
+    defer adapter.deinit();
+    try testing.expectEqual(provider.WireProtocol.chat_completions, adapter.profile.protocol);
+    const body = try client.transformBody(adapter, "{\"model\":\"original\"}");
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("{\"model\":\"adapted\"}", body);
+}
 
 // --- Tests: streaming tool_calls gop theo index (DeepSeek style) ---
 
@@ -1108,37 +1267,41 @@ fn feedLines(ctx: anytype, lines: []const []const u8) !void {
 
 test "openai stream: parallel tool calls gop theo index (DeepSeek style)" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
     // Chunk dau: id+name; cac chunk sau chi index+arguments (DeepSeek khong lap id)
     try feedLines(&ctx, &.{
         \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"bash","arguments":"{\"com"}}]}}]}
+        ,
         \\data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"file_read","arguments":"{\"pa"}}]}}]}
+        ,
         \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"mand\":\"ls\"}"}}]}}]}
+        ,
         \\data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"th\":\"a.zig\"}"}}]}}]}
+        ,
         \\data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+        ,
         \\data: [DONE]
     });
 
     try ctx.finalizeToolCalls();
     try testing.expectEqual(proto.StopReason.tool_use, ctx.response.stop_reason);
-    try testing.expectEqual(@as(usize, 2), ctx.response.content.len);
+    try testing.expectEqual(@as(usize, 2), ctx.response.content.items.len);
 
-    const first = ctx.response.content[0].tool_use;
+    const first = ctx.response.content.items[0].tool_use;
     try testing.expectEqualStrings("bash", first.name);
     try testing.expectEqualStrings("call_a", first.id);
     try testing.expectEqualStrings("{\"command\":\"ls\"}", first.input_json);
 
-    const second = ctx.response.content[1].tool_use;
+    const second = ctx.response.content.items[1].tool_use;
     try testing.expectEqualStrings("file_read", second.name);
     try testing.expectEqualStrings("call_b", second.id);
     try testing.expectEqualStrings("{\"path\":\"a.zig\"}", second.input_json);
@@ -1146,28 +1309,29 @@ test "openai stream: parallel tool calls gop theo index (DeepSeek style)" {
 
 test "openai stream: tool call khong co id — sinh id du phong" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
     // Provider compat khong gui id, chi index
     try feedLines(&ctx, &.{
         \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"glob","arguments":"{\"pat"}}]}}]}
+        ,
         \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"tern\":\"*.zig\"}"}}]}}]}
+        ,
         \\data: [DONE]
     });
 
     try ctx.finalizeToolCalls();
     try testing.expectEqual(proto.StopReason.tool_use, ctx.response.stop_reason);
-    try testing.expectEqual(@as(usize, 1), ctx.response.content.len);
-    const tu = ctx.response.content[0].tool_use;
+    try testing.expectEqual(@as(usize, 1), ctx.response.content.items.len);
+    const tu = ctx.response.content.items[0].tool_use;
     try testing.expectEqualStrings("glob", tu.name);
     try testing.expectEqualStrings("{\"pattern\":\"*.zig\"}", tu.input_json);
     try testing.expect(std.mem.startsWith(u8, tu.id, "call_"));
@@ -1211,14 +1375,13 @@ test "openai buildRequestBody: disable_stream_options omits stream_options" {
 
 test "openai stream: parse usage chunk (RFC-006 §3.1)" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
@@ -1243,14 +1406,13 @@ test "openai stream: parse usage chunk (RFC-006 §3.1)" {
 
 test "openai stream: DeepSeek usage alias prompt_cache_hit_tokens (RFC-006 §3.1)" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
@@ -1269,14 +1431,13 @@ test "openai stream: DeepSeek usage alias prompt_cache_hit_tokens (RFC-006 §3.1
 
 test "openai stream: delta.reasoning parsed as thinking (RFC-006 §3.3)" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
@@ -1307,14 +1468,13 @@ test "openai stream: delta.reasoning parsed as thinking (RFC-006 §3.3)" {
 
 test "openai stream: finish_reason content_filter maps to unknown (RFC-006 §3.4)" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
@@ -1331,14 +1491,13 @@ test "openai stream: finish_reason content_filter maps to unknown (RFC-006 §3.4
 
 test "openai stream: finish_reason function maps to tool_use (RFC-006 §3.4)" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
@@ -1383,7 +1542,7 @@ test "openai auto-negotiation: buildResponsesRequestBody format" {
         .{ .name = "bash", .description = "Run shell", .input_schema_json = "{\"type\":\"object\"}" },
     };
 
-    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, null, "System instructions", &msgs, &tools);
+    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, null, "System instructions", &msgs, &tools, provider.getProfile("openai"));
     defer alloc.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-5.6-terra\"") != null);
@@ -1395,14 +1554,13 @@ test "openai auto-negotiation: buildResponsesRequestBody format" {
 
 test "openai stream: Responses API event-based streaming parse" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
@@ -1480,7 +1638,7 @@ test "openai auto-negotiation: buildResponsesRequestBody multi-turn with functio
         .{ .name = "bash", .description = "Run shell", .input_schema_json = "{\"type\":\"object\"}" },
     };
 
-    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-luna", 4096, false, null, "System prompt", &msgs, &tools);
+    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-luna", 4096, false, null, "System prompt", &msgs, &tools, provider.getProfile("openai"));
     defer alloc.free(body);
 
     // Verify correct input format generated: user msg -> assistant text -> assistant function_call -> function_call_output
@@ -1492,14 +1650,13 @@ test "openai auto-negotiation: buildResponsesRequestBody multi-turn with functio
 
 test "openai stream: Responses API output_item.added and output_item.done does not duplicate arguments" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
@@ -1569,31 +1726,30 @@ test "openai dynamic reasoning_effort in buildResponsesRequestBody" {
     const tools = [_]proto.ToolDefinition{};
 
     // 1. With reasoning_effort = "low"
-    const body_low = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "low", "", &msgs, &tools);
+    const body_low = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "low", "", &msgs, &tools, provider.getProfile("openai"));
     defer alloc.free(body_low);
     try testing.expect(std.mem.indexOf(u8, body_low, "\"reasoning\":{\"effort\":\"low\"}") != null);
 
     // 2. With reasoning_effort = "high"
-    const body_high = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "high", "", &msgs, &tools);
+    const body_high = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "high", "", &msgs, &tools, provider.getProfile("openai"));
     defer alloc.free(body_high);
     try testing.expect(std.mem.indexOf(u8, body_high, "\"reasoning\":{\"effort\":\"high\"}") != null);
 
     // 3. With default null (falls back to medium)
-    const body_default = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, null, "", &msgs, &tools);
+    const body_default = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, null, "", &msgs, &tools, provider.getProfile("openai"));
     defer alloc.free(body_default);
     try testing.expect(std.mem.indexOf(u8, body_default, "\"reasoning\":{\"effort\":\"medium\"}") != null);
 }
 
 test "openai stream: Responses API embedded type in data without event prefix (OpenRouter style)" {
     const alloc = testing.allocator;
-    var resp = proto.Response.init(alloc);
-    defer resp.deinit();
     var ctx = StreamCtx{
         .alloc = alloc,
-        .response = resp,
+        .response = proto.Response.init(alloc),
         .line_buf = .empty,
         .tool_calls = .empty,
     };
+    defer ctx.response.deinit();
     defer ctx.line_buf.deinit(alloc);
     defer ctx.tool_calls.deinit(alloc);
 
@@ -1625,5 +1781,34 @@ test "openai stream: Responses API embedded type in data without event prefix (O
     try testing.expectEqual(@as(u64, 30), ctx.response.usage.total_tokens);
     try testing.expectEqual(@as(u64, 5), ctx.response.usage.cached_tokens);
     try testing.expectEqual(@as(u64, 8), ctx.response.usage.reasoning_tokens);
+}
+
+test "openai buildResponsesRequestBody: unsupported reasoning_param omits reasoning" {
+    const alloc = testing.allocator;
+    const msgs = [_]proto.Message{};
+    const tools = [_]proto.ToolDefinition{};
+
+    // RFC-012: profile-pinned .unsupported reasoning_param (deepseek) must never
+    // emit any reasoning field, even when forced onto the Responses API.
+    const body = try buildResponsesRequestBody(alloc, "deepseek-chat", 4096, false, "high", "", &msgs, &tools, provider.getProfile("deepseek"));
+    defer alloc.free(body);
+
+    try testing.expect(std.mem.indexOf(u8, body, "reasoning") == null);
+}
+
+test "openai sanitizeToolName: strips DSML tags and rejects invalid tool names" {
+    // Normal tool names
+    try testing.expectEqualStrings("bash", sanitizeToolName("bash").?);
+    try testing.expectEqualStrings("file_read", sanitizeToolName("file_read").?);
+    try testing.expectEqualStrings("my-custom_tool1", sanitizeToolName("my-custom_tool1").?);
+
+    // DeepSeek DSML leaked tag stripping
+    try testing.expectEqualStrings("read", sanitizeToolName("read</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>").?);
+    try testing.expectEqualStrings("file_read", sanitizeToolName("file_read<any_tag>").?);
+
+    // Empty or pure tags
+    try testing.expect(sanitizeToolName("</｜DSML｜tool_calls>") == null);
+    try testing.expect(sanitizeToolName("   ") == null);
+    try testing.expect(sanitizeToolName("invalid tool with spaces") == null);
 }
 

@@ -10,6 +10,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const utils = @import("../core/utils.zig");
 const main = @import("../main.zig");
+const hooks = @import("../core/hooks.zig");
 
 pub const c = @cImport({
     @cInclude("quickjs.h");
@@ -159,6 +160,7 @@ pub const Engine = struct {
             }
         }
         self.output_buf.appendSlice(self.alloc, text) catch {};
+        hooks.appendExecutionOutput(text);
     }
 
     fn interruptCallback(rt: ?*c.JSRuntime, opaque_ptr: ?*anyopaque) callconv(.c) c_int {
@@ -545,7 +547,6 @@ test "codeact hooks - pre/post hook quanh mini.write (M3)" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     const js_bindings = @import("js_bindings.zig");
-    const hooks = @import("../core/hooks.zig");
 
     hooks.setHookListener(testHookListener);
     defer hooks.setHookListener(null);

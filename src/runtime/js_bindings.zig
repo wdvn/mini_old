@@ -84,6 +84,18 @@ fn jsMiniGlob(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
     const pattern = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid pattern");
     defer engine.alloc.free(pattern);
 
+    // M2: policy check — mini.glob maps to 'glob' tool
+    if (guardPolicy(engine, "glob")) {
+        hooks.dispatch(engine.alloc, engine.io, .{
+            .event = "post-tool-use", .tool_name = "glob",
+            .input_json = pattern, .tool_result = "blocked by policy", .is_error = true,
+        });
+        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.glob (glob) is blocked");
+    }
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "pre-tool-use", .tool_name = "glob", .input_json = pattern,
+    });
+
     const base_path = if (argc >= 2 and c.JS_IsUndefined(argv[1]) == 0 and c.JS_IsNull(argv[1]) == 0)
         jsStringSlice(ctx, argv[1], engine.alloc)
     else
@@ -135,6 +147,18 @@ fn jsMiniGrep(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
 
     const pattern = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid pattern");
     defer engine.alloc.free(pattern);
+
+    // M2: policy check — mini.grep maps to 'grep' tool
+    if (guardPolicy(engine, "grep")) {
+        hooks.dispatch(engine.alloc, engine.io, .{
+            .event = "post-tool-use", .tool_name = "grep",
+            .input_json = pattern, .tool_result = "blocked by policy", .is_error = true,
+        });
+        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.grep (grep) is blocked");
+    }
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "pre-tool-use", .tool_name = "grep", .input_json = pattern,
+    });
 
     const path = if (argc >= 2 and c.JS_IsUndefined(argv[1]) == 0 and c.JS_IsNull(argv[1]) == 0)
         jsStringSlice(ctx, argv[1], engine.alloc)
@@ -198,6 +222,18 @@ fn jsMiniRead(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
 
     const path = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid path");
     defer engine.alloc.free(path);
+
+    // M2: policy check — mini.read maps to 'file_read' tool
+    if (guardPolicy(engine, "file_read")) {
+        hooks.dispatch(engine.alloc, engine.io, .{
+            .event = "post-tool-use", .tool_name = "file_read",
+            .input_json = path, .tool_result = "blocked by policy", .is_error = true,
+        });
+        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.read (file_read) is blocked");
+    }
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "pre-tool-use", .tool_name = "file_read", .input_json = path,
+    });
 
     var offset: usize = 1;
     var limit: usize = 2000;

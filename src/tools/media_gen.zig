@@ -25,6 +25,8 @@ pub const MediaGenConfig = struct {
     image_gen_model: []const u8 = "gpt-image-1",
     image_gen_size: []const u8 = "1024x1024",
     video_gen_enabled: bool = false,
+    /// Video gen provider: "openai" (Sora-compatible) | "openai_compat" (Agnes/etc).
+    video_gen_provider: []const u8 = "openai",
     video_gen_model: []const u8 = "sora-2",
     media_output_dir: ?[]const u8 = null,
     video_poll_timeout_secs: u32 = 600,
@@ -382,8 +384,13 @@ pub fn generateVideoDirect(
     }
 
     const model = model_opt orelse g_config.video_gen_model;
+    const is_compat = std.mem.eql(u8, g_config.video_gen_provider, "openai_compat");
     var base_url: []const u8 = "https://api.openai.com/v1";
-    if (g_config.openai_compat_url) |u| {
+    if (is_compat) {
+        if (g_config.openai_compat_url) |u| {
+            base_url = std.mem.trimEnd(u8, u, "/");
+        }
+    } else if (g_config.openai_compat_url) |u| {
         base_url = std.mem.trimEnd(u8, u, "/");
     }
 
@@ -400,9 +407,16 @@ pub fn generateVideoDirect(
     const escaped_prompt = try json.escape(alloc, prompt);
     defer alloc.free(escaped_prompt);
 
-    const req_body = try std.fmt.allocPrint(alloc,
-        \\{{"model":"{s}","prompt":"{s}","duration":{d}}}
-    , .{ model, escaped_prompt, seconds });
+    // AgnesAI: seconds is string, requires mode + size params
+    // Sora/OpenAI: duration is integer, no mode required
+    const req_body = if (is_compat)
+        try std.fmt.allocPrint(alloc,
+            \\{{"model":"{s}","prompt":"{s}","seconds":"{d}","mode":"text","size":"720P","aspect_ratio":"16:9"}}
+        , .{ model, escaped_prompt, seconds })
+    else
+        try std.fmt.allocPrint(alloc,
+            \\{{"model":"{s}","prompt":"{s}","duration":{d}}}
+        , .{ model, escaped_prompt, seconds });
     defer alloc.free(req_body);
 
     var res = try http_lib.fetch(alloc, io, .{
@@ -424,7 +438,8 @@ pub fn generateVideoDirect(
         };
     }
 
-    const job_id = json.findString(res.body, "id") orelse {
+    const job_id = json.findString(res.body, "id") orelse
+        json.findString(res.body, "task_id") orelse {
         return MediaResult{
             .path = "",
             .media_type = "",
@@ -434,8 +449,15 @@ pub fn generateVideoDirect(
         };
     };
 
+    // AgnesAI returns video_id separate from task id; use video_id for polling if present
+    const video_id = json.findString(res.body, "video_id") orelse job_id;
+
     // Polling loop
-    const poll_url = if (std.mem.endsWith(u8, base_url, "/v1"))
+    // AgnesAI: GET /agnesapi?video_id={id}&model_name={model}
+    // Sora/OpenAI: GET /v1/videos/{id}
+    const poll_url = if (is_compat)
+        try std.fmt.allocPrint(alloc, "{s}/agnesapi?video_id={s}&model_name={s}", .{ base_url, video_id, model })
+    else if (std.mem.endsWith(u8, base_url, "/v1"))
         try std.fmt.allocPrint(alloc, "{s}/videos/{s}", .{ base_url, job_id })
     else
         try std.fmt.allocPrint(alloc, "{s}/v1/videos/{s}", .{ base_url, job_id });
@@ -445,6 +467,9 @@ pub fn generateVideoDirect(
     const timeout_ms: i64 = @as(i64, @intCast(g_config.video_poll_timeout_secs)) * 1000;
 
     var completed = false;
+    // Save the last successful poll response body for metadata.url extraction
+    var last_poll_body: ?[]u8 = null;
+    defer if (last_poll_body) |b| alloc.free(b);
     while (utils.milliTimestamp() - start_time < timeout_ms) {
         var poll_res = http_lib.fetch(alloc, io, .{
             .url = poll_url,
@@ -461,6 +486,8 @@ pub fn generateVideoDirect(
             const status = json.findString(poll_res.body, "status") orelse "queued";
             if (std.mem.eql(u8, status, "completed")) {
                 completed = true;
+                // Clone body for later use (poll_res will be deinit'd after this iteration)
+                last_poll_body = try alloc.dupe(u8, poll_res.body);
                 break;
             } else if (std.mem.eql(u8, status, "failed")) {
                 const err_msg = json.findString(poll_res.body, "error") orelse "Video generation job failed";
@@ -487,30 +514,77 @@ pub fn generateVideoDirect(
     }
 
     // Download completed video content
+    // AgnesAI: use metadata.url from last poll response directly
+    // Sora/OpenAI: GET /v1/videos/{id}/content
+    if (is_compat and last_poll_body != null) {
+        const vid_url = json.findString(last_poll_body.?, "metadata.url") orelse {
+            return MediaResult{
+                .path = "",
+                .media_type = "",
+                .bytes = 0,
+                .ok = false,
+                .message = try alloc.dupe(u8, "Video completed but no metadata.url found"),
+            };
+        };
+        const base_filename = if (filename_opt) |f|
+            try sanitizeFilename(alloc, f)
+        else
+            try alloc.dupe(u8, "video");
+        defer alloc.free(base_filename);
+        const safe_name = if (std.mem.endsWith(u8, base_filename, ".mp4"))
+            try alloc.dupe(u8, base_filename)
+        else
+            try std.fmt.allocPrint(alloc, "{s}.mp4", .{base_filename});
+        defer alloc.free(safe_name);
+        const output_dir = g_config.media_output_dir orelse "media";
+        try ensureOutputDir(alloc, io, output_dir);
+        const ts = utils.milliTimestamp();
+        const fp = try std.fmt.allocPrint(alloc, "{s}/{d}_{s}", .{ output_dir, ts, safe_name });
+        errdefer alloc.free(fp);
+        const dl_res = http_lib.downloadToFile(alloc, io, .{
+            .url = vid_url,
+            .method = "GET",
+            .headers_json = headers_json,
+            .max_body_size = 200 * 1024 * 1024,
+            .timeout_s = 300,
+        }, fp) catch |e| {
+            return MediaResult{
+                .path = "",
+                .media_type = "",
+                .bytes = 0,
+                .ok = false,
+                .message = try std.fmt.allocPrint(alloc, "Failed to download video: {s}", .{@errorName(e)}),
+            };
+        };
+        defer if (dl_res.error_message) |m| alloc.free(m);
+        if (dl_res.status != 200 or dl_res.total_bytes == 0) {
+            const err_msg = dl_res.error_message orelse "Failed to download video content";
+            return MediaResult{
+                .path = "",
+                .media_type = "",
+                .bytes = 0,
+                .ok = false,
+                .message = try alloc.dupe(u8, err_msg),
+            };
+        }
+        hooks.dispatch(alloc, io, .{
+            .event = "media_saved",
+            .artifact_path = fp,
+            .artifact_type = "video/mp4",
+        });
+        return MediaResult{
+            .path = fp,
+            .media_type = try alloc.dupe(u8, "video/mp4"),
+            .bytes = dl_res.total_bytes,
+            .ok = true,
+            .message = try alloc.dupe(u8, "Video generated successfully"),
+        };
+    }
     const content_url = if (std.mem.endsWith(u8, base_url, "/v1"))
         try std.fmt.allocPrint(alloc, "{s}/videos/{s}/content", .{ base_url, job_id })
     else
         try std.fmt.allocPrint(alloc, "{s}/v1/videos/{s}/content", .{ base_url, job_id });
     defer alloc.free(content_url);
-
-    var dl_res = try http_lib.fetch(alloc, io, .{
-        .url = content_url,
-        .method = "GET",
-        .headers_json = headers_json,
-        .max_body_size = 200 * 1024 * 1024,
-        .timeout_s = 300,
-    });
-    defer dl_res.deinit(alloc);
-
-    if (dl_res.status != 200 or dl_res.body.len == 0) {
-        return MediaResult{
-            .path = "",
-            .media_type = "",
-            .bytes = 0,
-            .ok = false,
-            .message = try alloc.dupe(u8, "Failed to download video content"),
-        };
-    }
 
     const base_filename = if (filename_opt) |f|
         try sanitizeFilename(alloc, f)
@@ -531,10 +605,33 @@ pub fn generateVideoDirect(
     const final_path = try std.fmt.allocPrint(alloc, "{s}/{d}_{s}", .{ output_dir, ts, safe_name });
     errdefer alloc.free(final_path);
 
-    const cwd = std.Io.Dir.cwd();
-    const file = try cwd.createFile(io, final_path, .{});
-    defer file.close(io);
-    try file.writeStreamingAll(io, dl_res.body);
+    const dl_res = http_lib.downloadToFile(alloc, io, .{
+        .url = content_url,
+        .method = "GET",
+        .headers_json = headers_json,
+        .max_body_size = 200 * 1024 * 1024,
+        .timeout_s = 300,
+    }, final_path) catch |e| {
+        return MediaResult{
+            .path = "",
+            .media_type = "",
+            .bytes = 0,
+            .ok = false,
+            .message = try std.fmt.allocPrint(alloc, "Failed to download video: {s}", .{@errorName(e)}),
+        };
+    };
+    defer if (dl_res.error_message) |m| alloc.free(m);
+
+    if (dl_res.status != 200 or dl_res.total_bytes == 0) {
+        const err_msg = dl_res.error_message orelse "Failed to download video content";
+        return MediaResult{
+            .path = "",
+            .media_type = "",
+            .bytes = 0,
+            .ok = false,
+            .message = try alloc.dupe(u8, err_msg),
+        };
+    }
 
     hooks.dispatch(alloc, io, .{
         .event = "media_saved",
@@ -545,7 +642,7 @@ pub fn generateVideoDirect(
     return MediaResult{
         .path = final_path,
         .media_type = try alloc.dupe(u8, "video/mp4"),
-        .bytes = dl_res.body.len,
+        .bytes = dl_res.total_bytes,
         .ok = true,
         .message = try alloc.dupe(u8, "Video generated successfully"),
     };

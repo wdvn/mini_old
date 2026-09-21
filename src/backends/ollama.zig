@@ -78,12 +78,23 @@ pub const Client = struct {
         const headers = [_][]const u8{"Content-Type: application/json"};
         // RFC-009 Phase 5: stream stall watchdog (fixed 30s idle; Ollama is
         // local so a longer silence means the model/server is wedged).
+        // MINI_WATCHDOG_ENABLED=0 disables the idle stall watchdog.
+        const watchdog_enabled: bool = blk: {
+            if (utils.getEnvSlice("MINI_WATCHDOG_ENABLED")) |s| {
+                const v = std.mem.trim(u8, s, " \t");
+                break :blk !(std.mem.eql(u8, v, "0") or
+                    std.mem.eql(u8, v, "false") or
+                    std.mem.eql(u8, v, "off"));
+            }
+            break :blk true;
+        };
+        const idle_timeout_secs: u32 = if (watchdog_enabled) 30 else 0;
         var idle_aborted = false;
         const stream_result = http_lib.postStream(self.alloc, main.g_io, .{
             .url = url,
             .headers = &headers,
             .body = body,
-            .idle_timeout_secs = 30,
+            .idle_timeout_secs = idle_timeout_secs,
             .out_idle_aborted = &idle_aborted,
         }, StreamCtx.onChunk, &ctx);
         const req_http_code = if (stream_result) |c| c else |e| switch (e) {

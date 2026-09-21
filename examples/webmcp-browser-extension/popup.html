@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebMCP Browser Extension</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      max-width: 600px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    h1 { color: #333; }
+    .section {
+      background: white;
+      padding: 20px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .tool-list {
+      list-style: none;
+      padding: 0;
+    }
+    .tool-list li {
+      padding: 10px;
+      border-bottom: 1px solid #eee;
+    }
+    .tool-list li:last-child {
+      border-bottom: none;
+    }
+    .tool-name {
+      font-weight: 600;
+      color: #007bff;
+    }
+    .tool-desc {
+      color: #666;
+      font-size: 14px;
+    }
+    code {
+      background: #f0f0f0;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: monospace;
+    }
+    .config-section {
+      margin-top: 20px;
+    }
+    input, select {
+      width: 100%;
+      padding: 8px;
+      margin: 4px 0;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+    }
+    button {
+      background: #007bff;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 6px;
+      cursor: pointer;
+      margin-top: 10px;
+    }
+    button:hover {
+      background: #0056b3;
+    }
+  </style>
+</head>
+<body>
+  <h1>🤖 WebMCP Browser Extension</h1>
+  
+  <div class="section">
+    <h2>Available MCP Tools</h2>
+    <ul class="tool-list">
+      <li>
+        <div class="tool-name">get_current_url</div>
+        <div class="tool-desc">Get the current URL of the active tab</div>
+      </li>
+      <li>
+        <div class="tool-name">navigate</div>
+        <div class="tool-desc">Navigate to a URL</div>
+      </li>
+      <li>
+        <div class="tool-name">get_page_content</div>
+        <div class="tool-desc">Get page content as text or HTML</div>
+      </li>
+      <li>
+        <div class="tool-name">click</div>
+        <div class="tool-desc">Click an element by CSS selector</div>
+      </li>
+      <li>
+        <div class="tool-name">fill</div>
+        <div class="tool-desc">Fill a form field</div>
+      </li>
+      <li>
+        <div class="tool-name">screenshot</div>
+        <div class="tool-desc">Take a screenshot of the current page</div>
+      </li>
+      <li>
+        <div class="tool-name">evaluate</div>
+        <div class="tool-desc">Execute JavaScript in the page context</div>
+      </li>
+      <li>
+        <div class="tool-name">get_elements</div>
+        <div class="tool-desc">Get elements matching a CSS selector</div>
+      </li>
+      <li>
+        <div class="tool-name">list_tabs</div>
+        <div class="tool-desc">List all open tabs</div>
+      </li>
+      <li>
+        <div class="tool-name">switch_tab</div>
+        <div class="tool-desc">Switch to a tab by ID</div>
+      </li>
+    </ul>
+  </div>
+  
+  <div class="section config-section">
+    <h2>Configuration</h2>
+    <label>MCP Server Port:</label>
+    <input type="number" id="mcp-port" value="8765">
+    
+    <label>MCP Server URL:</label>
+    <input type="text" id="mcp-url" value="http://127.0.0.1:8765">
+    
+    <button onclick="saveConfig()">Save Configuration</button>
+  </div>
+  
+  <div class="section">
+    <h2>How to Use</h2>
+    <ol>
+      <li>Install this extension in Chrome: <code>chrome://extensions/</code></li>
+      <li>Enable "Developer mode" and click "Load unpacked"</li>
+      <li>Configure mini-agent to use MCP server at <code>http://127.0.0.1:8765</code></li>
+    </ol>
+    
+    <h3>Mini-agent MCP Config (~/.mini/mcp.json):</h3>
+    <pre><code>{
+  "servers": {
+    "browser": {
+      "command": "node",
+      "args": ["path/to/mcp-server.js"]
+    }
+  }
+}</code></pre>
+  </div>
+  
+  <script src="popup.js"></script>
+</body>
+</html>

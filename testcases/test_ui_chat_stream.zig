@@ -109,7 +109,6 @@ test "UI Chat Stream: TurnRenderer complete lifecycle" {
         .max_context_tokens = 128000,
         .duration_ms = 1200,
         .acts_count = 1,
-        .files_modified = 1,
     });
 }
 

@@ -73,6 +73,7 @@ pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, versio
 
         // Initialize TurnRenderer for this chat turn
         var renderer = chat_stream.TurnRenderer.init(alloc, io);
+        renderer.parser.thinking_tags = main.backends.provider_mod.getProfile(agent.config.openai_provider).thinking_tags;
         defer renderer.deinit();
         current_renderer = &renderer;
         defer current_renderer = null;
@@ -159,18 +160,46 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
         return true;
     }
 
+    // `/provider` command: switch OpenAI-compatible provider profile (RFC-012).
+    // Changes provider key which affects wire protocol, reasoning echo policy,
+    // thinking tag handling, and parameter format. Also reloads agent context
+    // with the new provider's thinking_tags for the TurnRenderer.
+    if (std.mem.startsWith(u8, input, "/provider ")) {
+        const provider_key = std.mem.trim(u8, input["/provider ".len..], " \t");
+        if (provider_key.len == 0) {
+            main.stdoutPrint("Usage: /provider <key>\n  Available: openai, deepseek, qwen, minimax, glm, kimi, xai, vllm, agnes, generic\n", .{});
+        } else {
+            // Update backend's provider key if using OpenAI-compat
+            switch (agent.backend) {
+                .openai => |*c| c.provider_key = provider_key,
+                else => {
+                    main.stdoutPrint("Provider switch only works with OpenAI-compatible backend.\n", .{});
+                    return true;
+                },
+            }
+            // Update renderer's thinking tags to match new provider
+            if (main.ui_repl.current_renderer) |r| {
+                r.parser.thinking_tags = main.backends.provider_mod.getProfile(provider_key).thinking_tags;
+            }
+            main.stdoutPrint("Provider set to: {s}\n", .{provider_key});
+        }
+        return true;
+    }
+
     if (std.mem.eql(u8, input, "/help")) {
         std.Io.File.stdout().writeStreamingAll(io,
             \\
             \\## REPL Commands
             \\  /clear              Clear conversation history
             \\  /model <backend>    Switch backend (openai, claude, ollama)
+            \\  /provider <key>     Switch OpenAI provider profile (openai|deepseek|qwen|minimax|glm|kimi|xai|vllm|agnes|generic)
             \\  /config [show]      Show current configuration
             \\  /config protocol <auto|chat|responses>  Set OpenAI protocol mode
             \\  /config thinking <on|off>               Toggle dynamic thinking governor
             \\  /config reasoning <auto|low|med|high|none> Set reasoning effort
             \\  /artifact [list]    View session artifacts list
             \\  /artifact show <fn> Read an artifact content
+            \\  /terminal-setup     Inspect & configure Shift+Enter / multiline terminal support
             \\  /quit, /exit, /q    Exit
             \\  /help               Show this help guide
             \\
@@ -180,6 +209,29 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
             \\## Available Tools
             \\  bash, file_read, file_write, file_edit, artifact_write, artifact_read, artifact_list
             \\  glob, grep, http_request, skills, invoke_subagent, batch_invoke_subagents
+            \\
+        ) catch {};
+        return true;
+    }
+
+    if (std.mem.eql(u8, input, "/terminal-setup") or std.mem.eql(u8, input, "/terminal")) {
+        std.Io.File.stdout().writeStreamingAll(io,
+            \\
+            \\## Terminal Multiline Input Setup & Capabilities
+            \\
+            \\mini-agent supports 4 distinct ways to insert newlines without submitting:
+            \\  1. Shift + Enter:
+            \\     - Native in Kitty, Ghostty, WezTerm, Foot, and modern xterm.
+            \\     - In VS Code / Cursor: Enabled via Kitty protocol or keybinding:
+            \\       "terminal.integrated.enableKittyKeyboardProtocol": true
+            \\       Or add to keybindings.json:
+            \\       { "key": "shift+enter", "command": "workbench.action.terminal.sendSequence", "args": { "text": "\u001b[13;2u" }, "when": "terminalFocus" }
+            \\  2. Alt + Enter / Option + Enter:
+            \\     - Instant newline across all terminals (sends ESC+Enter).
+            \\  3. Ctrl + J:
+            \\     - Standard ASCII linefeed (0x0A), 100% universal across all environments.
+            \\  4. Backslash (\) + Enter:
+            \\     - Line continuation: type \ at the end of a line and press Enter to continue on the next line.
             \\
         ) catch {};
         return true;
@@ -199,6 +251,8 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
         const sub = std.mem.trim(u8, input["/config".len..], " \t");
         if (sub.len == 0 or std.mem.eql(u8, sub, "show") or std.mem.startsWith(u8, sub, "show ")) {
             printConfig(agent);
+        } else if (std.mem.eql(u8, sub, "help") or sub.len == 0) {
+            printConfigHelp(io);
         } else if (std.mem.startsWith(u8, sub, "protocol")) {
             const mode_str = std.mem.trim(u8, sub["protocol".len..], " \t");
             if (mode_str.len > 0) {
@@ -314,20 +368,25 @@ fn printConfig(agent: *agent_mod.AgentLoop) void {
 
     const dynamic_thinking_str: []const u8 = if (agent.dynamic_thinking) "enabled (Cognitive Governor)" else "disabled";
     const memact_str: []const u8 = if (agent.config.memact_enabled) "enabled" else "disabled";
+    const image_gen_str: []const u8 = if (agent.config.image_gen_enabled) agent.config.image_gen_model else "disabled";
+    const video_gen_str: []const u8 = if (agent.config.video_gen_enabled) agent.config.video_gen_model else "disabled";
 
     main.stdoutPrint(
         "\n\x1b[1;36mmini-agent Configuration\x1b[0m\n" ++
-        "  \x1b[1mBackend:\x1b[0m          {s}\n" ++
-        "  \x1b[1mModel:\x1b[0m            {s}\n" ++
-        "  \x1b[1mEndpoint:\x1b[0m         {s}\n" ++
-        "  \x1b[1mProtocol:\x1b[0m         {s}\n" ++
-        "  \x1b[1mAPI Key:\x1b[0m          {s}\n" ++
-        "  \x1b[1mExecution Mode:\x1b[0m   {s}\n" ++
-        "  \x1b[1mContext Window:\x1b[0m   {d} tokens\n" ++
-        "  \x1b[1mMax Tokens:\x1b[0m       {d} tokens\n" ++
-        "  \x1b[1mDynamic Thinking:\x1b[0m {s}\n" ++
-        "  \x1b[1mReasoning Effort:\x1b[0m {s}\n" ++
-        "  \x1b[1mMemAct:\x1b[0m           {s}\n\n",
+            "  \x1b[1mBackend:\x1b[0m          {s}\n" ++
+            "  \x1b[1mModel:\x1b[0m            {s}\n" ++
+            "  \x1b[1mEndpoint:\x1b[0m         {s}\n" ++
+            "  \x1b[1mProtocol:\x1b[0m         {s}\n" ++
+            "  \x1b[1mAPI Key:\x1b[0m          {s}\n" ++
+            "  \x1b[1mExecution Mode:\x1b[0m   {s}\n" ++
+            "  \x1b[1mContext Window:\x1b[0m   {d} tokens\n" ++
+            "  \x1b[1mMax Tokens:\x1b[0m       {d} tokens\n" ++
+            "  \x1b[1mDynamic Thinking:\x1b[0m {s}\n" ++
+            "  \x1b[1mReasoning Effort:\x1b[0m {s}\n" ++
+            "  \x1b[1mMemAct:\x1b[0m           {s}\n" ++
+            "  \x1b[1mImage Input:\x1b[0m        {s}\n" ++
+            "  \x1b[1mImage Gen:\x1b[0m          {s}\n" ++
+            "  \x1b[1mVideo Gen:\x1b[0m          {s}\n\n",
         .{
             backend_name,
             model_name,
@@ -340,8 +399,108 @@ fn printConfig(agent: *agent_mod.AgentLoop) void {
             dynamic_thinking_str,
             reasoning_str,
             memact_str,
+            if (agent.config.image_input_enabled) "enabled" else "disabled",
+            image_gen_str,
+            video_gen_str,
         },
     );
+}
+
+fn printConfigHelp(io: std.Io) void {
+    std.Io.File.stdout().writeStreamingAll(io,
+        \\
+        \\## /config — Configuration Variables Reference
+        \\
+        \\### AI Backend
+        \\  OPENAI_COMPAT_URL       OpenAI-compatible API endpoint URL (highest priority backend)
+        \\  OPENAI_COMPAT_MODEL     Model name for OpenAI-compat endpoint (default: gpt-4o-mini)
+        \\  OPENAI_COMPAT_API_KEY   API key for OpenAI-compatible endpoint (optional)
+        \\  OPENAI_COMPAT_API_HEADER Header name for API key (default: Authorization)
+        \\  OPENAI_COMPAT_PROVIDER  Provider profile key: openai|deepseek|qwen|minimax|glm|kimi|xai|vllm|agnes|generic
+        \\  OPENAI_COMPAT_PROVIDER_JS Custom provider JS adapter path
+        \\  ANTHROPIC_API_KEY       Anthropic Claude API key
+        \\  CLAUDE_MODEL            Claude model ID (default: claude-opus-4-5)
+        \\  OLLAMA_HOST             Ollama base URL (default: http://localhost:11434)
+        \\  OLLAMA_MODEL            Ollama model name (default: llama3)
+        \\
+        \\### Agent & Reasoning (RFC-009)
+        \\  MINI_MAX_TOKENS                   Max tokens per response (default: 24000)
+        \\  MINI_MAX_TOKENS_CONTINUE_CAP      Max consecutive auto-continuations on truncation (default: 3)
+        \\  MINI_USE_COMPLETION_TOKENS        Use max_completion_tokens instead of max_tokens ("1"/"0")
+        \\  MINI_SYSTEM_FILE                  Path to system prompt .md file
+        \\  MINI_DYNAMIC_THINKING             Enable adaptive thinking governor ("0"=off, default: on)
+        \\  MINI_REASONING_EFFORT             Static reasoning effort: minimal|low|medium|high|none
+        \\  MINI_REASONING_EFFORT_DISABLED    Skip reasoning params for incompatible endpoints ("1"/"0")
+        \\  MINI_THINKING_BUDGET              Thinking budget in tokens for Claude (>= 1024)
+        \\
+        \\### Execution Mode
+        \\  MINI_EXECUTION_MODE   Agent execution mode: codeact|tools|auto (default: auto)
+        \\  MINI_MAX_ACTS         Max acts per turn before yielding (default: 30)
+        \\  MINI_LOOP_CONSECUTIVE_CAP  Max consecutive identical tool calls (default: 3)
+        \\  MINI_LOOP_WINDOW_CAP    Max identical tool calls in sliding window (default: 4)
+        \\
+        \\### MemAct (RFC-003)
+        \\  MINI_MEMACT_ENABLED          Enable MemAct memory system ("0" to disable)
+        \\  MINI_CONTEXT_WINDOW          Context window size in tokens (auto-detected if unset)
+        \\  MINI_CTX_SAFETY_MARGIN       Safety margin ratio for context (default: 0.15)
+        \\  MINI_CTX_COMPACT_THRESHOLD   History compaction trigger ratio (default: 0.85)
+        \\  MINI_MEMACT_TOP_K            Max memory items injected into prompt (default: 8)
+        \\  MINI_MEMACT_MEMORY_BUDGET    Token budget for memory block (default: 2000)
+        \\  MINI_MEMACT_EXTRACT          Memory extraction mode: async|sync|off (default: async)
+        \\  MINI_MEMORY_DIR              Custom memory directory path
+        \\
+        \\### Procedural Graph (RFC-010)
+        \\  MINI_MEMACT_PG_ENABLED           Enable procedural graph guidance ("0" to disable)
+        \\  MINI_MEMACT_PG_H                 Neighborhood hop distance (default: 2)
+        \\  MINI_MEMACT_PG_W                 Recent trajectory window size (default: 3)
+        \\  MINI_MEMACT_PG_AUTO_POPULATE     Auto-learn frequent tool transitions (default: on)
+        \\
+        \\### Tools
+        \\  MINI_TOOL_ALLOWLIST  Comma-separated list of allowed tools (null = allow all)
+        \\  MINI_TOOL_BLOCKLIST  Comma-separated list of blocked tools (null = block none)
+        \\
+        \\### Media I/O (RFC-011)
+        \\  MINI_IMAGE_INPUT_ENABLED      Enable @image:path parsing ("0" to disable)
+        \\  MINI_IMAGE_INPUT_MAX_PER_TURN Max image attachments per turn (default: 5)
+        \\  MINI_IMAGE_INPUT_MAX_BYTES    Max image file size in bytes (default: 10MB)
+        \\  MINI_IMAGE_GEN_ENABLED        Enable generate_image tool ("1" to enable)
+        \\  MINI_IMAGE_GEN_PROVIDER       Image gen provider: openai|openai_compat
+        \\  MINI_IMAGE_GEN_MODEL          Image generation model (default: gpt-image-1)
+        \\  MINI_IMAGE_GEN_SIZE           Default image size (default: 1024x1024)
+        \\  MINI_VIDEO_GEN_ENABLED        Enable generate_video tool ("1" to enable)
+        \\  MINI_VIDEO_GEN_MODEL          Video generation model (default: sora-2)
+        \\  MINI_MEDIA_OUTPUT_DIR         Media output directory
+        \\  MINI_VIDEO_POLL_TIMEOUT_SECS  Video job polling timeout in seconds (default: 600)
+        \\
+        \\### MCP & Hooks
+        \\  MINI_MCP_CONFIG       Path to mcp.json server configuration
+        \\  MINI_HOOK_COMMAND     Global hook command to run on events
+        \\  MINI_HOOKS_CONFIG     Path to hooks configuration file
+        \\
+        \\### Session & History
+        \\  MINI_SESSION       Override session ID
+        \\  MINI_SESSION_FILE  Direct path to session JSON file
+        \\  MINI_NO_HISTORY    Disable in-memory history saving ("1" to disable)
+        \\
+        \\### Budget
+        \\  MINI_BUDGET_MAX_TOKENS  Maximum token budget per session (default: 10000000)
+        \\
+        \\### Runtime Overrides (live, not persisted)
+        \\  /config protocol <auto|chat|responses>    Set OpenAI protocol mode
+        \\  /config thinking <on|off>                 Toggle dynamic thinking governor
+        \\  /config reasoning <auto|low|medium|high|none>  Set reasoning effort
+        \\
+        \\### File Sources (priority order)
+        \\  1. $MINI_ENV_FILE              — explicit .env path
+        \\  2. ./.env                      — project-level
+        \\  3. $MINI_AGENT_FOLDER/.env     — agent folder level
+        \\  4. ~/.mini/.env                — user-level
+        \\  5. $MINI_AGENT_FOLDER/config.json
+        \\  6. ~/.mini/config.json
+        \\
+        \\Note: Shell environment variables always override .env and config.json values.
+        \\
+    ) catch {};
 }
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -385,6 +544,7 @@ fn tryExecuteCustomSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.
     main.stdoutPrint("\x1b[90m[command /{s}]\x1b[0m\n", .{cmd_name});
 
     var renderer = chat_stream.TurnRenderer.init(alloc, io);
+    renderer.parser.thinking_tags = main.backends.provider_mod.getProfile(agent.config.openai_provider).thinking_tags;
     defer renderer.deinit();
     current_renderer = &renderer;
     defer current_renderer = null;

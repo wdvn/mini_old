@@ -131,10 +131,24 @@ pub fn build(b: *std.Build) void {
     const testcase_tests = b.addTest(.{ .root_module = testcase_mod });
     const run_testcase_tests = b.addRunArtifact(testcase_tests);
 
+    // 3. Workspace Context testcases (testcases/test_workspace_context.zig)
+    const ws_ctx_mod = b.createModule(.{
+        .root_source_file = b.path("testcases/test_workspace_context.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ws_ctx_mod.addImport("mini", test_mod);
+    ws_ctx_mod.addIncludePath(qjs_path);
+    ws_ctx_mod.linkLibrary(qjs_lib);
+    const ws_ctx_tests = b.addTest(.{ .root_module = ws_ctx_mod });
+    const run_ws_ctx_tests = b.addRunArtifact(ws_ctx_tests);
+
     // test-unit step: run unit tests and testcases only
     const test_unit_step = b.step("test-unit", "Run unit tests & testcases only (without E2E mock)");
     test_unit_step.dependOn(&run_tests.step);
     test_unit_step.dependOn(&run_testcase_tests.step);
+    test_unit_step.dependOn(&run_ws_ctx_tests.step);
 
     // 3. E2E tests with mock LLM server
     const run_e2e = b.addSystemCommand(&.{

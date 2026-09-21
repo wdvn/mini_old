@@ -38,6 +38,28 @@ const CASES = {
     }),
     finish: 'tool_calls',
   },
+  // Case: vision inspection (detected by presence of image blocks)
+  vision: {
+    match: (b) => {
+      if (Array.isArray(b.messages)) {
+        for (const m of b.messages) {
+          if (Array.isArray(m.content)) {
+            if (m.content.some(c => c.type === 'image_url' || c.type === 'input_image' || c.type === 'image')) return true;
+          }
+        }
+      }
+      if (Array.isArray(b.input)) {
+        if (b.input.some(item => item.type === 'input_image')) return true;
+      }
+      return false;
+    },
+    sse: (reqBody) => ({
+      id: 'mock-vision', object: 'chat.completion.chunk', created: Date.now() / 1000 | 0,
+      model: reqBody.model || 'mock-model',
+      choices: [{ index: 0, delta: { role: 'assistant', content: '[Vision Verified] Image received' }, finish_reason: null }],
+    }),
+    finish: 'stop',
+  },
   // Case: multiple content chunks (tests streaming chunk merging)
   long_text: {
     match: (b) => {
@@ -76,6 +98,34 @@ const server = http.createServer((req, res) => {
     if (url.pathname === '/health') {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       res.end('OK\n');
+      return;
+    }
+    if (url.pathname === '/v1/images/generations' || url.pathname === '/images/generations') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        created: Math.floor(Date.now() / 1000),
+        data: [{ b64_json: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=' }],
+      }));
+      return;
+    }
+    if ((url.pathname === '/v1/videos' || url.pathname === '/videos') && req.method === 'POST') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: 'mock-video-99', status: 'queued' }));
+      return;
+    }
+    if (url.pathname.match(/\/videos\/mock-video-99$/)) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: 'mock-video-99', status: 'completed' }));
+      return;
+    }
+    if (url.pathname.match(/\/videos\/mock-video-99\/content$/)) {
+      res.writeHead(200, { 'Content-Type': 'video/mp4' });
+      res.end(Buffer.from([
+        0x00, 0x00, 0x00, 0x10,
+        0x66, 0x74, 0x79, 0x70,
+        0x69, 0x73, 0x6f, 0x6d,
+        0x00, 0x00, 0x02, 0x00,
+      ]));
       return;
     }
     const caseName = url.searchParams.get('case');

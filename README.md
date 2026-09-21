@@ -237,13 +237,13 @@ Explicit CodeAct execution:
 mini-agent -m codeact -e "Use mini.sh to run 'date +%s' and report result"
 ```
 
-### Execution & Stopping Rules
+### Execution Rules
 
-The agent adheres to 4 core operational rules injected directly into the system prompt:
+The agent adheres to core operational rules injected directly into the system prompt:
 1. **Stop on Completion**: As soon as sufficient data is gathered or the goal is achieved, stop calling tools and reply immediately without redundant actions.
 2. **Confirm Before Mutation**: While investigating or diagnosing, do not modify files or configurations without explicit user instruction.
-3. **Avoid Action Loops**: If an approach fails after 2–3 attempts, stop and switch hypotheses rather than looping indefinitely.
-4. **Progress Checkpoint**: For large, complex tasks, periodically pause to summarize progress and request confirmation.
+3. **Avoid Action Loops & Plan Ahead**: If an approach fails after 2–3 attempts or an exploratory loop occurs, formulate a concrete execution plan and proceed with an alternate strategy rather than repeating failed operations.
+4. **Cognitive Efficiency**: Modulate thinking latency on routine operations with `mini.setThinking("low")`, reserving high effort for architecture and complex debugging.
 
 ### Session Persistence
 

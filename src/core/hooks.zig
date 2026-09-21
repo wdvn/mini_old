@@ -40,7 +40,7 @@ pub fn getHookListener() ?HookListener {
 }
 
 /// Callback type for tool lifecycle listener (RFC-010 Procedural Graph).
-pub const ToolListener = *const fn (tool_name: []const u8, is_error: bool) void;
+pub const ToolListener = *const fn (tool_name: []const u8, input_json: ?[]const u8, is_error: bool) void;
 var g_tool_listener: ?ToolListener = null;
 
 /// Set in-memory tool lifecycle listener.
@@ -51,6 +51,27 @@ pub fn setToolListener(listener: ?ToolListener) void {
 /// Get current in-memory tool lifecycle listener.
 pub fn getToolListener() ?ToolListener {
     return g_tool_listener;
+}
+
+/// Callback type for execution output chunks (Thread 3 tool/codeact execution -> ActCoordinator).
+pub const OutputListener = *const fn (chunk: []const u8) void;
+var g_output_listener: ?OutputListener = null;
+
+/// Set in-memory execution output chunk listener.
+pub fn setOutputListener(listener: ?OutputListener) void {
+    g_output_listener = listener;
+}
+
+/// Get current in-memory execution output chunk listener.
+pub fn getOutputListener() ?OutputListener {
+    return g_output_listener;
+}
+
+/// Forward an execution output chunk (stdout/stderr) to the active output listener.
+pub fn appendExecutionOutput(chunk: []const u8) void {
+    if (g_output_listener) |listener| {
+        listener(chunk);
+    }
 }
 
 /// Struct holding payload data emitted by hook events.
@@ -90,7 +111,7 @@ pub fn dispatch(alloc: Allocator, io: std.Io, payload: HookPayload) void {
     if (g_tool_listener) |tl| {
         if (std.mem.eql(u8, payload.event, "post-tool-use")) {
             if (payload.tool_name) |tname| {
-                tl(tname, payload.is_error);
+                tl(tname, payload.input_json, payload.is_error);
             }
         }
     }

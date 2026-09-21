@@ -19,10 +19,14 @@ pub const backends = struct {
     pub const openai_mod = @import("backends/openai.zig");
     pub const claude_mod = @import("backends/claude.zig");
     pub const ollama_mod = @import("backends/ollama.zig");
+    pub const provider_mod = @import("backends/provider.zig");
+    pub const js_provider = @import("backends/js_provider.zig");
 };
 pub const tools_mod = @import("tooling/registry.zig");
 pub const session_diagnostics = @import("tools/session_diagnostics.zig");
 pub const act_logger_mod = @import("core/act_logger.zig");
+pub const act_queue_mod = @import("core/act_queue.zig");
+pub const watchdog_mod = @import("core/watchdog.zig");
 pub const mcp_mod = @import("tooling/mcp.zig");
 pub const utils = @import("core/utils.zig");
 pub const cron_mod = @import("core/cron.zig");
@@ -46,6 +50,7 @@ pub const graph_store_mod = @import("core/memact/graph_store.zig");
 pub const tokens_mod = @import("core/memact/tokens.zig");
 pub const media_lib = @import("lib/media.zig");
 pub const media_gen_tool = @import("tools/media_gen.zig");
+pub const file_mod = @import("tools/file.zig");
 
 pub const VERSION = "1.0.0";
 
@@ -124,10 +129,19 @@ pub fn main(init: std.process.Init) !void {
     if (agent_folder_mod.resolveOrInitAgentFolder(alloc, init.io, init.environ_map)) |folder| {
         agent_folder_opt = folder;
         init.environ_map.put("MINI_AGENT_FOLDER", folder.path) catch {};
+        if (std.fs.path.dirname(folder.path)) |ws_root| {
+            init.environ_map.put("MINI_WORKSPACE_ROOT", ws_root) catch {};
+        }
     } else |err| {
         stderrPrint("[main] Error finding .agent: {any}\n", .{err});
     }
     defer if (agent_folder_opt) |*f| f.deinit();
+
+    if (init.environ_map.get("MINI_WORKSPACE_ROOT") == null) {
+        if (init.environ_map.get("PWD")) |pwd| {
+            init.environ_map.put("MINI_WORKSPACE_ROOT", pwd) catch {};
+        }
+    }
 
     // Load environment variables from .env and config.json
     config_mod.loadDotEnv(alloc, init.environ_map, init.io);
@@ -192,10 +206,10 @@ pub fn main(init: std.process.Init) !void {
             stderrPrint("Error: --install-cron requires -e <prompt>\n", .{});
             std.process.exit(1);
         }
-        
+
         const exe_path = try getAbsoluteExePath(alloc, init.io, args_raw[0]);
         defer alloc.free(exe_path);
-        
+
         cron_mod.installCronjob(alloc, init.io, cron_expr, exe_path, args.prompt.?) catch |e| {
             if (e == error.AlreadyExists) {
                 stdoutPrint("This cronjob already exists on the system!\n", .{});
@@ -260,6 +274,7 @@ pub fn main(init: std.process.Init) !void {
         defer media_res.deinit(alloc);
 
         var renderer = ui_repl.chat_stream.TurnRenderer.init(alloc, init.io);
+        renderer.parser.thinking_tags = backends.provider_mod.getProfile(cfg.openai_provider).thinking_tags;
         defer renderer.deinit();
         ui_repl.current_renderer = &renderer;
         defer ui_repl.current_renderer = null;
@@ -317,6 +332,7 @@ pub fn main(init: std.process.Init) !void {
         defer media_res.deinit(alloc);
 
         var renderer = ui_repl.chat_stream.TurnRenderer.init(alloc, init.io);
+        renderer.parser.thinking_tags = backends.provider_mod.getProfile(cfg.openai_provider).thinking_tags;
         defer renderer.deinit();
         ui_repl.current_renderer = &renderer;
         defer ui_repl.current_renderer = null;
@@ -455,17 +471,17 @@ fn getAbsoluteExePath(alloc: Allocator, io: std.Io, arg0: []const u8) ![]u8 {
     if (std.mem.startsWith(u8, arg0, "/")) {
         return alloc.dupe(u8, arg0);
     }
-    const argv = [_][]const u8{"realpath", arg0};
+    const argv = [_][]const u8{ "realpath", arg0 };
     var child = try std.process.spawn(io, .{
         .argv = &argv,
         .stdout = .pipe,
         .stderr = .ignore,
         .stdin = .ignore,
     });
-    
+
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(alloc);
-    
+
     if (child.stdout) |out| {
         var chunk: [1024]u8 = undefined;
         while (true) {
@@ -474,7 +490,7 @@ fn getAbsoluteExePath(alloc: Allocator, io: std.Io, arg0: []const u8) ![]u8 {
             try buf.appendSlice(alloc, chunk[0..n]);
         }
     }
-    
+
     _ = child.wait(io) catch {};
     return alloc.dupe(u8, std.mem.trim(u8, buf.items, " \t\r\n"));
 }
@@ -536,6 +552,7 @@ test {
     _ = @import("core/artifacts.zig");
     _ = @import("core/agent.zig");
     _ = @import("core/history.zig");
+    _ = @import("backends/openai.zig");
     _ = @import("core/journal.zig");
     _ = @import("core/protocol.zig");
     _ = @import("core/json.zig");
@@ -556,9 +573,9 @@ test {
     _ = @import("ui/spinner.zig");
     _ = @import("ui/diff_renderer.zig");
     _ = @import("ui/markdown.zig");
-    _ = @import("ui/chat_stream.zig");
+    _ = @import("core/act_queue.zig");
+    _ = @import("core/watchdog.zig");
     _ = quickjs_engine;
     _ = js_bindings;
     _ = process_manager;
 }
-

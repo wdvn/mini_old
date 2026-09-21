@@ -58,6 +58,11 @@ pub const Client = struct {
 
     /// Idle watchdog timeout scaled by active thinking budget (RFC-009 Phase 5).
     fn effectiveIdleTimeout(self: *const Client) u32 {
+        // Disabled? Return 0 to skip idle polling entirely.
+        if (utils.getEnvSlice("MINI_WATCHDOG_ENABLED")) |s| {
+            const v = std.mem.trim(u8, s, " \t");
+            if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "off")) return 0;
+        }
         if (utils.getEnvSlice("MINI_STREAM_IDLE_TIMEOUT")) |s| {
             return std.fmt.parseInt(u32, std.mem.trim(u8, s, " \t"), 10) catch 0;
         }
@@ -229,15 +234,20 @@ pub fn buildRequestBody(
             }
         } else {
             try w.writeByte('[');
-            for (msg.content, 0..) |block, bi| {
-                if (bi > 0) try w.writeByte(',');
+            var first_block = true;
+            for (msg.content) |block| {
                 switch (block) {
                     .text => |t| {
+                        if (t.len == 0) continue;
+                        if (!first_block) try w.writeByte(',');
+                        first_block = false;
                         const e = try json.escape(alloc, t);
                         defer alloc.free(e);
                         try w.print("{{\"type\":\"text\",\"text\":\"{s}\"}}", .{e});
                     },
                     .thinking => |th| {
+                        if (!first_block) try w.writeByte(',');
+                        first_block = false;
                         const t = try json.escape(alloc, th.thinking);
                         defer alloc.free(t);
                         const s = try json.escape(alloc, th.signature);
@@ -247,11 +257,15 @@ pub fn buildRequestBody(
                         , .{ t, s });
                     },
                     .tool_use => |tu| {
+                        if (!first_block) try w.writeByte(',');
+                        first_block = false;
                         try w.print(
                             \\{{"type":"tool_use","id":"{s}","name":"{s}","input":{s}}}
                         , .{ tu.id, tu.name, tu.input_json });
                     },
                     .tool_result => |tr| {
+                        if (!first_block) try w.writeByte(',');
+                        first_block = false;
                         const e = try json.escape(alloc, tr.content);
                         defer alloc.free(e);
                         try w.print(
@@ -259,6 +273,8 @@ pub fn buildRequestBody(
                         , .{ tr.tool_use_id, e, if (tr.is_error) "true" else "false" });
                     },
                     .image => |img| {
+                        if (!first_block) try w.writeByte(',');
+                        first_block = false;
                         try w.print(
                             \\{{"type":"image","source":{{"type":"base64","media_type":"{s}","data":"{s}"}}}}
                         , .{ img.media_type, img.data });

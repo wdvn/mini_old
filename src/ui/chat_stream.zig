@@ -27,6 +27,7 @@ const markdown_mod = @import("markdown.zig");
 const json_mod = @import("../core/json.zig");
 const utils = @import("../core/utils.zig");
 const signals = @import("../core/signals.zig");
+const provider = @import("../backends/provider.zig");
 const main = @import("../main.zig");
 
 /// Calculate visual display length (number of visible columns on terminal) of a string,
@@ -102,7 +103,6 @@ pub const TurnStats = struct {
     max_context_tokens: usize = 128 * 1024,
     duration_ms: u64 = 0,
     acts_count: usize = 1,
-    files_modified: usize = 0,
 };
 
 /// Lifecycle events emitted from LLM streaming
@@ -120,6 +120,55 @@ pub const StreamEvent = union(enum) {
     text_end,
 };
 
+pub const open_think_tags = [_][]const u8{
+    "<think>",
+    "<思考>",
+    "<推理>",
+    "<反思>",
+    "<推敲>",
+};
+
+pub const close_think_tags = [_][]const u8{
+    "</think>",
+    "</思考>",
+    "</推理>",
+    "</反思>",
+    "</推敲>",
+};
+
+fn isPrefixOfAny(buf: []const u8, tags: []const []const u8) bool {
+    for (tags) |tag| {
+        if (buf.len <= tag.len and std.mem.eql(u8, buf, tag[0..buf.len])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn isExactMatch(buf: []const u8, tags: []const []const u8) bool {
+    for (tags) |tag| {
+        if (std.mem.eql(u8, buf, tag)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// RFC-012 §3.5.2: select the active open/close tag arrays according to the
+/// provider profile's ThinkingTagSet. Returns null when tag parsing is disabled.
+const ActiveThinkTags = struct {
+    open: []const []const u8,
+    close: []const []const u8,
+};
+
+fn activeThinkTags(set: provider.ThinkingTagSet) ?ActiveThinkTags {
+    return switch (set) {
+        .english_and_chinese => .{ .open = &open_think_tags, .close = &close_think_tags },
+        .english_only => .{ .open = open_think_tags[0..1], .close = close_think_tags[0..1] },
+        .none => null,
+    };
+}
+
 /// Finite State Machine parsing stream chunks and emitting typed StreamEvents
 pub const StreamEventParser = struct {
     pub const ParseState = enum {
@@ -130,20 +179,28 @@ pub const StreamEventParser = struct {
     };
 
     state: ParseState = .idle,
-    tag_buf: [16]u8 = undefined,
+    tag_buf: [32]u8 = undefined,
     tag_len: usize = 0,
     fence_buf: [32]u8 = undefined,
     fence_len: usize = 0,
     in_fence_check: bool = false,
     closing_backticks: usize = 0,
+    /// RFC-012 §3.5.2: which thinking tags this parser recognizes (provider profile gate).
+    thinking_tags: provider.ThinkingTagSet = .english_and_chinese,
 
     pub fn init() StreamEventParser {
+        // Default keeps backward-compatible behavior: English + Chinese tags.
+        return initWithTags(.english_and_chinese);
+    }
+
+    pub fn initWithTags(tags: provider.ThinkingTagSet) StreamEventParser {
         return .{
             .state = .idle,
             .tag_len = 0,
             .fence_len = 0,
             .in_fence_check = false,
             .closing_backticks = 0,
+            .thinking_tags = tags,
         };
     }
 
@@ -156,23 +213,35 @@ pub const StreamEventParser = struct {
     }
 
     pub fn feed(self: *StreamEventParser, chunk: []const u8, context: anytype, comptime emitFn: fn (@TypeOf(context), StreamEvent) void) void {
+        // RFC-012 §3.5.2: resolve active tag arrays once per feed() based on the
+        // provider profile's ThinkingTagSet. With `.none` no tag matching occurs
+        // and every byte (including '<') flows straight through as text.
+        const active = activeThinkTags(self.thinking_tags);
+        const open_tags: []const []const u8 = if (active) |a| a.open else &.{};
+        const close_tags: []const []const u8 = if (active) |a| a.close else &.{};
+
         var i: usize = 0;
         while (i < chunk.len) {
             const c = chunk[i];
 
-            // 1. Parse <think>...</think>
+            // 1. Parse <think>...</think> and Chinese variants (<思考>...</思考>, <推理>, <反思>, <推敲>)
             if (self.state == .in_think) {
-                const expected = "</think>";
                 if (c == '<' or self.tag_len > 0) {
-                    self.tag_buf[self.tag_len] = c;
-                    self.tag_len += 1;
-                    i += 1;
+                    if (self.tag_len < self.tag_buf.len) {
+                        self.tag_buf[self.tag_len] = c;
+                        self.tag_len += 1;
+                        i += 1;
 
-                    if (self.tag_buf[self.tag_len - 1] == expected[self.tag_len - 1]) {
-                        if (self.tag_len == expected.len) {
+                        const cur = self.tag_buf[0..self.tag_len];
+                        if (isExactMatch(cur, close_tags)) {
                             self.state = .idle;
                             self.tag_len = 0;
                             emitFn(context, .think_end);
+                        } else if (isPrefixOfAny(cur, close_tags)) {
+                            // Valid prefix of a close tag, continue buffering
+                        } else {
+                            emitFn(context, .{ .think_chunk = cur });
+                            self.tag_len = 0;
                         }
                     } else {
                         emitFn(context, .{ .think_chunk = self.tag_buf[0..self.tag_len] });
@@ -273,15 +342,15 @@ pub const StreamEventParser = struct {
                 }
             }
 
-            // 4. Check opening <think> tag
-            const think_expected = "<think>";
+            // 4. Check opening thinking tags (<think>, <思考>, <推理>, <反思>, <推敲>)
             if (c == '<' or self.tag_len > 0) {
-                self.tag_buf[self.tag_len] = c;
-                self.tag_len += 1;
-                i += 1;
+                if (self.tag_len < self.tag_buf.len) {
+                    self.tag_buf[self.tag_len] = c;
+                    self.tag_len += 1;
+                    i += 1;
 
-                if (self.tag_buf[self.tag_len - 1] == think_expected[self.tag_len - 1]) {
-                    if (self.tag_len == think_expected.len) {
+                    const cur = self.tag_buf[0..self.tag_len];
+                    if (isExactMatch(cur, open_tags)) {
                         if (self.state == .in_text) {
                             self.state = .idle;
                             emitFn(context, .text_end);
@@ -289,6 +358,15 @@ pub const StreamEventParser = struct {
                         self.state = .in_think;
                         self.tag_len = 0;
                         emitFn(context, .think_start);
+                    } else if (isPrefixOfAny(cur, open_tags)) {
+                        // Valid prefix of an open tag, continue buffering
+                    } else {
+                        if (self.state != .in_text) {
+                            self.state = .in_text;
+                            emitFn(context, .text_start);
+                        }
+                        emitFn(context, .{ .text_chunk = cur });
+                        self.tag_len = 0;
                     }
                 } else {
                     if (self.state != .in_text) {
@@ -1184,9 +1262,10 @@ pub const TurnRenderer = struct {
             0.0;
 
         var footer_buf: [512]u8 = undefined;
-        const footer = std.fmt.bufPrint(&footer_buf,
+        const footer = std.fmt.bufPrint(
+            &footer_buf,
             " \x1b[90m────────────────────────────────────────────────────────────────────\x1b[0m\n" ++
-            " \x1b[90m{s} {d} tokens ({d} prompt / {d} completion) {s} {s} {s} Context: {d}/{d} ({d:.0}%) {s} {d} act(s)\x1b[0m\n\n",
+                " \x1b[90m{s} {d} tokens ({d} prompt / {d} completion) {s} {s} {s} Context: {d}/{d} ({d:.0}%) {s} {d} act(s)\x1b[0m\n\n",
             .{
                 term.GLYPH_STATS,
                 total_tokens,

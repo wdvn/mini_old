@@ -257,8 +257,214 @@ pub const PGraphStore = struct {
         return self.graph.findNodeByName(normalized);
     }
 
+    /// Check whether `to` node is reachable from `from` node via active directed edges.
+    fn isReachable(graph: *const Graph, from: NodeId, to: NodeId, alloc: Allocator) bool {
+        if (from == to) return true;
+        var visited = std.AutoHashMap(NodeId, void).init(alloc);
+        defer visited.deinit();
+        var queue = std.ArrayList(NodeId).empty;
+        defer queue.deinit(alloc);
+
+        queue.append(alloc, from) catch return false;
+        visited.put(from, {}) catch return false;
+
+        var head: usize = 0;
+        while (head < queue.items.len) : (head += 1) {
+            const curr = queue.items[head];
+            if (curr == to) return true;
+            if (curr >= graph.out_adj.items.len) continue;
+            for (graph.out_adj.items[curr].items) |eid| {
+                if (eid >= graph.edges.items.len) continue;
+                const edge = graph.edges.items[eid];
+                if (!edge.is_active) continue;
+                if (!visited.contains(edge.dst)) {
+                    if (edge.dst == to) return true;
+                    visited.put(edge.dst, {}) catch continue;
+                    queue.append(alloc, edge.dst) catch continue;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// 3D functional domains for procedural state space navigation.
+    pub const ToolDomain3D = enum {
+        explore,
+        mutate,
+        verify,
+        meta,
+
+        pub fn fromToolName(name: []const u8) ToolDomain3D {
+            if (std.mem.eql(u8, name, "file_edit") or
+                std.mem.eql(u8, name, "multi_file_edit") or
+                std.mem.eql(u8, name, "file_write"))
+            {
+                return .mutate;
+            }
+            if (std.mem.eql(u8, name, "subagent") or
+                std.mem.eql(u8, name, "codeact") or
+                std.mem.eql(u8, name, "batch_subagent"))
+            {
+                return .meta;
+            }
+            if (std.mem.eql(u8, name, "bash") or
+                std.mem.eql(u8, name, "http"))
+            {
+                return .verify;
+            }
+            // Explicit explore tools
+            if (std.mem.eql(u8, name, "grep") or
+                std.mem.eql(u8, name, "glob") or
+                std.mem.eql(u8, name, "list_dir") or
+                std.mem.eql(u8, name, "session_diagnostics") or
+                std.mem.eql(u8, name, "file_read") or
+                std.mem.eql(u8, name, "artifact") or
+                std.mem.eql(u8, name, "media_gen"))
+            {
+                return .explore;
+            }
+            return .explore;
+        }
+
+        pub fn label(self: ToolDomain3D) []const u8 {
+            return switch (self) {
+                .explore => "EXPLORE",
+                .mutate => "MUTATE",
+                .verify => "VERIFY",
+                .meta => "META",
+            };
+        }
+    };
+
+    pub const OrbitInfo = struct {
+        period: usize,
+        revolutions: usize,
+        orbit_nodes: []const []const u8,
+    };
+
+    /// Detects whether the trajectory exhibits signs of orbiting ("quay vòng") in 3D procedural space.
+    /// An orbit is a repeating closed cycle of length P in [2, 5] with zero code mutation (ΔZ = 0).
+    pub fn detectTrajectoryOrbit(trajectory: []const []const u8, current_tool: ?[]const u8) ?OrbitInfo {
+        if (trajectory.len < 2) return null;
+
+        const active_tool = current_tool orelse trajectory[trajectory.len - 1];
+
+        // 1. Check for multi-revolution periodic repeating patterns (revolutions >= 2)
+        var p: usize = 2;
+        while (p <= 5) : (p += 1) {
+            if (trajectory.len >= 2 * p) {
+                var matches = true;
+                var i: usize = 0;
+                while (i < p) : (i += 1) {
+                    const idx1 = trajectory.len - p + i;
+                    const idx2 = trajectory.len - 2 * p + i;
+                    if (!std.mem.eql(u8, trajectory[idx1], trajectory[idx2])) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches) {
+                    const cycle = trajectory[trajectory.len - p .. trajectory.len];
+                    // Verify that all vertices in the candidate cycle are mutually distinct (simple cycle)
+                    var distinct = true;
+                    for (cycle, 0..) |n1, a| {
+                        for (cycle[a + 1 ..]) |n2| {
+                            if (std.mem.eql(u8, n1, n2)) {
+                                distinct = false;
+                                break;
+                            }
+                        }
+                        if (!distinct) break;
+                    }
+                    if (!distinct) continue;
+
+                    // Verify ΔZ = 0 (no mutation tool in the orbit)
+                    var has_mutation = false;
+                    for (cycle) |node_name| {
+                        if (ToolDomain3D.fromToolName(node_name) == .mutate) {
+                            has_mutation = true;
+                            break;
+                        }
+                    }
+                    if (!has_mutation) {
+                        var revs: usize = 2;
+                        var offset: usize = 3 * p;
+                        while (trajectory.len >= offset) : (offset += p) {
+                            var rev_match = true;
+                            var j: usize = 0;
+                            while (j < p) : (j += 1) {
+                                if (!std.mem.eql(u8, trajectory[trajectory.len - p + j], trajectory[trajectory.len - offset + j])) {
+                                    rev_match = false;
+                                    break;
+                                }
+                            }
+                            if (rev_match) revs += 1 else break;
+                        }
+                        return OrbitInfo{
+                            .period = p,
+                            .revolutions = revs,
+                            .orbit_nodes = cycle,
+                        };
+                    }
+                }
+            }
+        }
+
+        // 2. Check for first closure of an orbit (revolutions = 1)
+        // Occurs when active_tool matches a previously visited node at distance P in [2, 5]
+        p = 2;
+        while (p <= 5) : (p += 1) {
+            if (trajectory.len >= p + 1) {
+                const head = trajectory[trajectory.len - 1];
+                const tail = trajectory[trajectory.len - 1 - p];
+                if (std.mem.eql(u8, head, tail) and std.mem.eql(u8, head, active_tool)) {
+                    const cycle = trajectory[trajectory.len - 1 - p .. trajectory.len - 1];
+                    // Verify all vertices in the cycle are mutually distinct
+                    var distinct = true;
+                    for (cycle, 0..) |n1, a| {
+                        for (cycle[a + 1 ..]) |n2| {
+                            if (std.mem.eql(u8, n1, n2)) {
+                                distinct = false;
+                                break;
+                            }
+                        }
+                        if (!distinct) break;
+                    }
+                    if (!distinct) continue;
+
+                    // Check ΔZ = 0 across the cycle
+                    var has_mutation = false;
+                    for (cycle) |node_name| {
+                        if (ToolDomain3D.fromToolName(node_name) == .mutate) {
+                            has_mutation = true;
+                            break;
+                        }
+                    }
+                    if (!has_mutation) {
+                        return OrbitInfo{
+                            .period = p,
+                            .revolutions = 1,
+                            .orbit_nodes = cycle,
+                        };
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    fn isObservationalOrGeneric(name: []const u8) bool {
+        return std.mem.eql(u8, name, "bash") or
+            std.mem.eql(u8, name, "file_read") or
+            std.mem.eql(u8, name, "session_diagnostics");
+    }
+
     /// Extract h-hop neighborhood subgraph guidance formatted as markdown (RFC-010 PG-3).
-    /// Returns null if no active transitions or if selective policy decides no guidance is needed.
+    /// If an orbit is detected in 3D procedural space ("dấu hiệu quay vòng"), produces a
+    /// Checkpoint & Recap block instead of cyclic forward step suggestions.
+    /// `user_request` is the original task prompt — injected to keep the model anchored
+    /// to its goal rather than drifting into generic exploration.
     pub fn serializeGuidance(
         self: *PGraphStore,
         alloc: Allocator,
@@ -266,10 +472,51 @@ pub const PGraphStore = struct {
         recent_actions: []const []const u8,
         last_failed: bool,
         max_hops: u32,
+        user_request: ?[]const u8,
     ) !?[]u8 {
-        _ = recent_actions;
         const act_str = last_action orelse return null;
         const start_node_id = self.matchNode(act_str) orelse return null;
+
+        // Check for 3D trajectory orbit (signs of "quay vòng" in procedural space)
+        if (detectTrajectoryOrbit(recent_actions, act_str)) |orbit| {
+            var bw = utils.BufWriter.init(alloc);
+            errdefer bw.deinit();
+
+            try bw.writeAll("[Procedural 3D Map Checkpoint & Trajectory Recap]\n");
+            try bw.print("📍 Waypoint: 3D Trajectory Orbit Detected (circling pattern: ", .{});
+            for (orbit.orbit_nodes) |on| {
+                try bw.print("`{s}` → ", .{on});
+            }
+            try bw.print("`{s}`, period={d}, revolutions={d})\n\n", .{ act_str, orbit.period, orbit.revolutions });
+
+            try bw.writeAll("🗺️ Explored Territory Recap:\n");
+            for (orbit.orbit_nodes) |on| {
+                const dom = ToolDomain3D.fromToolName(on);
+                const desc = if (self.matchNode(on)) |nid| self.graph.nodes.items[nid].desc else "";
+                try bw.print("- `{s}` [{s}]: {s}\n", .{ on, dom.label(), desc });
+            }
+
+            try bw.writeAll("\n⚠️ Navigation Checkpoint (ΔZ = 0, zero code mutation in orbit):\n");
+            try bw.print("You have scouted this region of the procedural map. All immediate forward paths from `{s}` have already been explored in this trajectory.\n\n", .{act_str});
+
+            try bw.writeAll("⚡ Orbit Break Directive:\n");
+            try bw.writeAll("Do NOT repeat this exploratory cycle. You have already gathered sufficient context in your context window.\n");
+
+            // Anchor to the user's original task so the model knows WHAT to advance toward
+            if (user_request) |req| {
+                const trunc = if (req.len > 180) req[0..180] ++ "..." else req;
+                try bw.print("🎯 Your task: \"{s}\"\n\n", .{trunc});
+            }
+
+            try bw.writeAll("You MUST:\n");
+            try bw.writeAll("1. Summarize the key findings from your exploration in 1-2 sentences.\n");
+            try bw.writeAll("2. Use those findings to make DIRECT PROGRESS on the task — e.g. edit code with `file_edit`/`file_write`, run a targeted test, or conclude with a direct answer.\n");
+            try bw.writeAll("3. Execute the first concrete step NOW — do NOT output another exploratory tool call.\n");
+            try bw.writeAll("4. If you already have enough information, skip further exploration and answer the user's question directly.\n");
+
+            const slice = try bw.toOwnedSlice();
+            return slice;
+        }
 
         // Selective guidance policy: check if node has active outgoing edges or previous act failed
         const out_edges = if (start_node_id < self.graph.out_adj.items.len) self.graph.out_adj.items[start_node_id].items else &.{};
@@ -292,11 +539,11 @@ pub const PGraphStore = struct {
         var bw = utils.BufWriter.init(alloc);
         errdefer bw.deinit();
 
-        try bw.writeAll("[Procedural Graph Guidance]\n");
+        try bw.writeAll("[Procedural Advisory (Optional Suggestions)]\n");
         if (last_failed) {
-            try bw.writeAll("⚠️ Previous action reported an error or non-zero exit code. Adhere to error recovery guidance:\n");
+            try bw.writeAll("Notice: Previous action reported a non-zero exit code or failure. Consider these heuristic suggestions if helpful (you are NOT required to follow them):\n");
         }
-        try bw.print("Current Action: `{s}`\nAdmissible Next Steps (h={d}-hop neighborhood):\n", .{ current_node_name, max_hops });
+        try bw.print("Current Action: `{s}`\nObserved Pattern Suggestions (h={d}-hop neighborhood):\n", .{ current_node_name, max_hops });
 
         var printed_edges: usize = 0;
         for (neighborhood.edges) |eid| {
@@ -304,8 +551,25 @@ pub const PGraphStore = struct {
             const edge = self.graph.edges.items[eid];
             if (!edge.is_active) continue;
 
-            const src_name = self.graph.nodes.items[edge.src].name;
+            // Suppress self-loops
+            if (edge.src == edge.dst) continue;
+
             const dst_name = self.graph.nodes.items[edge.dst].name;
+
+            // Cycle suppression: if destination tool (or intermediate path node) was executed recently in trajectory,
+            // suppress it from suggested next steps to avoid ping-pong loops (regardless of last_failed).
+            var in_recent = false;
+            for (recent_actions) |ra| {
+                if (self.matchNode(ra)) |ra_id| {
+                    if (ra_id == edge.dst or (edge.src != start_node_id and ra_id == edge.src)) {
+                        in_recent = true;
+                        break;
+                    }
+                }
+            }
+            if (in_recent) continue;
+
+            const src_name = self.graph.nodes.items[edge.src].name;
             const rel_str = edge.rel.toString();
 
             try bw.print("- `{s}` → `{s}` ({s})\n", .{ src_name, dst_name, rel_str });
@@ -313,7 +577,7 @@ pub const PGraphStore = struct {
                 if (cond.len > 0) try bw.print("  - Condition: {s}\n", .{cond});
             }
             if (edge.attr.guidance) |guid| {
-                if (guid.len > 0) try bw.print("  - Guidance: {s}\n", .{guid});
+                if (guid.len > 0) try bw.print("  - Suggestion: {s}\n", .{guid});
             }
             if (edge.attr.pitfalls) |pit| {
                 if (pit.len > 0) try bw.print("  - Pitfalls: {s}\n", .{pit});
@@ -321,9 +585,28 @@ pub const PGraphStore = struct {
             printed_edges += 1;
         }
 
-        if (printed_edges == 0 and !last_failed) {
+        if (printed_edges == 0) {
+            if (last_failed) {
+                // All known recovery actions have already been attempted recently.
+                // Explicitly advise the model not to repeat exploratory queries.
+                try bw.writeAll("- No new untried recovery steps found in procedural neighborhood.\n");
+                try bw.writeAll("⚠️ Note: You have already attempted the standard exploratory tools for this failure. Do NOT repeat previous searches; formulate a direct fix and proceed to modify code.\n");
+                const slice = try bw.toOwnedSlice();
+                return slice;
+            }
             bw.deinit();
             return null;
+        }
+
+        try bw.writeAll("⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed directly to modifying code or concluding.\n");
+
+        // Anchor to the user's original request so suggestions stay task-focused
+        if (user_request) |req| {
+            try bw.writeAll("\n🎯 Current task reminder: \"");
+            // Truncate to first ~200 chars to keep advisory compact
+            const trunc = if (req.len > 200) req[0..200] ++ "..." else req;
+            try bw.writeAll(trunc);
+            try bw.writeAll("\" — tailor your next step to make direct progress on this task.\n");
         }
 
         const slice = try bw.toOwnedSlice();
@@ -341,7 +624,10 @@ pub const PGraphStore = struct {
         const src_name = self.graph.nodes.items[src_id].name;
         const dst_name = self.graph.nodes.items[dst_id].name;
 
-        // If edge already exists and is active, no need to learn
+        // Guard 1: Do not auto-populate transitions between two generic observation/execution tools
+        if (isObservationalOrGeneric(src_name) and isObservationalOrGeneric(dst_name)) return;
+
+        // Guard 2: If edge already exists and is active, no need to learn
         const out_edges = if (src_id < self.graph.out_adj.items.len) self.graph.out_adj.items[src_id].items else &.{};
         for (out_edges) |eid| {
             if (eid < self.graph.edges.items.len) {
@@ -349,6 +635,18 @@ pub const PGraphStore = struct {
                 if (edge.is_active and edge.dst == dst_id) return;
             }
         }
+
+        // Guard 3: Direct reverse edge check (prevent immediate 2-cycles A <-> B)
+        const rev_edges = if (dst_id < self.graph.out_adj.items.len) self.graph.out_adj.items[dst_id].items else &.{};
+        for (rev_edges) |eid| {
+            if (eid < self.graph.edges.items.len) {
+                const edge = self.graph.edges.items[eid];
+                if (edge.is_active and edge.dst == src_id) return;
+            }
+        }
+
+        // Guard 4: Reachability check (prevent multi-hop cycles A -> B -> ... -> A)
+        if (isReachable(&self.graph, dst_id, src_id, self.alloc)) return;
 
         const key = try std.fmt.allocPrint(self.alloc, "{s}->{s}", .{ src_name, dst_name });
         defer self.alloc.free(key);
@@ -366,6 +664,9 @@ pub const PGraphStore = struct {
                 defer self.alloc.free(line);
 
                 try self.appendEvent(io, line);
+
+                // Run cycle repair as secondary safety guarantee
+                _ = repairCycles(&self.graph, self.alloc) catch 0;
             }
         } else {
             const owned_key = try self.alloc.dupe(u8, key);

@@ -25,10 +25,24 @@
 //!   - Working directory: process CWD
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const json = @import("../core/json.zig");
 const utils = @import("../core/utils.zig");
 const main = @import("../main.zig");
+const hooks = @import("../core/hooks.zig");
+
+var g_active_pid: std.atomic.Value(std.process.Child.Id) = std.atomic.Value(std.process.Child.Id).init(0);
+
+/// Interrupt the currently executing bash child process (if any).
+pub fn interruptCurrent() void {
+    const pid = g_active_pid.swap(0, .acq_rel);
+    if (pid > 0) {
+        if (comptime builtin.os.tag != .windows) {
+            _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+        }
+    }
+}
 
 /// List of blocked command patterns.
 const BLOCKED_PATTERNS = [_][]const u8{
@@ -92,12 +106,14 @@ fn drainPipe(io: std.Io, pipe: std.Io.File, buf: []u8) usize {
             // Buffer has room — read into buffer
             const n = pipe.readStreaming(io, &.{buf[stored..]}) catch break;
             if (n == 0) break;
+            hooks.appendExecutionOutput(buf[stored .. stored + n]);
             stored += n;
         } else {
             // Buffer full — drain remainder to prevent deadlock
             var sink: [4096]u8 = undefined;
             const n = pipe.readStreaming(io, &.{&sink}) catch break;
             if (n == 0) break;
+            hooks.appendExecutionOutput(sink[0..n]);
         }
     }
     return stored;
@@ -131,6 +147,10 @@ fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: 
         .stdout = .pipe,
         .stderr = .pipe,
     });
+    if (child.id) |pid| {
+        g_active_pid.store(pid, .release);
+    }
+    defer g_active_pid.store(0, .release);
 
     if (stdin_str) |s| {
         if (child.stdin) |in_pipe| {

@@ -28,6 +28,7 @@
 //!   `MINI_REASONING_EFFORT`         Reasoning effort ("minimal"|"low"|"medium"|"high"|"none")
 //!   `MINI_REASONING_EFFORT_DISABLED` "1" to omit reasoning parameters for compat endpoints
 //!   `MINI_THINKING_BUDGET`          Thinking budget tokens (e.g. for Claude thinking.budget_tokens >= 1024)
+//!   `MINI_WATCHDOG_ENABLED`         "0" to disable stream stall watchdog (idle timeout); default: enabled
 //!
 //! ### MemAct (RFC-003)
 //!   `MINI_MEMACT_ENABLED`       "0" to disable MemAct (default: enabled)
@@ -51,8 +52,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const utils = @import("utils.zig");
-const skills_mod = @import("skills.zig");
+pub const skills_mod = @import("skills.zig");
 const main = @import("../main.zig");
+const provider_mod = @import("../backends/provider.zig");
 
 
 // ---------------------------------------------------------------------------
@@ -101,6 +103,9 @@ pub const Config = struct {
     openai_compat_model: []const u8,
     /// Flag to use max_completion_tokens instead of max_tokens.
     openai_compat_use_completion_tokens: bool,
+    /// Provider profile key for OpenAI-compat backend (RFC-012).
+    openai_provider: []const u8 = "generic",
+    openai_provider_js: ?[]const u8 = null,
     /// Anthropic API key. Null = unconfigured.
     anthropic_key: ?[]const u8,
     /// Claude model ID.
@@ -154,7 +159,10 @@ pub const Config = struct {
 
     // Procedural Graph (RFC-010)
     /// Whether Procedural Graph online guidance is enabled.
-    memact_pg_enabled: bool = false,
+    memact_pg_enabled: bool = true,
+    /// Whether to emit procedural advisory/checkpoint messages to stderr.
+    /// Default: true (show). Set MINI_MEMACT_PG_QUIET=1 to hide.
+    memact_pg_advisory: bool = true,
     /// Procedural Graph neighborhood hop distance for localized guidance (default: 2).
     memact_pg_h: u32 = 2,
     /// Number of recent trajectory acts considered for context (default: 3).
@@ -164,6 +172,24 @@ pub const Config = struct {
 
     // Budget Limits (RFC-002)
     budget_max_tokens: usize,
+
+    // Execution & Action Loop Limits
+    /// Maximum acts allowed per turn before yielding control to user (default: 30).
+    max_acts_per_turn: usize = 30,
+    /// Maximum consecutive identical tool calls before circuit breaker trips (default: 3).
+    action_loop_consecutive_cap: usize = 3,
+    /// Maximum occurrences of identical tool call within sliding window before circuit breaker trips (default: 4).
+    action_loop_window_cap: usize = 4,
+    /// Maximum consecutive read-only exploratory actions before warning (default: 5).
+    action_loop_readonly_warn_cap: usize = 5,
+    /// Maximum consecutive read-only exploratory actions before tripping circuit breaker (default: 10).
+    action_loop_readonly_trip_cap: usize = 10,
+    /// Macro-cycle repetition threshold for alternating tools before tripping circuit breaker (default: 2).
+    action_loop_macro_cycle_cap: usize = 2,
+    /// 3D procedural map orbit repetition threshold before tripping action loop circuit breaker (default: 2).
+    action_loop_orbit_cap: usize = 2,
+    /// Whether to display action loop detection messages to stderr/REPL (default: true). Set MINI_ACTION_LOOP_DISPLAY=0 to suppress.
+    action_loop_display: bool = true,
 
     // MCP
     /// Path to mcp.json file. Null = default ~/.mini/mcp.json.
@@ -204,10 +230,18 @@ pub const Config = struct {
     video_gen_enabled: bool = false,
     /// Video gen model: "sora-2", "sora-2-pro", etc.
     video_gen_model: []const u8 = "sora-2",
+    /// Video gen provider: "openai" | "openai_compat".
+    video_gen_provider: []const u8 = "openai",
     /// Media output directory. Null = "<workspace>/media".
     media_output_dir: ?[]const u8 = null,
     /// Video job polling timeout in seconds (default: 600).
     video_poll_timeout_secs: u32 = 600,
+
+    // 3-Thread Watchdog & Act Coordinator (RFC-015)
+    act_timeout_secs: u32 = 120,
+    watchdog_tracking_interval_s: u32 = 10,
+    watchdog_recap_interval: usize = 10,
+    watchdog_interval_ms: u32 = 200,
 
     /// Default system prompt when MINI_SYSTEM_FILE is not configured.
     pub const default_system_prompt =
@@ -239,12 +273,11 @@ pub const Config = struct {
         \\2. Immediately after closing the ``` tag you MUST STOP (yield turn) for the system to execute and return results in the next turn.
         \\3. Absolutely DO NOT fabricate outputs, DO NOT self-monologue or speculate results, and DO NOT write multiple code blocks in the same turn.
         \\
-        \\## Execution & Stopping Rules:
+        \\## Execution Rules:
         \\1. Stop on Completion: As soon as enough evidence is gathered, the answer is determined, or the goal is completed: STOP CALLING TOOLS/CODE IMMEDIATELY to respond to the user. Do not perform extraneous actions beyond the scope requested.
         \\2. Confirm Before Mutation: While investigating/diagnosing, absolutely DO NOT modify files, configuration, or system state unless explicitly requested by the user. Always present findings and propose options first.
-        \\3. Avoid Action Loops: If an approach does not yield results after 2-3 attempts, stop to re-evaluate hypotheses rather than repeating similar failed operations.
-        \\4. Progress Checkpoint: If a complex task requires multiple steps and initial exploration does not conclude it, stop to summarize progress and request direction from the user.
-        \\5. Cognitive Efficiency: Minimize thinking latency on simple inspection or routine tool executions by self-modulating with `mini.setThinking("low")`; reserve high thinking effort for architecture design, complex debugging, or error recovery.
+        \\3. Avoid Action Loops & Plan Ahead: If an approach does not yield results after 2-3 attempts or an exploratory loop occurs, do not repeat similar failed operations. Formulate a structured execution plan and proceed immediately with executing the next steps using an alternate strategy.
+        \\4. Cognitive Efficiency: Minimize thinking latency on simple inspection or routine tool executions by self-modulating with `mini.setThinking("low")`; reserve high thinking effort for architecture design, complex debugging, or error recovery.
         \\
         \\Please answer concisely, accurately, and effectively in English.
     ;
@@ -261,6 +294,16 @@ pub const Config = struct {
         const openai_key = env_map.get("OPENAI_COMPAT_API_KEY");
         const openai_api_header = env_map.get("OPENAI_COMPAT_API_HEADER") orelse "Authorization";
         const openai_model = env_map.get("OPENAI_COMPAT_MODEL") orelse "gpt-4o-mini";
+        const openai_provider_key = blk: {
+            if (env_map.get("OPENAI_COMPAT_PROVIDER") orelse env_map.get("MINI_PROVIDER")) |p| {
+                if (p.len > 0) break :blk p;
+            }
+            if (openai_url) |url| {
+                const detected = provider_mod.detectFromUrl(url);
+                if (!std.mem.eql(u8, detected, "generic")) break :blk detected;
+            }
+            break :blk "generic";
+        };
         const anthropic_key = env_map.get("ANTHROPIC_API_KEY");
         const claude_model = env_map.get("CLAUDE_MODEL") orelse "claude-opus-4-5";
         const ollama_url = env_map.get("OLLAMA_HOST") orelse "http://localhost:11434";
@@ -338,8 +381,13 @@ pub const Config = struct {
         const memory_dir: ?[]const u8 = env_map.get("MINI_MEMORY_DIR");
 
         const memact_pg_enabled: bool = blk: {
-            const s = env_map.get("MINI_MEMACT_PG_ENABLED") orelse env_map.get("MINI_PG_ENABLED") orelse break :blk false;
+            const s = env_map.get("MINI_MEMACT_PG_ENABLED") orelse env_map.get("MINI_PG_ENABLED") orelse "1";
             break :blk std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
+        };
+
+        const memact_pg_advisory: bool = blk: {
+            const s = env_map.get("MINI_MEMACT_PG_ADVISORY") orelse "1";
+            break :blk !std.mem.eql(u8, s, "0") and !std.mem.eql(u8, s, "false");
         };
 
         const memact_pg_h: u32 = blk: {
@@ -367,6 +415,46 @@ pub const Config = struct {
             break :blk !std.mem.eql(u8, v, "1");
         };
 
+        const max_acts_per_turn: usize = blk: {
+            const s = env_map.get("MINI_MAX_ACTS") orelse break :blk 30;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 30;
+        };
+
+        const action_loop_consecutive_cap: usize = blk: {
+            const s = env_map.get("MINI_LOOP_CONSECUTIVE_CAP") orelse break :blk 3;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 3;
+        };
+
+        const action_loop_window_cap: usize = blk: {
+            const s = env_map.get("MINI_LOOP_WINDOW_CAP") orelse break :blk 4;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 4;
+        };
+
+        const action_loop_readonly_warn_cap: usize = blk: {
+            const s = env_map.get("MINI_LOOP_READONLY_WARN") orelse break :blk 5;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 5;
+        };
+
+        const action_loop_readonly_trip_cap: usize = blk: {
+            const s = env_map.get("MINI_LOOP_READONLY_TRIP") orelse break :blk 10;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 10;
+        };
+
+        const action_loop_macro_cycle_cap: usize = blk: {
+            const s = env_map.get("MINI_LOOP_MACRO_CYCLE_CAP") orelse break :blk 2;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 2;
+        };
+
+        const action_loop_orbit_cap: usize = blk: {
+            const s = env_map.get("MINI_LOOP_ORBIT_CAP") orelse break :blk 2;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 2;
+        };
+
+        const action_loop_display: bool = blk: {
+            const v = env_map.get("MINI_ACTION_LOOP_DISPLAY") orelse "1";
+            break :blk !std.mem.eql(u8, v, "0") and !std.mem.eql(u8, v, "false");
+        };
+
         // System prompt: from file or default
         const sp_result = loadSystemPrompt(alloc, env_map, io);
 
@@ -376,9 +464,10 @@ pub const Config = struct {
         };
 
         if (!utils.isSubagent()) {
-            main.stderrPrint("[config] Env bindings: OPENAI_COMPAT_URL={s}, OPENAI_COMPAT_MODEL={s}, MINI_HOME={s}\n", .{
+            main.stderrPrint("[config] Env bindings: OPENAI_COMPAT_URL={s}, OPENAI_COMPAT_MODEL={s}, PROVIDER={s}, MINI_HOME={s}\n", .{
                 openai_url orelse "(null)",
                 openai_model,
+                openai_provider_key,
                 env_map.get("MINI_HOME") orelse "(null)",
             });
             main.stderrPrint("[config] Build: {s} | {s} | {s} | zig {s}\n", .{
@@ -465,6 +554,7 @@ pub const Config = struct {
         };
 
         const video_gen_model = env_map.get("MINI_VIDEO_GEN_MODEL") orelse "sora-2";
+        const video_gen_provider = env_map.get("MINI_VIDEO_GEN_PROVIDER") orelse "openai";
         const media_output_dir = env_map.get("MINI_MEDIA_OUTPUT_DIR");
 
         const video_poll_timeout_secs: u32 = blk: {
@@ -486,6 +576,23 @@ pub const Config = struct {
             }
         }
 
+        const act_timeout_secs: u32 = blk: {
+            const s = env_map.get("MINI_ACT_TIMEOUT_SECS") orelse env_map.get("MINI_ACT_TIMEOUT") orelse break :blk 120;
+            break :blk std.fmt.parseInt(u32, s, 10) catch 120;
+        };
+        const watchdog_tracking_s: u32 = blk: {
+            const s = env_map.get("MINI_WATCHDOG_TRACKING_S") orelse break :blk 10;
+            break :blk std.fmt.parseInt(u32, s, 10) catch 10;
+        };
+        const watchdog_recap_interval: usize = blk: {
+            const s = env_map.get("MINI_WATCHDOG_RECAP_INTERVAL") orelse break :blk 10;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 10;
+        };
+        const watchdog_interval_ms: u32 = blk: {
+            const s = env_map.get("MINI_WATCHDOG_INTERVAL_MS") orelse break :blk 200;
+            break :blk std.fmt.parseInt(u32, s, 10) catch 200;
+        };
+
         return .{
             .execution_mode = exec_mode,
             .openai_protocol = openai_proto,
@@ -494,6 +601,8 @@ pub const Config = struct {
             .openai_compat_api_header = openai_api_header,
             .openai_compat_model = openai_model,
             .openai_compat_use_completion_tokens = use_completion_tokens,
+            .openai_provider = openai_provider_key,
+            .openai_provider_js = env_map.get("OPENAI_COMPAT_PROVIDER_JS"),
             .anthropic_key = anthropic_key,
             .claude_model = claude_model,
             .ollama_url = ollama_url,
@@ -518,10 +627,19 @@ pub const Config = struct {
             .memact_extract = memact_extract,
             .memory_dir = memory_dir,
             .memact_pg_enabled = memact_pg_enabled,
+            .memact_pg_advisory = memact_pg_advisory,
             .memact_pg_h = memact_pg_h,
             .memact_pg_w = memact_pg_w,
             .memact_pg_auto_populate = memact_pg_auto_populate,
             .budget_max_tokens = budget_max_tokens,
+            .max_acts_per_turn = max_acts_per_turn,
+            .action_loop_consecutive_cap = action_loop_consecutive_cap,
+            .action_loop_window_cap = action_loop_window_cap,
+            .action_loop_readonly_warn_cap = action_loop_readonly_warn_cap,
+            .action_loop_readonly_trip_cap = action_loop_readonly_trip_cap,
+            .action_loop_macro_cycle_cap = action_loop_macro_cycle_cap,
+            .action_loop_orbit_cap = action_loop_orbit_cap,
+            .action_loop_display = action_loop_display,
             .mcp_config_path = env_map.get("MINI_MCP_CONFIG"),
             .history_enabled = history_enabled,
             .hook_command = hook_cmd,
@@ -537,8 +655,13 @@ pub const Config = struct {
             .image_gen_size = image_gen_size,
             .video_gen_enabled = video_gen_enabled,
             .video_gen_model = video_gen_model,
+            .video_gen_provider = video_gen_provider,
             .media_output_dir = media_output_dir,
             .video_poll_timeout_secs = video_poll_timeout_secs,
+            .act_timeout_secs = act_timeout_secs,
+            .watchdog_tracking_interval_s = watchdog_tracking_s,
+            .watchdog_recap_interval = watchdog_recap_interval,
+            .watchdog_interval_ms = watchdog_interval_ms,
         };
     }
 
@@ -559,7 +682,163 @@ pub const Config = struct {
 
 const SpResult = struct { buf: ?[]u8, text: []const u8 };
 
-fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, io: std.Io) SpResult {
+/// Scans the workspace directory to build a dynamic context block informing the
+/// model about the current environment (working directory, project name, detected
+/// project stack, git branch, and top-level files/directories).
+pub fn buildWorkspaceContext(alloc: Allocator, env_map: *const std.process.Environ.Map, io: std.Io) ?[]u8 {
+    const ws_root: ?[]const u8 = blk: {
+        if (env_map.get("MINI_WORKSPACE_ROOT")) |r| break :blk r;
+        if (env_map.get("MINI_AGENT_FOLDER")) |agent_dir| {
+            if (std.fs.path.dirname(agent_dir)) |parent| break :blk parent;
+        }
+        if (env_map.get("PWD")) |pwd| break :blk pwd;
+        break :blk null;
+    };
+    const root = ws_root orelse return null;
+
+    var prj_name = std.fs.path.basename(root);
+    if (std.mem.eql(u8, prj_name, ".") or prj_name.len == 0) {
+        if (env_map.get("PWD")) |pwd| {
+            const b = std.fs.path.basename(pwd);
+            if (b.len > 0 and !std.mem.eql(u8, b, ".")) prj_name = b;
+        }
+    }
+
+    const cwd = std.Io.Dir.cwd();
+    var dir = cwd.openDir(io, root, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+
+    // 1. Detect project types via marker files
+    const Marker = struct {
+        file: []const u8,
+        name: []const u8,
+    };
+    const MARKERS = [_]Marker{
+        .{ .file = "go.mod", .name = "Go" },
+        .{ .file = "package.json", .name = "Node.js / Web" },
+        .{ .file = "Cargo.toml", .name = "Rust" },
+        .{ .file = "build.zig", .name = "Zig" },
+        .{ .file = "build.zig.zon", .name = "Zig" },
+        .{ .file = "pyproject.toml", .name = "Python" },
+        .{ .file = "requirements.txt", .name = "Python" },
+        .{ .file = "setup.py", .name = "Python" },
+        .{ .file = "pom.xml", .name = "Java (Maven)" },
+        .{ .file = "build.gradle", .name = "Java/Kotlin (Gradle)" },
+        .{ .file = "CMakeLists.txt", .name = "C/C++" },
+        .{ .file = "Makefile", .name = "Make" },
+    };
+
+    var detected_types = std.ArrayList([]const u8).empty;
+    defer detected_types.deinit(alloc);
+
+    for (MARKERS) |marker| {
+        if (dir.statFile(io, marker.file, .{})) |_| {
+            var already = false;
+            for (detected_types.items) |existing| {
+                if (std.mem.eql(u8, existing, marker.name)) {
+                    already = true;
+                    break;
+                }
+            }
+            if (!already) {
+                detected_types.append(alloc, marker.name) catch {};
+            }
+        } else |_| {}
+    }
+
+    // 2. Detect Git Branch from .git/HEAD
+    var git_branch: ?[]const u8 = null;
+    var head_buf: [128]u8 = undefined;
+    if (dir.openFile(io, ".git/HEAD", .{})) |head_file| {
+        defer head_file.close(io);
+        if (utils.readAll(io, head_file, &head_buf)) |n| {
+            const head_content = std.mem.trim(u8, head_buf[0..n], " \t\r\n");
+            if (std.mem.startsWith(u8, head_content, "ref: refs/heads/")) {
+                git_branch = head_content["ref: refs/heads/".len..];
+            } else if (head_content.len >= 7) {
+                git_branch = head_content[0..7];
+            }
+        } else |_| {}
+    } else |_| {}
+
+    // 3. Collect top-level workspace entries (directories with '/', files without)
+    var entries_list = std.ArrayList([]const u8).empty;
+    defer {
+        for (entries_list.items) |item| alloc.free(item);
+        entries_list.deinit(alloc);
+    }
+
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        if (std.mem.eql(u8, entry.name, "node_modules") or
+            std.mem.eql(u8, entry.name, "zig-cache") or
+            std.mem.eql(u8, entry.name, "zig-out") or
+            std.mem.eql(u8, entry.name, "__pycache__") or
+            std.mem.eql(u8, entry.name, "target") or
+            std.mem.eql(u8, entry.name, "dist") or
+            std.mem.eql(u8, entry.name, "build"))
+        {
+            continue;
+        }
+
+        if (entry.kind == .directory) {
+            const dname = std.fmt.allocPrint(alloc, "{s}/", .{entry.name}) catch continue;
+            entries_list.append(alloc, dname) catch {
+                alloc.free(dname);
+                continue;
+            };
+        } else {
+            const fname = alloc.dupe(u8, entry.name) catch continue;
+            entries_list.append(alloc, fname) catch {
+                alloc.free(fname);
+                continue;
+            };
+        }
+        if (entries_list.items.len >= 35) break;
+    }
+
+    std.mem.sort([]const u8, entries_list.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+
+    var bw = utils.BufWriter.init(alloc);
+    defer bw.deinit();
+
+    bw.print("<workspace_context>\n", .{}) catch return null;
+    bw.print("- Working Directory: {s}\n", .{root}) catch return null;
+    bw.print("- Project Name: {s}\n", .{prj_name}) catch return null;
+
+    if (detected_types.items.len > 0) {
+        bw.print("- Project Type: ", .{}) catch return null;
+        for (detected_types.items, 0..) |t, idx| {
+            if (idx > 0) bw.print(", ", .{}) catch return null;
+            bw.print("{s}", .{t}) catch return null;
+        }
+        bw.print("\n", .{}) catch return null;
+    }
+
+    if (git_branch) |branch| {
+        bw.print("- Git Branch: {s}\n", .{branch}) catch return null;
+    }
+
+    if (entries_list.items.len > 0) {
+        bw.print("- Workspace Entries: ", .{}) catch return null;
+        for (entries_list.items, 0..) |item, idx| {
+            if (idx > 0) bw.print(", ", .{}) catch return null;
+            bw.print("{s}", .{item}) catch return null;
+        }
+        bw.print("\n", .{}) catch return null;
+    }
+
+    bw.print("</workspace_context>\n", .{}) catch return null;
+
+    return bw.toOwnedSlice() catch null;
+}
+
+pub fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, io: std.Io) SpResult {
     var base_buf: ?[]u8 = null;
     var base_text: []const u8 = Config.default_system_prompt;
 
@@ -587,10 +866,81 @@ fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, i
 
     var result = SpResult{ .buf = base_buf, .text = base_text };
 
+    // 1. Dynamic Workspace Context
+    if (buildWorkspaceContext(alloc, env_map, io)) |ws_ctx| {
+        defer alloc.free(ws_ctx);
+        const combined = std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ result.text, ws_ctx }) catch null;
+        if (combined) |c| {
+            if (result.buf) |b| alloc.free(b);
+            result = .{ .buf = c, .text = c };
+            if (!utils.isSubagent()) main.stderrPrint("[config] Injected workspace context into system prompt\n", .{});
+        }
+    }
+
     var agents_text_accum = std.ArrayList(u8).empty;
     defer agents_text_accum.deinit(alloc);
 
-    // 1. Global AGENTS.md (~/.mini/AGENTS.md)
+    const ws_root: ?[]const u8 = blk: {
+        if (env_map.get("MINI_WORKSPACE_ROOT")) |r| break :blk r;
+        if (env_map.get("MINI_AGENT_FOLDER")) |agent_dir| {
+            if (std.fs.path.dirname(agent_dir)) |parent| break :blk parent;
+        }
+        if (env_map.get("PWD")) |pwd| break :blk pwd;
+        break :blk null;
+    };
+
+    var loaded_root_agents = false;
+
+    // 2. Project AGENTS.md (Workspace Root)
+    if (ws_root) |root| {
+        const root_path = std.fmt.allocPrint(alloc, "{s}/AGENTS.md", .{root}) catch null;
+        if (root_path) |rp| {
+            defer alloc.free(rp);
+            if (readAgentFile(alloc, io, rp)) |text| {
+                defer alloc.free(text);
+                agents_text_accum.appendSlice(alloc, text) catch {};
+                agents_text_accum.appendSlice(alloc, "\n\n") catch {};
+                loaded_root_agents = true;
+                if (!utils.isSubagent()) main.stderrPrint("[config] Loaded workspace AGENTS.md ({d} bytes)\n", .{text.len});
+            }
+        }
+        // Fallback: CLAUDE.md if no AGENTS.md in workspace root
+        if (!loaded_root_agents) {
+            const claude_path = std.fmt.allocPrint(alloc, "{s}/CLAUDE.md", .{root}) catch null;
+            if (claude_path) |cp| {
+                defer alloc.free(cp);
+                if (readAgentFile(alloc, io, cp)) |text| {
+                    defer alloc.free(text);
+                    agents_text_accum.appendSlice(alloc, text) catch {};
+                    agents_text_accum.appendSlice(alloc, "\n\n") catch {};
+                    loaded_root_agents = true;
+                    if (!utils.isSubagent()) main.stderrPrint("[config] Loaded workspace CLAUDE.md ({d} bytes)\n", .{text.len});
+                }
+            }
+        }
+    }
+
+    // 3. Agent Folder AGENTS.md (MINI_AGENT_FOLDER/AGENTS.md)
+    if (env_map.get("MINI_AGENT_FOLDER")) |agent_dir| {
+        const project_path = std.fmt.allocPrint(alloc, "{s}/AGENTS.md", .{agent_dir}) catch null;
+        if (project_path) |pp| {
+            defer alloc.free(pp);
+            var is_same = false;
+            if (ws_root) |root| {
+                if (std.mem.eql(u8, root, agent_dir)) is_same = true;
+            }
+            if (!is_same) {
+                if (readAgentFile(alloc, io, pp)) |text| {
+                    defer alloc.free(text);
+                    agents_text_accum.appendSlice(alloc, text) catch {};
+                    agents_text_accum.appendSlice(alloc, "\n\n") catch {};
+                    if (!utils.isSubagent()) main.stderrPrint("[config] Loaded .agent AGENTS.md ({d} bytes)\n", .{text.len});
+                }
+            }
+        }
+    }
+
+    // 4. Global AGENTS.md (~/.mini/AGENTS.md)
     if (env_map.get("HOME")) |home| {
         const global_path = std.fmt.allocPrint(alloc, "{s}/.mini/AGENTS.md", .{home}) catch null;
         if (global_path) |gp| {
@@ -600,20 +950,6 @@ fn loadSystemPrompt(alloc: Allocator, env_map: *const std.process.Environ.Map, i
                 agents_text_accum.appendSlice(alloc, text) catch {};
                 agents_text_accum.appendSlice(alloc, "\n\n") catch {};
                 if (!utils.isSubagent()) main.stderrPrint("[config] Loaded global AGENTS.md ({d} bytes)\n", .{text.len});
-            }
-        }
-    }
-
-    // 2. Project AGENTS.md (MINI_AGENT_FOLDER/AGENTS.md)
-    if (env_map.get("MINI_AGENT_FOLDER")) |agent_dir| {
-        const project_path = std.fmt.allocPrint(alloc, "{s}/AGENTS.md", .{agent_dir}) catch null;
-        if (project_path) |pp| {
-            defer alloc.free(pp);
-            if (readAgentFile(alloc, io, pp)) |text| {
-                defer alloc.free(text);
-                agents_text_accum.appendSlice(alloc, text) catch {};
-                agents_text_accum.appendSlice(alloc, "\n\n") catch {};
-                if (!utils.isSubagent()) main.stderrPrint("[config] Loaded project AGENTS.md ({d} bytes)\n", .{text.len});
             }
         }
     }
@@ -684,15 +1020,21 @@ pub const JsonConfig = struct {
     openai_compat_api_header: ?[]const u8 = null,
     openai_compat_model: ?[]const u8 = null,
     openai_compat_use_completion_tokens: ?bool = null,
+    openai_compat_provider: ?[]const u8 = null,
+    openai_compat_provider_js: ?[]const u8 = null,
+    openai_provider: ?[]const u8 = null,
     anthropic_api_key: ?[]const u8 = null,
     claude_model: ?[]const u8 = null,
     ollama_host: ?[]const u8 = null,
     ollama_model: ?[]const u8 = null,
     max_tokens: ?u32 = null,
     memact_enabled: ?bool = null,
+    memact_pg_enabled: ?bool = null,
+    memact_pg_advisory: ?bool = null,
     context_window: ?u32 = null,
     tool_allowlist: ?[]const u8 = null,
     tool_blocklist: ?[]const u8 = null,
+    watchdog_enabled: ?bool = null,
     mcp_config: ?[]const u8 = null,
     hook_command: ?[]const u8 = null,
     session: ?[]const u8 = null,
@@ -804,6 +1146,8 @@ fn tryLoadJsonConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: st
     if (cfg.openai_compat_api_header) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_API_HEADER", val);
     if (cfg.openai_compat_model) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_MODEL", val);
     if (cfg.openai_compat_use_completion_tokens) |val| count += setEnvDefault(env_map, "MINI_USE_COMPLETION_TOKENS", if (val) "1" else "0");
+    if (cfg.openai_compat_provider_js) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER_JS", val);
+    if (cfg.openai_compat_provider orelse cfg.openai_provider) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER", val);
     if (cfg.anthropic_api_key) |val| count += setEnvDefault(env_map, "ANTHROPIC_API_KEY", val);
     if (cfg.claude_model) |val| count += setEnvDefault(env_map, "CLAUDE_MODEL", val);
     if (cfg.ollama_host) |val| count += setEnvDefault(env_map, "OLLAMA_HOST", val);
@@ -813,12 +1157,15 @@ fn tryLoadJsonConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: st
         if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_MAX_TOKENS", s) else |_| {}
     }
     if (cfg.memact_enabled) |val| count += setEnvDefault(env_map, "MINI_MEMACT_ENABLED", if (val) "1" else "0");
+    if (cfg.memact_pg_enabled) |val| count += setEnvDefault(env_map, "MINI_MEMACT_PG_ENABLED", if (val) "1" else "0");
+    if (cfg.memact_pg_advisory) |val| count += setEnvDefault(env_map, "MINI_MEMACT_PG_ADVISORY", if (val) "1" else "0");
     if (cfg.context_window) |val| {
         var num_buf: [32]u8 = undefined;
         if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_CONTEXT_WINDOW", s) else |_| {}
     }
     if (cfg.tool_allowlist) |val| count += setEnvDefault(env_map, "MINI_TOOL_ALLOWLIST", val);
     if (cfg.tool_blocklist) |val| count += setEnvDefault(env_map, "MINI_TOOL_BLOCKLIST", val);
+    if (cfg.watchdog_enabled) |val| count += setEnvDefault(env_map, "MINI_WATCHDOG_ENABLED", if (val) "1" else "0");
     if (cfg.mcp_config) |val| count += setEnvDefault(env_map, "MINI_MCP_CONFIG", val);
     if (cfg.hook_command) |val| count += setEnvDefault(env_map, "MINI_HOOK_COMMAND", val);
     if (cfg.session) |val| count += setEnvDefault(env_map, "MINI_SESSION", val);
@@ -891,7 +1238,8 @@ test "JsonConfig parsing" {
         \\  "openai_protocol": "responses",
         \\  "openai_compat_model": "gpt-4o",
         \\  "max_tokens": 4096,
-        \\  "memact_enabled": true
+        \\  "memact_enabled": true,
+        \\  "memact_pg_enabled": true
         \\}
     ;
 
@@ -903,4 +1251,26 @@ test "JsonConfig parsing" {
     try std.testing.expectEqualStrings("gpt-4o", parsed.value.openai_compat_model.?);
     try std.testing.expectEqual(4096, parsed.value.max_tokens.?);
     try std.testing.expectEqual(true, parsed.value.memact_enabled.?);
+    try std.testing.expectEqual(true, parsed.value.memact_pg_enabled.?);
 }
+
+test "Config default memact_pg_enabled is true" {
+    const alloc = std.testing.allocator;
+    var env_map = std.process.Environ.Map.init(alloc);
+    defer env_map.deinit();
+
+    const def_val: bool = blk: {
+        const s = env_map.get("MINI_MEMACT_PG_ENABLED") orelse env_map.get("MINI_PG_ENABLED") orelse "1";
+        break :blk std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
+    };
+    try std.testing.expect(def_val);
+
+    try env_map.put("MINI_MEMACT_PG_ENABLED", "0");
+    const disabled_val: bool = blk: {
+        const s = env_map.get("MINI_MEMACT_PG_ENABLED") orelse env_map.get("MINI_PG_ENABLED") orelse "1";
+        break :blk std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
+    };
+    try std.testing.expect(!disabled_val);
+}
+
+

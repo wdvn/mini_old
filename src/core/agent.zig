@@ -13,13 +13,17 @@
 //! ```
 //!
 //! ## Backends
-//! Agent prioritizes backends in the following order:
+//! Agent selects a single backend at startup, in the following order:
 //!   1. OpenAI-compatible (if OPENAI_COMPAT_URL is set)
 //!   2. Claude (if ANTHROPIC_API_KEY is set)
-//!   3. Ollama (local fallback)
+//!   3. Ollama (local)
 //!
 //! ## Fallback
-//! If primary backend fails, agent attempts remaining backends.
+//! There is no cross-provider fallback at this layer: protocol/vendor
+//! fallback is handled inside the provider abstraction (RFC-012), and the
+//! act retry loop in `processInput` re-runs the same backend on transient
+//! transport errors. A blind extra Ollama attempt was removed because it
+//! usually pointed at a non-running local server and masked the real error.
 //!
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -45,6 +49,8 @@ const cas_mod = @import("cas.zig");
 pub const journal_mod = @import("journal.zig");
 pub const act_logger_mod = @import("act_logger.zig");
 pub const signals = @import("signals.zig");
+pub const act_queue = @import("act_queue.zig");
+pub const watchdog_mod = @import("watchdog.zig");
 const chat_stream = @import("../ui/chat_stream.zig");
 const term = @import("../ui/terminal.zig");
 const spinner_mod = @import("../ui/spinner.zig");
@@ -59,10 +65,30 @@ fn getEnvVar(name: [*:0]const u8) ?[]const u8 {
 
 var g_active_agent: ?*AgentLoop = null;
 
-fn agentToolListener(tool_name: []const u8, is_error: bool) void {
+fn agentToolListener(tool_name: []const u8, input_json: ?[]const u8, is_error: bool) void {
     if (g_active_agent) |agent| {
-        agent.onToolCompleted(tool_name, is_error);
+        agent.onToolCompleted(tool_name, input_json, is_error);
     }
+}
+
+fn agentOutputListener(chunk: []const u8) void {
+    if (g_active_agent) |agent| {
+        agent.coordinator.appendActLog(chunk);
+    }
+}
+
+fn watchdogInterruptHandler() void {
+    if (g_active_agent) |agent| {
+        agent.engine.requestInterrupt();
+    }
+    tools_mod.interruptActiveBash();
+}
+
+fn watchdogDecisionHandler(ctx: watchdog_mod.DecisionContext) watchdog_mod.TimeoutDecision {
+    if (g_active_agent) |agent| {
+        return agent.consultLlmOnTimeout(ctx);
+    }
+    return .{ .should_kill = false, .extend_seconds = 60 };
 }
 
 /// Maximum retries on rate limit.
@@ -198,6 +224,105 @@ pub const AgentLoop = struct {
     last_executed_tool: ?[]u8 = null,
     /// Recent tool execution sequence (w acts window).
     recent_tools: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Action Loop Guard: tool signatures executed in current turn.
+    turn_tool_records: std.ArrayListUnmanaged(ToolCallRecord) = .empty,
+    /// Hard dedupe cache: recent read-only tool results served on exact repeat
+    /// instead of re-execution (mechanical replay-loop barrier).
+    tool_cache: std.ArrayListUnmanaged(ToolCacheEntry) = .empty,
+    /// 3D Procedural Map trajectory tracking for orbit detection and Checkpoint & Recap.
+    turn_tool_trajectory: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Consecutive identical tool call counter.
+    consecutive_dup_tool_count: usize = 0,
+    /// Consecutive read-only exploratory tool call counter.
+    consecutive_readonly_count: usize = 0,
+    /// Last detected loop reason.
+    last_loop_reason: LoopReason = .none,
+    /// Flag set when action loop circuit breaker trips to break out of agent loop.
+    action_loop_tripped: bool = false,
+    /// Number of times the agent has prompted the model to formulate a plan and execute next step to recover from an action loop in the current turn.
+    loop_plan_retries: usize = 0,
+    /// Flag indicating that a plan has been requested to break an action loop; if the model returns text without tool execution, prompts the model to execute step 1.
+    plan_execution_pending: bool = false,
+    /// Consecutive watchdog directives injected while model keeps answering in text. Caps at 2 to prevent infinite looping.
+    plan_watchdog_retries: usize = 0,
+
+    // Plan Watchdog: Enforces execution of committed plans and prevents action procrastination
+    plan_active: bool = false,
+    plan_summary_buf: [160]u8 = undefined,
+    plan_summary_len: usize = 0,
+    plan_procrastination_count: usize = 0,
+    plan_procrastination_cap: usize = 2,
+    current_user_request: ?[]const u8 = null,
+    /// Progress summary from last act (injected as advisory before each new act).
+    progress_summary_buf: [512]u8 = undefined,
+    progress_summary_len: usize = 0,
+
+    /// 3-Thread Coordinator & State Monitor (RFC-015)
+    coordinator: *act_queue.ActCoordinator,
+    /// Thread 2 Watchdog Monitor
+    watchdog: ?*watchdog_mod.Watchdog = null,
+
+    pub fn setPlan(self: *AgentLoop, summary: []const u8) void {
+        if (!self.plan_active) {
+            self.plan_active = true;
+            self.plan_procrastination_count = 0;
+        }
+        const len = @min(summary.len, self.plan_summary_buf.len);
+        @memcpy(self.plan_summary_buf[0..len], summary[0..len]);
+        self.plan_summary_len = len;
+    }
+
+    pub fn clearPlan(self: *AgentLoop) void {
+        self.plan_active = false;
+        self.plan_summary_len = 0;
+        self.plan_procrastination_count = 0;
+        self.plan_execution_pending = false;
+    }
+
+    pub fn getPlanSummary(self: *const AgentLoop) []const u8 {
+        if (self.plan_summary_len > 0) return self.plan_summary_buf[0..self.plan_summary_len];
+        return "active implementation plan";
+    }
+
+    /// Update progress summary after an act completes. Caps at progress_summary_buf.
+    pub fn updateProgress(self: *AgentLoop, summary: []const u8) void {
+        const len = @min(summary.len, self.progress_summary_buf.len);
+        @memcpy(self.progress_summary_buf[0..len], summary[0..len]);
+        self.progress_summary_len = len;
+    }
+
+    /// Clear progress summary (call at start of each turn).
+    pub fn clearProgress(self: *AgentLoop) void {
+        self.progress_summary_len = 0;
+    }
+
+    pub const ToolCallRecord = struct {
+        name: []u8,
+        args_hash: u64,
+    };
+
+    /// Cached result of a previously executed read-only tool call (per turn).
+    pub const ToolCacheEntry = struct {
+        name: []u8,
+        args_hash: u64,
+        result: []u8,
+    };
+
+    pub const LoopReason = enum {
+        none,
+        identical_repeat,
+        window_repeat,
+        macro_cycle_2,
+        macro_cycle_3,
+        readonly_budget,
+        orbit_cycle,
+    };
+
+    pub const LoopCheckResult = enum {
+        allow,
+        warn,
+        trip,
+    };
 
     pub const Error = error{
         LLMAuthenticationError,
@@ -226,7 +351,7 @@ pub const AgentLoop = struct {
                     .chat_completions => .chat_completions,
                     .responses => .responses,
                 };
-                break :blk .{ .openai = openai_mod.Client.initWithProtocol(
+                var client = openai_mod.Client.initWithProvider(
                     alloc,
                     url,
                     config.openai_compat_key orelse "",
@@ -234,7 +359,10 @@ pub const AgentLoop = struct {
                     config.openai_compat_model,
                     config.max_tokens,
                     proto_mode,
-                ) };
+                    config.openai_provider,
+                );
+                client.provider_js = config.openai_provider_js;
+                break :blk .{ .openai = client };
             }
             if (config.anthropic_key) |key| {
                 if (!utils.isSubagent()) main.stderrPrint("[agent] Backend: Claude ({s})\n", .{config.claude_model});
@@ -270,6 +398,7 @@ pub const AgentLoop = struct {
             .image_gen_size = config.image_gen_size,
             .video_gen_enabled = config.video_gen_enabled,
             .video_gen_model = config.video_gen_model,
+            .video_gen_provider = config.video_gen_provider,
             .media_output_dir = config.media_output_dir,
             .video_poll_timeout_secs = config.video_poll_timeout_secs,
             .openai_compat_url = config.openai_compat_url,
@@ -316,6 +445,20 @@ pub const AgentLoop = struct {
             }
         }
 
+        const coordinator = act_queue.ActCoordinator.init(alloc);
+        const watchdog = watchdog_mod.Watchdog.init(alloc, io, coordinator, .{
+            .tracking_interval_s = config.watchdog_tracking_interval_s,
+            .act_timeout_secs = config.act_timeout_secs,
+            .recap_interval_acts = config.watchdog_recap_interval,
+            .poll_interval_ms = config.watchdog_interval_ms,
+            .verbose_stderr = config.action_loop_display,
+        });
+        watchdog.interrupt_fn = &watchdogInterruptHandler;
+        watchdog.decision_fn = &watchdogDecisionHandler;
+        watchdog.start() catch |e| {
+            if (!utils.isSubagent()) main.stderrPrint("[agent] Warning: Failed to start Watchdog thread: {s}\n", .{@errorName(e)});
+        };
+
         return .{
             .alloc = alloc,
             .io = io,
@@ -333,11 +476,18 @@ pub const AgentLoop = struct {
             .pg_store = pg_store_ptr,
             .last_executed_tool = null,
             .recent_tools = .empty,
+            .coordinator = coordinator,
+            .watchdog = watchdog,
         };
     }
 
     /// Releases memory.
     pub fn deinit(self: *AgentLoop) void {
+        if (self.watchdog) |wd| {
+            wd.deinit();
+            self.watchdog = null;
+        }
+        self.coordinator.deinit();
         if (self.snapshot_tracker) |*t| {
             snapshot_mod.setTracker(null);
             t.deinit();
@@ -362,6 +512,387 @@ pub const AgentLoop = struct {
             self.alloc.free(t);
         }
         self.recent_tools.deinit(self.alloc);
+        self.deinitTurnToolRecords();
+    }
+
+    pub fn isReadOnlyTool(name: []const u8) bool {
+        return std.mem.eql(u8, name, "file_read") or
+            std.mem.eql(u8, name, "read") or
+            std.mem.eql(u8, name, "grep") or
+            std.mem.eql(u8, name, "glob") or
+            std.mem.eql(u8, name, "list_dir") or
+            std.mem.eql(u8, name, "session_diagnostics");
+    }
+
+    pub fn isMutatingTool(name: []const u8) bool {
+        return std.mem.eql(u8, name, "file_edit") or
+            std.mem.eql(u8, name, "edit") or
+            std.mem.eql(u8, name, "multi_file_edit") or
+            std.mem.eql(u8, name, "file_write") or
+            std.mem.eql(u8, name, "write");
+    }
+
+    pub fn isExploratoryToolCall(tool_name: []const u8, input_json: []const u8) bool {
+        if (isReadOnlyTool(tool_name)) return true;
+        if (std.mem.eql(u8, tool_name, "bash")) {
+            if (json_mod.findString(input_json, "command")) |cmd| {
+                const trimmed = std.mem.trim(u8, cmd, " \t\r\n");
+                // Check if modifying or redirecting output
+                if (std.mem.startsWith(u8, trimmed, "sed -i") or
+                    std.mem.indexOf(u8, trimmed, " > ") != null or
+                    std.mem.indexOf(u8, trimmed, " >> ") != null or
+                    std.mem.startsWith(u8, trimmed, "cat >") or
+                    std.mem.startsWith(u8, trimmed, "cat <<"))
+                {
+                    return false;
+                }
+                if (std.mem.startsWith(u8, trimmed, "cat ") or
+                    std.mem.startsWith(u8, trimmed, "sed ") or
+                    std.mem.startsWith(u8, trimmed, "grep ") or
+                    std.mem.startsWith(u8, trimmed, "head ") or
+                    std.mem.startsWith(u8, trimmed, "tail ") or
+                    std.mem.startsWith(u8, trimmed, "ls ") or
+                    std.mem.eql(u8, trimmed, "ls") or
+                    std.mem.startsWith(u8, trimmed, "find "))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    pub fn detectPlanInText(text: []const u8) ?[]const u8 {
+        const markers = [_][]const u8{
+            "tôi sẽ implement",
+            "tôi sẽ thực hiện",
+            "tôi sẽ tiến hành",
+            "sẽ implement",
+            "sẽ thực thi",
+            "sẽ tiến hành",
+            "kế hoạch:",
+            "bước 1:",
+            "i will implement",
+            "i'll implement",
+            "i will now apply",
+            "i will now edit",
+            "i will now create",
+            "plan:",
+            "step 1:",
+            "here is the plan",
+            "implementation plan",
+        };
+
+        for (markers) |marker| {
+            if (marker.len == 0 or text.len < marker.len) continue;
+            var i: usize = 0;
+            while (i <= text.len - marker.len) : (i += 1) {
+                if (std.ascii.eqlIgnoreCase(text[i .. i + marker.len], marker)) {
+                    const start = i;
+                    const end = @min(text.len, start + 120);
+                    return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
+                }
+            }
+        }
+        return null;
+    }
+
+    pub fn isPlanOnlyRequest(user_text_opt: ?[]const u8) bool {
+        const text = user_text_opt orelse return false;
+        const markers = [_][]const u8{
+            "chỉ lên kế hoạch",
+            "chỉ lập kế hoạch",
+            "không sửa file",
+            "không sửa code",
+            "không edit",
+            "only plan",
+            "just plan",
+            "plan only",
+            "do not edit",
+            "don't edit",
+            "do not modify",
+            "don't modify",
+        };
+        for (markers) |m| {
+            var i: usize = 0;
+            if (text.len < m.len) continue;
+            while (i <= text.len - m.len) : (i += 1) {
+                if (std.ascii.eqlIgnoreCase(text[i .. i + m.len], m)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    pub const MacroCycle = struct {
+        period: usize,
+        repetitions: usize,
+    };
+
+    /// Detects repeating patterns in tool name sequence:
+    /// - 2-cycle: [A, B, A, B] (period = 2)
+    /// - 3-cycle: [A, B, C, A, B, C] (period = 3)
+    pub fn detectMacroCycle(records: []const ToolCallRecord, current_name: []const u8) ?MacroCycle {
+        const len = records.len;
+        // Check period 2: [A, B, A, B]
+        if (len >= 3) {
+            const b = current_name;
+            const a = records[len - 1].name;
+            if (!std.mem.eql(u8, a, b)) {
+                if (std.mem.eql(u8, records[len - 2].name, b) and std.mem.eql(u8, records[len - 3].name, a)) {
+                    var reps: usize = 2;
+                    if (len >= 5 and std.mem.eql(u8, records[len - 4].name, b) and std.mem.eql(u8, records[len - 5].name, a)) {
+                        reps = 3;
+                    }
+                    return .{ .period = 2, .repetitions = reps };
+                }
+            }
+        }
+
+        // Check period 3: [A, B, C, A, B, C]
+        if (len >= 5) {
+            const c = current_name;
+            const b = records[len - 1].name;
+            const a = records[len - 2].name;
+            if (!std.mem.eql(u8, a, b) and !std.mem.eql(u8, b, c) and !std.mem.eql(u8, a, c)) {
+                if (std.mem.eql(u8, records[len - 3].name, c) and
+                    std.mem.eql(u8, records[len - 4].name, b) and
+                    std.mem.eql(u8, records[len - 5].name, a))
+                {
+                    var reps: usize = 2;
+                    if (len >= 8 and
+                        std.mem.eql(u8, records[len - 6].name, c) and
+                        std.mem.eql(u8, records[len - 7].name, b) and
+                        std.mem.eql(u8, records[len - 8].name, a))
+                    {
+                        reps = 3;
+                    }
+                    return .{ .period = 3, .repetitions = reps };
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// Evaluates whether a tool call constitutes an action loop (consecutive identical, sliding window repeat,
+    /// macro-cycle alternating sequence, or read-only exploratory budget exceeded).
+    pub fn checkActionLoop(self: *AgentLoop, tool_name: []const u8, input_json: []const u8) !LoopCheckResult {
+        const trimmed = std.mem.trim(u8, input_json, " \t\r\n");
+        // Whitespace-insensitive hash: replays after truncation often re-serialize
+        // the same JSON with different formatting; treat them as identical calls.
+        const args_hash = fuzzyArgsHash(trimmed);
+
+        // 1. Update read-only exploratory counter
+        if (isReadOnlyTool(tool_name)) {
+            self.consecutive_readonly_count += 1;
+        } else {
+            // Any non-readonly tool resets the read-only counter (dropping rule requiring file mutation)
+            self.consecutive_readonly_count = 0;
+        }
+
+        // 2. Check macro-cycle (alternating tool names across consecutive calls)
+        const macro_cycle = detectMacroCycle(self.turn_tool_records.items, tool_name);
+
+        // 3. Check consecutive duplicates (identical arguments)
+        if (self.turn_tool_records.items.len > 0) {
+            const last = self.turn_tool_records.items[self.turn_tool_records.items.len - 1];
+            if (std.mem.eql(u8, last.name, tool_name) and last.args_hash == args_hash) {
+                self.consecutive_dup_tool_count += 1;
+            } else {
+                self.consecutive_dup_tool_count = 1;
+            }
+        } else {
+            self.consecutive_dup_tool_count = 1;
+        }
+
+        // 4. Count occurrences in sliding window of recent tool executions
+        var window_count: usize = 0;
+        const window_size = @min(self.turn_tool_records.items.len, 10);
+        const start_idx = self.turn_tool_records.items.len - window_size;
+        for (self.turn_tool_records.items[start_idx..]) |rec| {
+            if (std.mem.eql(u8, rec.name, tool_name) and rec.args_hash == args_hash) {
+                window_count += 1;
+            }
+        }
+        window_count += 1; // including current
+
+        // 5. Append to turn records (cap at 16 items)
+        if (self.turn_tool_records.items.len >= 16) {
+            const oldest = self.turn_tool_records.orderedRemove(0);
+            self.alloc.free(oldest.name);
+        }
+        const dup_name = try self.alloc.dupe(u8, tool_name);
+        errdefer self.alloc.free(dup_name);
+        try self.turn_tool_records.append(self.alloc, .{
+            .name = dup_name,
+            .args_hash = args_hash,
+        });
+
+        // Also append to 3D trajectory (cap at 32 items)
+        if (self.turn_tool_trajectory.items.len >= 32) {
+            const oldest_t = self.turn_tool_trajectory.orderedRemove(0);
+            self.alloc.free(oldest_t);
+        }
+        const dup_traj = try self.alloc.dupe(u8, tool_name);
+        errdefer self.alloc.free(dup_traj);
+        try self.turn_tool_trajectory.append(self.alloc, dup_traj);
+
+        // Check 3D procedural map orbit
+        const traj_orbit = graph_store_mod.PGraphStore.detectTrajectoryOrbit(self.turn_tool_trajectory.items, tool_name);
+
+        // 6. Evaluate circuit breaker thresholds (TRIP)
+        if (self.consecutive_dup_tool_count >= self.config.action_loop_consecutive_cap or
+            window_count >= self.config.action_loop_window_cap)
+        {
+            self.action_loop_tripped = true;
+            self.last_loop_reason = if (self.consecutive_dup_tool_count >= self.config.action_loop_consecutive_cap) .identical_repeat else .window_repeat;
+            return .trip;
+        }
+
+        if (macro_cycle) |mc| {
+            if (mc.repetitions >= 3) {
+                self.action_loop_tripped = true;
+                self.last_loop_reason = if (mc.period == 2) .macro_cycle_2 else .macro_cycle_3;
+                return .trip;
+            }
+        }
+
+        if (traj_orbit) |orbit| {
+            if (orbit.revolutions >= self.config.action_loop_orbit_cap) {
+                self.action_loop_tripped = true;
+                self.last_loop_reason = .orbit_cycle;
+                return .trip;
+            }
+        }
+
+        // Note: readonly actions do not trip circuit breaker alone unless repetitive (handled by window/consecutive/orbit checks)
+        // or procrastinating on an active plan (handled by Plan Watchdog).
+
+        // 7. Evaluate warning thresholds (WARN)
+        if (self.consecutive_dup_tool_count >= 2 or window_count >= 3) {
+            self.last_loop_reason = if (self.consecutive_dup_tool_count >= 2) .identical_repeat else .window_repeat;
+            return .warn;
+        }
+
+        if (macro_cycle) |mc| {
+            if (mc.repetitions >= self.config.action_loop_macro_cycle_cap) {
+                self.last_loop_reason = if (mc.period == 2) .macro_cycle_2 else .macro_cycle_3;
+                return .warn;
+            }
+        }
+
+        if (traj_orbit) |orbit| {
+            if (orbit.revolutions >= 1) {
+                self.last_loop_reason = .orbit_cycle;
+                return .warn;
+            }
+        }
+
+        if (self.consecutive_readonly_count >= self.config.action_loop_readonly_warn_cap) {
+            self.last_loop_reason = .readonly_budget;
+            return .warn;
+        }
+
+        self.last_loop_reason = .none;
+        return .allow;
+    }
+
+    pub fn clearTurnToolRecords(self: *AgentLoop) void {
+        for (self.turn_tool_records.items) |rec| {
+            self.alloc.free(rec.name);
+        }
+        self.turn_tool_records.clearRetainingCapacity();
+        self.clearToolCache();
+        for (self.turn_tool_trajectory.items) |t| {
+            self.alloc.free(t);
+        }
+        self.turn_tool_trajectory.clearRetainingCapacity();
+        self.consecutive_dup_tool_count = 0;
+        self.consecutive_readonly_count = 0;
+        self.last_loop_reason = .none;
+    }
+
+    pub fn deinitTurnToolRecords(self: *AgentLoop) void {
+        self.clearTurnToolRecords();
+        self.turn_tool_records.deinit(self.alloc);
+        self.turn_tool_trajectory.deinit(self.alloc);
+        self.clearToolCache();
+        self.tool_cache.deinit(self.alloc);
+    }
+
+    /// Frees all cached tool results (called on turn reset and deinit).
+    pub fn clearToolCache(self: *AgentLoop) void {
+        for (self.tool_cache.items) |entry| {
+            self.alloc.free(entry.name);
+            self.alloc.free(entry.result);
+        }
+        self.tool_cache.clearRetainingCapacity();
+    }
+
+    /// Whitespace-insensitive args hash: collapses runs of whitespace outside of
+    /// nothing (JSON args are compact strings; escaping keeps structure intact) so
+    /// that a replayed tool call with re-serialized JSON still matches the original
+    /// signature. Falls back to exact bytes when normalization is unnecessary.
+    pub fn fuzzyArgsHash(input_json: []const u8) u64 {
+        var h = std.hash.Wyhash.init(0);
+        var i: usize = 0;
+        var in_string = false;
+        var prev_space = false;
+        while (i < input_json.len) : (i += 1) {
+            const c = input_json[i];
+            if (in_string) {
+                h.update(&[_]u8{c});
+                if (c == '\\' and i + 1 < input_json.len) {
+                    i += 1;
+                    h.update(&[_]u8{input_json[i]});
+                } else if (c == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                in_string = true;
+                prev_space = false;
+                h.update(&[_]u8{c});
+                continue;
+            }
+            if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+                // Collapse whitespace runs outside strings into a single marker.
+                if (!prev_space) h.update(&[_]u8{' '});
+                prev_space = true;
+                continue;
+            }
+            prev_space = false;
+            h.update(&[_]u8{c});
+        }
+        return h.final();
+    }
+
+    /// Looks up a cached result for a read-only tool call with matching args.
+    /// Returns the cached result slice (owned by tool_cache, valid until clearToolCache).
+    fn lookupToolCache(self: *AgentLoop, tool_name: []const u8, args_hash: u64) ?[]const u8 {
+        for (self.tool_cache.items) |entry| {
+            if (entry.args_hash == args_hash and std.mem.eql(u8, entry.name, tool_name)) {
+                return entry.result;
+            }
+        }
+        return null;
+    }
+
+    /// Stores a tool result in the per-turn dedupe cache (cap 8 entries, FIFO eviction).
+    fn storeToolCache(self: *AgentLoop, tool_name: []const u8, args_hash: u64, result: []const u8) !void {
+        if (self.tool_cache.items.len >= 8) {
+            const oldest = self.tool_cache.orderedRemove(0);
+            self.alloc.free(oldest.name);
+            self.alloc.free(oldest.result);
+        }
+        try self.tool_cache.append(self.alloc, .{
+            .name = try self.alloc.dupe(u8, tool_name),
+            .args_hash = args_hash,
+            .result = try self.alloc.dupe(u8, result),
+        });
     }
 
     /// Saves the latest backend error context for subsequent journal recordError.
@@ -372,6 +903,17 @@ pub const AgentLoop = struct {
         self.last_backend_raw_error = null;
         if (raw) |r| {
             self.last_backend_raw_error = self.alloc.dupe(u8, r) catch null;
+        }
+    }
+
+    /// Resets the captured HTTP error context. Called at the start of every
+    /// backend attempt so that a *transport* failure (which never sets a status
+    /// code) is not mis-attributed to a previous request's 429/400 body.
+    fn clearLastErrorContext(self: *AgentLoop) void {
+        self.last_backend_http_code = 0;
+        if (self.last_backend_raw_error) |old| {
+            self.alloc.free(old);
+            self.last_backend_raw_error = null;
         }
     }
 
@@ -404,13 +946,17 @@ pub const AgentLoop = struct {
     fn logActDebug(
         self: *AgentLoop,
         act_id: usize,
-        input_msgs: []const proto.Message,
+        input_msgs_count: usize,
         tool_defs: []const proto.ToolDefinition,
         response: *const proto.Response,
         js_code_opt: ?[]const u8,
         exec_info: act_logger_mod.ActExecutionInfo,
     ) void {
         const logger = if (self.act_logger != null) &self.act_logger.? else return;
+
+        const msgs = self.history.messages();
+        const safe_count = @min(input_msgs_count, msgs.len);
+        const input_msgs = msgs[0..safe_count];
 
         var text_acc: ?[]const u8 = null;
         var think_acc: ?[]const u8 = null;
@@ -470,7 +1016,15 @@ pub const AgentLoop = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !StepResult {
-        if (signals.isInterrupted()) return error.Interrupted;
+        if (signals.isInterrupted() or self.coordinator.isTimedOut()) return error.Interrupted;
+
+        // Check for Watchdog 3-act recap advisory
+        if (self.coordinator.popPendingRecapAdvisory()) |advisory| {
+            defer self.alloc.free(advisory);
+            try self.history.addUser(advisory);
+        }
+
+        self.coordinator.updateStatus(act_id, .calling_llm, "Calling LLM backend");
 
         if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
             if (act_id > 1) {
@@ -498,24 +1052,55 @@ pub const AgentLoop = struct {
         var ephemeral_blocks: ?[]proto.ContentBlock = null;
         defer if (ephemeral_blocks) |b| self.alloc.free(b);
 
-        if (self.pg_store) |pg| {
-            ephemeral_guidance = pg.serializeGuidance(
-                self.alloc,
-                self.last_executed_tool,
-                self.recent_tools.items,
-                self.last_act_failed,
-                self.config.memact_pg_h,
-            ) catch null;
+        var progress_text: ?[]u8 = null;
+        defer if (progress_text) |t| self.alloc.free(t);
 
-            if (ephemeral_guidance) |guidance_text| {
-                const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
-                blocks[0] = .{ .text = guidance_text };
-                ephemeral_blocks = blocks;
-                try temp_input_msgs.append(self.alloc, .{
-                    .role = .user,
-                    .content = blocks,
-                });
+        var progress_blocks: ?[]proto.ContentBlock = null;
+        defer if (progress_blocks) |b| self.alloc.free(b);
+
+        if (self.pg_store) |pg| {
+            // Only inject procedural guidance if advisory is enabled
+            if (self.config.memact_pg_advisory) {
+                const traj_slice: []const []const u8 = if (self.turn_tool_trajectory.items.len > 0)
+                    self.turn_tool_trajectory.items
+                else
+                    self.recent_tools.items;
+
+                ephemeral_guidance = pg.serializeGuidance(
+                    self.alloc,
+                    self.last_executed_tool,
+                    traj_slice,
+                    self.last_act_failed,
+                    self.config.memact_pg_h,
+                    self.current_user_request,
+                ) catch null;
+
+                if (ephemeral_guidance) |guidance_text| {
+                    const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+                    blocks[0] = .{ .text = guidance_text };
+                    ephemeral_blocks = blocks;
+                    try temp_input_msgs.append(self.alloc, .{
+                        .role = .user,
+                        .content = blocks,
+                    });
+                }
             }
+        }
+
+        // Progress Tracking: inject summary of previous act's work
+        if (self.progress_summary_len > 0 and act_id > 1) {
+            progress_text = try std.fmt.allocPrint(
+                self.alloc,
+                "[Progress Checkpoint]\nThe previous act ({d}) completed with the following progress:\n{s}\n\nBefore proceeding, please assess: what has been accomplished, what remains, and whether you should continue or conclude.",
+                .{ act_id - 1, self.progress_summary_buf[0..self.progress_summary_len] },
+            );
+            const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+            blocks[0] = .{ .text = progress_text.? };
+            progress_blocks = blocks;
+            try temp_input_msgs.append(self.alloc, .{
+                .role = .user,
+                .content = blocks,
+            });
         }
 
         // Dynamic Thinking / Reasoning Effort modulation
@@ -585,14 +1170,21 @@ pub const AgentLoop = struct {
         // Append response to history (if has content)
         _ = try self.history.addAssistantResponse(&response);
 
-        // Retrieve safe slice after history may have reallocated
-        const valid_input_msgs = self.history.messages()[0..input_msgs_count];
-
-        // Accumulate completion tokens
+        // Accumulate completion tokens and detect plan commitments
         for (response.content.items) |block| {
             switch (block) {
-                .text => |t| self.last_turn_completion_tokens += self.token_estimator.estimate(t),
-                .thinking => |th| self.last_turn_completion_tokens += self.token_estimator.estimate(th.thinking),
+                .text => |t| {
+                    self.last_turn_completion_tokens += self.token_estimator.estimate(t);
+                    if (detectPlanInText(t)) |plan_summary| {
+                        self.setPlan(plan_summary);
+                    }
+                },
+                .thinking => |th| {
+                    self.last_turn_completion_tokens += self.token_estimator.estimate(th.thinking);
+                    if (detectPlanInText(th.thinking)) |plan_summary| {
+                        self.setPlan(plan_summary);
+                    }
+                },
                 .tool_use => |tu| self.last_turn_completion_tokens += self.token_estimator.estimate(tu.name) + self.token_estimator.estimate(tu.input_json),
                 else => {},
             }
@@ -608,9 +1200,16 @@ pub const AgentLoop = struct {
         }
 
         if (response.stop_reason == .tool_use or has_tool_use_blocks) {
-            self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "tool_call" });
-            try self.executeTools(act_id, &response);
+            const exec_summary = try self.executeTools(act_id, &response);
+            self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{
+                .exec_type = "tool_call",
+                .is_error = exec_summary.any_tool_err,
+                .duration_ms = exec_summary.total_dur_ms,
+            });
             main.stderrPrint("\n", .{});
+            if (self.action_loop_tripped) {
+                return .exit_loop;
+            }
             return .continue_loop;
         }
 
@@ -618,6 +1217,51 @@ pub const AgentLoop = struct {
         if (self.config.execution_mode != .tools) {
             if (findJsCodeInResponse(self.alloc, &response)) |js_code| {
                 defer self.alloc.free(js_code);
+
+                const js_loop_check = self.checkActionLoop("codeact", js_code) catch .allow;
+                if (js_loop_check == .trip) {
+                    if (self.loop_plan_retries < 2) {
+                        self.loop_plan_retries += 1;
+                        self.plan_execution_pending = true;
+                        if (self.config.action_loop_display) {
+                            main.stderrPrint(
+                                "\n\x1b[33m[agent] ⚠️ Action loop detected: identical CodeAct script repeated without progress. Requesting model to formulate plan and execute next step.\x1b[0m\n",
+                                .{},
+                            );
+                        }
+                        if (main.ui_repl.current_renderer) |r| {
+                            r.ensureNewline();
+                            r.write(" \x1b[33m[Action Loop Detected: Requesting Plan & Execution]\x1b[0m\n");
+                        }
+                        if (self.journal) |*j| {
+                            j.recordEvent(self.io, act_id, .checkpoint_created, "CodeAct action loop - requesting plan & execution") catch {};
+                        }
+                        const trip_msg = "[CodeAct Checkpoint & Recap]: Action loop detected.\n\n[CodeAct Advisory (Optional Suggestions)]\nCurrent Action: repeated identical CodeAct script\nObservation: Identical script executed without progress.\n⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed at your discretion.";
+                        try self.history.addUser(trip_msg);
+                        self.action_loop_tripped = false;
+                        self.consecutive_dup_tool_count = 0;
+                        return .continue_loop;
+                    } else {
+                        main.stderrPrint(
+                            "\n\x1b[33m[agent] ⚠️ Action loop persisted after replanning attempts: identical CodeAct script repeated. Halting loop.\x1b[0m\n",
+                            .{},
+                        );
+                        const trip_msg = "[CodeAct System Intervention]: Action loop persisted after multiple replanning attempts. Halting execution. Synthesize your findings and answer the user now.";
+                        try self.history.addUser(trip_msg);
+                        self.action_loop_tripped = true;
+                        return .exit_loop;
+                    }
+                }
+
+                // Plan completion: mutating CodeAct script means the model is executing its plan.
+                if (self.plan_active and !isPlanOnlyRequest(self.current_user_request)) {
+                    if (std.mem.indexOf(u8, js_code, "file_edit") != null or
+                        std.mem.indexOf(u8, js_code, "file_write") != null or
+                        std.mem.indexOf(u8, js_code, "write") != null)
+                    {
+                        self.clearPlan();
+                    }
+                }
 
                 const start_codeact_ms = utils.milliTimestamp();
                 if (main.ui_repl.current_renderer) |r| {
@@ -628,12 +1272,14 @@ pub const AgentLoop = struct {
 
                 signals.registerActiveEngine(self.engine);
                 defer signals.registerActiveEngine(null);
+                self.coordinator.updateStatus(act_id, .executing_codeact, "Running QuickJS script");
 
                 var res = self.engine.eval(js_code, "agent_codeact.js") catch |e| {
+                    media_gen_tool.clearTurnAttachments(self.alloc);
                     self.last_act_failed = true;
                     const end_err_ms = utils.milliTimestamp();
                     const dur_ms = if (end_err_ms >= start_codeact_ms) @as(u64, @intCast(end_err_ms - start_codeact_ms)) else 0;
-                    self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, js_code, .{
+                    self.logActDebug(act_id, input_msgs_count, tool_defs, &response, js_code, .{
                         .exec_type = "codeact",
                         .is_error = true,
                         .duration_ms = dur_ms,
@@ -655,7 +1301,7 @@ pub const AgentLoop = struct {
                 const end_codeact_ms = utils.milliTimestamp();
                 const dur_ms = if (end_codeact_ms >= start_codeact_ms) @as(u64, @intCast(end_codeact_ms - start_codeact_ms)) else 0;
 
-                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, js_code, .{
+                self.logActDebug(act_id, input_msgs_count, tool_defs, &response, js_code, .{
                     .exec_type = "codeact",
                     .stdout = res.stdout,
                     .return_value_json = res.return_value_json,
@@ -689,9 +1335,16 @@ pub const AgentLoop = struct {
                         try out_buf.writeAll("(Code executed successfully with no output)\n");
                     }
 
-                    try self.history.addUser(out_buf.list.items);
+                    const turn_attached = media_gen_tool.getTurnAttachments();
+                    if (turn_attached.len > 0) {
+                        try self.history.addUserWithImages(out_buf.list.items, turn_attached);
+                        media_gen_tool.clearTurnAttachments(self.alloc);
+                    } else {
+                        try self.history.addUser(out_buf.list.items);
+                    }
                     return .continue_loop;
                 } else {
+                    media_gen_tool.clearTurnAttachments(self.alloc);
                     if (main.ui_repl.current_renderer) |r| {
                         r.finishTool("codeact", if (res.error_message) |m| m else "JS Error", true, dur_ms, null, null);
                     } else {
@@ -727,14 +1380,48 @@ pub const AgentLoop = struct {
 
         switch (response.stop_reason) {
             .end_turn, .stop_sequence => {
-                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "none" });
+                self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{ .exec_type = "none" });
+                if ((self.plan_active or self.plan_execution_pending) and !isPlanOnlyRequest(self.current_user_request)) {
+                    // Don't clear pending yet — keep it true while we decide what to do
+                    self.plan_watchdog_retries += 1;
+                    const watchdog_max = 2;
+                    if (self.plan_watchdog_retries >= watchdog_max) {
+                        // Cap reached: stop injecting directives, clear plan state,
+                        // let the model proceed normally on next iteration.
+                        main.stderrPrint(
+                            "\n\x1b[33m[watchdog] ⚠️ Plan Watchdog stopping after {d} consecutive directive injections without tool execution.\x1b[0m\n",
+                            .{watchdog_max},
+                        );
+                        self.clearPlan();
+                        self.plan_execution_pending = false;
+                        self.plan_watchdog_retries = 0;
+                        return .continue_loop;
+                    }
+                    main.stderrPrint(
+                        "\n\x1b[33m[watchdog] ⚠️ Model emitted text without tool execution while an implementation plan is active. Commanding immediate execution of Step 1...\x1b[0m\n",
+                        .{},
+                    );
+                    if (main.ui_repl.current_renderer) |r| {
+                        r.ensureNewline();
+                        r.write(" \x1b[33m[Plan Watchdog: Plan declared without execution. Enforcing Step 1 execution]\x1b[0m\n");
+                    }
+                    var dir_buf = utils.BufWriter.init(self.alloc);
+                    defer dir_buf.deinit();
+                    try dir_buf.print(
+                        "[Plan Watchdog Directive]: You formulated an active implementation plan ('{s}') but ended your turn with descriptive text only without executing any tools. You MUST now proceed directly to executing Step 1 using tools (e.g. file_edit, bash, etc.). Do not return monologue or explanation without tool actions.",
+                        .{ self.getPlanSummary() },
+                    );
+                    try self.history.addUser(dir_buf.list.items);
+                    self.plan_execution_pending = false;
+                    return .continue_loop;
+                }
                 if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
                     main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
                 }
                 return .exit_loop;
             },
             .max_tokens => {
-                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "max_tokens" });
+                self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{ .exec_type = "max_tokens" });
                 // Response truncated mid-stream. DO NOT exit — insert observation
                 // requesting model to continue EXACTLY from where it stopped (without repeating
                 // already output content) to finish the incomplete block (JS block / tool_use / text).
@@ -744,6 +1431,11 @@ pub const AgentLoop = struct {
                     return .exit_loop;
                 }
                 main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response truncated (max_tokens), requesting continuation ({d}/5)...\x1b[0m\n", .{self.max_tokens_continues});
+                // Close out orphaned tool_use blocks: any tool call present in the
+                // truncated response was recorded in history but never executed.
+                // Synthesizing a tool_result tells the model the call is already
+                // "answered", preventing mechanical replay of the same call.
+                try self.closeOrphanedToolUses(&response);
                 var buf = utils.BufWriter.init(self.alloc);
                 defer buf.deinit();
                 try buf.print(
@@ -754,9 +1446,16 @@ pub const AgentLoop = struct {
                 return .continue_loop;
             },
             .tool_use => {
-                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{ .exec_type = "tool_call" });
-                try self.executeTools(act_id, &response);
+                const exec_summary = try self.executeTools(act_id, &response);
+                self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{
+                    .exec_type = "tool_call",
+                    .is_error = exec_summary.any_tool_err,
+                    .duration_ms = exec_summary.total_dur_ms,
+                });
                 main.stderrPrint("\n", .{});
+                if (self.action_loop_tripped) {
+                    return .exit_loop;
+                }
                 return .continue_loop;
             },
             // RFC-009 Phase 5: stream aborted by idle stall watchdog. Partial
@@ -764,7 +1463,7 @@ pub const AgentLoop = struct {
             // call was received, execute it normally; otherwise inject an
             // observation so the governor escalates effort on retry.
             .stream_aborted => {
-                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{
+                self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{
                     .exec_type = "stream_idle_timeout",
                     .is_error = true,
                     .error_message = "stream aborted by idle watchdog",
@@ -778,7 +1477,15 @@ pub const AgentLoop = struct {
                 }
                 if (has_tool_use) {
                     self.last_act_failed = true;
-                    try self.executeTools(act_id, &response);
+                    const exec_summary = try self.executeTools(act_id, &response);
+                    self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{
+                        .exec_type = "tool_call",
+                        .is_error = exec_summary.any_tool_err,
+                        .duration_ms = exec_summary.total_dur_ms,
+                    });
+                    if (self.action_loop_tripped) {
+                        return .exit_loop;
+                    }
                     return .continue_loop;
                 }
                 if (response.content.items.len == 0) {
@@ -789,12 +1496,14 @@ pub const AgentLoop = struct {
                 // Partial text present: treat like truncation — ask model to continue.
                 self.last_act_failed = true;
                 main.stderrPrint("\n\x1b[33m[agent] ⚠️ Stream stalled mid-response, requesting continuation...\x1b[0m\n", .{});
+                // Close out orphaned tool_use blocks (same rationale as max_tokens).
+                try self.closeOrphanedToolUses(&response);
                 const note = "[System] The previous response was interrupted because the model stream went silent (idle watchdog). Continue EXACTLY from where it stopped — do not repeat already written content.";
                 try self.history.addUser(note);
                 return .continue_loop;
             },
             .unknown => {
-                self.logActDebug(act_id, valid_input_msgs, tool_defs, &response, null, .{
+                self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{
                     .exec_type = "error",
                     .is_error = true,
                     .error_message = response.raw_debug_info,
@@ -879,7 +1588,7 @@ pub const AgentLoop = struct {
 
     /// Processes user input through agentic loop.
     /// Handle tool completion lifecycle event (RFC-010 Procedural Graph tracking)
-    pub fn onToolCompleted(self: *AgentLoop, tool_name: []const u8, is_error: bool) void {
+    pub fn onToolCompleted(self: *AgentLoop, tool_name: []const u8, input_json: ?[]const u8, is_error: bool) void {
         if (self.pg_store) |pg| {
             if (self.last_executed_tool) |prev_tool| {
                 pg.recordTransition(self.io, prev_tool, tool_name) catch {};
@@ -903,6 +1612,16 @@ pub const AgentLoop = struct {
         } else |_| {}
 
         self.last_act_failed = is_error;
+        const args_hash: u64 = if (input_json) |ij|
+            std.hash.Wyhash.hash(0, std.mem.trim(u8, ij, " \t\r\n"))
+        else
+            0;
+
+        self.coordinator.recordToolExecution(
+            tool_name,
+            args_hash,
+            isReadOnlyTool(tool_name),
+        );
     }
 
     /// `text_cb`: invoked with each text chunk as AI streams.
@@ -915,8 +1634,56 @@ pub const AgentLoop = struct {
         return self.processInputWithImages(user_text, &.{}, text_cb, think_cb);
     }
 
-    /// Process user input with optional attached image blocks (RFC-011 Media Ingestion).
+    const TurnWorkerContext = struct {
+        agent: *AgentLoop,
+        user_text: []const u8,
+        images: []const proto.ImageBlock,
+        text_cb: ?*const fn ([]const u8) void,
+        think_cb: ?*const fn ([]const u8) void,
+        result: anyerror!void = {},
+    };
+
+    fn turnWorkerThreadEntry(ctx: *TurnWorkerContext) void {
+        ctx.result = ctx.agent.executeTurnWorker(
+            ctx.user_text,
+            ctx.images,
+            ctx.text_cb,
+            ctx.think_cb,
+        );
+    }
+
+    /// Process user input with optional attached image blocks (RFC-011 Media Ingestion, RFC-015 3-Thread Architecture).
     pub fn processInputWithImages(
+        self: *AgentLoop,
+        user_text: []const u8,
+        images: []const proto.ImageBlock,
+        text_cb: ?*const fn ([]const u8) void,
+        think_cb: ?*const fn ([]const u8) void,
+    ) !void {
+        self.coordinator.resetTurn();
+        defer self.coordinator.notifyTurnComplete();
+
+        // If inside subagent thread or child execution: execute directly
+        if (utils.isSubagent()) {
+            return self.executeTurnWorker(user_text, images, text_cb, think_cb);
+        }
+
+        var ctx = TurnWorkerContext{
+            .agent = self,
+            .user_text = user_text,
+            .images = images,
+            .text_cb = text_cb,
+            .think_cb = think_cb,
+        };
+
+        const worker_thread = try std.Thread.spawn(.{}, turnWorkerThreadEntry, .{&ctx});
+        worker_thread.join();
+
+        return ctx.result;
+    }
+
+    /// Concrete act execution running on Thread 3 (Act Executor).
+    pub fn executeTurnWorker(
         self: *AgentLoop,
         user_text: []const u8,
         images: []const proto.ImageBlock,
@@ -925,9 +1692,11 @@ pub const AgentLoop = struct {
     ) !void {
         g_active_agent = self;
         hooks_mod.setToolListener(&agentToolListener);
+        hooks_mod.setOutputListener(&agentOutputListener);
         defer {
             g_active_agent = null;
             hooks_mod.setToolListener(null);
+            hooks_mod.setOutputListener(null);
         }
 
         // Clear turn-level tool attachments
@@ -967,6 +1736,16 @@ pub const AgentLoop = struct {
         self.max_tokens_continues = 0;
         self.last_act_failed = false;
         self.js_retry_count = 0;
+        self.clearTurnToolRecords();
+        self.consecutive_dup_tool_count = 0;
+        self.consecutive_readonly_count = 0;
+        self.action_loop_tripped = false;
+        self.loop_plan_retries = 0;
+        self.plan_execution_pending = false;
+        self.plan_watchdog_retries = 0;
+        self.clearPlan();
+        self.clearProgress();
+        self.current_user_request = user_text;
 
         // Retrieve relevant tool definitions for user message based on execution_mode
         const tool_defs = switch (self.config.execution_mode) {
@@ -1002,8 +1781,8 @@ pub const AgentLoop = struct {
         var rate_limit_retries: usize = 0;
         const max_retries = 3;
 
-        // Unbounded acts — model decides when to stop (exit_loop).
-        while (true) : (act_id += 1) {
+        // Act loop — model decides when to stop (exit_loop). No hard cap on acts.
+        while (true) {
             self.last_turn_acts = act_id;
             var try_count: usize = 0;
 
@@ -1015,6 +1794,31 @@ pub const AgentLoop = struct {
                 const result = self.executeStep(act_id, tool_defs, text_cb, think_cb) catch |e| {
                     switch (e) {
                         error.Interrupted => {
+                            if (self.coordinator.isTimedOut()) {
+                                const timeout_ctx = self.coordinator.popPendingTimeoutContext();
+                                defer if (timeout_ctx) |ctx| self.alloc.free(ctx);
+                                const reason = if (timeout_ctx) |ctx| ctx else "Action timed out and was killed by Watchdog";
+
+                                if (main.ui_repl.current_renderer) |r| {
+                                    r.stopWaiting();
+                                    if (r.is_thinking) r.endThinking();
+                                    r.clearInplaceLine();
+                                    r.ensureNewline();
+                                    r.write(" \x1b[31m[Watchdog Timeout: Action terminated by LLM decision]\x1b[0m\n");
+                                } else {
+                                    main.stderrPrint("\n\x1b[31m[Watchdog Timeout: Action terminated by LLM decision: {s}]\x1b[0m\n", .{reason});
+                                }
+                                signals.setInterrupted(false);
+                                self.coordinator.setTimedOut(false);
+                                self.last_act_failed = true;
+
+                                const err_msg = try std.fmt.allocPrint(self.alloc, "[Watchdog Timeout]: The previous action timed out and was terminated (LLM decision: KILL). Reason: {s}. Please adjust your strategy or command.", .{reason});
+                                defer self.alloc.free(err_msg);
+                                try self.history.addUser(err_msg);
+                                self.coordinator.finishAct(act_id, false);
+                                break;
+                            }
+
                             if (main.ui_repl.current_renderer) |r| {
                                 r.stopWaiting();
                                 if (r.is_thinking) r.endThinking();
@@ -1212,20 +2016,68 @@ pub const AgentLoop = struct {
                     if (self.journal) |*j| {
                         j.recordActComplete(self.io, act_id, .{
                             .act_id = act_id,
-                            .file_snapshots = &.{}, 
+                            .file_snapshots = &.{},
                         }) catch {};
                     }
                 }
 
+                // Build progress summary from act results
+                {
+                    var pb = std.ArrayListUnmanaged(u8).empty;
+                    defer pb.deinit(self.alloc);
+                    // File changes
+                    if (self.snapshot_tracker) |*t| {
+                        for (t.tracked.items) |tf| {
+                            if (tf.previous_content_hash) |_| {
+                                const line = try std.fmt.allocPrint(self.alloc, "Modified: {s}\n", .{tf.path});
+                                defer self.alloc.free(line);
+                                pb.appendSlice(self.alloc, line) catch {};
+                            }
+                        }
+                        t.reset();
+                    }
+                    // Tool summary (last 5 unique tools used)
+                    if (self.turn_tool_records.items.len > 0) {
+                        var seen_tools: [5][]const u8 = undefined;
+                        var seen_count: usize = 0;
+                        const limit = @min(self.turn_tool_records.items.len, 5);
+                        for (self.turn_tool_records.items[self.turn_tool_records.items.len - limit ..]) |rec| {
+                            var is_dup = false;
+                            for (seen_tools[0..seen_count]) |st| {
+                                if (std.mem.eql(u8, st, rec.name)) {
+                                    is_dup = true;
+                                    break;
+                                }
+                            }
+                            if (is_dup) continue;
+                            if (seen_count < seen_tools.len) {
+                                seen_tools[seen_count] = rec.name;
+                                seen_count += 1;
+                            }
+                            const line = try std.fmt.allocPrint(self.alloc, "Tool: {s}\n", .{rec.name});
+                            defer self.alloc.free(line);
+                            pb.appendSlice(self.alloc, line) catch {};
+                        }
+                    }
+                    const summary = try pb.toOwnedSlice(self.alloc);
+                    self.updateProgress(summary);
+                    self.alloc.free(summary);
+                }
+
                 if (result == .exit_loop) {
                     if (self.journal) |*j| j.recordEvent(self.io, act_id, .task_completed, "Task completed") catch {};
+                    self.coordinator.finishAct(act_id, !self.last_act_failed);
+                    self.coordinator.notifyTurnComplete();
                     return;
                 }
-                break; 
+                self.coordinator.finishAct(act_id, !self.last_act_failed);
+                break;
             } else {
                 main.stderrPrint("\n\x1b[31m[agent] ⛔ Act {d} failed after {d} unrecoverable attempts. Terminating task.\x1b[0m\n", .{ act_id, max_retries + 1 });
+                self.coordinator.finishAct(act_id, false);
                 return error.ActRetryExhausted;
             }
+            act_id += 1;
         }
     }
 
@@ -1249,7 +2101,7 @@ pub const AgentLoop = struct {
                 .chat_completions => .chat_completions,
                 .responses => .responses,
             };
-            self.backend = .{ .openai = openai_mod.Client.initWithProtocol(
+            self.backend = .{ .openai = openai_mod.Client.initWithProvider(
                 self.alloc,
                 url,
                 cfg.openai_compat_key orelse "",
@@ -1257,7 +2109,9 @@ pub const AgentLoop = struct {
                 model_override orelse cfg.openai_compat_model,
                 cfg.max_tokens,
                 proto_mode,
+                cfg.openai_provider,
             ) };
+            self.backend.openai.provider_js = cfg.openai_provider_js;
         } else if (std.mem.eql(u8, backend_name, "claude")) {
             const key = cfg.anthropic_key orelse {
                 main.stderrPrint("[agent] ANTHROPIC_API_KEY is not configured\n", .{});
@@ -1353,7 +2207,19 @@ pub const AgentLoop = struct {
             r.startWaiting();
         }
 
-        // Primary backend
+        // Clear stale HTTP error context (e.g. a previous act's 429/400). Without
+        // this a transport failure below would be mis-attributed to that old
+        // status/body in the journal (see sendToBackend error handling).
+        self.clearLastErrorContext();
+
+        // Primary backend.
+        //
+        // Cross-provider fallback (e.g. OpenAI-compat -> Responses API, or
+        // vendor routing) is already handled *inside* the backend / provider
+        // abstraction layer (RFC-012), so there is no second Ollama attempt
+        // here. Blindly falling back to a local Ollama that is usually not
+        // running only added an extra failing round-trip and masked the real
+        // primary error in the journal.
         const primary = self.backend.send(system_prompt, msgs, tool_defs, text_cb, think_cb);
         if (primary) |resp| return resp else |e| {
             if (e == error.Interrupted or signals.isInterrupted()) {
@@ -1364,61 +2230,107 @@ pub const AgentLoop = struct {
                 if (r.is_thinking) r.endThinking();
                 r.ensureNewline();
             }
-            // Fallback: try Ollama if primary is not Ollama
-            main.stderrPrint("\n[agent] {s} error ({s}), trying Ollama...\n", .{ self.backend.name(), @errorName(e) });
-            if (self.backend != .ollama) {
-                if (main.ui_repl.current_renderer) |r| {
-                    r.startWaiting();
-                }
-                var fallback = ollama_mod.Client.init(
+            // Journal the transport/parse error using the PRIMARY backend's error
+            // name (previously this was recorded as the Ollama fallback's
+            // ConnectionRefused, which masked the true cause).
+            if (self.journal) |*j| {
+                const desc = std.fmt.allocPrint(
                     self.alloc,
-                    self.config.ollama_url,
-                    self.config.ollama_model,
-                    self.config.max_tokens,
-                );
-                if (fallback.sendMessage(system_prompt, msgs, tool_defs, text_cb, think_cb)) |resp| {
-                    main.stderrPrint("[agent] Ollama fallback succeeded\n", .{});
-                    // Journal: primary error (transport/parse — e.g. ReadFailed) but
-                    // fallback succeeded. Turn continues, but primary error is recorded
-                    // for debugging from journal (stderr is ephemeral).
-                    if (self.journal) |*j| {
-                        j.recordError(self.io, act_id, .llm_provider_error, "Primary backend error, fallback Ollama succeeded — continuing turn", .{
-                            .backend = self.backend.name(),
-                            .model = self.backend.model(),
-                            .error_name = @errorName(e),
-                            .http_code = self.last_backend_http_code,
-                            .attempt = 1,
-                            .raw_snippet = self.last_backend_raw_error,
-                        }) catch {};
-                    }
-                    return resp;
-                } else |fb_err| {
-                    if (main.ui_repl.current_renderer) |r| {
-                        r.stopWaiting();
-                        if (r.is_thinking) r.endThinking();
-                        r.ensureNewline();
-                    }
-                    // Journal: fallback also failed — record both errors for debugging
-                    // (primary + ollama fallback) in the same event.
-                    if (self.journal) |*j| {
-                        const desc = std.fmt.allocPrint(
-                            self.alloc,
-                            "Primary {s} error ({s}), fallback Ollama also failed ({s})",
-                            .{ self.backend.name(), @errorName(e), @errorName(fb_err) },
-                        ) catch "Primary + fallback both failed";
-                        defer self.alloc.free(desc);
-                        j.recordError(self.io, act_id, .llm_provider_error, desc, .{
-                            .backend = self.backend.name(),
-                            .model = self.backend.model(),
-                            .error_name = @errorName(fb_err),
-                            .attempt = 1,
-                            .raw_snippet = self.last_backend_raw_error,
-                        }) catch {};
-                    }
-                }
+                    "{s} backend error ({s})",
+                    .{ self.backend.name(), @errorName(e) },
+                ) catch "Backend error";
+                defer self.alloc.free(desc);
+                j.recordError(self.io, act_id, .llm_provider_error, desc, .{
+                    .backend = self.backend.name(),
+                    .model = self.backend.model(),
+                    .error_name = @errorName(e),
+                    .http_code = self.last_backend_http_code,
+                    .attempt = 1,
+                    .raw_snippet = self.last_backend_raw_error,
+                }) catch {};
             }
             return e;
         }
+    }
+
+    /// 1-call LLM consultation invoked by Thread 2 Watchdog on timeout.
+    /// Evaluates whether the long-running action is making valid progress (WAIT) or stuck/hung (KILL).
+    pub fn consultLlmOnTimeout(self: *AgentLoop, ctx: watchdog_mod.DecisionContext) watchdog_mod.TimeoutDecision {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const system_prompt =
+            \\You are the Watchdog Supervisor for mini-agent.
+            \\An action is taking longer than the configured timeout limit.
+            \\Your job is to analyze the action and output to decide if it is legitimately working (e.g. compiling, downloading, running a long test suite) or hung/frozen/waiting for input.
+        ;
+
+        var prompt_buf = utils.BufWriter.init(alloc);
+        prompt_buf.print(
+            \\Act {d} has been running action '{s}' for {d}s (timeout limit is {d}s).
+            \\
+            \\Recent execution output tail ({d} bytes):
+            \\```
+            \\{s}
+            \\```
+            \\
+            \\Determine whether this action is making legitimate forward progress that needs more time, OR is stuck, deadlocked, idling, or waiting on user input.
+            \\
+            \\Respond on the first line strictly with:
+            \\DECISION: WAIT <seconds> (e.g., DECISION: WAIT 60)
+            \\or
+            \\DECISION: KILL
+            \\
+            \\On the second line, provide a short 1-sentence reason:
+            \\REASON: <explanation>
+        , .{
+            ctx.act_id,
+            ctx.action_desc,
+            ctx.elapsed_s,
+            ctx.timeout_s,
+            ctx.log_tail.len,
+            ctx.log_tail,
+        }) catch {
+            return .{ .should_kill = false, .extend_seconds = 60 };
+        };
+
+        const blocks = [_]proto.ContentBlock{
+            .{ .text = prompt_buf.list.items },
+        };
+        const msgs = [_]proto.Message{
+            .{
+                .role = .user,
+                .content = &blocks,
+            },
+        };
+
+        var resp = self.backend.send(
+            system_prompt,
+            &msgs,
+            &[_]proto.ToolDefinition{},
+            null,
+            null,
+        ) catch |e| {
+            var fallback = watchdog_mod.TimeoutDecision{
+                .should_kill = false,
+                .extend_seconds = 30,
+            };
+            const err_msg = std.fmt.bufPrint(&fallback.reason_buf, "LLM decision call failed: {s}, safety wait 30s", .{@errorName(e)}) catch "LLM decision failed";
+            fallback.reason_len = err_msg.len;
+            return fallback;
+        };
+        defer resp.deinit();
+
+        var full_text = utils.BufWriter.init(alloc);
+        for (resp.content.items) |block| {
+            switch (block) {
+                .text => |t| full_text.writeAll(t) catch {},
+                else => {},
+            }
+        }
+
+        return parseTimeoutDecision(full_text.list.items);
     }
 
     /// Performs context compaction (MemAct compaction) when model returns context limit error.
@@ -1506,25 +2418,211 @@ pub const AgentLoop = struct {
         }
     }
 
-    /// Executes all tool_use blocks in response.
+    /// Execution summary returned by executeTools for act debug logging.
+    pub const ToolExecSummary = struct {
+        any_tool_err: bool,
+        total_dur_ms: u64,
+        tool_count: usize,
+    };
 
-    fn executeTools(self: *AgentLoop, act_id: usize, response: *const proto.Response) !void {
-        _ = act_id;
+    /// Synthesizes `tool_result` blocks (is_error=true) for tool_use blocks present
+    /// in a truncated/aborted response. Those tool calls were recorded in history
+    /// via addAssistantResponse but will never be executed — without a matching
+    /// result the model tends to replay the entire call from scratch. Marking them
+    /// as "interrupted" closes the protocol loop and steers the model to continue
+    /// from where it stopped instead.
+    fn closeOrphanedToolUses(self: *AgentLoop, response: *const proto.Response) !void {
+        var results = ArrayList(proto.ToolResult).empty;
+        defer results.deinit(self.alloc);
+        var allocated = ArrayList([]u8).empty;
+        defer {
+            for (allocated.items) |s| self.alloc.free(s);
+            allocated.deinit(self.alloc);
+        }
+        for (response.content.items) |block| {
+            switch (block) {
+                .tool_use => |tu| {
+                    const msg = try std.fmt.allocPrint(
+                        self.alloc,
+                        "[interrupted: this tool call was truncated before execution — do NOT re-issue it; continue from where the response stopped]",
+                        .{},
+                    );
+                    try allocated.append(self.alloc, msg);
+                    try results.append(self.alloc, .{
+                        .tool_use_id = tu.id,
+                        .content = msg,
+                        .is_error = true,
+                    });
+                },
+                else => {},
+            }
+        }
+        if (results.items.len > 0) {
+            try self.history.addToolResults(results.items);
+        }
+    }
+
+    /// Executes all tool_use blocks in response.
+    /// Returns execution summary for act debug logging.
+
+    fn executeTools(self: *AgentLoop, act_id: usize, response: *const proto.Response) !ToolExecSummary {
         var any_tool_err = false;
         var results = ArrayList(proto.ToolResult).empty;
         defer results.deinit(self.alloc);
-        
+
         var allocated_strings = ArrayList([]u8).empty;
         defer {
             for (allocated_strings.items) |s| self.alloc.free(s);
             allocated_strings.deinit(self.alloc);
         }
+        var total_dur_ms: u64 = 0;
+        var tool_count: usize = 0;
 
         for (response.content.items) |block| {
             if (signals.isInterrupted()) return error.Interrupted;
             switch (block) {
                 .tool_use => |tu| {
+                    const loop_check = self.checkActionLoop(tu.name, tu.input_json) catch .allow;
+                    if (loop_check == .trip) {
+                        const trip_reason_str = switch (self.last_loop_reason) {
+                            .macro_cycle_2 => "alternating tool loop (A ↔ B) repeated",
+                            .macro_cycle_3 => "3-step tool cycle (A → B → C) repeated",
+                            .orbit_cycle => "closed orbit in 3D procedural map repeated",
+                            .readonly_budget => "read-only exploratory budget exceeded without code mutation",
+                            else => "called repeatedly with identical parameters",
+                        };
+
+                        if (self.loop_plan_retries < 2) {
+                            self.loop_plan_retries += 1;
+                            self.plan_execution_pending = true;
+                            main.stderrPrint(
+                                "\n\x1b[33m[agent] ⚠️ Action loop detected: {s}. Requesting model to formulate plan and execute next step.\x1b[0m\n",
+                                .{trip_reason_str},
+                            );
+                            if (main.ui_repl.current_renderer) |r| {
+                                r.ensureNewline();
+                                r.write(" \x1b[33m[Action Loop Checkpoint: Requesting Plan & Execution]\x1b[0m\n");
+                            }
+                            if (self.journal) |*j| {
+                                j.recordEvent(self.io, act_id, .checkpoint_created, "Action loop detected - requesting plan & execution") catch {};
+                            }
+                            const trip_msg = switch (self.last_loop_reason) {
+                                .orbit_cycle, .macro_cycle_2, .macro_cycle_3 => blk: {
+                                    var mbw = utils.BufWriter.init(self.alloc);
+                                    errdefer mbw.deinit();
+                                    mbw.writeAll("[Action Loop Checkpoint & Trajectory Recap]\n") catch {};
+                                    mbw.print("📍 Waypoint: Action loop detected ({s}).\n", .{trip_reason_str}) catch {};
+                                    mbw.writeAll("🗺️ Trajectory Scouted: ") catch {};
+                                    for (self.turn_tool_trajectory.items, 0..) |tn, i| {
+                                        if (i > 0) mbw.writeAll(" → ") catch {};
+                                        mbw.print("`{s}`", .{tn}) catch {};
+                                    }
+                                    mbw.writeAll("\n⚠️ Exploration has circled in place without forward progress (ΔZ = 0).\n") catch {};
+                                    mbw.writeAll("Consider a different approach for the next step if appropriate.\n") catch {};
+                                    break :blk try mbw.toOwnedSlice();
+                                },
+                                .readonly_budget => try std.fmt.allocPrint(
+                                    self.alloc,
+                                    "[Action Loop Checkpoint & Trajectory Recap]\n📍 Waypoint: Read-only exploratory budget exceeded ({d} consecutive search/read actions without mutation).\n\n[Exploration Advisory (Optional Suggestions)]\nCurrent Action: read-only exploration\nObservation: Sufficient context gathered.\n⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed directly to modifying code or concluding.",
+                                    .{self.consecutive_readonly_count},
+                                ),
+                                else => try std.fmt.allocPrint(
+                                    self.alloc,
+                                    "[Action Loop Checkpoint & Trajectory Recap]\n📍 Waypoint: Repeated invocation of '{s}' with identical parameters.\n\n[Tool Call Advisory (Optional Suggestions)]\nCurrent Action: `{s}`\nObservation: Already invoked with identical arguments. Data is in context.\n⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed directly to modifying code or concluding.",
+                                    .{ tu.name, tu.name },
+                                ),
+                            };
+                            try allocated_strings.append(self.alloc, trip_msg);
+                            try results.append(self.alloc, .{
+                                .tool_use_id = tu.id,
+                                .content = trip_msg,
+                                .is_error = true,
+                            });
+                            self.action_loop_tripped = false;
+                            self.consecutive_dup_tool_count = 0;
+                            break;
+                        } else {
+                            main.stderrPrint(
+                                "\n\x1b[33m[agent] ⚠️ Action loop persisted after replanning attempts: {s}. Halting turn.\x1b[0m\n",
+                                .{trip_reason_str},
+                            );
+                            if (main.ui_repl.current_renderer) |r| {
+                                r.ensureNewline();
+                                r.write(" \x1b[33m[Action loop persisted: halting turn]\x1b[0m\n");
+                            }
+                            const trip_msg = try std.fmt.allocPrint(
+                                self.alloc,
+                                "[Action Loop Halt]: Action loop persisted after multiple replanning requests ({s}). Execution paused. Please explain your status and request user guidance.",
+                                .{trip_reason_str},
+                            );
+                            try allocated_strings.append(self.alloc, trip_msg);
+                            try results.append(self.alloc, .{
+                                .tool_use_id = tu.id,
+                                .content = trip_msg,
+                                .is_error = true,
+                            });
+                            self.action_loop_tripped = true;
+                            break;
+                        }
+                    }
+
+                    var warn_suffix: ?[]u8 = null;
+                    defer if (warn_suffix) |w| self.alloc.free(w);
+                    if (loop_check == .warn) {
+                        warn_suffix = switch (self.last_loop_reason) {
+                            .orbit_cycle, .macro_cycle_2, .macro_cycle_3 => std.fmt.allocPrint(
+                                self.alloc,
+                                "\n\n[3D Procedural Map Advisory: Orbit Checkpoint & Recap]\n⚠️ Trajectory Orbit Detected: You are circling around already-scouted nodes in procedural space. If you have gathered sufficient context, consider whether further exploration is needed or if you may proceed to conclude.",
+                                .{},
+                            ) catch null,
+                            .readonly_budget => std.fmt.allocPrint(
+                                self.alloc,
+                                "\n\n[System Advisory]: You have performed {d} consecutive read-only exploratory actions. If you have gathered sufficient information, proceed to take action or synthesize your response.",
+                                .{self.consecutive_readonly_count},
+                            ) catch null,
+                            else => std.fmt.allocPrint(
+                                self.alloc,
+                                "\n\n[System Advisory]: Action loop detected. You have called '{s}' with identical arguments multiple times. You already have this data in your context. If you feel you have enough information, you may synthesize your findings and respond to the user.",
+                                .{tu.name},
+                            ) catch null,
+                        };
+                    }
+
+                    // Plan completion: non-exploratory tool call means the model is executing its plan.
+                    if (self.plan_active and !isPlanOnlyRequest(self.current_user_request) and
+                        !isExploratoryToolCall(tu.name, tu.input_json))
+                    {
+                        self.clearPlan();
+                    }
+
+                    // Hard dedupe barrier: serve cached result for repeated read-only
+                    // calls instead of re-executing (prevents mechanical replay loops;
+                    // model sees identical data without redundant execution).
+                    if (isReadOnlyTool(tu.name)) {
+                        const cache_hash = fuzzyArgsHash(tu.input_json);
+                        if (self.lookupToolCache(tu.name, cache_hash)) |cached| {
+                            main.stderrPrint(
+                                "\x1b[33m[duplicate: serving cached result]\x1b[0m\n",
+                                .{},
+                            );
+                            const note = try std.fmt.allocPrint(
+                                self.alloc,
+                                "[duplicate: identical call already executed this turn — cached result below]\n{s}",
+                                .{cached},
+                            );
+                            try allocated_strings.append(self.alloc, note);
+                            try results.append(self.alloc, .{
+                                .tool_use_id = tu.id,
+                                .content = note,
+                                .is_error = false,
+                            });
+                            tool_count += 1;
+                            continue;
+                        }
+                    }
+
                     const start_tool_ms = utils.milliTimestamp();
+                    self.coordinator.updateStatus(act_id, .executing_tool, tu.name);
                     if (main.ui_repl.current_renderer) |r| {
                         r.startTool(tu.name, tu.input_json);
                     } else {
@@ -1550,14 +2648,6 @@ pub const AgentLoop = struct {
                         }
                     }
 
-                    // Dispatch pre-tool-use hook
-                    hooks_mod.dispatch(self.alloc, self.io, .{
-                        .event = "pre-tool-use",
-                        .tool_id = tu.id,
-                        .tool_name = tu.name,
-                        .input_json = tu.input_json,
-                    });
-
                     // Snapshot file if editing tool
                     if (std.mem.eql(u8, tu.name, "file_edit") or std.mem.eql(u8, tu.name, "file_write")) {
                         if (json_mod.findString(tu.input_json, "path")) |path| {
@@ -1580,24 +2670,37 @@ pub const AgentLoop = struct {
                     const max_tool_result = 64 * 1024;
                     const truncated = if (result.len > max_tool_result) result[0..max_tool_result] else result;
 
-                    // Dispatch post-tool-use hook
-                    hooks_mod.dispatch(self.alloc, self.io, .{
-                        .event = "post-tool-use",
-                        .tool_id = tu.id,
-                        .tool_name = tu.name,
-                        .input_json = tu.input_json,
-                        .tool_result = truncated,
-                        .is_error = is_err,
-                    });
+                    var merged_suffix = utils.BufWriter.init(self.alloc);
+                    defer merged_suffix.deinit();
+                    if (warn_suffix) |ws| try merged_suffix.writeAll(ws);
+
+                    const final_content = if (merged_suffix.list.items.len > 0) blk: {
+                        const merged = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ truncated, merged_suffix.list.items });
+                        try allocated_strings.append(self.alloc, merged);
+                        break :blk merged;
+                    } else truncated;
 
                     try results.append(self.alloc, .{
                         .tool_use_id = tu.id,
-                        .content = truncated,
+                        .content = final_content,
                         .is_error = is_err,
                     });
+                    // Cache successful read-only results for the dedupe barrier.
+                    if (!is_err and isReadOnlyTool(tu.name)) {
+                        self.storeToolCache(tu.name, fuzzyArgsHash(tu.input_json), truncated) catch {};
+                    }
+                    if (!is_err) {
+                        self.loop_plan_retries = 0;
+                        self.plan_execution_pending = false;
+                        if (!isExploratoryToolCall(tu.name, tu.input_json)) {
+                            self.clearPlan();
+                        }
+                    }
 
                     const end_tool_ms = utils.milliTimestamp();
                     const dur_ms = if (end_tool_ms >= start_tool_ms) @as(u64, @intCast(end_tool_ms - start_tool_ms)) else 0;
+                    total_dur_ms += dur_ms;
+                    tool_count += 1;
 
                     if (main.ui_repl.current_renderer) |r| {
                         var patch_path: ?[]const u8 = null;
@@ -1629,6 +2732,11 @@ pub const AgentLoop = struct {
             }
         }
         self.last_act_failed = any_tool_err;
+        return ToolExecSummary{
+            .any_tool_err = any_tool_err,
+            .total_dur_ms = total_dur_ms,
+            .tool_count = tool_count,
+        };
     }
 };
 
@@ -1775,6 +2883,85 @@ pub fn findJsCodeInResponse(alloc: Allocator, response: *const proto.Response) ?
     return null;
 }
 
+/// Parses LLM response into a structured TimeoutDecision.
+pub fn parseTimeoutDecision(text: []const u8) watchdog_mod.TimeoutDecision {
+    var decision = watchdog_mod.TimeoutDecision{
+        .should_kill = false,
+        .extend_seconds = 60,
+    };
+
+    var line_it = std.mem.splitScalar(u8, text, '\n');
+    var found_decision = false;
+
+    while (line_it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \r\t*#_`");
+        if (line.len == 0) continue;
+
+        if (!found_decision) {
+            // Check for KILL
+            if (std.ascii.indexOfIgnoreCase(line, "KILL") != null) {
+                // Ensure it's not saying "DO NOT KILL" or "DON'T KILL"
+                if (std.ascii.indexOfIgnoreCase(line, "NOT KILL") == null and
+                    std.ascii.indexOfIgnoreCase(line, "DON'T KILL") == null and
+                    std.ascii.indexOfIgnoreCase(line, "DONT KILL") == null)
+                {
+                    decision.should_kill = true;
+                    found_decision = true;
+                    continue;
+                }
+            }
+
+            // Check for WAIT
+            if (std.ascii.indexOfIgnoreCase(line, "WAIT") != null) {
+                decision.should_kill = false;
+                found_decision = true;
+
+                // Look for optional seconds after WAIT
+                var word_it = std.mem.tokenizeAny(u8, line, " :,\t*#_`");
+                while (word_it.next()) |w| {
+                    if (std.ascii.eqlIgnoreCase(w, "wait")) {
+                        if (word_it.next()) |num_str| {
+                            const digits_end = for (num_str, 0..) |c, i| {
+                                if (c < '0' or c > '9') break i;
+                            } else num_str.len;
+                            if (digits_end > 0) {
+                                if (std.fmt.parseInt(u32, num_str[0..digits_end], 10)) |secs| {
+                                    decision.extend_seconds = std.math.clamp(secs, 10, 300);
+                                } else |_| {}
+                            }
+                        }
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+
+        // Check for REASON
+        if (std.ascii.startsWithIgnoreCase(line, "REASON:") or std.ascii.startsWithIgnoreCase(line, "REASON :")) {
+            const colon_idx = std.mem.indexOfScalar(u8, line, ':') orelse 0;
+            const r = std.mem.trim(u8, line[colon_idx + 1 ..], " \t*#_`");
+            const copy_len = @min(r.len, decision.reason_buf.len);
+            @memcpy(decision.reason_buf[0..copy_len], r[0..copy_len]);
+            decision.reason_len = copy_len;
+            break;
+        } else if (found_decision and decision.reason_len == 0) {
+            const copy_len = @min(line.len, decision.reason_buf.len);
+            @memcpy(decision.reason_buf[0..copy_len], line[0..copy_len]);
+            decision.reason_len = copy_len;
+        }
+    }
+
+    if (decision.reason_len == 0) {
+        const default_reason = if (decision.should_kill) "Action declared hung by LLM supervisor" else "Action granted extended execution time by LLM supervisor";
+        const copy_len = @min(default_reason.len, decision.reason_buf.len);
+        @memcpy(decision.reason_buf[0..copy_len], default_reason[0..copy_len]);
+        decision.reason_len = copy_len;
+    }
+
+    return decision;
+}
+
 
 test "agent - extractJsCodeBlock" {
     const alloc = std.testing.allocator;
@@ -1809,4 +2996,472 @@ test "agent - convertXmlToolTagsToJs" {
     try std.testing.expect(std.mem.indexOf(u8, js.?, "mini.read") != null);
     try std.testing.expect(std.mem.indexOf(u8, js.?, "mini.glob") != null);
 }
+
+test "agent - checkActionLoop consecutive identical tool calls" {
+    const alloc = std.testing.allocator;
+    var cfg: config_mod.Config = undefined;
+    cfg.action_loop_consecutive_cap = 3;
+    cfg.action_loop_window_cap = 4;
+    cfg.action_loop_readonly_warn_cap = 5;
+    cfg.action_loop_readonly_trip_cap = 10;
+    cfg.action_loop_macro_cycle_cap = 2;
+    cfg.action_loop_orbit_cap = 2;
+
+    var agent: AgentLoop = undefined;
+    agent.alloc = alloc;
+    agent.config = &cfg;
+    agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
+    agent.turn_tool_trajectory = .empty;
+    agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
+    agent.action_loop_tripped = false;
+    defer agent.deinitTurnToolRecords();
+
+    // Call 1: first time -> allow
+    const res1 = try agent.checkActionLoop("bash", "{\"command\":\"ls -la\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.allow, res1);
+    try std.testing.expectEqual(@as(usize, 1), agent.consecutive_dup_tool_count);
+    try std.testing.expect(!agent.action_loop_tripped);
+
+    // Call 2: second consecutive identical call -> warn
+    const res2 = try agent.checkActionLoop("bash", "{\"command\":\"ls -la\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.warn, res2);
+    try std.testing.expectEqual(@as(usize, 2), agent.consecutive_dup_tool_count);
+    try std.testing.expect(!agent.action_loop_tripped);
+
+    // Call 3: third consecutive identical call -> trip circuit breaker!
+    const res3 = try agent.checkActionLoop("bash", "{\"command\":\"ls -la\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.trip, res3);
+    try std.testing.expectEqual(@as(usize, 3), agent.consecutive_dup_tool_count);
+    try std.testing.expect(agent.action_loop_tripped);
+}
+
+test "agent - checkActionLoop different commands reset consecutive count" {
+    const alloc = std.testing.allocator;
+    var cfg: config_mod.Config = undefined;
+    cfg.action_loop_consecutive_cap = 3;
+    cfg.action_loop_window_cap = 4;
+    cfg.action_loop_readonly_warn_cap = 5;
+    cfg.action_loop_readonly_trip_cap = 10;
+    cfg.action_loop_macro_cycle_cap = 2;
+    cfg.action_loop_orbit_cap = 2;
+
+    var agent: AgentLoop = undefined;
+    agent.alloc = alloc;
+    agent.config = &cfg;
+    agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
+    agent.turn_tool_trajectory = .empty;
+    agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
+    agent.action_loop_tripped = false;
+    defer agent.deinitTurnToolRecords();
+
+    // Call 1
+    _ = try agent.checkActionLoop("file_read", "{\"path\":\"a.txt\"}");
+    try std.testing.expectEqual(@as(usize, 1), agent.consecutive_dup_tool_count);
+
+    // Call 2: different command
+    const res = try agent.checkActionLoop("file_read", "{\"path\":\"b.txt\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.allow, res);
+    try std.testing.expectEqual(@as(usize, 1), agent.consecutive_dup_tool_count);
+    try std.testing.expect(!agent.action_loop_tripped);
+}
+
+test "agent - checkActionLoop windowed repetition detection" {
+    const alloc = std.testing.allocator;
+    var cfg: config_mod.Config = undefined;
+    cfg.action_loop_consecutive_cap = 3;
+    cfg.action_loop_window_cap = 4;
+    cfg.action_loop_readonly_warn_cap = 5;
+    cfg.action_loop_readonly_trip_cap = 10;
+    cfg.action_loop_macro_cycle_cap = 2;
+    cfg.action_loop_orbit_cap = 2;
+
+    var agent: AgentLoop = undefined;
+    agent.alloc = alloc;
+    agent.config = &cfg;
+    agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
+    agent.turn_tool_trajectory = .empty;
+    agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
+    agent.action_loop_tripped = false;
+    defer agent.deinitTurnToolRecords();
+
+    // Alternating calls with same tool name ("bash"): A, B, A, B, A, B, A
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"cat SKILL.md\"}");
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"ls\"}");
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"cat SKILL.md\"}");
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"ls\"}");
+
+    // A3 -> 3rd occurrence in sliding window -> warn!
+    const res_a3 = try agent.checkActionLoop("bash", "{\"command\":\"cat SKILL.md\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.warn, res_a3);
+
+    // B3 -> 3rd occurrence in sliding window -> warn!
+    const res_b3 = try agent.checkActionLoop("bash", "{\"command\":\"ls\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.warn, res_b3);
+
+    // A4 -> 4th occurrence in sliding window -> trip!
+    const res_a4 = try agent.checkActionLoop("bash", "{\"command\":\"cat SKILL.md\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.trip, res_a4);
+    try std.testing.expect(agent.action_loop_tripped);
+}
+
+test "agent - checkActionLoop 2-cycle alternating tool names detection" {
+    const alloc = std.testing.allocator;
+    var cfg: config_mod.Config = undefined;
+    cfg.action_loop_consecutive_cap = 5;
+    cfg.action_loop_window_cap = 8;
+    cfg.action_loop_readonly_warn_cap = 10;
+    cfg.action_loop_readonly_trip_cap = 20;
+    cfg.action_loop_macro_cycle_cap = 2;
+    cfg.action_loop_orbit_cap = 4;
+
+    var agent: AgentLoop = undefined;
+    agent.alloc = alloc;
+    agent.config = &cfg;
+    agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
+    agent.turn_tool_trajectory = .empty;
+    agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
+    agent.action_loop_tripped = false;
+    defer agent.deinitTurnToolRecords();
+
+    // Sequence: grep(q1) -> bash(c1) -> grep(q2) -> bash(c2)
+    // Note: parameters are DIFFERENT so argument hashes never repeat!
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"fn foo\"}");
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"zig build test\"}");
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"fn bar\"}");
+
+    // 4th step: 2 full cycles of [grep, bash] -> warn!
+    const res4 = try agent.checkActionLoop("bash", "{\"command\":\"zig build run\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.warn, res4);
+    try std.testing.expectEqual(AgentLoop.LoopReason.macro_cycle_2, agent.last_loop_reason);
+    try std.testing.expect(!agent.action_loop_tripped);
+
+    // Cycle 3: grep(q3) -> bash(c3)
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"fn baz\"}");
+    const res6 = try agent.checkActionLoop("bash", "{\"command\":\"zig build test\"}");
+    // 3 full cycles of alternating tools -> trip!
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.trip, res6);
+    try std.testing.expectEqual(AgentLoop.LoopReason.macro_cycle_2, agent.last_loop_reason);
+    try std.testing.expect(agent.action_loop_tripped);
+}
+
+test "agent - checkActionLoop 3-cycle macro sequence detection" {
+    const alloc = std.testing.allocator;
+    var cfg: config_mod.Config = undefined;
+    cfg.action_loop_consecutive_cap = 5;
+    cfg.action_loop_window_cap = 8;
+    cfg.action_loop_readonly_warn_cap = 10;
+    cfg.action_loop_readonly_trip_cap = 20;
+    cfg.action_loop_macro_cycle_cap = 2;
+    cfg.action_loop_orbit_cap = 4;
+
+    var agent: AgentLoop = undefined;
+    agent.alloc = alloc;
+    agent.config = &cfg;
+    agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
+    agent.turn_tool_trajectory = .empty;
+    agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
+    agent.action_loop_tripped = false;
+    defer agent.deinitTurnToolRecords();
+
+    // Real-world scenario from session 63448:
+    // Cycle 1: bash -> grep -> file_read
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"zig build test\"}");
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"TurnRenderer\"}");
+    _ = try agent.checkActionLoop("file_read", "{\"path\":\"src/ui/chat_stream.zig\"}");
+
+    // Cycle 2: bash -> grep -> file_read (distinct query & path arguments)
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"zig build test-unit\"}");
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"deduplication\"}");
+
+    // 6th step: completes 2 full cycles of [bash, grep, file_read] -> warn!
+    const res6 = try agent.checkActionLoop("file_read", "{\"path\":\"testcases/test_backend.zig\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.warn, res6);
+    try std.testing.expectEqual(AgentLoop.LoopReason.macro_cycle_3, agent.last_loop_reason);
+    try std.testing.expect(!agent.action_loop_tripped);
+
+    // Cycle 3: bash -> grep -> file_read
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"./test_run\"}");
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"assert\"}");
+    const res9 = try agent.checkActionLoop("file_read", "{\"path\":\"src/main.zig\"}");
+    // 3 full cycles -> trip circuit breaker!
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.trip, res9);
+    try std.testing.expectEqual(AgentLoop.LoopReason.macro_cycle_3, agent.last_loop_reason);
+    try std.testing.expect(agent.action_loop_tripped);
+}
+
+test "agent - checkActionLoop read-only exploratory budget and mutation reset" {
+    const alloc = std.testing.allocator;
+    var cfg: config_mod.Config = undefined;
+    cfg.action_loop_consecutive_cap = 5;
+    cfg.action_loop_window_cap = 8;
+    cfg.action_loop_readonly_warn_cap = 3;
+    cfg.action_loop_readonly_trip_cap = 5;
+    cfg.action_loop_macro_cycle_cap = 4;
+    cfg.action_loop_orbit_cap = 4;
+
+    var agent: AgentLoop = undefined;
+    agent.alloc = alloc;
+    agent.config = &cfg;
+    agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
+    agent.turn_tool_trajectory = .empty;
+    agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
+    agent.action_loop_tripped = false;
+    defer agent.deinitTurnToolRecords();
+
+    // Read 1: allow
+    _ = try agent.checkActionLoop("file_read", "{\"path\":\"a.txt\"}");
+    try std.testing.expectEqual(@as(usize, 1), agent.consecutive_readonly_count);
+
+    // Read 2: allow
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"foo\"}");
+    try std.testing.expectEqual(@as(usize, 2), agent.consecutive_readonly_count);
+
+    // Read 3: hits readonly_warn_cap (3) -> warn!
+    const res3 = try agent.checkActionLoop("glob", "{\"pattern\":\"*.zig\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.warn, res3);
+    try std.testing.expectEqual(AgentLoop.LoopReason.readonly_budget, agent.last_loop_reason);
+    try std.testing.expectEqual(@as(usize, 3), agent.consecutive_readonly_count);
+    try std.testing.expect(!agent.action_loop_tripped);
+
+    // Mutating action: file_edit -> resets consecutive_readonly_count to 0!
+    const res_edit = try agent.checkActionLoop("file_edit", "{\"path\":\"a.txt\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.allow, res_edit);
+    try std.testing.expectEqual(@as(usize, 0), agent.consecutive_readonly_count);
+
+    // Read-only counter increments again
+    _ = try agent.checkActionLoop("file_read", "{\"path\":\"b.txt\"}");
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"bar\"}");
+    _ = try agent.checkActionLoop("glob", "{\"pattern\":\"*.zig\"}");
+    _ = try agent.checkActionLoop("list_dir", "{\"path\":\"src\"}");
+    // 5th read-only tool in a row -> hits readonly_warn_cap (3) -> warns, but does NOT trip circuit breaker
+    const res_warn = try agent.checkActionLoop("session_diagnostics", "{}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.warn, res_warn);
+    try std.testing.expectEqual(AgentLoop.LoopReason.readonly_budget, agent.last_loop_reason);
+    try std.testing.expect(!agent.action_loop_tripped);
+
+    // Non-readonly action (e.g. bash test command) resets consecutive_readonly_count to 0!
+    const res_bash = try agent.checkActionLoop("bash", "{\"command\":\"zig build test\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.allow, res_bash);
+    try std.testing.expectEqual(@as(usize, 0), agent.consecutive_readonly_count);
+}
+
+test "agent - checkActionLoop 3D procedural map orbit detection and checkpoint trip" {
+    const alloc = std.testing.allocator;
+    var cfg: config_mod.Config = undefined;
+    cfg.action_loop_consecutive_cap = 10;
+    cfg.action_loop_window_cap = 10;
+    cfg.action_loop_readonly_warn_cap = 10;
+    cfg.action_loop_readonly_trip_cap = 20;
+    cfg.action_loop_macro_cycle_cap = 5;
+    cfg.action_loop_orbit_cap = 2;
+
+    var agent: AgentLoop = undefined;
+    agent.alloc = alloc;
+    agent.config = &cfg;
+    agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
+    agent.turn_tool_trajectory = .empty;
+    agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
+    agent.action_loop_tripped = false;
+    defer agent.deinitTurnToolRecords();
+
+    // Orbit 1: bash -> grep -> file_read
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"zig build test\"}");
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"foo\"}");
+    _ = try agent.checkActionLoop("file_read", "{\"path\":\"a.zig\"}");
+
+    // Orbit 1 closes: bash (matches bash 3 steps ago) -> orbit detected (rev 1) -> warn!
+    const res_orbit1 = try agent.checkActionLoop("bash", "{\"command\":\"zig build test-unit\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.warn, res_orbit1);
+    try std.testing.expectEqual(AgentLoop.LoopReason.orbit_cycle, agent.last_loop_reason);
+    try std.testing.expect(!agent.action_loop_tripped);
+
+    // Orbit 2 continues: grep -> file_read
+    _ = try agent.checkActionLoop("grep", "{\"query\":\"bar\"}");
+    _ = try agent.checkActionLoop("file_read", "{\"path\":\"b.zig\"}");
+
+    // Orbit 2 closes: bash -> revolutions = 2 reaches action_loop_orbit_cap (2) -> trip!
+    const res_orbit2 = try agent.checkActionLoop("bash", "{\"command\":\"zig build test\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.trip, res_orbit2);
+    try std.testing.expectEqual(AgentLoop.LoopReason.orbit_cycle, agent.last_loop_reason);
+    try std.testing.expect(agent.action_loop_tripped);
+}
+
+test "agent - action loop recovery via plan and execute" {
+    const alloc = std.testing.allocator;
+    var cfg: config_mod.Config = undefined;
+    cfg.action_loop_consecutive_cap = 2;
+    cfg.action_loop_window_cap = 10;
+    cfg.action_loop_readonly_warn_cap = 10;
+    cfg.action_loop_readonly_trip_cap = 20;
+    cfg.action_loop_macro_cycle_cap = 5;
+    cfg.action_loop_orbit_cap = 5;
+
+    var agent: AgentLoop = undefined;
+    agent.alloc = alloc;
+    agent.config = &cfg;
+    agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
+    agent.turn_tool_trajectory = .empty;
+    agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
+    agent.action_loop_tripped = false;
+    agent.loop_plan_retries = 0;
+    agent.plan_execution_pending = false;
+    defer agent.deinitTurnToolRecords();
+
+    // Call 1: first time
+    _ = try agent.checkActionLoop("bash", "{\"command\":\"ls\"}");
+    try std.testing.expectEqual(@as(usize, 0), agent.loop_plan_retries);
+
+    // Call 2: reaches cap -> trip
+    const res = try agent.checkActionLoop("bash", "{\"command\":\"ls\"}");
+    try std.testing.expectEqual(AgentLoop.LoopCheckResult.trip, res);
+    try std.testing.expect(agent.action_loop_tripped);
+
+    // Simulate recovery logic in executeTools:
+    // First trip: request plan & execution instead of halting
+    if (agent.loop_plan_retries < 2) {
+        agent.loop_plan_retries += 1;
+        agent.plan_execution_pending = true;
+        agent.action_loop_tripped = false; // Turn continues!
+        agent.consecutive_dup_tool_count = 0;
+    }
+    try std.testing.expectEqual(@as(usize, 1), agent.loop_plan_retries);
+    try std.testing.expect(agent.plan_execution_pending);
+    try std.testing.expect(!agent.action_loop_tripped);
+
+    // Model executes mutation tool (file_edit) -> recovery succeeds!
+    agent.loop_plan_retries = 0;
+    agent.plan_execution_pending = false;
+    try std.testing.expectEqual(@as(usize, 0), agent.loop_plan_retries);
+    try std.testing.expect(!agent.plan_execution_pending);
+}
+
+test "agent - plan watchdog enforcement and procrastination intercept" {
+    const alloc = std.testing.allocator;
+    var cfg: config_mod.Config = undefined;
+    cfg.action_loop_consecutive_cap = 5;
+    cfg.action_loop_window_cap = 8;
+    cfg.action_loop_readonly_warn_cap = 5;
+    cfg.action_loop_readonly_trip_cap = 10;
+    cfg.action_loop_macro_cycle_cap = 4;
+    cfg.action_loop_orbit_cap = 4;
+
+    var agent: AgentLoop = undefined;
+    agent.alloc = alloc;
+    agent.config = &cfg;
+    agent.turn_tool_records = .empty;
+    agent.tool_cache = .empty;
+    agent.turn_tool_trajectory = .empty;
+    agent.consecutive_dup_tool_count = 0;
+    agent.consecutive_readonly_count = 0;
+    agent.last_loop_reason = .none;
+    agent.action_loop_tripped = false;
+    agent.plan_active = false;
+    agent.plan_summary_len = 0;
+    agent.plan_procrastination_count = 0;
+    agent.plan_procrastination_cap = 2;
+    agent.current_user_request = null;
+    defer agent.deinitTurnToolRecords();
+
+    // 1. Detect plan in Vietnamese text
+    const vn_plan = AgentLoop.detectPlanInText("Đúng rồi, tôi sẽ implement fix cho bug này bằng cách thêm guard.");
+    try std.testing.expect(vn_plan != null);
+    agent.setPlan(vn_plan.?);
+    try std.testing.expect(agent.plan_active);
+    try std.testing.expectEqual(@as(usize, 0), agent.plan_procrastination_count);
+
+    // 2. Exploratory tool call detection
+    try std.testing.expect(AgentLoop.isExploratoryToolCall("file_read", "{\"path\":\"src/core/agent.zig\"}"));
+    try std.testing.expect(AgentLoop.isExploratoryToolCall("grep", "{\"query\":\"plan\"}"));
+    try std.testing.expect(AgentLoop.isExploratoryToolCall("bash", "{\"command\":\"cat src/core/agent.zig\"}"));
+    try std.testing.expect(AgentLoop.isExploratoryToolCall("bash", "{\"command\":\"sed -n '1,10p' file\"}"));
+    try std.testing.expect(!AgentLoop.isExploratoryToolCall("bash", "{\"command\":\"sed -i 's/a/b/g' file\"}"));
+    try std.testing.expect(!AgentLoop.isExploratoryToolCall("bash", "{\"command\":\"zig build test\"}"));
+    try std.testing.expect(!AgentLoop.isExploratoryToolCall("file_edit", "{\"path\":\"a.zig\"}"));
+
+    // 3. Procrastination counter increments on exploratory calls
+    agent.plan_procrastination_count += 1;
+    try std.testing.expectEqual(@as(usize, 1), agent.plan_procrastination_count);
+    try std.testing.expect(agent.plan_procrastination_count < agent.plan_procrastination_cap);
+
+    // 4. At cap, procrastination trips watchdog intercept
+    agent.plan_procrastination_count += 1;
+    try std.testing.expectEqual(@as(usize, 2), agent.plan_procrastination_count);
+    try std.testing.expect(agent.plan_procrastination_count >= agent.plan_procrastination_cap);
+
+    // 5. Executing mutating tool clears plan
+    agent.clearPlan();
+    try std.testing.expect(!agent.plan_active);
+    try std.testing.expectEqual(@as(usize, 0), agent.plan_procrastination_count);
+
+    // 6. Test isPlanOnlyRequest
+    try std.testing.expect(AgentLoop.isPlanOnlyRequest("Lập kế hoạch, không sửa file"));
+    try std.testing.expect(AgentLoop.isPlanOnlyRequest("please provide plan only"));
+    try std.testing.expect(!AgentLoop.isPlanOnlyRequest("hãy sửa bug này và chạy test"));
+}
+
+test "agent - parseTimeoutDecision" {
+    // 1. Explicit WAIT with seconds and reason
+    const text1 =
+        \\DECISION: WAIT 120
+        \\REASON: Long compilation of Zig packages in progress.
+    ;
+    const d1 = parseTimeoutDecision(text1);
+    try std.testing.expect(!d1.should_kill);
+    try std.testing.expectEqual(@as(u32, 120), d1.extend_seconds);
+    try std.testing.expectEqualStrings("Long compilation of Zig packages in progress.", d1.reason());
+
+    // 2. Simple WAIT without explicit seconds (defaults to 60)
+    const text2 =
+        \\WAIT
+        \\REASON: npm install downloading tarballs.
+    ;
+    const d2 = parseTimeoutDecision(text2);
+    try std.testing.expect(!d2.should_kill);
+    try std.testing.expectEqual(@as(u32, 60), d2.extend_seconds);
+    try std.testing.expectEqualStrings("npm install downloading tarballs.", d2.reason());
+
+    // 3. Explicit KILL
+    const text3 =
+        \\DECISION: KILL
+        \\REASON: Process is hung waiting on stdin.
+    ;
+    const d3 = parseTimeoutDecision(text3);
+    try std.testing.expect(d3.should_kill);
+    try std.testing.expectEqualStrings("Process is hung waiting on stdin.", d3.reason());
+
+    // 4. Markdown formatted decision
+    const text4 =
+        \\**DECISION**: `KILL`
+        \\**REASON**: Deadlock detected in worker process.
+    ;
+    const d4 = parseTimeoutDecision(text4);
+    try std.testing.expect(d4.should_kill);
+    try std.testing.expect(std.mem.indexOf(u8, d4.reason(), "Deadlock detected") != null);
+}
+
+
 

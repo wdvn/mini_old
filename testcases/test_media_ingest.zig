@@ -169,7 +169,7 @@ test "media_ingest: openai backend serializes image blocks in chat completions a
     try testing.expect(std.mem.indexOf(u8, cc_body, "data:image/png;base64,ZmFrZV9iNjRfaW1hZ2VfZGF0YQ==") != null);
 
     // 2. Responses API
-    const resp_body = try openai_backend.buildResponsesRequestBody(alloc, "gpt-5.6-terra", 1024, false, null, "Sys", &msgs, &tools);
+    const resp_body = try openai_backend.buildResponsesRequestBody(alloc, "gpt-5.6-terra", 1024, false, null, "Sys", &msgs, &tools, mini.backends.provider_mod.getProfile("openai"));
     defer alloc.free(resp_body);
 
     try testing.expect(std.mem.indexOf(u8, resp_body, "\"type\":\"input_image\"") != null);
@@ -220,3 +220,37 @@ test "media_ingest: history addUserWithImages stores and frees image blocks clea
     try testing.expectEqualStrings("data2", msg.content[2].image.data);
     try testing.expectEqualStrings("image/jpeg", msg.content[2].image.media_type);
 }
+
+test "media_ingest: pure image prompt without text does not emit empty text blocks in Claude and OpenAI" {
+    const alloc = testing.allocator;
+
+    // 1. History addUserWithImages with empty text should only contain the image block
+    var history = history_mod.History.init(alloc);
+    defer history.deinit();
+
+    const images = [_]proto.ImageBlock{
+        .{ .data = "ZmFrZV9iNjRfaW1hZ2VfZGF0YQ==", .media_type = "image/png" },
+    };
+    try history.addUserWithImages("", &images);
+
+    try testing.expectEqual(@as(usize, 1), history.len());
+    const msg = history.messages()[0];
+    try testing.expectEqual(@as(usize, 1), msg.content.len);
+    try testing.expect(msg.content[0] == .image);
+
+    // 2. Claude serialization must not emit {"type":"text","text":""}
+    const tools = [_]proto.ToolDefinition{};
+    const claude_body = try claude_backend.buildRequestBody(alloc, "claude-3-5-sonnet", 1024, null, "Sys", history.messages(), &tools);
+    defer alloc.free(claude_body);
+
+    try testing.expect(std.mem.indexOf(u8, claude_body, "\"type\":\"text\",\"text\":\"\"") == null);
+    try testing.expect(std.mem.indexOf(u8, claude_body, "\"type\":\"image\"") != null);
+
+    // 3. OpenAI Chat Completions serialization must not emit {"type":"text","text":""}
+    const openai_body = try openai_backend.buildRequestBody(alloc, "gpt-4o", 1024, false, false, null, false, "Sys", history.messages(), &tools);
+    defer alloc.free(openai_body);
+
+    try testing.expect(std.mem.indexOf(u8, openai_body, "\"type\":\"text\",\"text\":\"\"") == null);
+    try testing.expect(std.mem.indexOf(u8, openai_body, "\"type\":\"image_url\"") != null);
+}
+
