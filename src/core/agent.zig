@@ -263,6 +263,10 @@ pub const AgentLoop = struct {
     /// Consecutive watchdog directives injected while model keeps answering in text. Caps at 2 to prevent infinite looping.
     plan_watchdog_retries: usize = 0,
 
+    /// Track whether the most recent LLM response had no meaningful content (empty/whitespace only).
+    /// Used to prevent premature exit_loop when model returns nothing but also didn't fail.
+    response_content_empty: bool = false,
+
     // Plan Watchdog: Enforces execution of committed plans and prevents action procrastination
     plan_active: bool = false,
     plan_summary_buf: [160]u8 = undefined,
@@ -496,6 +500,7 @@ pub const AgentLoop = struct {
             .recent_tools = .empty,
             .coordinator = coordinator,
             .watchdog = watchdog,
+            .response_content_empty = false,
         };
     }
 
@@ -1186,7 +1191,34 @@ pub const AgentLoop = struct {
         }
 
         // Append response to history (if has content)
-        _ = try self.history.addAssistantResponse(&response);
+        const was_added = try self.history.addAssistantResponse(&response);
+
+        // Detect empty/whitespace-only response (fix for ghost stop issue)
+        // When model returns only thinking + whitespace text with no tool calls,
+        // we should NOT exit the loop — instead inject a directive to continue.
+
+        // 1. Native Tool Calling: if model calls tool via stop_reason .tool_use or has tool_use blocks
+        var has_tool_use_blocks = false;
+        for (response.content.items) |block| {
+            if (block == .tool_use) {
+                has_tool_use_blocks = true;
+                break;
+            }
+        }
+
+        var has_meaningful_text = false;
+        if (was_added) {
+            for (response.content.items) |block| {
+                if (block == .text) {
+                    const trimmed = std.mem.trim(u8, block.text, " \r\n\t");
+                    if (trimmed.len > 0) {
+                        has_meaningful_text = true;
+                        break;
+                    }
+                }
+            }
+        }
+        self.response_content_empty = !has_meaningful_text and !has_tool_use_blocks;
 
         // Accumulate completion tokens and detect plan commitments
         for (response.content.items) |block| {
@@ -1205,15 +1237,6 @@ pub const AgentLoop = struct {
                 },
                 .tool_use => |tu| self.last_turn_completion_tokens += self.token_estimator.estimate(tu.name) + self.token_estimator.estimate(tu.input_json),
                 else => {},
-            }
-        }
-
-        // 1. Native Tool Calling: if model calls tool via stop_reason .tool_use or has tool_use blocks
-        var has_tool_use_blocks = false;
-        for (response.content.items) |block| {
-            if (block == .tool_use) {
-                has_tool_use_blocks = true;
-                break;
             }
         }
 
@@ -1403,6 +1426,27 @@ pub const AgentLoop = struct {
         switch (response.stop_reason) {
             .end_turn, .stop_sequence => {
                 self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{ .exec_type = "none" });
+
+                // Fix: If response has no meaningful content (empty/whitespace only),
+                // treat it like a failed response and request the model to continue.
+                // This prevents "ghost stops" where model outputs only \n\n\n.
+                if (self.response_content_empty and !has_tool_use_blocks) {
+                    main.stderrPrint(
+                        "\n\x1b[33m[agent] ⚠️ Empty response detected (whitespace only), requesting continuation...\x1b[0m\n",
+                        .{},
+                    );
+                    if (main.ui_repl.current_renderer) |r| {
+                        r.ensureNewline();
+                        r.write(" \x1b[33m[Agent Advisory]: Your previous response contained no actionable content. Please proceed with tool execution or provide a substantive answer.\x1b[0m\n");
+                    }
+                    try self.history.addUser(
+                        "[System] Your previous response contained only whitespace or empty content. You must either execute tools to make progress, or provide a substantive text answer to the user's request.",
+                    );
+                    self.response_content_empty = false;
+                    return .continue_loop;
+                }
+                self.response_content_empty = false;
+
                 if ((self.plan_active or self.plan_execution_pending) and !isPlanOnlyRequest(self.current_user_request)) {
                     // Don't clear pending yet — keep it true while we decide what to do
                     self.plan_watchdog_retries += 1;
