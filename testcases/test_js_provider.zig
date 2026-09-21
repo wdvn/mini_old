@@ -158,4 +158,73 @@ test "js_provider: non-null-terminated buffer with 0xAA suffix" {
     try testing.expectEqualStrings("Hello", reasoning.?);
 }
 
+test "js_provider: load JSON provider profile as adapter" {
+    const alloc = testing.allocator;
+
+    const json_source =
+        \\{
+        \\    "name": "CustomJSONProvider",
+        \\    "protocol": "chat_completions",
+        \\    "reasoning_field": "reasoning_content",
+        \\    "echo_policy": "drop",
+        \\    "thinking_tags": "english_only",
+        \\    "reasoning_param": "top_level_effort",
+        \\    "supports_stream_options": true,
+        \\    "use_completion_tokens": true
+        \\}
+    ;
+
+    var adapter = try js_provider.JsProviderAdapter.initFromSource(alloc, json_source);
+    defer adapter.deinit();
+
+    try testing.expectEqualStrings("CustomJSONProvider", adapter.profile.name);
+    try testing.expectEqual(mini.backends.provider_mod.WireProtocol.chat_completions, adapter.profile.protocol);
+    try testing.expectEqual(mini.backends.provider_mod.ReasoningField.reasoning_content, adapter.profile.reasoning_field);
+    try testing.expectEqual(mini.backends.provider_mod.EchoPolicy.drop, adapter.profile.echo_policy);
+    try testing.expectEqual(mini.backends.provider_mod.ThinkingTagSet.english_only, adapter.profile.thinking_tags);
+    try testing.expectEqual(mini.backends.provider_mod.ReasoningParamFormat.top_level_effort, adapter.profile.reasoning_param);
+    try testing.expect(adapter.profile.supports_stream_options);
+    try testing.expect(adapter.profile.use_completion_tokens);
+}
+
+test "config: auto-detects $MINI_HOME/provider/<provider>.json" {
+    const alloc = testing.allocator;
+    const io = mini.getIo();
+
+    // Create temporary directory structure: /tmp/test_mini_home/provider/testmodel.json
+    const tmp_home = "/tmp/test_mini_home_provider_json";
+    const tmp_provider_dir = "/tmp/test_mini_home_provider_json/provider";
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, tmp_provider_dir) catch {};
+    defer cwd.deleteTree(io, tmp_home) catch {};
+
+    const json_file_path = "/tmp/test_mini_home_provider_json/provider/testmodel.json";
+    const test_json =
+        \\{
+        \\    "name": "TestModelAI",
+        \\    "protocol": "chat_completions",
+        \\    "url": "https://api.testmodel.ai/v1",
+        \\    "model": "testmodel-v1"
+        \\}
+    ;
+    {
+        const f = try cwd.createFile(io, json_file_path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, test_json);
+    }
+
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+
+    try env.put("MINI_HOME", tmp_home);
+    try env.put("OPENAI_COMPAT_PROVIDER", "testmodel");
+
+    mini.config_mod.loadDotEnv(alloc, &env, io);
+
+    try testing.expectEqualStrings("https://api.testmodel.ai/v1", env.get("OPENAI_COMPAT_URL").?);
+    try testing.expectEqualStrings("testmodel-v1", env.get("OPENAI_COMPAT_MODEL").?);
+    try testing.expectEqualStrings("chat_completions", env.get("OPENAI_PROTOCOL").?);
+    try testing.expectEqualStrings(json_file_path, env.get("OPENAI_COMPAT_PROVIDER_JS").?);
+}
+
 

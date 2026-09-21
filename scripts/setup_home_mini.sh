@@ -56,6 +56,8 @@ DIRECTORIES=(
     "${MINI_HOME}/artifacts"
     "${MINI_HOME}/memory"
     "${MINI_HOME}/cas"
+    "${MINI_HOME}/providers"
+    "${MINI_HOME}/provider"
 )
 
 for dir in "${DIRECTORIES[@]}"; do

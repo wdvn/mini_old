@@ -1040,6 +1040,23 @@ pub const JsonConfig = struct {
     session: ?[]const u8 = null,
 };
 
+pub const JsonProviderConfig = struct {
+    name: ?[]const u8 = null,
+    protocol: ?[]const u8 = null,
+    reasoning_field: ?[]const u8 = null,
+    echo_policy: ?[]const u8 = null,
+    thinking_tags: ?[]const u8 = null,
+    reasoning_param: ?[]const u8 = null,
+    supports_stream_options: ?bool = null,
+    use_completion_tokens: ?bool = null,
+    provider_js: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    base_url: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+    api_header: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+};
+
 /// Loads environment variables from .env and config.json files in priority order:
 ///   1. $MINI_ENV_FILE
 ///   2. ./.env
@@ -1117,6 +1134,9 @@ pub fn loadDotEnv(alloc: Allocator, env_map: *std.process.Environ.Map, io: std.I
             tryLoadJsonConfig(alloc, env_map, io, jp);
         } else |_| {}
     }
+
+    // 3. Load active provider default configuration and adapter (<provider>.json and <provider>.js)
+    loadActiveProviderConfig(alloc, env_map, io);
 }
 
 fn tryLoadJsonConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: std.Io, path: []const u8) void {
@@ -1172,6 +1192,136 @@ fn tryLoadJsonConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: st
 
     if (count > 0) {
         if (!utils.isSubagent()) main.stderrPrint("[config] Loaded {d} settings from {s}\n", .{ count, path });
+    }
+}
+
+fn tryLoadProviderJson(alloc: Allocator, env_map: *std.process.Environ.Map, io: std.Io, path: []const u8) bool {
+    const cwd = std.Io.Dir.cwd();
+    const file = cwd.openFile(io, path, .{}) catch return false;
+    defer file.close(io);
+
+    const stat = file.stat(io) catch return false;
+    if (stat.size == 0 or stat.size > 64 * 1024) return false;
+
+    const buf = alloc.alloc(u8, @intCast(stat.size)) catch return false;
+    defer alloc.free(buf);
+
+    const n = utils.readAll(io, file, buf) catch return false;
+    const data = buf[0..n];
+
+    var parsed = std.json.parseFromSlice(JsonProviderConfig, alloc, data, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+
+    const cfg = parsed.value;
+    var count: usize = 0;
+
+    if (cfg.protocol) |val| count += setEnvDefault(env_map, "OPENAI_PROTOCOL", val);
+    if (cfg.url orelse cfg.base_url) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_URL", val);
+    if (cfg.api_key) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_API_KEY", val);
+    if (cfg.api_header) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_API_HEADER", val);
+    if (cfg.model) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_MODEL", val);
+    if (cfg.use_completion_tokens) |val| count += setEnvDefault(env_map, "MINI_USE_COMPLETION_TOKENS", if (val) "1" else "0");
+    if (cfg.provider_js) |val| count += setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER_JS", val);
+
+    if (count > 0 and !utils.isSubagent()) {
+        main.stderrPrint("[config] Loaded {d} provider setting(s) from {s}\n", .{ count, path });
+    }
+    return true;
+}
+
+fn loadActiveProviderConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: std.Io) void {
+    const provider_key = blk: {
+        if (env_map.get("OPENAI_COMPAT_PROVIDER") orelse env_map.get("MINI_PROVIDER")) |p| {
+            if (p.len > 0) break :blk p;
+        }
+        if (env_map.get("OPENAI_COMPAT_URL")) |url| {
+            const detected = provider_mod.detectFromUrl(url);
+            if (!std.mem.eql(u8, detected, "generic")) break :blk detected;
+        }
+        break :blk "";
+    };
+    if (provider_key.len == 0) return;
+
+    var dir_buf: [12][512]u8 = undefined;
+    var dir_lens: [12]usize = undefined;
+    var dir_count: usize = 0;
+
+    const appendDir = struct {
+        fn add(dirs: *[12][512]u8, lens: *[12]usize, count: *usize, d: []const u8) void {
+            if (count.* >= 12 or d.len == 0 or d.len >= 512) return;
+            @memcpy(dirs[count.*][0..d.len], d);
+            lens[count.*] = d.len;
+            count.* += 1;
+        }
+    }.add;
+
+    // 1. Workspace / Project candidates
+    if (env_map.get("MINI_AGENT_FOLDER")) |agent_dir| {
+        if (agent_dir.len > 0) {
+            var b: [512]u8 = undefined;
+            if (std.fmt.bufPrint(&b, "{s}/providers", .{agent_dir})) |s| appendDir(&dir_buf, &dir_lens, &dir_count, s) else |_| {}
+            if (std.fmt.bufPrint(&b, "{s}/provider", .{agent_dir})) |s| appendDir(&dir_buf, &dir_lens, &dir_count, s) else |_| {}
+        }
+    }
+    appendDir(&dir_buf, &dir_lens, &dir_count, ".agent/providers");
+    appendDir(&dir_buf, &dir_lens, &dir_count, ".agent/provider");
+    appendDir(&dir_buf, &dir_lens, &dir_count, "providers");
+    appendDir(&dir_buf, &dir_lens, &dir_count, "provider");
+
+    // 2. Global candidates ($MINI_HOME or ~/.mini)
+    if (env_map.get("MINI_HOME")) |mh| {
+        if (mh.len > 0) {
+            var b: [512]u8 = undefined;
+            if (std.fmt.bufPrint(&b, "{s}/providers", .{mh})) |s| appendDir(&dir_buf, &dir_lens, &dir_count, s) else |_| {}
+            if (std.fmt.bufPrint(&b, "{s}/provider", .{mh})) |s| appendDir(&dir_buf, &dir_lens, &dir_count, s) else |_| {}
+        }
+    } else if (env_map.get("HOME")) |h| {
+        var b: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&b, "{s}/.mini/providers", .{h})) |s| appendDir(&dir_buf, &dir_lens, &dir_count, s) else |_| {}
+        if (std.fmt.bufPrint(&b, "{s}/.mini/provider", .{h})) |s| appendDir(&dir_buf, &dir_lens, &dir_count, s) else |_| {}
+    }
+
+    const cwd = std.Io.Dir.cwd();
+    for (0..dir_count) |i| {
+        const d = dir_buf[i][0..dir_lens[i]];
+        var json_buf: [512]u8 = undefined;
+        var js_buf: [512]u8 = undefined;
+
+        const json_path = std.fmt.bufPrint(&json_buf, "{s}/{s}.json", .{ d, provider_key }) catch continue;
+        const js_path = std.fmt.bufPrint(&js_buf, "{s}/{s}.js", .{ d, provider_key }) catch continue;
+
+        const has_json = if (cwd.openFile(io, json_path, .{})) |f| blk: {
+            f.close(io);
+            break :blk true;
+        } else |_| false;
+
+        const has_js = if (cwd.openFile(io, js_path, .{})) |f| blk: {
+            f.close(io);
+            break :blk true;
+        } else |_| false;
+
+        if (has_json) {
+            _ = tryLoadProviderJson(alloc, env_map, io, json_path);
+            _ = setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER", provider_key);
+            if (env_map.get("OPENAI_COMPAT_PROVIDER_JS") == null) {
+                if (has_js) {
+                    _ = setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER_JS", js_path);
+                } else {
+                    _ = setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER_JS", json_path);
+                }
+            }
+            if (!utils.isSubagent()) {
+                main.stderrPrint("[config] Provider profile: auto-loaded {s}\n", .{json_path});
+            }
+            break;
+        } else if (has_js) {
+            _ = setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER", provider_key);
+            _ = setEnvDefault(env_map, "OPENAI_COMPAT_PROVIDER_JS", js_path);
+            if (!utils.isSubagent()) {
+                main.stderrPrint("[config] Provider adapter: auto-loaded {s}\n", .{js_path});
+            }
+            break;
+        }
     }
 }
 

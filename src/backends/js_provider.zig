@@ -43,11 +43,15 @@ fn isFunction(ctx: *c.JSContext, v: c.JSValue) bool {
     return c.JS_IsFunction(ctx, v) != 0;
 }
 
-/// Heuristic: input looks like a file path if it ends with .js and
+fn isBoolean(v: c.JSValue) bool {
+    return c.JS_IsBool(v) != 0;
+}
+
+/// Heuristic: input looks like a file path if it ends with .js or .json and
 /// does not contain obvious JS syntax characters.
 fn looksLikeFilePath(input: []const u8) bool {
     if (input.len == 0 or input.len > 4096) return false;
-    if (!std.mem.endsWith(u8, input, ".js")) return false;
+    if (!std.mem.endsWith(u8, input, ".js") and !std.mem.endsWith(u8, input, ".json")) return false;
     for (input) |ch| {
         if (ch == '{' or ch == '(' or ch == ';' or ch == '\n') return false;
     }
@@ -232,14 +236,20 @@ pub const JsProviderAdapter = struct {
         const ctx = c.JS_NewContext(rt) orelse return error.QuickJSContextInitFailed;
         errdefer c.JS_FreeContext(ctx);
 
-        // Normalize source: replace "export default" with "return " outside comments/strings
+        // Normalize source: replace "export default" with "return " outside comments/strings,
+        // or wrap raw JSON objects in "return ( ... );"
         var normalized_source = std.ArrayListUnmanaged(u8).empty;
         defer normalized_source.deinit(alloc);
 
+        const trimmed_source = std.mem.trim(u8, source, " \t\r\n");
         if (findExportDefault(source)) |idx| {
             try normalized_source.appendSlice(alloc, source[0..idx]);
             try normalized_source.appendSlice(alloc, "return ");
             try normalized_source.appendSlice(alloc, source[idx + "export default".len ..]);
+        } else if (std.mem.startsWith(u8, trimmed_source, "{")) {
+            try normalized_source.appendSlice(alloc, "return (");
+            try normalized_source.appendSlice(alloc, trimmed_source);
+            try normalized_source.appendSlice(alloc, ");\n");
         } else {
             try normalized_source.appendSlice(alloc, source);
         }
@@ -413,6 +423,33 @@ pub const JsProviderAdapter = struct {
                 defer c.JS_FreeCString(ctx, str);
                 self.profile.reasoning_param = std.meta.stringToEnum(provider_mod.ReasoningParamFormat, std.mem.span(str)) orelse return error.InvalidReasoningParam;
             }
+        }
+
+        // Reasoning field
+        const rf_val = c.JS_GetPropertyStr(ctx, obj, "reasoning_field");
+        defer c.JS_FreeValue(ctx, rf_val);
+        if (isString(rf_val)) {
+            const str = c.JS_ToCString(ctx, rf_val);
+            if (str != null) {
+                defer c.JS_FreeCString(ctx, str);
+                if (std.meta.stringToEnum(provider_mod.ReasoningField, std.mem.span(str))) |rf| {
+                    self.profile.reasoning_field = rf;
+                }
+            }
+        }
+
+        // Supports stream options
+        const sso_val = c.JS_GetPropertyStr(ctx, obj, "supports_stream_options");
+        defer c.JS_FreeValue(ctx, sso_val);
+        if (isBoolean(sso_val)) {
+            self.profile.supports_stream_options = (c.JS_ToBool(ctx, sso_val) != 0);
+        }
+
+        // Use completion tokens
+        const uct_val = c.JS_GetPropertyStr(ctx, obj, "use_completion_tokens");
+        defer c.JS_FreeValue(ctx, uct_val);
+        if (isBoolean(uct_val)) {
+            self.profile.use_completion_tokens = (c.JS_ToBool(ctx, uct_val) != 0);
         }
 
         // 5. Hooks: extractReasoning
