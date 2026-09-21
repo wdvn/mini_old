@@ -234,8 +234,22 @@ pub const Config = struct {
     video_gen_provider: []const u8 = "openai",
     /// Media output directory. Null = "<workspace>/media".
     media_output_dir: ?[]const u8 = null,
-    /// Video job polling timeout in seconds (default: 600).
-    video_poll_timeout_secs: u32 = 600,
+    /// Video poll timeout in seconds.
+    video_poll_timeout_secs: u32 = 300,
+
+    // RFC-019: Structured Planning System
+    /// Enable structured planning system. Default: false.
+    enable_structured_planning: bool = false,
+    /// Minimum task length (chars) to trigger planning. Default: 50.
+    planning_min_task_length: usize = 50,
+    /// Enable drift detection. Default: true.
+    plan_drift_detection: bool = true,
+    /// Max plan steps (prevent infinite planning). Default: 20.
+    plan_max_steps: usize = 20,
+    /// Plan persistence directory. Null = ~/.mini/plans/.
+    plans_dir: ?[]const u8 = null,
+    /// Use enhanced progress checkpoint format. Default: true.
+    enhanced_progress_checkpoint: bool = true,
 
     // 3-Thread Watchdog & Act Coordinator (RFC-015)
     act_timeout_secs: u32 = 120,
@@ -562,6 +576,29 @@ pub const Config = struct {
             break :blk std.fmt.parseInt(u32, s, 10) catch 600;
         };
 
+        // RFC-019: Structured Planning System
+        const enable_structured_planning: bool = blk: {
+            const v = env_map.get("MINI_ENABLE_STRUCTURED_PLANNING") orelse "0";
+            break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+        };
+        const planning_min_task_length: usize = blk: {
+            const s = env_map.get("MINI_PLANNING_MIN_TASK_LENGTH") orelse break :blk 50;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 50;
+        };
+        const plan_drift_detection: bool = blk: {
+            const v = env_map.get("MINI_PLAN_DRIFT_DETECTION") orelse "1";
+            break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+        };
+        const plan_max_steps: usize = blk: {
+            const s = env_map.get("MINI_PLAN_MAX_STEPS") orelse break :blk 20;
+            break :blk std.fmt.parseInt(usize, s, 10) catch 20;
+        };
+        const plans_dir = env_map.get("MINI_PLANS_DIR");
+        const enhanced_progress_checkpoint: bool = blk: {
+            const v = env_map.get("MINI_ENHANCED_PROGRESS_CHECKPOINT") orelse "1";
+            break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+        };
+
         if (!utils.isSubagent()) {
             if (dynamic_thinking_enabled) {
                 main.stderrPrint("[config] Cognitive Governor: dynamic thinking enabled (effort={s}, budget={?d})\n", .{
@@ -662,6 +699,13 @@ pub const Config = struct {
             .watchdog_tracking_interval_s = watchdog_tracking_s,
             .watchdog_recap_interval = watchdog_recap_interval,
             .watchdog_interval_ms = watchdog_interval_ms,
+            // RFC-019: Structured Planning System
+            .enable_structured_planning = enable_structured_planning,
+            .planning_min_task_length = planning_min_task_length,
+            .plan_drift_detection = plan_drift_detection,
+            .plan_max_steps = plan_max_steps,
+            .plans_dir = plans_dir,
+            .enhanced_progress_checkpoint = enhanced_progress_checkpoint,
         };
     }
 
@@ -1038,6 +1082,13 @@ pub const JsonConfig = struct {
     mcp_config: ?[]const u8 = null,
     hook_command: ?[]const u8 = null,
     session: ?[]const u8 = null,
+    // RFC-019: Structured Planning System
+    enable_structured_planning: ?bool = null,
+    planning_min_task_length: ?usize = null,
+    plan_drift_detection: ?bool = null,
+    plan_max_steps: ?usize = null,
+    plans_dir: ?[]const u8 = null,
+    enhanced_progress_checkpoint: ?bool = null,
 };
 
 pub const JsonProviderConfig = struct {
@@ -1189,6 +1240,18 @@ fn tryLoadJsonConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: st
     if (cfg.mcp_config) |val| count += setEnvDefault(env_map, "MINI_MCP_CONFIG", val);
     if (cfg.hook_command) |val| count += setEnvDefault(env_map, "MINI_HOOK_COMMAND", val);
     if (cfg.session) |val| count += setEnvDefault(env_map, "MINI_SESSION", val);
+    if (cfg.enable_structured_planning) |val| count += setEnvDefault(env_map, "MINI_ENABLE_STRUCTURED_PLANNING", if (val) "1" else "0");
+    if (cfg.planning_min_task_length) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_PLANNING_MIN_TASK_LENGTH", s) else |_| {}
+    }
+    if (cfg.plan_drift_detection) |val| count += setEnvDefault(env_map, "MINI_PLAN_DRIFT_DETECTION", if (val) "1" else "0");
+    if (cfg.plan_max_steps) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_PLAN_MAX_STEPS", s) else |_| {}
+    }
+    if (cfg.plans_dir) |val| count += setEnvDefault(env_map, "MINI_PLANS_DIR", val);
+    if (cfg.enhanced_progress_checkpoint) |val| count += setEnvDefault(env_map, "MINI_ENHANCED_PROGRESS_CHECKPOINT", if (val) "1" else "0");
 
     if (count > 0) {
         if (!utils.isSubagent()) main.stderrPrint("[config] Loaded {d} settings from {s}\n", .{ count, path });
@@ -1370,6 +1433,30 @@ test "JsonConfig parsing" {
     try std.testing.expectEqual(4096, parsed.value.max_tokens.?);
     try std.testing.expectEqual(true, parsed.value.memact_enabled.?);
     try std.testing.expectEqual(true, parsed.value.memact_pg_enabled.?);
+}
+
+test "JsonConfig parsing RFC-019 planning fields" {
+    const alloc = std.testing.allocator;
+    const json_str =
+        \\{
+        \\  "enable_structured_planning": true,
+        \\  "planning_min_task_length": 100,
+        \\  "plan_drift_detection": true,
+        \\  "plan_max_steps": 15,
+        \\  "plans_dir": "/tmp/custom_plans",
+        \\  "enhanced_progress_checkpoint": true
+        \\}
+    ;
+
+    var parsed = try std.json.parseFromSlice(JsonConfig, alloc, json_str, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(true, parsed.value.enable_structured_planning.?);
+    try std.testing.expectEqual(100, parsed.value.planning_min_task_length.?);
+    try std.testing.expectEqual(true, parsed.value.plan_drift_detection.?);
+    try std.testing.expectEqual(15, parsed.value.plan_max_steps.?);
+    try std.testing.expectEqualStrings("/tmp/custom_plans", parsed.value.plans_dir.?);
+    try std.testing.expectEqual(true, parsed.value.enhanced_progress_checkpoint.?);
 }
 
 test "Config default memact_pg_enabled is true" {

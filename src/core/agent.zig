@@ -46,6 +46,11 @@ const tokens_mod = @import("memact/tokens.zig");
 const graph_store_mod = @import("memact/graph_store.zig");
 const snapshot_mod = @import("snapshot.zig");
 const cas_mod = @import("cas.zig");
+const plan_mod = @import("plan.zig");
+const plan_parser = @import("plan_parser.zig");
+const plan_executor = @import("plan_executor.zig");
+const plan_monitor = @import("plan_monitor.zig");
+const plan_store_mod = @import("plan_store.zig");
 pub const journal_mod = @import("journal.zig");
 pub const act_logger_mod = @import("act_logger.zig");
 pub const signals = @import("signals.zig");
@@ -278,10 +283,34 @@ pub const AgentLoop = struct {
     progress_summary_buf: [512]u8 = undefined,
     progress_summary_len: usize = 0,
 
+    // RFC-019 Structured Planning System
+    /// Structured plan (replaces plan_active/plan_summary_buf when enabled)
+    current_plan: ?plan_mod.Plan = null,
+    /// Current step index being executed
+    current_step_idx: usize = 0,
+    /// Plan execution context
+    plan_ctx: plan_executor.ExecutionContext = .{},
+    /// Plan store for cross-turn persistence
+    plan_store: ?*plan_store_mod.PlanStore = null,
+    /// Drift score tracker
+    plan_drift_score: f64 = 0.0,
+    /// Enable structured planning (config-gated)
+    enable_structured_planning: bool = false,
+
     /// 3-Thread Coordinator & State Monitor (RFC-015)
     coordinator: *act_queue.ActCoordinator,
     /// Thread 2 Watchdog Monitor
     watchdog: ?*watchdog_mod.Watchdog = null,
+
+    pub fn setStructuredPlan(self: *AgentLoop, plan: plan_mod.Plan) void {
+        if (self.current_plan) |*p| {
+            p.deinit(self.alloc);
+        }
+        self.current_plan = plan;
+        self.plan_ctx = .{};
+        self.plan_drift_score = 0.0;
+        self.plan_active = true;
+    }
 
     pub fn setPlan(self: *AgentLoop, summary: []const u8) void {
         if (!self.plan_active) {
@@ -291,6 +320,18 @@ pub const AgentLoop = struct {
         const len = @min(summary.len, self.plan_summary_buf.len);
         @memcpy(self.plan_summary_buf[0..len], summary[0..len]);
         self.plan_summary_len = len;
+
+        // RFC-019: If structured planning is enabled, attempt to parse structured plan from summary
+        if (self.enable_structured_planning and self.current_plan == null) {
+            if (plan_parser.extractStructuredPlan(summary, self.alloc) catch null) |plan| {
+                if (plan.stepCount() > 0) {
+                    self.setStructuredPlan(plan);
+                } else {
+                    var mut_p = plan;
+                    mut_p.deinit(self.alloc);
+                }
+            }
+        }
     }
 
     pub fn clearPlan(self: *AgentLoop) void {
@@ -298,6 +339,12 @@ pub const AgentLoop = struct {
         self.plan_summary_len = 0;
         self.plan_procrastination_count = 0;
         self.plan_execution_pending = false;
+        if (self.current_plan) |*p| {
+            p.deinit(self.alloc);
+            self.current_plan = null;
+        }
+        self.plan_ctx = .{};
+        self.plan_drift_score = 0.0;
     }
 
     pub fn getPlanSummary(self: *const AgentLoop) []const u8 {
@@ -431,7 +478,7 @@ pub const AgentLoop = struct {
         var path_buf: [256]u8 = undefined;
         const home_dir = utils.getEnvSlice("HOME") orelse ".";
         const cas_path = try std.fmt.bufPrint(&path_buf, "{s}/.mini/cas", .{home_dir});
-        const cas = try cas_mod.CAS.init(alloc, io, cas_path);
+        var cas = try cas_mod.CAS.init(alloc, io, cas_path);
 
         var acts_buf: [256]u8 = undefined;
         const acts_path = std.fmt.bufPrint(&acts_buf, "{s}/.mini/acts", .{home_dir}) catch "/tmp/mini_acts";
@@ -462,6 +509,25 @@ pub const AgentLoop = struct {
                         main.stderrPrint("[agent] Warning: Failed to init PGraphStore: {s}\n", .{@errorName(e)});
                         alloc.destroy(st);
                     }
+                }
+            }
+        }
+
+        // RFC-019: Initialize Plan Store
+        const cas_ptr: *cas_mod.CAS = &cas;
+        var plan_store_ptr: ?*plan_store_mod.PlanStore = null;
+        if (config.enable_structured_planning) {
+            var plans_path_buf: [512]u8 = undefined;
+            const plans_dir = config.plans_dir orelse (std.fmt.bufPrint(&plans_path_buf, "{s}/.mini/plans", .{home_dir}) catch ".mini/plans");
+            const store = alloc.create(plan_store_mod.PlanStore) catch null;
+            if (store) |st| {
+                if (plan_store_mod.PlanStore.init(alloc, io, cas_ptr, plans_dir)) |val| {
+                    st.* = val;
+                    plan_store_ptr = st;
+                    main.stderrPrint("[agent] Plan Store initialized at: {s}\n", .{plans_dir});
+                } else |e| {
+                    main.stderrPrint("[agent] Warning: Failed to init PlanStore: {s}\n", .{@errorName(e)});
+                    alloc.destroy(st);
                 }
             }
         }
@@ -501,6 +567,8 @@ pub const AgentLoop = struct {
             .coordinator = coordinator,
             .watchdog = watchdog,
             .response_content_empty = false,
+            .enable_structured_planning = config.enable_structured_planning,
+            .plan_store = plan_store_ptr,
         };
     }
 
@@ -536,6 +604,15 @@ pub const AgentLoop = struct {
         }
         self.recent_tools.deinit(self.alloc);
         self.deinitTurnToolRecords();
+        if (self.plan_store) |ps| {
+            ps.deinit();
+            self.alloc.destroy(ps);
+            self.plan_store = null;
+        }
+        if (self.current_plan) |*p| {
+            p.deinit(self.alloc);
+            self.current_plan = null;
+        }
     }
 
     pub fn isReadOnlyTool(name: []const u8) bool {
@@ -1112,11 +1189,40 @@ pub const AgentLoop = struct {
 
         // Progress Tracking: inject summary of previous act's work
         if (self.progress_summary_len > 0 and act_id > 1) {
-            progress_text = try std.fmt.allocPrint(
-                self.alloc,
-                "[Progress Checkpoint]\nThe previous act ({d}) completed with the following progress:\n{s}\n\nBefore proceeding, please assess: what has been accomplished, what remains, and whether you should continue or conclude.",
-                .{ act_id - 1, self.progress_summary_buf[0..self.progress_summary_len] },
-            );
+            // Enhanced format: include plan context if available (RFC-019)
+            var progress_buf = utils.BufWriter.init(self.alloc);
+            defer progress_buf.deinit();
+
+            try progress_buf.writeAll("[Progress Checkpoint]\n");
+            try progress_buf.print("Previous act ({d}) completed with:\n", .{act_id - 1});
+
+            if (self.enable_structured_planning and self.current_plan != null) {
+                const plan = &self.current_plan.?;
+                const progress_msg = try plan_executor.generateProgressSummary(plan, &self.plan_ctx, self.alloc);
+                defer self.alloc.free(progress_msg);
+                try progress_buf.writeAll(progress_msg);
+                try progress_buf.writeAll("\n");
+
+                if (self.config.plan_drift_detection and self.plan_drift_score > 0.5) {
+                    try progress_buf.writeAll("⚠️ Drift detected: execution diverged from planned step.\n");
+                    try progress_buf.writeAll("Please realign with the active step or update your plan.\n\n");
+                }
+            } else if (self.plan_active and self.plan_summary_len > 0) {
+                // Legacy: show plan summary
+                try progress_buf.writeAll("📋 Plan Status:\n");
+                try progress_buf.writeAll(self.plan_summary_buf[0..self.plan_summary_len]);
+                try progress_buf.writeAll("\n\n");
+            }
+
+            // Show tools used in previous act
+            try progress_buf.writeAll("Tools executed:\n");
+            try progress_buf.writeAll(self.progress_summary_buf[0..self.progress_summary_len]);
+            try progress_buf.writeAll("\n\n");
+
+            // Directive: ask model to continue with next step
+            try progress_buf.writeAll("Next step directive: Execute the next planned step using appropriate tools. Do not return explanatory text without tool execution.");
+
+            progress_text = try progress_buf.toOwnedSlice();
             const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
             blocks[0] = .{ .text = progress_text.? };
             progress_blocks = blocks;
@@ -1228,11 +1334,39 @@ pub const AgentLoop = struct {
                     if (detectPlanInText(t)) |plan_summary| {
                         self.setPlan(plan_summary);
                     }
+                    // RFC-019: Try to parse structured plan from LLM output
+                    if (self.enable_structured_planning and self.current_plan == null) {
+                        if (plan_parser.extractStructuredPlan(t, self.alloc) catch null) |plan| {
+                            if (plan.stepCount() > 0) {
+                                self.setStructuredPlan(plan);
+                                if (!utils.isSubagent()) {
+                                    main.stderrPrint("[agent] Structured plan detected: {d} steps\n", .{plan.stepCount()});
+                                }
+                            } else {
+                                var mut_plan = plan;
+                                mut_plan.deinit(self.alloc);
+                            }
+                        }
+                    }
                 },
                 .thinking => |th| {
                     self.last_turn_completion_tokens += self.token_estimator.estimate(th.thinking);
                     if (detectPlanInText(th.thinking)) |plan_summary| {
                         self.setPlan(plan_summary);
+                    }
+                    // RFC-019: Try to parse structured plan from thinking
+                    if (self.enable_structured_planning and self.current_plan == null) {
+                        if (plan_parser.extractStructuredPlan(th.thinking, self.alloc) catch null) |plan| {
+                            if (plan.stepCount() > 0) {
+                                self.setStructuredPlan(plan);
+                                if (!utils.isSubagent()) {
+                                    main.stderrPrint("[agent] Structured plan detected from thinking: {d} steps\n", .{plan.stepCount()});
+                                }
+                            } else {
+                                var mut_plan = plan;
+                                mut_plan.deinit(self.alloc);
+                            }
+                        }
                     }
                 },
                 .tool_use => |tu| self.last_turn_completion_tokens += self.token_estimator.estimate(tu.name) + self.token_estimator.estimate(tu.input_json),
@@ -1825,8 +1959,29 @@ pub const AgentLoop = struct {
         self.clearProgress();
         self.current_user_request = user_text;
 
+        // RFC-019: Try to restore plan from store or trigger planning phase
+        if (self.enable_structured_planning and self.plan_store != null) {
+            const req_hash = std.hash.Fnv1a_64.hash(user_text);
+            if (self.plan_store.?.restore(req_hash) catch null) |plan| {
+                self.setStructuredPlan(plan);
+                if (self.current_plan.?.findActiveStepIndex()) |idx| {
+                    self.plan_ctx.current_step_idx = idx;
+                }
+                if (!utils.isSubagent()) {
+                    main.stderrPrint("[agent] Plan restored from store: {d} steps\n", .{self.current_plan.?.stepCount()});
+                }
+            }
+        }
+
+        const tool_hint: ?[]const u8 = if (self.enable_structured_planning and self.current_plan != null) blk: {
+            if (self.plan_ctx.current_step_idx < self.current_plan.?.stepCount()) {
+                break :blk self.current_plan.?.steps.items[self.plan_ctx.current_step_idx].tool_hint;
+            }
+            break :blk null;
+        } else null;
+
         // Retrieve relevant tool definitions for user message based on execution_mode
-        const tool_defs = switch (self.config.execution_mode) {
+        const raw_tool_defs = switch (self.config.execution_mode) {
             .codeact => &[_]proto.ToolDefinition{}, // Disable 100% of tools sent to API in codeact mode to force LLM to write CodeAct JS
             .tools => blk: {
                 const all_defs = tools_mod.getRelevantDefinitions(turn_alloc, user_text);
@@ -1840,6 +1995,11 @@ pub const AgentLoop = struct {
             },
             .auto => tools_mod.getRelevantDefinitions(turn_alloc, user_text),
         };
+
+        const tool_defs = if (tool_hint != null)
+            tools_mod.filterDefinitionsForPlan(turn_alloc, raw_tool_defs, tool_hint)
+        else
+            raw_tool_defs;
 
 
         if (self.journal == null) {
@@ -2779,7 +2939,76 @@ pub const AgentLoop = struct {
                         self.loop_plan_retries = 0;
                         self.plan_execution_pending = false;
                         if (!isExploratoryToolCall(tu.name, tu.input_json)) {
-                            self.clearPlan();
+                            // RFC-019: Plan execution tracking
+                            if (self.enable_structured_planning and self.current_plan != null) {
+                                var plan = &self.current_plan.?;
+                                // Check drift
+                                if (self.config.plan_drift_detection) {
+                                    const drift = plan_monitor.checkPlanDrift(
+                                        plan,
+                                        &self.plan_ctx,
+                                        tu.name,
+                                    );
+                                    if (drift) |d| {
+                                        self.plan_drift_score += d.drift_score;
+                                        // Inject drift correction if score too high
+                                        if (self.plan_drift_score > 0.8) {
+                                            const correction = plan_monitor.generateReplanSuggestion(
+                                                plan,
+                                                self.plan_ctx.steps_completed,
+                                                self.plan_drift_score,
+                                                self.alloc,
+                                            ) catch null;
+                                            if (correction) |c| {
+                                                defer self.alloc.free(c);
+                                                const adv = std.fmt.allocPrint(self.alloc, "[System Advisory]: {s}", .{c}) catch null;
+                                                if (adv) |a| {
+                                                    try allocated_strings.append(self.alloc, a);
+                                                    try results.append(self.alloc, .{
+                                                        .tool_use_id = tu.id,
+                                                        .content = a,
+                                                        .is_error = false,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Complete current step if tool matches hint
+                                if (self.plan_ctx.current_step_idx < plan.stepCount()) {
+                                    const current_step = &plan.steps.items[self.plan_ctx.current_step_idx];
+                                    if (current_step.tool_hint) |hint| {
+                                        if (std.mem.eql(u8, tu.name, hint)) {
+                                            plan_executor.completeStep(plan, &self.plan_ctx);
+                                            if (!utils.isSubagent()) {
+                                                main.stderrPrint("[agent] Plan step completed: {s}\n", .{current_step.description});
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Check if plan is complete
+                                if (self.plan_ctx.is_complete or plan.isComplete()) {
+                                    if (!utils.isSubagent()) {
+                                        main.stderrPrint("[agent] Plan completed! Saving to store...\n", .{});
+                                    }
+                                    if (self.plan_store) |ps| {
+                                        ps.save(plan) catch |e| {
+                                            main.stderrPrint("[agent] Warning: Failed to save plan: {s}\n", .{@errorName(e)});
+                                        };
+                                    }
+                                    self.clearPlan();
+                                } else {
+                                    // Move to next step
+                                    if (self.plan_ctx.current_step_idx + 1 < plan.stepCount()) {
+                                        self.plan_ctx.current_step_idx += 1;
+                                        plan.steps.items[self.plan_ctx.current_step_idx].status = .active;
+                                    }
+                                }
+                            } else {
+                                self.clearPlan();
+                            }
                         }
                     }
 
@@ -3469,6 +3698,11 @@ test "agent - plan watchdog enforcement and procrastination intercept" {
     agent.plan_summary_len = 0;
     agent.plan_procrastination_count = 0;
     agent.plan_procrastination_cap = 2;
+    agent.current_plan = null;
+    agent.enable_structured_planning = false;
+    agent.plan_store = null;
+    agent.plan_drift_score = 0.0;
+    agent.plan_ctx = .{};
     agent.current_user_request = null;
     defer agent.deinitTurnToolRecords();
 

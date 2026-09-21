@@ -52,6 +52,12 @@ pub const tokens_mod = @import("core/memact/tokens.zig");
 pub const media_lib = @import("lib/media.zig");
 pub const media_gen_tool = @import("tools/media_gen.zig");
 pub const file_mod = @import("tools/file.zig");
+pub const plan_mod = @import("core/plan.zig");
+pub const plan_parser_mod = @import("core/plan_parser.zig");
+pub const plan_executor_mod = @import("core/plan_executor.zig");
+pub const plan_monitor_mod = @import("core/plan_monitor.zig");
+pub const plan_store_mod = @import("core/plan_store.zig");
+pub const cas_mod = @import("core/cas.zig");
 
 pub const VERSION = "1.0.0";
 
@@ -579,4 +585,10 @@ test {
     _ = quickjs_engine;
     _ = js_bindings;
     _ = process_manager;
+    _ = plan_mod;
+    _ = plan_parser_mod;
+    _ = plan_executor_mod;
+    _ = plan_monitor_mod;
+    _ = plan_store_mod;
+    _ = cas_mod;
 }

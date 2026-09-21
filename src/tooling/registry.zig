@@ -397,11 +397,56 @@ pub fn getRelevantDefinitions(alloc: Allocator, user_text: []const u8) []const p
     return filtered_buf[0..count];
 }
 
-fn isCoreTool(name: []const u8) bool {
+pub fn isCoreTool(name: []const u8) bool {
     for (&core_tools) |ct| {
         if (std.mem.eql(u8, name, ct)) return true;
     }
     return false;
+}
+
+// PSEUDOCODE:
+// 1. Normalize tool name
+// 2. Return true if tool is in exploration tool set (file_read, read, grep, glob, skills)
+// 3. Otherwise return false
+
+/// Check if a tool is an exploration tool that should always remain available (RFC-019).
+pub fn isExplorationTool(name: []const u8) bool {
+    const norm = normalizeToolName(name);
+    return std.mem.eql(u8, norm, "file_read") or
+        std.mem.eql(u8, norm, "grep") or
+        std.mem.eql(u8, norm, "glob") or
+        std.mem.eql(u8, norm, "skills");
+}
+
+// PSEUDOCODE:
+// 1. If tool_hint is null, return all_defs directly
+// 2. Iterate through all_defs
+// 3. Keep exploration tools and tool matching normalized tool_hint
+// 4. Return filtered list (or all_defs if empty)
+
+/// Filter relevant definitions for plan-aware tool selection (RFC-019).
+/// Exploration tools always remain available. If tool_hint is provided, preferred tool is kept.
+pub fn filterDefinitionsForPlan(
+    alloc: Allocator,
+    all_defs: []const proto.ToolDefinition,
+    tool_hint: ?[]const u8,
+) []const proto.ToolDefinition {
+    if (tool_hint == null) return all_defs;
+    const hint = tool_hint.?;
+    const norm_hint = normalizeToolName(hint);
+
+    var filtered = std.ArrayListUnmanaged(proto.ToolDefinition).empty;
+    errdefer filtered.deinit(alloc);
+
+    for (all_defs) |td| {
+        const norm_td = normalizeToolName(td.name);
+        if (isExplorationTool(norm_td) or std.mem.eql(u8, norm_td, norm_hint)) {
+            filtered.append(alloc, td) catch continue;
+        }
+    }
+
+    if (filtered.items.len == 0) return all_defs;
+    return filtered.toOwnedSlice(alloc) catch all_defs;
 }
 
 /// Match policy entry (trimmed) with tool name.
@@ -638,3 +683,33 @@ test "registry: subagent depth limit permission" {
     try std.testing.expect(!isPermitted("invoke_subagent"));
     try std.testing.expect(!isPermitted("batch_invoke_subagents"));
 }
+
+test "registry: plan-aware tool filtering" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expect(isExplorationTool("file_read"));
+    try std.testing.expect(isExplorationTool("grep"));
+    try std.testing.expect(isExplorationTool("glob"));
+    try std.testing.expect(isExplorationTool("skills"));
+    try std.testing.expect(!isExplorationTool("bash"));
+    try std.testing.expect(!isExplorationTool("file_edit"));
+
+    const sample_defs = [_]proto.ToolDefinition{
+        .{ .name = "bash", .description = "run bash", .input_schema_json = "{}" },
+        .{ .name = "file_read", .description = "read file", .input_schema_json = "{}" },
+        .{ .name = "file_edit", .description = "edit file", .input_schema_json = "{}" },
+        .{ .name = "grep", .description = "search code", .input_schema_json = "{}" },
+    };
+
+    // With tool_hint = "file_edit": keep file_read, grep (exploration) + file_edit (hint)
+    const filtered = filterDefinitionsForPlan(alloc, &sample_defs, "file_edit");
+    defer if (filtered.ptr != sample_defs[0..].ptr) alloc.free(filtered);
+
+    try std.testing.expectEqual(3, filtered.len);
+    var has_bash = false;
+    for (filtered) |td| {
+        if (std.mem.eql(u8, td.name, "bash")) has_bash = true;
+    }
+    try std.testing.expect(!has_bash);
+}
+

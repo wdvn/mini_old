@@ -31,6 +31,11 @@ test {
     _ = @import("test_js_provider.zig");
     _ = @import("test_editor_multiline.zig");
     _ = @import("test_three_threads_watchdog.zig");
+    _ = @import("test_plan_parser.zig");
+    _ = @import("test_plan_executor.zig");
+    _ = @import("test_plan_monitor.zig");
+    _ = @import("test_plan_store.zig");
+    _ = @import("test_plan_integration.zig");
 }
 
 // ---------------------------------------------------------------------------
