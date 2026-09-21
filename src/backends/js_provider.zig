@@ -54,6 +54,93 @@ fn looksLikeFilePath(input: []const u8) bool {
     return true;
 }
 
+/// Locates "export default" keyword in JavaScript source code outside of
+/// single-line comments (//...), multi-line comments (/*...*/), and string literals.
+fn findExportDefault(source: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < source.len) {
+        const c0 = source[i];
+        // Single-line comment: // ... \n
+        if (c0 == '/' and i + 1 < source.len and source[i + 1] == '/') {
+            i += 2;
+            while (i < source.len and source[i] != '\n') : (i += 1) {}
+            continue;
+        }
+        // Multi-line comment: /* ... */
+        if (c0 == '/' and i + 1 < source.len and source[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < source.len and !(source[i] == '*' and source[i + 1] == '/')) : (i += 1) {}
+            if (i + 1 < source.len) i += 2;
+            continue;
+        }
+        // Single-quote string: ' ... '
+        if (c0 == '\'') {
+            i += 1;
+            while (i < source.len and source[i] != '\'') {
+                if (source[i] == '\\' and i + 1 < source.len) i += 1;
+                i += 1;
+            }
+            if (i < source.len) i += 1;
+            continue;
+        }
+        // Double-quote string: " ... "
+        if (c0 == '"') {
+            i += 1;
+            while (i < source.len and source[i] != '"') {
+                if (source[i] == '\\' and i + 1 < source.len) i += 1;
+                i += 1;
+            }
+            if (i < source.len) i += 1;
+            continue;
+        }
+        // Template literal: ` ... `
+        if (c0 == '`') {
+            i += 1;
+            while (i < source.len and source[i] != '`') {
+                if (source[i] == '\\' and i + 1 < source.len) i += 1;
+                i += 1;
+            }
+            if (i < source.len) i += 1;
+            continue;
+        }
+        // Check for "export default"
+        if (std.mem.startsWith(u8, source[i..], "export default")) {
+            const before_ok = (i == 0) or (!std.ascii.isAlphanumeric(source[i - 1]) and source[i - 1] != '_');
+            const after_idx = i + "export default".len;
+            const after_ok = (after_idx >= source.len) or (!std.ascii.isAlphanumeric(source[after_idx]) and source[after_idx] != '_');
+            if (before_ok and after_ok) {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// Logs QuickJS exception message and stack trace to stderr.
+fn logJsException(ctx: *c.JSContext, prefix: []const u8) void {
+    const exc = c.JS_GetException(ctx);
+    defer c.JS_FreeValue(ctx, exc);
+
+    const exc_str = c.JS_ToCString(ctx, exc);
+    if (exc_str != null) {
+        defer c.JS_FreeCString(ctx, exc_str);
+        main.stderrPrint("[js_provider] {s}: {s}\n", .{ prefix, std.mem.span(exc_str) });
+    } else {
+        main.stderrPrint("[js_provider] {s}: unknown QuickJS exception\n", .{prefix});
+    }
+
+    const stack_val = c.JS_GetPropertyStr(ctx, exc, "stack");
+    defer c.JS_FreeValue(ctx, stack_val);
+    if (c.JS_IsUndefined(stack_val) == 0 and c.JS_IsNull(stack_val) == 0) {
+        const stack_str = c.JS_ToCString(ctx, stack_val);
+        if (stack_str != null) {
+            defer c.JS_FreeCString(ctx, stack_str);
+            main.stderrPrint("[js_provider] Stack: {s}\n", .{std.mem.span(stack_str)});
+        }
+    }
+}
+
 pub const JsProviderAdapter = struct {
     alloc: Allocator,
     rt: *c.JSRuntime,
@@ -83,19 +170,56 @@ pub const JsProviderAdapter = struct {
 
     /// Initialize adapter from JS source code or file path (auto-detected).
     pub fn initFromSource(alloc: Allocator, source: []const u8) !*JsProviderAdapter {
-        // Auto-detect: if source looks like a file path, load from file.
-        const trimmed_input = std.mem.trim(u8, source, " \t\r\n");
-        if (looksLikeFilePath(trimmed_input)) {
-            return initFromFileWithProfile(alloc, trimmed_input, null);
-        }
         return initFromSourceWithProfile(alloc, source, null);
     }
 
-    /// Initialize adapter from JS source code, with an optional
-    /// base profile to inherit from (defaults to "generic" if null).
-    /// This function always treats input as raw JS source (no file path detection).
+    /// Initialize adapter from JS source code or file path (auto-detected),
+    /// with an optional base profile to inherit from (defaults to "generic" if null).
     pub fn initFromSourceWithProfile(alloc: Allocator, source: []const u8, base_profile: ?ProviderProfile) !*JsProviderAdapter {
+        const trimmed_input = std.mem.trim(u8, source, " \t\r\n");
+        if (looksLikeFilePath(trimmed_input)) {
+            return initFromFileWithProfile(alloc, trimmed_input, base_profile);
+        }
+        return initFromRawSourceWithProfile(alloc, source, base_profile);
+    }
 
+    /// Initialize adapter from a JS file path with default profile.
+    pub fn initFromFile(alloc: Allocator, path: []const u8) !*JsProviderAdapter {
+        return initFromFileWithProfile(alloc, path, null);
+    }
+
+    /// Initialize adapter from a JS file path with optional base profile.
+    pub fn initFromFileWithProfile(alloc: Allocator, path: []const u8, base_profile: ?ProviderProfile) !*JsProviderAdapter {
+        const io = main.getIo();
+        const cwd = std.Io.Dir.cwd();
+        const file = cwd.openFile(io, path, .{}) catch |err| {
+            main.stderrPrint("[js_provider] Failed to open provider JS file '{s}': {s}\n", .{ path, @errorName(err) });
+            return error.JsProviderFileNotFound;
+        };
+        defer file.close(io);
+
+        const len_u64 = file.length(io) catch |err| {
+            main.stderrPrint("[js_provider] Failed to get length of provider JS file '{s}': {s}\n", .{ path, @errorName(err) });
+            return error.JsProviderFileReadFailed;
+        };
+        if (len_u64 == 0) return error.JsProviderExportMissing;
+        if (len_u64 > 1024 * 1024) return error.JsProviderFileTooLarge;
+
+        const len: usize = @intCast(len_u64);
+        const buf = alloc.alloc(u8, len) catch return error.OutOfMemory;
+        defer alloc.free(buf);
+
+        const n = file.readPositionalAll(io, buf, 0) catch |err| {
+            main.stderrPrint("[js_provider] Failed to read provider JS file '{s}': {s}\n", .{ path, @errorName(err) });
+            return error.JsProviderFileReadFailed;
+        };
+        if (n == 0) return error.JsProviderExportMissing;
+
+        return try initFromRawSourceWithProfile(alloc, buf[0..n], base_profile);
+    }
+
+    /// Initialize adapter from raw JS source code (always treats input as JS source).
+    fn initFromRawSourceWithProfile(alloc: Allocator, source: []const u8, base_profile: ?ProviderProfile) !*JsProviderAdapter {
         const rt = c.JS_NewRuntime() orelse return error.QuickJSRuntimeInitFailed;
         errdefer c.JS_FreeRuntime(rt);
 
@@ -108,16 +232,16 @@ pub const JsProviderAdapter = struct {
         const ctx = c.JS_NewContext(rt) orelse return error.QuickJSContextInitFailed;
         errdefer c.JS_FreeContext(ctx);
 
-        // Normalize source: if it starts with export default, replace with return
+        // Normalize source: replace "export default" with "return " outside comments/strings
         var normalized_source = std.ArrayListUnmanaged(u8).empty;
         defer normalized_source.deinit(alloc);
 
-        const trimmed = std.mem.trim(u8, source, " \t\r\n");
-        if (std.mem.startsWith(u8, trimmed, "export default")) {
+        if (findExportDefault(source)) |idx| {
+            try normalized_source.appendSlice(alloc, source[0..idx]);
             try normalized_source.appendSlice(alloc, "return ");
-            try normalized_source.appendSlice(alloc, trimmed["export default".len..]);
+            try normalized_source.appendSlice(alloc, source[idx + "export default".len ..]);
         } else {
-            try normalized_source.appendSlice(alloc, trimmed);
+            try normalized_source.appendSlice(alloc, source);
         }
 
         // Wrap in self-invoking function that supports:
@@ -154,8 +278,7 @@ pub const JsProviderAdapter = struct {
         // Sentinel null-terminator for QuickJS C eval
         var eval_val = c.JS_Eval(ctx, wrapper.items.ptr, wrapper.items.len - 1, "<provider_js>", c.JS_EVAL_TYPE_GLOBAL);
         if (isException(eval_val)) {
-            const exc = c.JS_GetException(ctx);
-            c.JS_FreeValue(ctx, exc);
+            logJsException(ctx, "Failed to evaluate provider wrapper");
             return error.JsEvaluationFailed;
         }
 
@@ -163,10 +286,10 @@ pub const JsProviderAdapter = struct {
         if (!isObject(eval_val)) {
             c.JS_FreeValue(ctx, eval_val);
 
-            const expr_body = if (std.mem.startsWith(u8, trimmed, "export default"))
-                std.mem.trim(u8, trimmed["export default".len..], " \t\r\n")
+            const expr_body = if (findExportDefault(source)) |idx|
+                std.mem.trim(u8, source[idx + "export default".len..], " \t\r\n")
             else
-                trimmed;
+                std.mem.trim(u8, source, " \t\r\n");
 
             var expr_wrapper = std.ArrayListUnmanaged(u8).empty;
             defer expr_wrapper.deinit(alloc);
@@ -176,8 +299,7 @@ pub const JsProviderAdapter = struct {
 
             eval_val = c.JS_Eval(ctx, expr_wrapper.items.ptr, expr_wrapper.items.len - 1, "<provider_expr>", c.JS_EVAL_TYPE_GLOBAL);
             if (isException(eval_val)) {
-                const exc = c.JS_GetException(ctx);
-                defer c.JS_FreeValue(ctx, exc);
+                logJsException(ctx, "Failed to evaluate provider expression");
                 return error.JsEvaluationFailed;
             }
 
@@ -211,28 +333,6 @@ pub const JsProviderAdapter = struct {
         };
 
         return self;
-    }
-
-    /// Initialize adapter from a JS file path.
-    pub fn initFromFile(alloc: Allocator, path: []const u8) !*JsProviderAdapter {
-        return initFromFileWithProfile(alloc, path, null);
-    }
-
-    /// Initialize adapter from a JS file path with optional base profile.
-    fn initFromFileWithProfile(alloc: Allocator, path: []const u8, base_profile: ?ProviderProfile) !*JsProviderAdapter {
-        const io = main.getIo();
-        const cwd = std.Io.Dir.cwd();
-        const file = cwd.openFile(io, path, .{}) catch return error.JsProviderFileNotFound;
-        defer file.close(io);
-
-        // Provider JS files are small; 1MB fixed buffer is plenty.
-        var buf: [1024 * 1024]u8 = undefined;
-        const n = utils.readAll(io, file, &buf) catch return error.JsProviderFileReadFailed;
-        if (n == 0) return error.JsProviderExportMissing;
-
-        // Delegate to initFromSourceWithProfile — content won't trigger file-path
-        // auto-detect because it contains JS syntax characters.
-        return try initFromSourceWithProfile(alloc, buf[0..n], base_profile);
     }
 
     fn parseExportedObject(self: *JsProviderAdapter) !void {
@@ -349,8 +449,7 @@ pub const JsProviderAdapter = struct {
 
         const chunk_val = c.JS_ParseJSON(self.ctx, raw_chunk_json.ptr, raw_chunk_json.len, "<chunk>");
         if (isException(chunk_val)) {
-            const exc = c.JS_GetException(self.ctx);
-            c.JS_FreeValue(self.ctx, exc);
+            logJsException(self.ctx, "extractReasoning JSON parse error");
             return null;
         }
         defer c.JS_FreeValue(self.ctx, chunk_val);
@@ -360,8 +459,7 @@ pub const JsProviderAdapter = struct {
         defer c.JS_FreeValue(self.ctx, ret_val);
 
         if (isException(ret_val)) {
-            const exc = c.JS_GetException(self.ctx);
-            c.JS_FreeValue(self.ctx, exc);
+            logJsException(self.ctx, "extractReasoning hook execution failed");
             return null;
         }
 
@@ -387,8 +485,7 @@ pub const JsProviderAdapter = struct {
 
         const chunk_val = c.JS_ParseJSON(self.ctx, raw_chunk_json.ptr, raw_chunk_json.len, "<chunk>");
         if (isException(chunk_val)) {
-            const exc = c.JS_GetException(self.ctx);
-            c.JS_FreeValue(self.ctx, exc);
+            logJsException(self.ctx, "extractContent JSON parse error");
             return null;
         }
         defer c.JS_FreeValue(self.ctx, chunk_val);
@@ -398,8 +495,7 @@ pub const JsProviderAdapter = struct {
         defer c.JS_FreeValue(self.ctx, ret_val);
 
         if (isException(ret_val)) {
-            const exc = c.JS_GetException(self.ctx);
-            c.JS_FreeValue(self.ctx, exc);
+            logJsException(self.ctx, "extractContent hook execution failed");
             return null;
         }
 
@@ -426,8 +522,7 @@ pub const JsProviderAdapter = struct {
 
         const req_val = c.JS_ParseJSON(self.ctx, raw_request_json.ptr, raw_request_json.len, "<req>");
         if (isException(req_val)) {
-            const exc = c.JS_GetException(self.ctx);
-            c.JS_FreeValue(self.ctx, exc);
+            logJsException(self.ctx, "transformRequest JSON parse error");
             return error.InvalidRequestJson;
         }
         defer c.JS_FreeValue(self.ctx, req_val);
@@ -437,8 +532,7 @@ pub const JsProviderAdapter = struct {
         defer c.JS_FreeValue(self.ctx, ret_val);
 
         if (isException(ret_val)) {
-            const exc = c.JS_GetException(self.ctx);
-            c.JS_FreeValue(self.ctx, exc);
+            logJsException(self.ctx, "transformRequest hook execution failed");
             return error.JsRequestTransformFailed;
         }
 

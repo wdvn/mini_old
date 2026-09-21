@@ -414,7 +414,7 @@ test "pruneOldJournals keeps N newest files, preserves current file" {
 
     // Dedicated test directory — do not touch actual ~/.mini/sessions
     var buf: [128]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_journal_prune_test_{d}", .{std.posix.getpid()});
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_journal_prune_test_{d}", .{std.c.getpid()});
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, dir);

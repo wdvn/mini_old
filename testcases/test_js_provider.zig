@@ -80,3 +80,63 @@ test "js_provider: CommonJS and object returning syntax" {
     defer alloc.free(reasoning.?);
     try testing.expectEqualStrings("Thinking with details plural", reasoning.?);
 }
+
+test "js_provider: load from file path providers/agnes.js via initFromSourceWithProfile" {
+    const alloc = testing.allocator;
+    const path = "providers/agnes.js";
+
+    // Mimics openai.zig's Client.loadAdapter with base profile
+    const profile = mini.backends.provider_mod.getProfile("generic");
+    var adapter = try js_provider.JsProviderAdapter.initFromSourceWithProfile(alloc, path, profile);
+    defer adapter.deinit();
+
+    try testing.expectEqualStrings("Agnes AI", adapter.profile.name);
+    try testing.expectEqual(mini.backends.provider_mod.WireProtocol.chat_completions, adapter.profile.protocol);
+    try testing.expectEqual(mini.backends.provider_mod.EchoPolicy.drop, adapter.profile.echo_policy);
+    try testing.expectEqual(mini.backends.provider_mod.ThinkingTagSet.english_only, adapter.profile.thinking_tags);
+    try testing.expectEqual(mini.backends.provider_mod.ReasoningParamFormat.top_level_effort, adapter.profile.reasoning_param);
+
+    // Verify extractReasoning on nested delta.detail.reasoning_content
+    const chunk_json =
+        \\{"choices":[{"delta":{"detail":{"reasoning_content":"Thinking step via Agnes adapter"}}}]}
+    ;
+    const reasoning = adapter.extractReasoning(alloc, chunk_json);
+    try testing.expect(reasoning != null);
+    defer alloc.free(reasoning.?);
+    try testing.expectEqualStrings("Thinking step via Agnes adapter", reasoning.?);
+}
+
+test "js_provider: leading comments and helper declarations before export default" {
+    const alloc = testing.allocator;
+
+    const js_source =
+        \\//! Line comment 1
+        \\// Line comment 2
+        \\/* Block comment */
+        \\const PREFIX = "Helper_";
+        \\function getPrefix() { return PREFIX; }
+        \\
+        \\export default {
+        \\    name: getPrefix() + "Provider",
+        \\    protocol: "responses"
+        \\};
+    ;
+
+    var adapter = try js_provider.JsProviderAdapter.initFromSource(alloc, js_source);
+    defer adapter.deinit();
+
+    try testing.expectEqualStrings("Helper_Provider", adapter.profile.name);
+    try testing.expectEqual(mini.backends.provider_mod.WireProtocol.responses, adapter.profile.protocol);
+}
+
+test "js_provider: syntax error logs cleanly and returns JsEvaluationFailed" {
+    const alloc = testing.allocator;
+
+    const invalid_js =
+        \\function broken( { return 123; }
+    ;
+
+    const res = js_provider.JsProviderAdapter.initFromSource(alloc, invalid_js);
+    try testing.expectError(error.JsEvaluationFailed, res);
+}
+
