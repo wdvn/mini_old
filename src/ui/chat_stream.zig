@@ -204,6 +204,30 @@ pub const StreamEventParser = struct {
         };
     }
 
+    pub fn flush(self: *StreamEventParser, context: anytype, comptime emitFn: fn (@TypeOf(context), StreamEvent) void) void {
+        if (self.in_fence_check and self.fence_len > 0) {
+            if (self.state != .in_text) {
+                self.state = .in_text;
+                emitFn(context, .text_start);
+            }
+            emitFn(context, .{ .text_chunk = self.fence_buf[0..self.fence_len] });
+            self.in_fence_check = false;
+            self.fence_len = 0;
+        }
+        if (self.tag_len > 0) {
+            if (self.state == .in_think) {
+                emitFn(context, .{ .think_chunk = self.tag_buf[0..self.tag_len] });
+            } else {
+                if (self.state != .in_text) {
+                    self.state = .in_text;
+                    emitFn(context, .text_start);
+                }
+                emitFn(context, .{ .text_chunk = self.tag_buf[0..self.tag_len] });
+            }
+            self.tag_len = 0;
+        }
+    }
+
     pub fn resetAct(self: *StreamEventParser) void {
         self.state = .idle;
         self.tag_len = 0;
@@ -482,7 +506,6 @@ pub const TurnRenderer = struct {
 
     pub fn deinit(self: *TurnRenderer) void {
         self.stopWaiting();
-        self.clearInplaceLine();
     }
 
     // -----------------------------------------------------------------------
@@ -515,8 +538,10 @@ pub const TurnRenderer = struct {
 
     /// Reset error signature on successful act or turn completion.
     pub fn resetErrorSignature(self: *TurnRenderer) void {
-        self.last_error_signature = 0;
-        self.clearInplaceLine();
+        if (self.last_error_signature != 0) {
+            self.last_error_signature = 0;
+            self.clearInplaceLine();
+        }
     }
 
     /// Compute 64-bit FNV-1a error signature combining HTTP code and raw response body.
@@ -1081,6 +1106,7 @@ pub const TurnRenderer = struct {
 
     pub fn endTextResponse(self: *TurnRenderer) void {
         self.highlighter.flush(self.io);
+        self.ensureNewline();
         if (self.ui_state == .text_streaming) {
             self.ui_state = .idle;
         }
@@ -1236,9 +1262,12 @@ pub const TurnRenderer = struct {
         if (self.ui_state == .codeact_live or self.ui_state == .codeact_ready or self.is_codeact) {
             self.endCodeAct();
         }
+        self.parser.flush(self, dispatchParserEvent);
         if (self.ui_state == .text_streaming) {
             self.endTextResponse();
         }
+        self.highlighter.flush(self.io);
+        self.ensureNewline();
         self.parser.resetAct();
         self.ui_state = .idle;
         self.resetErrorSignature();

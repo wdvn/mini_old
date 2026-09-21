@@ -235,6 +235,13 @@ pub const StreamHighlighter = struct {
             self.in_code_header = false;
             self.in_closing_fence = false;
         }
+        if (self.fence_backtick_count > 0) {
+            var k: usize = 0;
+            while (k < self.fence_backtick_count) : (k += 1) {
+                term.writeStdout("`");
+            }
+            self.fence_backtick_count = 0;
+        }
         term.writeStdout("\x1b[0m");
         self.state = .normal;
         self.at_line_start = true;

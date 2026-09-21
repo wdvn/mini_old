@@ -170,3 +170,24 @@ test "UI Chat Stream: startTool and finishTool multi-line detail and snippet" {
         .completion_tokens = 200,
     });
 }
+
+test "UI Chat Stream: text response without trailing newline preserves state and finishes cleanly" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var renderer = chat_stream.TurnRenderer.init(alloc, io);
+    renderer.startTurn("hello");
+
+    // Process chunk without newline
+    renderer.processTextChunk("Hello! How can I help you today?");
+    try std.testing.expectEqual(chat_stream.TurnRenderer.UIState.text_streaming, renderer.ui_state);
+
+    // finishTurn flushes and resets cleanly without erasing state
+    renderer.finishTurn(.{
+        .prompt_tokens = 10,
+        .completion_tokens = 20,
+    });
+    try std.testing.expectEqual(chat_stream.TurnRenderer.UIState.idle, renderer.ui_state);
+    try std.testing.expect(renderer.consecutive_newlines >= 1);
+}
+
