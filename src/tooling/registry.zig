@@ -41,6 +41,7 @@ const mcp_mod = @import("mcp.zig");
 const hooks = @import("../core/hooks.zig");
 const skills_mod = @import("../core/skills.zig");
 const quickjs = @import("../runtime/quickjs_engine.zig");
+const signals = @import("../core/signals.zig");
 
 // ---------------------------------------------------------------------------
 // Global state (single-threaded)
@@ -185,10 +186,21 @@ pub fn executeTool(alloc: Allocator, io: std.Io, name: []const u8, input_json: [
     });
 
     var is_error = false;
+    // PSEUDOCODE:
+    // 1. Execute tool handler
+    // 2. If Interrupted error or signals.isInterrupted(), propagate error.Interrupted immediately
+    // 3. Otherwise wrap error message and dispatch post-tool-use hook
     const res = executeToolInternal(alloc, io, name, input_json) catch |e| blk: {
+        if (e == error.Interrupted or signals.isInterrupted()) {
+            return error.Interrupted;
+        }
         is_error = true;
         break :blk try std.fmt.allocPrint(alloc, "Tool error: {s}", .{@errorName(e)});
     };
+    if (signals.isInterrupted()) {
+        alloc.free(res);
+        return error.Interrupted;
+    }
 
     hooks.dispatch(alloc, io, .{
         .event = "post-tool-use",
@@ -568,6 +580,11 @@ fn executeSkills(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
 /// Interrupt active bash process (called on Watchdog timeout or SIGINT).
 pub fn interruptActiveBash() void {
     bash_tool.interruptCurrent();
+}
+
+/// Force kill active bash process group with SIGKILL (called on Watchdog escalation).
+pub fn forceKillActiveBash() void {
+    bash_tool.forceKillCurrent();
 }
 
 test "codeact as native tool: codeact in registry" {

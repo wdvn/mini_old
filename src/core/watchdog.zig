@@ -71,6 +71,9 @@ pub const Watchdog = struct {
     /// Optional external interrupt hook (e.g. QuickJS requestInterrupt).
     interrupt_fn: ?*const fn () void = null,
 
+    /// Optional external force kill hook (e.g. SIGKILL active processes).
+    force_kill_fn: ?*const fn () void = null,
+
     /// Optional 1-call LLM timeout decision handler.
     decision_fn: ?DecisionFn = null,
 
@@ -212,6 +215,25 @@ pub const Watchdog = struct {
                                 .{ state.act_id, reason_str },
                             );
                         }
+                    }
+                } else {
+                    // PSEUDOCODE:
+                    // 1. If act is still running past timeout (state.is_timed_out is true), escalate
+                    // 2. Reinforce signals.setInterrupted(true)
+                    // 3. Call force_kill_fn to deliver SIGKILL to child process group
+                    // 4. Emit escalation notice to stderr
+                    signals.setInterrupted(true);
+                    if (self.force_kill_fn) |fk_fn| {
+                        fk_fn();
+                    } else if (self.interrupt_fn) |int_fn| {
+                        int_fn();
+                    }
+                    if (self.config.verbose_stderr) {
+                        printStderr(
+                            self.io,
+                            "\x1b[31m[watchdog] 🛑 Act {d} still running past timeout ({d}s). Escalating to force kill (SIGKILL).\x1b[0m\n",
+                            .{ state.act_id, elapsed_s },
+                        );
                     }
                 }
             }

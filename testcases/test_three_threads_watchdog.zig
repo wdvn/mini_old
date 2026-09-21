@@ -301,3 +301,45 @@ test "Watchdog: decision function choosing KILL triggers interrupt and sets time
     defer alloc.free(timeout_ctx.?);
     try testing.expectEqualStrings("Hung waiting for stdin", timeout_ctx.?);
 }
+
+var g_force_kill_invoked: bool = false;
+fn mockForceKillHook() void {
+    g_force_kill_invoked = true;
+}
+
+test "Watchdog: escalation invokes force_kill_fn when act remains running past timeout" {
+    defer signals.setInterrupted(false);
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var coordinator = act_queue.ActCoordinator.init(alloc);
+    defer coordinator.deinit();
+
+    var watchdog = watchdog_mod.Watchdog.init(alloc, io, coordinator, .{
+        .tracking_interval_s = 10,
+        .act_timeout_secs = 5,
+        .verbose_stderr = false,
+    });
+    defer watchdog.deinit();
+    watchdog.decision_fn = &mockDecisionKill;
+    watchdog.force_kill_fn = &mockForceKillHook;
+
+    coordinator.resetTurn();
+    coordinator.updateStatus(1, .executing_tool, "bash: hung");
+
+    // Exceed initial 5s timeout
+    coordinator.lock();
+    coordinator.state.act_start_ms -= 6000;
+    coordinator.unlock();
+
+    // First tick: triggers interrupt (KILL decision)
+    g_force_kill_invoked = false;
+    watchdog.tick();
+    try testing.expect(coordinator.getMonitorState().is_timed_out);
+    try testing.expect(!g_force_kill_invoked);
+
+    // Second tick: act is still running past timeout -> triggers force_kill_fn escalation!
+    watchdog.tick();
+    try testing.expect(g_force_kill_invoked);
+    try testing.expect(signals.isInterrupted());
+}

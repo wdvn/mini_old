@@ -31,15 +31,36 @@ const json = @import("../core/json.zig");
 const utils = @import("../core/utils.zig");
 const main = @import("../main.zig");
 const hooks = @import("../core/hooks.zig");
+const signals = @import("../core/signals.zig");
 
 var g_active_pid: std.atomic.Value(std.process.Child.Id) = std.atomic.Value(std.process.Child.Id).init(0);
 
-/// Interrupt the currently executing bash child process (if any).
+// PSEUDOCODE:
+// 1. Read g_active_pid atomically with acquire ordering
+// 2. If pid > 0, send SIGTERM to process group (-pid)
+// 3. Fallback to single pid if group kill fails
 pub fn interruptCurrent() void {
-    const pid = g_active_pid.swap(0, .acq_rel);
+    const pid = g_active_pid.load(.acquire);
     if (pid > 0) {
         if (comptime builtin.os.tag != .windows) {
-            _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+            _ = std.posix.kill(-pid, std.posix.SIG.TERM) catch {
+                _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+            };
+        }
+    }
+}
+
+// PSEUDOCODE:
+// 1. Read g_active_pid atomically with acquire ordering
+// 2. If pid > 0, send SIGKILL to process group (-pid)
+// 3. Fallback to single pid if group kill fails
+pub fn forceKillCurrent() void {
+    const pid = g_active_pid.load(.acquire);
+    if (pid > 0) {
+        if (comptime builtin.os.tag != .windows) {
+            _ = std.posix.kill(-pid, std.posix.SIG.KILL) catch {
+                _ = std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+            };
         }
     }
 }
@@ -99,9 +120,41 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
 
 /// Drain pipe completely into buffer. Retain at most first buf.len bytes.
 /// Excess data is drained so child process does not block on pipe.
+// PSEUDOCODE:
+// 1. Loop until pipe is exhausted or interrupted
+// 2. Poll pipe with 250ms timeout on POSIX to avoid blocking indefinitely when child hangs
+// 3. If poll times out (ready == 0), check signals.isInterrupted(); break if set, else continue
+// 4. If POLL.ERR or POLL.NVAL, break
+// 5. If POLL.HUP and not POLL.IN, break (EOF)
+// 6. Read available bytes into buf (or discard sink) and append to hooks
+// 7. Check signals.isInterrupted() and break if set
 fn drainPipe(io: std.Io, pipe: std.Io.File, buf: []u8) usize {
     var stored: usize = 0;
     while (true) {
+        if (signals.isInterrupted()) break;
+
+        if (comptime builtin.os.tag != .windows) {
+            var pfd = [_]std.posix.pollfd{.{
+                .fd = pipe.handle,
+                .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&pfd, 250) catch |err| {
+                if (err == error.Interrupted) continue;
+                break;
+            };
+            if (ready == 0) {
+                if (signals.isInterrupted()) break;
+                continue;
+            }
+            if ((pfd[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) {
+                break;
+            }
+            if ((pfd[0].revents & std.posix.POLL.HUP) != 0 and (pfd[0].revents & std.posix.POLL.IN) == 0) {
+                break;
+            }
+        }
+
         if (stored < buf.len) {
             // Buffer has room — read into buffer
             const n = pipe.readStreaming(io, &.{buf[stored..]}) catch break;
@@ -136,13 +189,46 @@ test "bash tool: command JSON escape unescaped before execution" {
     try std.testing.expectEqualStrings("hello world", std.mem.trim(u8, res, " \n\r\t\""));
 }
 
+fn testInterruptorThread() void {
+    const io = main.getIo();
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake) catch {};
+    signals.setInterrupted(true);
+    interruptCurrent();
+}
+
+test "bash tool: process group interruption terminates sleeping command promptly" {
+    if (comptime builtin.os.tag == .windows) return;
+    defer signals.setInterrupted(false);
+    const alloc = std.testing.allocator;
+    const io = main.getIo();
+
+    signals.setInterrupted(false);
+    const t = try std.Thread.spawn(.{}, testInterruptorThread, .{});
+    defer t.join();
+
+    const input = "{\"command\":\"sleep 10\"}";
+    const res = executeTool(alloc, io, input);
+    if (res) |output| {
+        defer alloc.free(output);
+    } else |err| {
+        try std.testing.expectEqual(error.Interrupted, err);
+    }
+}
+
 /// Run shell command and collect output.
 /// Uses separate thread to read stderr concurrently with stdout to avoid pipe deadlock.
 /// Buffers are heap-allocated (128KB per stream).
+// PSEUDOCODE:
+// 1. Spawn /bin/sh with pgid = 0 so all children/grandchildren share a process group
+// 2. Track pid in g_active_pid
+// 3. Concurrently drain stdout and stderr using interrupt-aware drainPipe
+// 4. If signals.isInterrupted(), force-kill process group before waiting
+// 5. Wait for child and return output or error.Interrupted
 fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: ?[]const u8) ![]u8 {
     const argv = [_][]const u8{ "/bin/sh", "-c", command };
     var child = try std.process.spawn(io, .{
         .argv = &argv,
+        .pgid = 0,
         .stdin = if (stdin_str != null) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -188,10 +274,20 @@ fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: 
         stdelen = drainPipe(io, err_pipe, stderr_buf);
     }
 
+    // If interrupted while draining pipes, ensure process group is terminated
+    if (signals.isInterrupted()) {
+        forceKillCurrent();
+    }
+
     // Await child process termination after draining pipes
     const term = child.wait(io) catch |e| {
+        if (signals.isInterrupted()) return error.Interrupted;
         return std.fmt.allocPrint(alloc, "Wait error: {s}", .{@errorName(e)});
     };
+
+    if (signals.isInterrupted()) {
+        return error.Interrupted;
+    }
 
     const exit_code: u8 = switch (term) {
         .exited => |code| code,

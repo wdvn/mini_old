@@ -78,7 +78,8 @@ pub const GLYPH_BULLET = "•";
 /// Safely write raw bytes to stdout (skipped during testing to prevent blocking mock Io).
 pub fn writeStdout(bytes: []const u8) void {
     if (comptime builtin.is_test) return;
-    std.Io.File.stdout().writeStreamingAll(main.getIo(), bytes) catch {};
+    const f = std.Io.File.stdout();
+    f.writeStreamingAll(main.getIo(), bytes) catch {};
 }
 
 // ---------------------------------------------------------------------------

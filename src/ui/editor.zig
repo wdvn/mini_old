@@ -537,6 +537,9 @@ pub const LineEditor = struct {
         // unaffected. Unknown terminals ignore the request (no-op), plain
         // Enter still sends '\r'.
         stdout_file.writeStreamingAll(io, "\x1b[>4;1m\x1b[>1u\x1b[?2004h") catch {};
+        var buf: [1024]u8 = undefined;
+        var w = stdout_file.writerStreaming(io, &buf);
+        w.flush() catch {};
 
         self.buf.clearRetainingCapacity();
         self.pos = 0;

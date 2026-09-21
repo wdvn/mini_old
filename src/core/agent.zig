@@ -88,6 +88,16 @@ fn watchdogInterruptHandler() void {
     tools_mod.interruptActiveBash();
 }
 
+fn watchdogForceKillHandler() void {
+    while (!g_agent_mutex.tryLock()) {}
+    const agent = g_active_agent;
+    g_agent_mutex.unlock();
+    if (agent) |a| {
+        a.engine.requestInterrupt();
+    }
+    tools_mod.forceKillActiveBash();
+}
+
 fn watchdogDecisionHandler(ctx: watchdog_mod.DecisionContext) watchdog_mod.TimeoutDecision {
     while (!g_agent_mutex.tryLock()) {}
     const agent = g_active_agent;
@@ -461,6 +471,7 @@ pub const AgentLoop = struct {
             .verbose_stderr = config.action_loop_display,
         });
         watchdog.interrupt_fn = &watchdogInterruptHandler;
+        watchdog.force_kill_fn = &watchdogForceKillHandler;
         watchdog.decision_fn = &watchdogDecisionHandler;
         watchdog.start() catch |e| {
             if (!utils.isSubagent()) main.stderrPrint("[agent] Warning: Failed to start Watchdog thread: {s}\n", .{@errorName(e)});
@@ -2683,11 +2694,18 @@ pub const AgentLoop = struct {
 
                     var is_err = false;
                     const result = tools_mod.executeTool(self.alloc, self.io, tu.name, tu.input_json) catch |e| blk: {
+                        if (e == error.Interrupted or signals.isInterrupted()) {
+                            return error.Interrupted;
+                        }
                         is_err = true;
                         any_tool_err = true;
                         const msg = try std.fmt.allocPrint(self.alloc, "Tool error: {s}", .{@errorName(e)});
                         break :blk msg;
                     };
+                    if (signals.isInterrupted()) {
+                        self.alloc.free(result);
+                        return error.Interrupted;
+                    }
                     try allocated_strings.append(self.alloc, result);
 
                     // Truncate if oversized
