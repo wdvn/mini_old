@@ -165,3 +165,18 @@ This document complements the sections above, focusing on **analysis, root cause
 - **UI & Terminal Stream**: `src/ui/chat_stream.zig` (TurnRenderer, in-place retry replacements, ANSI truncation, raw backend error formatting), `src/ui/repl.zig`, `src/ui/editor.zig`, `src/ui/paste.zig`.
 - **Memory & History**: `src/core/history.zig`, `src/core/memact/`.
 - **Tools & Registry**: `src/tooling/registry.zig` (15 built-in tools + MCP dispatcher), `src/tools/session_diagnostics.zig`, `src/core/skills.zig`.
+
+## 4. Structured Planning & Deliberation Guidelines (RFC-019)
+
+1. **Complexity Self-Assessment**:
+   - For multi-step tasks (>= 2 steps, architectural refactors, or cross-file edits), formulate a structured implementation plan using JSON or Markdown checklist before mutating code.
+   - Structure plans with step IDs, explicit descriptions, prerequisite dependencies, and preferred tool hints.
+2. **Grounding in Active Code**:
+   - Always verify facts against the active codebase using `mini.read`, `mini.grep`, or `mini.glob`.
+   - Never guess file contents, function signatures, types, or configuration keys.
+3. **Adaptive Cognitive Modulation (`mini.setThinking`)**:
+   - Use `mini.setThinking("low")` for routine exploration and status inspections.
+   - Use `mini.setThinking("high")` when analyzing root causes, debugging, or planning architecture.
+4. **Surgical Implementation & Empirical Verification**:
+   - Make minimal, precise changes (`mini.patch`).
+   - Run relevant unit tests and build commands via `mini.sh(...)` after changes to empirically verify correctness.
