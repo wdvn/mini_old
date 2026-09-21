@@ -294,8 +294,8 @@ pub const AgentLoop = struct {
     plan_store: ?*plan_store_mod.PlanStore = null,
     /// Drift score tracker
     plan_drift_score: f64 = 0.0,
-    /// Enable structured planning (config-gated)
-    enable_structured_planning: bool = false,
+    /// Enable structured planning (config-gated; default: true, overridable via /plan)
+    enable_structured_planning: bool = true,
 
     /// 3-Thread Coordinator & State Monitor (RFC-015)
     coordinator: *act_queue.ActCoordinator,
@@ -663,35 +663,48 @@ pub const AgentLoop = struct {
     }
 
     pub fn detectPlanInText(text: []const u8) ?[]const u8 {
-        const markers = [_][]const u8{
-            "tôi sẽ implement",
-            "tôi sẽ thực hiện",
-            "tôi sẽ tiến hành",
-            "sẽ implement",
-            "sẽ thực thi",
-            "sẽ tiến hành",
-            "kế hoạch:",
-            "bước 1:",
-            "i will implement",
-            "i'll implement",
-            "i will now apply",
-            "i will now edit",
-            "i will now create",
-            "plan:",
-            "step 1:",
-            "here is the plan",
-            "implementation plan",
-        };
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0) continue;
 
-        for (markers) |marker| {
-            if (marker.len == 0 or text.len < marker.len) continue;
-            var i: usize = 0;
-            while (i <= text.len - marker.len) : (i += 1) {
-                if (std.ascii.eqlIgnoreCase(text[i .. i + marker.len], marker)) {
-                    const start = i;
+            // 1. Markdown heading (# ... ######) containing plan keyword
+            if (trimmed[0] == '#') {
+                var i: usize = 0;
+                while (i < trimmed.len and trimmed[i] == '#') : (i += 1) {}
+                if (i <= 6 and i < trimmed.len and (trimmed[i] == ' ' or trimmed[i] == '\t')) {
+                    const title = std.mem.trim(u8, trimmed[i..], " \t#*`_");
+                    if (plan_parser.isPlanHeaderKeyword(title)) {
+                        const start = @intFromPtr(trimmed.ptr) - @intFromPtr(text.ptr);
+                        const end = @min(text.len, start + 120);
+                        return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
+                    }
+                }
+                continue;
+            }
+
+            // 2. Line label ending with ':' or bold label: "Plan:", "**Plan:**", "Implementation Plan:", "Kế hoạch:"
+            const stripped = std.mem.trim(u8, trimmed, " \t*_`");
+            if (stripped.len > 0 and (std.mem.endsWith(u8, stripped, ":") or std.mem.startsWith(u8, stripped, "**"))) {
+                const title = std.mem.trim(u8, stripped, " \t:*_`");
+                if (plan_parser.isPlanHeaderKeyword(title) or
+                    std.ascii.startsWithIgnoreCase(title, "step 1") or
+                    std.ascii.startsWithIgnoreCase(title, "bước 1"))
+                {
+                    const start = @intFromPtr(trimmed.ptr) - @intFromPtr(text.ptr);
                     const end = @min(text.len, start + 120);
                     return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
                 }
+            }
+
+            // 3. Explicit action commitment prefix: "I will implement" / "Tôi sẽ implement"
+            if (std.ascii.indexOfIgnoreCase(trimmed, "i will implement") != null or
+                std.ascii.indexOfIgnoreCase(trimmed, "tôi sẽ implement") != null or
+                std.ascii.indexOfIgnoreCase(trimmed, "implementation plan") != null)
+            {
+                const start = @intFromPtr(trimmed.ptr) - @intFromPtr(text.ptr);
+                const end = @min(text.len, start + 120);
+                return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
             }
         }
         return null;
@@ -699,28 +712,20 @@ pub const AgentLoop = struct {
 
     pub fn isPlanOnlyRequest(user_text_opt: ?[]const u8) bool {
         const text = user_text_opt orelse return false;
-        const markers = [_][]const u8{
-            "chỉ lên kế hoạch",
-            "chỉ lập kế hoạch",
-            "không sửa file",
-            "không sửa code",
-            "không edit",
-            "only plan",
-            "just plan",
-            "plan only",
-            "do not edit",
-            "don't edit",
-            "do not modify",
-            "don't modify",
-        };
-        for (markers) |m| {
-            var i: usize = 0;
-            if (text.len < m.len) continue;
-            while (i <= text.len - m.len) : (i += 1) {
-                if (std.ascii.eqlIgnoreCase(text[i .. i + m.len], m)) {
-                    return true;
-                }
-            }
+        // Check for explicit plan-only intent or negation of file edits/mutations
+        if (std.ascii.indexOfIgnoreCase(text, "only plan") != null or
+            std.ascii.indexOfIgnoreCase(text, "just plan") != null or
+            std.ascii.indexOfIgnoreCase(text, "plan only") != null or
+            std.ascii.indexOfIgnoreCase(text, "do not edit") != null or
+            std.ascii.indexOfIgnoreCase(text, "don't edit") != null or
+            std.ascii.indexOfIgnoreCase(text, "do not modify") != null or
+            std.ascii.indexOfIgnoreCase(text, "don't modify") != null or
+            std.ascii.indexOfIgnoreCase(text, "chỉ lên kế hoạch") != null or
+            std.ascii.indexOfIgnoreCase(text, "chỉ lập kế hoạch") != null or
+            std.ascii.indexOfIgnoreCase(text, "không sửa") != null or
+            std.ascii.indexOfIgnoreCase(text, "không edit") != null)
+        {
+            return true;
         }
         return false;
     }
@@ -1331,43 +1336,33 @@ pub const AgentLoop = struct {
             switch (block) {
                 .text => |t| {
                     self.last_turn_completion_tokens += self.token_estimator.estimate(t);
-                    if (detectPlanInText(t)) |plan_summary| {
-                        self.setPlan(plan_summary);
-                    }
-                    // RFC-019: Try to parse structured plan from LLM output
-                    if (self.enable_structured_planning and self.current_plan == null) {
-                        if (plan_parser.extractStructuredPlan(t, self.alloc) catch null) |plan| {
-                            if (plan.stepCount() > 0) {
-                                self.setStructuredPlan(plan);
-                                if (!utils.isSubagent()) {
-                                    main.stderrPrint("[agent] Structured plan detected: {d} steps\n", .{plan.stepCount()});
+                    if (self.enable_structured_planning) {
+                        // RFC-019: Canonical structured plan parser
+                        if (self.current_plan == null) {
+                            if (plan_parser.extractStructuredPlan(t, self.alloc) catch null) |plan| {
+                                if (plan.stepCount() > 0) {
+                                    self.setStructuredPlan(plan);
+                                    if (!utils.isSubagent()) {
+                                        main.stderrPrint("[agent] Structured plan detected: {d} steps\n", .{plan.stepCount()});
+                                    }
+                                } else {
+                                    var mut_plan = plan;
+                                    mut_plan.deinit(self.alloc);
                                 }
-                            } else {
-                                var mut_plan = plan;
-                                mut_plan.deinit(self.alloc);
                             }
+                        }
+                    } else {
+                        // Legacy plan detection fallback only when structured planning is disabled
+                        if (detectPlanInText(t)) |plan_summary| {
+                            self.setPlan(plan_summary);
                         }
                     }
                 },
                 .thinking => |th| {
                     self.last_turn_completion_tokens += self.token_estimator.estimate(th.thinking);
-                    if (detectPlanInText(th.thinking)) |plan_summary| {
-                        self.setPlan(plan_summary);
-                    }
-                    // RFC-019: Try to parse structured plan from thinking
-                    if (self.enable_structured_planning and self.current_plan == null) {
-                        if (plan_parser.extractStructuredPlan(th.thinking, self.alloc) catch null) |plan| {
-                            if (plan.stepCount() > 0) {
-                                self.setStructuredPlan(plan);
-                                if (!utils.isSubagent()) {
-                                    main.stderrPrint("[agent] Structured plan detected from thinking: {d} steps\n", .{plan.stepCount()});
-                                }
-                            } else {
-                                var mut_plan = plan;
-                                mut_plan.deinit(self.alloc);
-                            }
-                        }
-                    }
+                    // Thinking blocks are internal model reasoning scratchpads.
+                    // We deliberately do NOT extract plans or commitments from thinking,
+                    // preventing false-positive watchdog oscillation loops.
                 },
                 .tool_use => |tu| self.last_turn_completion_tokens += self.token_estimator.estimate(tu.name) + self.token_estimator.estimate(tu.input_json),
                 else => {},
@@ -1498,6 +1493,7 @@ pub const AgentLoop = struct {
                         main.stderrPrint("\x1b[32m[ok]\x1b[0m\n", .{});
                     }
                     self.js_retry_count = 0;
+                    self.plan_watchdog_retries = 0;
                     self.last_act_failed = false;
 
                     var out_buf = utils.BufWriter.init(self.alloc);
@@ -1586,8 +1582,10 @@ pub const AgentLoop = struct {
                     self.plan_watchdog_retries += 1;
                     const watchdog_max = 2;
                     if (self.plan_watchdog_retries >= watchdog_max) {
-                        // Cap reached: stop injecting directives, clear plan state,
-                        // let the model proceed normally on next iteration.
+                        // PSEUDOCODE:
+                        // 1. Log watchdog cap reached warning
+                        // 2. Clear plan state and reset retries
+                        // 3. Conclude turn and return text answer to user (exit loop)
                         main.stderrPrint(
                             "\n\x1b[33m[watchdog] ⚠️ Plan Watchdog stopping after {d} consecutive directive injections without tool execution.\x1b[0m\n",
                             .{watchdog_max},
@@ -1595,7 +1593,15 @@ pub const AgentLoop = struct {
                         self.clearPlan();
                         self.plan_execution_pending = false;
                         self.plan_watchdog_retries = 0;
-                        return .continue_loop;
+                        if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
+                            main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
+                        }
+                        if (self.journal) |*j| {
+                            j.recordEvent(self.io, act_id, .task_completed, "Model responded with text after plan watchdog retries") catch {};
+                        }
+                        self.action_loop_tripped = false;
+                        self.consecutive_dup_tool_count = 0;
+                        return .exit_loop;
                     }
                     main.stderrPrint(
                         "\n\x1b[33m[watchdog] ⚠️ Model emitted text without tool execution while an implementation plan is active. Commanding immediate execution of Step 1...\x1b[0m\n",
@@ -2938,6 +2944,7 @@ pub const AgentLoop = struct {
                     if (!is_err) {
                         self.loop_plan_retries = 0;
                         self.plan_execution_pending = false;
+                        self.plan_watchdog_retries = 0;
                         if (!isExploratoryToolCall(tu.name, tu.input_json)) {
                             // RFC-019: Plan execution tracking
                             if (self.enable_structured_planning and self.current_plan != null) {
@@ -3057,23 +3064,29 @@ pub const AgentLoop = struct {
 
 /// Extracts JavaScript code block from markdown text (```js ... ``` or ```javascript ... ```).
 pub fn extractJsCodeBlock(alloc: Allocator, text: []const u8) ?[]const u8 {
-    const markers = [_][]const u8{
-        "```javascript\n",
-        "```js\n",
-        "```javascript\r\n",
-        "```js\r\n",
-    };
-    for (markers) |m| {
-        if (std.mem.indexOf(u8, text, m)) |start_idx| {
-            const code_start = start_idx + m.len;
-            if (std.mem.indexOf(u8, text[code_start..], "```")) |end_idx| {
-                const code = text[code_start .. code_start + end_idx];
+    var search_idx: usize = 0;
+    while (search_idx < text.len) {
+        const fence_pos = std.mem.indexOfPos(u8, text, search_idx, "```") orelse break;
+        const tag_start = fence_pos + 3;
+        var tag_end = tag_start;
+        while (tag_end < text.len and text[tag_end] != '\n' and text[tag_end] != '\r') : (tag_end += 1) {}
+        const lang = std.mem.trim(u8, text[tag_start..tag_end], " \t");
+
+        // Check if language tag is javascript or js
+        if (std.ascii.eqlIgnoreCase(lang, "js") or std.ascii.eqlIgnoreCase(lang, "javascript")) {
+            var code_start = tag_end;
+            if (code_start < text.len and text[code_start] == '\r') code_start += 1;
+            if (code_start < text.len and text[code_start] == '\n') code_start += 1;
+
+            if (std.mem.indexOfPos(u8, text, code_start, "```")) |end_pos| {
+                const code = text[code_start..end_pos];
                 const trimmed = std.mem.trim(u8, code, " \r\n\t");
                 if (trimmed.len > 0) {
                     return alloc.dupe(u8, trimmed) catch null;
                 }
             }
         }
+        search_idx = tag_start;
     }
     return null;
 }

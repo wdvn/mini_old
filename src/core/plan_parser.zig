@@ -9,6 +9,7 @@ const plan_mod = @import("plan.zig");
 const Plan = plan_mod.Plan;
 const PlanStep = plan_mod.PlanStep;
 const utils = @import("utils.zig");
+const registry = @import("../tooling/registry.zig");
 
 // ---------------------------------------------------------------------------
 // JSON Plan Parser
@@ -113,37 +114,183 @@ pub fn parsePlanJson(text: []const u8, alloc: Allocator) !Plan {
 // ---------------------------------------------------------------------------
 // Markdown Plan Parser (Fallback)
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Markdown Plan Parser (Structural Header & State Machine)
+// ---------------------------------------------------------------------------
 
 // PSEUDOCODE:
-// 1. Locate plan section marker ("## Plan", "# Plan", "Plan:", etc.)
-// 2. Iterate lines in section using SplitIterator
-// 3. Match numbered items ("1. ", "1) ") or markdown task items ("- [ ]", "* [ ]")
-// 4. Parse step description, tool hint in parentheses (e.g. "(bash)", "(file_read)")
-// 5. Parse dependencies if mentioned (e.g. "depends on 1" or "[depends on 1, 2]")
-// 6. Return plan with parsed steps, or null if no valid steps found
+// 1. Scan line by line through Markdown text.
+// 2. State machine tracks active plan section:
+//    - Enters plan section when line is a plan heading (e.g. `## Plan`, `# Implementation Plan`, `**Plan:**`).
+//    - Exits plan section when a subsequent non-plan heading (`## Summary`, `## Notes`) is hit.
+//    - Self-identifying checklist items (`- [ ]`, `* [ ]`) always qualify as plan steps.
+// 3. Inside plan section, extract numbered steps ("1. ", "1) ", "Step 1: ") or checklist items.
+// 4. Extract paren tool hints using canonical registry.isBuiltinTool() and dependencies cleanly.
+// 5. Return Plan if stepCount > 0, else null.
 
-pub fn parsePlanMarkdown(text: []const u8, alloc: Allocator) !?Plan {
-    const markers = [_][]const u8{
-        "## Plan",
-        "# Plan",
-        "## Implementation Plan",
-        "# Implementation Plan",
-        "Plan:",
-        "Kế hoạch:",
-    };
+/// Checks whether a heading or title denotes a plan section.
+/// Matches "plan" (with word boundary) or Vietnamese "kế hoạch" / "ke hoach".
+pub fn isPlanHeaderKeyword(title: []const u8) bool {
+    if (utils.hasWordIgnoreCase(title, "plan")) return true;
+    if (std.ascii.indexOfIgnoreCase(title, "kế hoạch") != null or
+        std.ascii.indexOfIgnoreCase(title, "ke hoach") != null)
+    {
+        return true;
+    }
+    return false;
+}
 
-    var start_idx: ?usize = null;
-    for (markers) |m| {
-        if (std.mem.indexOf(u8, text, m)) |idx| {
-            start_idx = idx;
-            break;
+/// Checks whether a line is a Markdown heading (# ... ######).
+fn isMarkdownHeading(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0 or trimmed[0] != '#') return false;
+    var i: usize = 0;
+    while (i < trimmed.len and trimmed[i] == '#') : (i += 1) {}
+    return i <= 6 and i < trimmed.len and (trimmed[i] == ' ' or trimmed[i] == '\t');
+}
+
+/// Returns the title text of a line if it is a Plan Section Header.
+/// Matches markdown headings containing a plan keyword (e.g. `## Plan`, `# Implementation Plan`),
+/// or bold/plain labels (e.g. `**Plan:**`, `Plan:`, `Implementation Plan:`).
+fn extractPlanHeaderTitle(line: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0) return null;
+
+    // 1. Markdown heading (# ... ######)
+    if (trimmed[0] == '#') {
+        var i: usize = 0;
+        while (i < trimmed.len and trimmed[i] == '#') : (i += 1) {}
+        if (i <= 6 and i < trimmed.len and (trimmed[i] == ' ' or trimmed[i] == '\t')) {
+            const title = std.mem.trim(u8, trimmed[i..], " \t#*`_");
+            if (isPlanHeaderKeyword(title)) {
+                return title;
+            }
+        }
+        return null;
+    }
+
+    // 2. Bold or plain line label: `**Plan:**`, `Plan:`, `Implementation Plan:`
+    const stripped = std.mem.trim(u8, trimmed, " \t*_`");
+    if (stripped.len > 0 and (std.mem.endsWith(u8, stripped, ":") or std.mem.startsWith(u8, stripped, "**"))) {
+        const title = std.mem.trim(u8, stripped, " \t:*_`");
+        if (isPlanHeaderKeyword(title)) {
+            return title;
         }
     }
 
-    const section = if (start_idx) |idx| text[idx..] else text;
-    var lines = std.mem.splitScalar(u8, section, '\n');
+    return null;
+}
 
-    var plan = try Plan.init(alloc, "Extracted from Markdown", std.hash.Fnv1a_64.hash(section));
+const StepPrefixResult = struct {
+    is_checklist: bool,
+    is_completed: bool,
+    desc_start: usize,
+};
+
+/// Parses step numbering/prefix: checklist, "{d}.", "{d})", "Step {d}:", "Bước {d}:"
+fn parseStepPrefix(line: []const u8, step_id: u64) ?StepPrefixResult {
+    // Checklist items
+    if (std.mem.startsWith(u8, line, "- [ ] ") or std.mem.startsWith(u8, line, "* [ ] ")) {
+        return .{ .is_checklist = true, .is_completed = false, .desc_start = 6 };
+    }
+    if (std.mem.startsWith(u8, line, "- [x] ") or std.mem.startsWith(u8, line, "* [x] ") or
+        std.mem.startsWith(u8, line, "- [X] ") or std.mem.startsWith(u8, line, "* [X] "))
+    {
+        return .{ .is_checklist = true, .is_completed = true, .desc_start = 6 };
+    }
+
+    var num_buf: [32]u8 = undefined;
+
+    // "{d}."
+    const p1 = std.fmt.bufPrint(&num_buf, "{d}.", .{step_id}) catch "";
+    if (p1.len > 0 and std.mem.startsWith(u8, line, p1)) {
+        var pos = p1.len;
+        while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) : (pos += 1) {}
+        return .{ .is_checklist = false, .is_completed = false, .desc_start = pos };
+    }
+
+    // "{d})"
+    const p2 = std.fmt.bufPrint(&num_buf, "{d})", .{step_id}) catch "";
+    if (p2.len > 0 and std.mem.startsWith(u8, line, p2)) {
+        var pos = p2.len;
+        while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) : (pos += 1) {}
+        return .{ .is_checklist = false, .is_completed = false, .desc_start = pos };
+    }
+
+    // "Step {d}:" or "Step {d}." or "Step {d} -"
+    const p3 = std.fmt.bufPrint(&num_buf, "Step {d}", .{step_id}) catch "";
+    if (p3.len > 0 and std.ascii.startsWithIgnoreCase(line, p3)) {
+        var pos = p3.len;
+        if (pos < line.len and (line[pos] == ':' or line[pos] == '.' or line[pos] == '-')) pos += 1;
+        while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) : (pos += 1) {}
+        return .{ .is_checklist = false, .is_completed = false, .desc_start = pos };
+    }
+
+    return null;
+}
+
+/// Parses parenthesized or bracketed metadata in a step description to extract tool hint and dependencies.
+fn extractMetadataFromDesc(
+    alloc: Allocator,
+    raw_desc: []const u8,
+    deps_list: *std.ArrayListUnmanaged(u64),
+) ?[]const u8 {
+    var tool_hint: ?[]const u8 = null;
+
+    var search_start: usize = 0;
+    while (search_start < raw_desc.len) {
+        const open_idx = std.mem.indexOfAnyPos(u8, raw_desc, search_start, "([") orelse break;
+        const close_char: u8 = if (raw_desc[open_idx] == '(') ')' else ']';
+        const close_idx = std.mem.indexOfScalarPos(u8, raw_desc, open_idx + 1, close_char) orelse break;
+
+        const content = raw_desc[open_idx + 1 .. close_idx];
+        var it = std.mem.splitScalar(u8, content, ',');
+        while (it.next()) |token| {
+            const trimmed = std.mem.trim(u8, token, " \t");
+            if (trimmed.len == 0) continue;
+
+            // Check dependency keywords
+            if (parseDependencyIds(trimmed, alloc, deps_list)) {
+                continue;
+            }
+
+            // Check if token matches a recognized tool in registry
+            if (tool_hint == null and registry.isBuiltinTool(trimmed)) {
+                tool_hint = registry.normalizeToolName(trimmed);
+            }
+        }
+        search_start = close_idx + 1;
+    }
+
+    return tool_hint;
+}
+
+fn parseDependencyIds(token: []const u8, alloc: Allocator, deps_list: *std.ArrayListUnmanaged(u64)) bool {
+    const dep_keywords = [_][]const u8{
+        "depends on", "depend on", "dependencies:", "dependency:", "deps:", "dep:", "after",
+    };
+    for (dep_keywords) |kw| {
+        if (std.ascii.indexOfIgnoreCase(token, kw)) |kw_idx| {
+            const remainder = token[kw_idx + kw.len ..];
+            const trimmed = std.mem.trim(u8, remainder, " :[]()");
+            var it = std.mem.splitScalar(u8, trimmed, ' ');
+            while (it.next()) |part| {
+                const clean = std.mem.trim(u8, part, " ,;#");
+                if (std.fmt.parseInt(u64, clean, 10)) |id| {
+                    deps_list.append(alloc, id) catch {};
+                } else |_| {}
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn parsePlanMarkdown(text: []const u8, alloc: Allocator) !?Plan {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+
+    var in_plan_section = false;
+    var plan = try Plan.init(alloc, "Extracted from Markdown", std.hash.Fnv1a_64.hash(text));
     errdefer plan.deinit(alloc);
 
     var step_id: u64 = 1;
@@ -152,80 +299,55 @@ pub fn parsePlanMarkdown(text: []const u8, alloc: Allocator) !?Plan {
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
         if (trimmed.len == 0) continue;
 
-        var num_buf1: [16]u8 = undefined;
-        const p1 = std.fmt.bufPrint(&num_buf1, "{d}.", .{step_id}) catch "";
-        var num_buf2: [16]u8 = undefined;
-        const p2 = std.fmt.bufPrint(&num_buf2, "{d})", .{step_id}) catch "";
-
-        var is_step = false;
-        var desc_start: usize = 0;
-
-        if (p1.len > 0 and std.mem.startsWith(u8, trimmed, p1)) {
-            is_step = true;
-            desc_start = p1.len;
-        } else if (p2.len > 0 and std.mem.startsWith(u8, trimmed, p2)) {
-            is_step = true;
-            desc_start = p2.len;
-        } else if (std.mem.startsWith(u8, trimmed, "- [ ] ") or std.mem.startsWith(u8, trimmed, "* [ ] ")) {
-            is_step = true;
-            desc_start = 6;
-        } else if (std.mem.startsWith(u8, trimmed, "- [x] ") or std.mem.startsWith(u8, trimmed, "* [x] ")) {
-            is_step = true;
-            desc_start = 6;
+        // Check if line declares a Plan section
+        if (extractPlanHeaderTitle(trimmed)) |title| {
+            in_plan_section = true;
+            if (std.mem.eql(u8, plan.task_description, "Extracted from Markdown") and title.len > 0) {
+                alloc.free(plan.task_description);
+                plan.task_description = try alloc.dupe(u8, title);
+            }
+            continue;
         }
 
-        if (is_step) {
-            const raw_desc = std.mem.trim(u8, trimmed[desc_start..], " ");
-            if (raw_desc.len == 0) continue;
-
-            // Check for tool hint in parentheses: "(file_read)" or "(file_edit, depends on 1)"
-            var tool_hint: ?[]const u8 = null;
-            if (std.mem.indexOf(u8, raw_desc, "(")) |pi| {
-                if (std.mem.indexOf(u8, raw_desc[pi..], ")")) |close_rel| {
-                    var hint = raw_desc[pi + 1 .. pi + close_rel];
-                    if (std.mem.indexOf(u8, hint, ",")) |comma_idx| {
-                        hint = std.mem.trim(u8, hint[0..comma_idx], " ");
-                    }
-                    if (std.mem.startsWith(u8, hint, "file_") or
-                        std.mem.startsWith(u8, hint, "bash") or
-                        std.mem.startsWith(u8, hint, "grep") or
-                        std.mem.startsWith(u8, hint, "glob") or
-                        std.mem.startsWith(u8, hint, "http"))
-                    {
-                        tool_hint = hint;
-                    }
-                }
+        // Check if we hit a non-plan markdown heading -> ends active plan section
+        if (isMarkdownHeading(trimmed)) {
+            if (in_plan_section and plan.stepCount() > 0) {
+                break; // Plan section completed, subsequent headings are separate sections
             }
-
-            // Check for dependencies: "(depends on 1)" or "[depends on 1, 2]"
-            var deps_list = std.ArrayListUnmanaged(u64).empty;
-            defer deps_list.deinit(alloc);
-
-            const dep_marker = "depends on ";
-            if (std.mem.indexOf(u8, raw_desc, dep_marker)) |d_idx| {
-                const after_marker = raw_desc[d_idx + dep_marker.len ..];
-                const end_pos = std.mem.indexOfAny(u8, after_marker, "])\n") orelse after_marker.len;
-                const dep_ids_str = std.mem.trim(u8, after_marker[0..end_pos], " []");
-
-                var it = std.mem.splitScalar(u8, dep_ids_str, ',');
-                while (it.next()) |id_str| {
-                    const trimmed_id = std.mem.trim(u8, id_str, " ");
-                    if (std.fmt.parseInt(u64, trimmed_id, 10)) |num| {
-                        try deps_list.append(alloc, num);
-                    } else |_| {}
-                }
-            }
-
-            var step = try PlanStep.initWithId(alloc, step_id, raw_desc, deps_list.items, tool_hint);
-            errdefer step.deinit(alloc);
-
-            if (std.mem.startsWith(u8, trimmed, "- [x] ") or std.mem.startsWith(u8, trimmed, "* [x] ")) {
-                step.status = .completed;
-            }
-
-            try plan.addStepOwned(alloc, step);
-            step_id += 1;
+            in_plan_section = false;
+            continue;
         }
+
+        // Parse step prefix
+        const prefix_res = parseStepPrefix(trimmed, step_id);
+        if (prefix_res == null) continue;
+
+        const res = prefix_res.?;
+        // Numbered list items are ONLY parsed if we are inside an explicit Plan section.
+        // Checklists are self-identifying and can start/continue a plan.
+        if (!in_plan_section and !res.is_checklist) continue;
+
+        if (res.is_checklist) {
+            in_plan_section = true;
+        }
+
+        const raw_desc = std.mem.trim(u8, trimmed[res.desc_start..], " ");
+        if (raw_desc.len == 0) continue;
+
+        var deps_list = std.ArrayListUnmanaged(u64).empty;
+        defer deps_list.deinit(alloc);
+
+        const tool_hint = extractMetadataFromDesc(alloc, raw_desc, &deps_list);
+
+        var step = try PlanStep.initWithId(alloc, step_id, raw_desc, deps_list.items, tool_hint);
+        errdefer step.deinit(alloc);
+
+        if (res.is_completed) {
+            step.status = .completed;
+        }
+
+        try plan.addStepOwned(alloc, step);
+        step_id += 1;
     }
 
     if (plan.stepCount() == 0) {
@@ -235,6 +357,7 @@ pub fn parsePlanMarkdown(text: []const u8, alloc: Allocator) !?Plan {
 
     return plan;
 }
+
 
 // ---------------------------------------------------------------------------
 // Main Entry Point
@@ -371,3 +494,69 @@ test "extractStructuredPlan - markdown fallback" {
     try std.testing.expect(plan_opt != null);
     try std.testing.expectEqual(2, plan_opt.?.stepCount());
 }
+
+test "parsePlanMarkdown - bare numbered list without plan marker returns null" {
+    const alloc = std.testing.allocator;
+
+    const input =
+        "Here are two reasons why this happened:\n" ++
+        "1. The bug was in connect.py\n" ++
+        "2. The file extension check failed\n";
+
+    var plan_opt = try parsePlanMarkdown(input, alloc);
+    defer if (plan_opt) |*p| p.deinit(alloc);
+
+    try std.testing.expect(plan_opt == null);
+}
+
+test "parsePlanMarkdown - explanation heading does not trigger plan" {
+    const alloc = std.testing.allocator;
+
+    const input =
+        "## Explanation\n" ++
+        "1. The function checks args\n" ++
+        "2. It returns early\n";
+
+    var plan_opt = try parsePlanMarkdown(input, alloc);
+    defer if (plan_opt) |*p| p.deinit(alloc);
+
+    try std.testing.expect(plan_opt == null);
+}
+
+test "parsePlanMarkdown - section termination on subsequent non-plan heading" {
+    const alloc = std.testing.allocator;
+
+    const input =
+        "## Action Plan\n" ++
+        "1. Step one (bash)\n" ++
+        "2. Step two (file_edit, depends on 1)\n" ++
+        "## Summary of Changes\n" ++
+        "1. Point one that is not a plan step\n" ++
+        "2. Point two that is not a plan step\n";
+
+    var plan_opt = try parsePlanMarkdown(input, alloc);
+    defer if (plan_opt) |*p| p.deinit(alloc);
+
+    try std.testing.expect(plan_opt != null);
+    try std.testing.expectEqual(2, plan_opt.?.stepCount());
+}
+
+test "parsePlanMarkdown - Step N prefix and bracketed metadata" {
+    const alloc = std.testing.allocator;
+
+    const input =
+        "### Plan\n" ++
+        "Step 1: Inspect module structure [glob]\n" ++
+        "Step 2: Apply patch [file_edit, dep: 1]\n";
+
+    var plan_opt = try parsePlanMarkdown(input, alloc);
+    defer if (plan_opt) |*p| p.deinit(alloc);
+
+    try std.testing.expect(plan_opt != null);
+    try std.testing.expectEqual(2, plan_opt.?.stepCount());
+    try std.testing.expectEqualStrings("glob", plan_opt.?.steps.items[0].tool_hint.?);
+    try std.testing.expectEqualStrings("file_edit", plan_opt.?.steps.items[1].tool_hint.?);
+    try std.testing.expectEqual(1, plan_opt.?.steps.items[1].dependencies.len);
+    try std.testing.expectEqual(@as(u64, 1), plan_opt.?.steps.items[1].dependencies[0]);
+}
+

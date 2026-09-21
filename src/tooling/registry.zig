@@ -468,6 +468,21 @@ pub fn normalizeToolName(name: []const u8) []const u8 {
     return name;
 }
 
+/// Check if a name is a known built-in tool or recognized alias.
+pub fn isBuiltinTool(name: []const u8) bool {
+    const norm = normalizeToolName(name);
+    if (std.mem.eql(u8, norm, "file_read") or
+        std.mem.eql(u8, norm, "glob") or
+        std.mem.eql(u8, norm, "grep"))
+    {
+        return true;
+    }
+    for (definitions) |td| {
+        if (std.mem.eql(u8, norm, td.name)) return true;
+    }
+    return false;
+}
+
 pub fn isPermitted(name: []const u8) bool {
     // Block subagent calls if depth limit reached to avoid infinite recursion (Leaf Worker Pattern)
     if (std.mem.eql(u8, name, "invoke_subagent") or std.mem.eql(u8, name, "batch_invoke_subagents")) {

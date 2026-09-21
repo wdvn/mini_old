@@ -238,8 +238,8 @@ pub const Config = struct {
     video_poll_timeout_secs: u32 = 300,
 
     // RFC-019: Structured Planning System
-    /// Enable structured planning system. Default: false.
-    enable_structured_planning: bool = false,
+    /// Enable structured planning system. Default: true.
+    enable_structured_planning: bool = true,
     /// Minimum task length (chars) to trigger planning. Default: 50.
     planning_min_task_length: usize = 50,
     /// Enable drift detection. Default: true.
@@ -1104,6 +1104,7 @@ fn appendSkillsBlock(alloc: Allocator, env_map: *const std.process.Environ.Map, 
 /// Supports syntax: `KEY=VALUE`, `KEY="VALUE"`, `KEY='VALUE'`,
 ///                  `export KEY=VALUE`, `# comment`, empty lines.
 pub const JsonConfig = struct {
+    // Backend
     execution_mode: ?[]const u8 = null,
     openai_protocol: ?[]const u8 = null,
     openai_compat_url: ?[]const u8 = null,
@@ -1118,17 +1119,67 @@ pub const JsonConfig = struct {
     claude_model: ?[]const u8 = null,
     ollama_host: ?[]const u8 = null,
     ollama_model: ?[]const u8 = null,
+    // Agent
     max_tokens: ?u32 = null,
-    memact_enabled: ?bool = null,
-    memact_pg_enabled: ?bool = null,
-    memact_pg_advisory: ?bool = null,
-    context_window: ?u32 = null,
+    // Tools
     tool_allowlist: ?[]const u8 = null,
     tool_blocklist: ?[]const u8 = null,
-    watchdog_enabled: ?bool = null,
+    // Reasoning & Thinking (RFC-009)
+    reasoning_effort: ?[]const u8 = null,
+    reasoning_effort_disabled: ?bool = null,
+    thinking_budget_tokens: ?u32 = null,
+    thinking_temperature: ?f32 = null,
+    max_tokens_continue_cap: ?usize = null,
+    dynamic_thinking_enabled: ?bool = null,
+    // MemAct Config (RFC-003)
+    memact_enabled: ?bool = null,
+    context_window: ?u32 = null,
+    ctx_safety_margin: ?f32 = null,
+    ctx_compact_threshold: ?f32 = null,
+    memact_top_k: ?u32 = null,
+    memact_memory_budget: ?u32 = null,
+    memact_extract: ?[]const u8 = null,
+    memory_dir: ?[]const u8 = null,
+    // Procedural Graph (RFC-010)
+    memact_pg_enabled: ?bool = null,
+    memact_pg_advisory: ?bool = null,
+    memact_pg_h: ?u32 = null,
+    memact_pg_w: ?u32 = null,
+    memact_pg_auto_populate: ?bool = null,
+    // Budget Limits (RFC-002)
+    budget_max_tokens: ?usize = null,
+    // Execution & Action Loop Limits
+    max_acts_per_turn: ?usize = null,
+    action_loop_consecutive_cap: ?usize = null,
+    action_loop_window_cap: ?usize = null,
+    action_loop_readonly_warn_cap: ?usize = null,
+    action_loop_readonly_trip_cap: ?usize = null,
+    action_loop_macro_cycle_cap: ?usize = null,
+    action_loop_orbit_cap: ?usize = null,
+    action_loop_display: ?bool = null,
+    // MCP
     mcp_config: ?[]const u8 = null,
+    // History
+    history_enabled: ?bool = null,
+    // Hooks
     hook_command: ?[]const u8 = null,
-    session: ?[]const u8 = null,
+    hooks_config_path: ?[]const u8 = null,
+    // Session
+    session_id: ?[]const u8 = null,
+    session_file: ?[]const u8 = null,
+    // RFC-011: Media I/O
+    image_input_enabled: ?bool = null,
+    image_input_max_per_turn: ?u8 = null,
+    image_input_max_bytes: ?usize = null,
+    image_gen_enabled: ?bool = null,
+    image_gen_provider: ?[]const u8 = null,
+    image_gen_model: ?[]const u8 = null,
+    image_gen_size: ?[]const u8 = null,
+    video_gen_enabled: ?bool = null,
+    video_gen_model: ?[]const u8 = null,
+    video_gen_provider: ?[]const u8 = null,
+    media_output_dir: ?[]const u8 = null,
+    video_poll_timeout_secs: ?u32 = null,
     // RFC-019: Structured Planning System
     enable_structured_planning: ?bool = null,
     planning_min_task_length: ?usize = null,
@@ -1136,6 +1187,11 @@ pub const JsonConfig = struct {
     plan_max_steps: ?usize = null,
     plans_dir: ?[]const u8 = null,
     enhanced_progress_checkpoint: ?bool = null,
+    // 3-Thread Watchdog & Act Coordinator (RFC-015)
+    act_timeout_secs: ?u32 = null,
+    watchdog_tracking_interval_s: ?u32 = null,
+    watchdog_recap_interval: ?usize = null,
+    watchdog_interval_ms: ?u32 = null,
 };
 
 pub const JsonProviderConfig = struct {
@@ -1274,19 +1330,128 @@ fn tryLoadJsonConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: st
         var num_buf: [32]u8 = undefined;
         if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_MAX_TOKENS", s) else |_| {}
     }
+    if (cfg.tool_allowlist) |val| count += setEnvDefault(env_map, "MINI_TOOL_ALLOWLIST", val);
+    if (cfg.tool_blocklist) |val| count += setEnvDefault(env_map, "MINI_TOOL_BLOCKLIST", val);
+    // Reasoning & Thinking (RFC-009)
+    if (cfg.reasoning_effort) |val| count += setEnvDefault(env_map, "MINI_REASONING_EFFORT", val);
+    if (cfg.reasoning_effort_disabled) |val| count += setEnvDefault(env_map, "MINI_REASONING_EFFORT_DISABLED", if (val) "1" else "0");
+    if (cfg.thinking_budget_tokens) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_THINKING_BUDGET", s) else |_| {}
+    }
+    if (cfg.thinking_temperature) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d:.4}", .{val})) |s| count += setEnvDefault(env_map, "MINI_THINKING_TEMPERATURE", s) else |_| {}
+    }
+    if (cfg.max_tokens_continue_cap) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_MAX_TOKENS_CONTINUE_CAP", s) else |_| {}
+    }
+    if (cfg.dynamic_thinking_enabled) |val| count += setEnvDefault(env_map, "MINI_DYNAMIC_THINKING", if (val) "1" else "0");
+    // MemAct Config (RFC-003)
     if (cfg.memact_enabled) |val| count += setEnvDefault(env_map, "MINI_MEMACT_ENABLED", if (val) "1" else "0");
-    if (cfg.memact_pg_enabled) |val| count += setEnvDefault(env_map, "MINI_MEMACT_PG_ENABLED", if (val) "1" else "0");
-    if (cfg.memact_pg_advisory) |val| count += setEnvDefault(env_map, "MINI_MEMACT_PG_ADVISORY", if (val) "1" else "0");
     if (cfg.context_window) |val| {
         var num_buf: [32]u8 = undefined;
         if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_CONTEXT_WINDOW", s) else |_| {}
     }
-    if (cfg.tool_allowlist) |val| count += setEnvDefault(env_map, "MINI_TOOL_ALLOWLIST", val);
-    if (cfg.tool_blocklist) |val| count += setEnvDefault(env_map, "MINI_TOOL_BLOCKLIST", val);
-    if (cfg.watchdog_enabled) |val| count += setEnvDefault(env_map, "MINI_WATCHDOG_ENABLED", if (val) "1" else "0");
+    if (cfg.ctx_safety_margin) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d:.4}", .{val})) |s| count += setEnvDefault(env_map, "MINI_CTX_SAFETY_MARGIN", s) else |_| {}
+    }
+    if (cfg.ctx_compact_threshold) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d:.4}", .{val})) |s| count += setEnvDefault(env_map, "MINI_CTX_COMPACT_THRESHOLD", s) else |_| {}
+    }
+    if (cfg.memact_top_k) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_MEMACT_TOP_K", s) else |_| {}
+    }
+    if (cfg.memact_memory_budget) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_MEMACT_MEMORY_BUDGET", s) else |_| {}
+    }
+    if (cfg.memact_extract) |val| count += setEnvDefault(env_map, "MINI_MEMACT_EXTRACT", val);
+    if (cfg.memory_dir) |val| count += setEnvDefault(env_map, "MINI_MEMORY_DIR", val);
+    // Procedural Graph (RFC-010)
+    if (cfg.memact_pg_enabled) |val| count += setEnvDefault(env_map, "MINI_MEMACT_PG_ENABLED", if (val) "1" else "0");
+    if (cfg.memact_pg_advisory) |val| count += setEnvDefault(env_map, "MINI_MEMACT_PG_ADVISORY", if (val) "1" else "0");
+    if (cfg.memact_pg_h) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_MEMACT_PG_H", s) else |_| {}
+    }
+    if (cfg.memact_pg_w) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_MEMACT_PG_W", s) else |_| {}
+    }
+    if (cfg.memact_pg_auto_populate) |val| count += setEnvDefault(env_map, "MINI_MEMACT_PG_AUTO_POPULATE", if (val) "1" else "0");
+    // Budget Limits (RFC-002)
+    if (cfg.budget_max_tokens) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_BUDGET_MAX_TOKENS", s) else |_| {}
+    }
+    // Execution & Action Loop Limits
+    if (cfg.max_acts_per_turn) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_MAX_ACTS", s) else |_| {}
+    }
+    if (cfg.action_loop_consecutive_cap) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_LOOP_CONSECUTIVE_CAP", s) else |_| {}
+    }
+    if (cfg.action_loop_window_cap) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_LOOP_WINDOW_CAP", s) else |_| {}
+    }
+    if (cfg.action_loop_readonly_warn_cap) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_LOOP_READONLY_WARN", s) else |_| {}
+    }
+    if (cfg.action_loop_readonly_trip_cap) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_LOOP_READONLY_TRIP", s) else |_| {}
+    }
+    if (cfg.action_loop_macro_cycle_cap) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_LOOP_MACRO_CYCLE_CAP", s) else |_| {}
+    }
+    if (cfg.action_loop_orbit_cap) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_LOOP_ORBIT_CAP", s) else |_| {}
+    }
+    if (cfg.action_loop_display) |val| count += setEnvDefault(env_map, "MINI_ACTION_LOOP_DISPLAY", if (val) "1" else "0");
+    // MCP
     if (cfg.mcp_config) |val| count += setEnvDefault(env_map, "MINI_MCP_CONFIG", val);
+    // History
+    if (cfg.history_enabled) |val| count += setEnvDefault(env_map, "MINI_NO_HISTORY", if (val) "0" else "1");
+    // Hooks
     if (cfg.hook_command) |val| count += setEnvDefault(env_map, "MINI_HOOK_COMMAND", val);
-    if (cfg.session) |val| count += setEnvDefault(env_map, "MINI_SESSION", val);
+    if (cfg.hooks_config_path) |val| count += setEnvDefault(env_map, "MINI_HOOKS_CONFIG", val);
+    // Session
+    if (cfg.session_id) |val| count += setEnvDefault(env_map, "MINI_SESSION", val);
+    if (cfg.session_file) |val| count += setEnvDefault(env_map, "MINI_SESSION_FILE", val);
+    // RFC-011: Media I/O
+    if (cfg.image_input_enabled) |val| count += setEnvDefault(env_map, "MINI_IMAGE_INPUT_ENABLED", if (val) "1" else "0");
+    if (cfg.image_input_max_per_turn) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_IMAGE_INPUT_MAX_PER_TURN", s) else |_| {}
+    }
+    if (cfg.image_input_max_bytes) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_IMAGE_INPUT_MAX_BYTES", s) else |_| {}
+    }
+    if (cfg.image_gen_enabled) |val| count += setEnvDefault(env_map, "MINI_IMAGE_GEN_ENABLED", if (val) "1" else "0");
+    if (cfg.image_gen_provider) |val| count += setEnvDefault(env_map, "MINI_IMAGE_GEN_PROVIDER", val);
+    if (cfg.image_gen_model) |val| count += setEnvDefault(env_map, "MINI_IMAGE_GEN_MODEL", val);
+    if (cfg.image_gen_size) |val| count += setEnvDefault(env_map, "MINI_IMAGE_GEN_SIZE", val);
+    if (cfg.video_gen_enabled) |val| count += setEnvDefault(env_map, "MINI_VIDEO_GEN_ENABLED", if (val) "1" else "0");
+    if (cfg.video_gen_model) |val| count += setEnvDefault(env_map, "MINI_VIDEO_GEN_MODEL", val);
+    if (cfg.video_gen_provider) |val| count += setEnvDefault(env_map, "MINI_VIDEO_GEN_PROVIDER", val);
+    if (cfg.media_output_dir) |val| count += setEnvDefault(env_map, "MINI_MEDIA_OUTPUT_DIR", val);
+    if (cfg.video_poll_timeout_secs) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_VIDEO_POLL_TIMEOUT_SECS", s) else |_| {}
+    }
+    // RFC-019: Structured Planning System
     if (cfg.enable_structured_planning) |val| count += setEnvDefault(env_map, "MINI_ENABLE_STRUCTURED_PLANNING", if (val) "1" else "0");
     if (cfg.planning_min_task_length) |val| {
         var num_buf: [32]u8 = undefined;
@@ -1299,6 +1464,23 @@ fn tryLoadJsonConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: st
     }
     if (cfg.plans_dir) |val| count += setEnvDefault(env_map, "MINI_PLANS_DIR", val);
     if (cfg.enhanced_progress_checkpoint) |val| count += setEnvDefault(env_map, "MINI_ENHANCED_PROGRESS_CHECKPOINT", if (val) "1" else "0");
+    // 3-Thread Watchdog & Act Coordinator (RFC-015)
+    if (cfg.act_timeout_secs) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_ACT_TIMEOUT_SECS", s) else |_| {}
+    }
+    if (cfg.watchdog_tracking_interval_s) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_WATCHDOG_TRACKING_S", s) else |_| {}
+    }
+    if (cfg.watchdog_recap_interval) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_WATCHDOG_RECAP_INTERVAL", s) else |_| {}
+    }
+    if (cfg.watchdog_interval_ms) |val| {
+        var num_buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&num_buf, "{d}", .{val})) |s| count += setEnvDefault(env_map, "MINI_WATCHDOG_INTERVAL_MS", s) else |_| {}
+    }
 
     if (count > 0) {
         if (!utils.isSubagent()) main.stderrPrint("[config] Loaded {d} settings from {s}\n", .{ count, path });

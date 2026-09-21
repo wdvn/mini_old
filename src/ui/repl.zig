@@ -208,6 +208,7 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
             \\  /config protocol <auto|chat|responses>  Set OpenAI protocol mode
             \\  /config thinking <on|off>               Toggle dynamic thinking governor
             \\  /config reasoning <auto|low|med|high|none> Set reasoning effort
+            \\  /plan on/off/status                       Toggle structured planning mode
             \\  /artifact [list]    View session artifacts list
             \\  /artifact show <fn> Read an artifact content
             \\  /terminal-setup     Inspect & configure Shift+Enter / multiline terminal support
@@ -289,6 +290,24 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
             }
         } else {
             main.stdoutPrint("Usage: /config [show] | protocol <auto|chat|responses> | thinking <on|off> | reasoning <auto|low|medium|high|none>\n", .{});
+        }
+        return true;
+    }
+
+    // `/plan` command: toggle structured planning mode (RFC-019).
+    // Usage: /plan on | /plan off | /plan status
+    if (std.mem.startsWith(u8, input, "/plan")) {
+        const sub = std.mem.trim(u8, input["/plan".len..], " \t");
+        if (std.mem.eql(u8, sub, "") or std.mem.eql(u8, sub, "status")) {
+            main.stdoutPrint("[plan] Structured planning: {s}\n", .{if (agent.enable_structured_planning) "ON" else "OFF"});
+        } else if (std.mem.eql(u8, sub, "on") or std.mem.eql(u8, sub, "true") or std.mem.eql(u8, sub, "1")) {
+            agent.enable_structured_planning = true;
+            main.stdoutPrint("[plan] Structured planning enabled.\n", .{});
+        } else if (std.mem.eql(u8, sub, "off") or std.mem.eql(u8, sub, "false") or std.mem.eql(u8, sub, "0")) {
+            agent.enable_structured_planning = false;
+            main.stdoutPrint("[plan] Structured planning disabled.\n", .{});
+        } else {
+            main.stdoutPrint("Usage: /plan on | off | status\n", .{});
         }
         return true;
     }
