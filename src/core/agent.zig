@@ -1206,7 +1206,11 @@ pub const AgentLoop = struct {
             }
         }
 
-        if (response.stop_reason == .tool_use or has_tool_use_blocks) {
+        // PSEUDOCODE:
+        // 1. Only execute native tools if response actually contains tool_use blocks.
+        // 2. If stop_reason was .tool_use but has_tool_use_blocks is false, do not execute empty tools;
+        //    fall through to CodeAct JavaScript check or normal text response completion.
+        if (has_tool_use_blocks) {
             const exec_summary = try self.executeTools(act_id, &response);
             self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{
                 .exec_type = "tool_call",
@@ -1453,17 +1457,25 @@ pub const AgentLoop = struct {
                 return .continue_loop;
             },
             .tool_use => {
-                const exec_summary = try self.executeTools(act_id, &response);
-                self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{
-                    .exec_type = "tool_call",
-                    .is_error = exec_summary.any_tool_err,
-                    .duration_ms = exec_summary.total_dur_ms,
-                });
-                main.stderrPrint("\n", .{});
-                if (self.action_loop_tripped) {
-                    return .exit_loop;
+                // PSEUDOCODE:
+                // 1. Check if has_tool_use_blocks is true.
+                // 2. If true, execute tools and continue loop (or exit if tripped).
+                // 3. If false (stop_reason was tool_use but 0 tools materialized), log debug and exit loop.
+                if (has_tool_use_blocks) {
+                    const exec_summary = try self.executeTools(act_id, &response);
+                    self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{
+                        .exec_type = "tool_call",
+                        .is_error = exec_summary.any_tool_err,
+                        .duration_ms = exec_summary.total_dur_ms,
+                    });
+                    main.stderrPrint("\n", .{});
+                    if (self.action_loop_tripped) {
+                        return .exit_loop;
+                    }
+                    return .continue_loop;
                 }
-                return .continue_loop;
+                self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{ .exec_type = "none" });
+                return .exit_loop;
             },
             // RFC-009 Phase 5: stream aborted by idle stall watchdog. Partial
             // content (if any) is already in the response. If a complete tool
@@ -1795,6 +1807,7 @@ pub const AgentLoop = struct {
         // Act loop — model decides when to stop (exit_loop). No hard cap on acts.
         while (true) {
             self.last_turn_acts = act_id;
+            main.beginAct(act_id);
             var try_count: usize = 0;
 
             while (try_count <= max_retries) : (try_count += 1) {

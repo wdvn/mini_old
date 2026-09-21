@@ -5,6 +5,8 @@
 //!
 //! Usage: Set OPENAI_COMPAT_JS_PROVIDER=providers/agnes.js in your environment
 //! or load via config.
+//!
+//! NOTE: Uses ES5-compatible syntax (no optional chaining) for QuickJS 0.8.0 compatibility.
 
 export default {
     name: "Agnes AI",
@@ -14,25 +16,43 @@ export default {
     reasoning_param: "top_level_effort",
 
     /**
+     * Helper: safely get nested property without optional chaining (QuickJS 0.8.0 compat).
+     */
+    _safeGet(obj, path) {
+        var parts = path.split('.');
+        var current = obj;
+        for (var i = 0; i < parts.length; i++) {
+            if (current == null || current === undefined) return undefined;
+            current = current[parts[i]];
+        }
+        return current;
+    },
+
+    /**
      * Extract reasoning content from SSE chunks.
      * Handles both standard and nested formats used by Agnes AI.
      */
     extractReasoning(chunk) {
+        if (!chunk || !chunk.choices) return null;
+        var firstChoice = chunk.choices[0];
+        if (!firstChoice || !firstChoice.delta) return null;
+        var delta = firstChoice.delta;
+
         // Try standard delta.reasoning_content
-        if (chunk?.choices?.[0]?.delta?.reasoning_content) {
-            return chunk.choices[0].delta.reasoning_content;
+        if (delta.reasoning_content) {
+            return delta.reasoning_content;
         }
         // Try nested delta.detail.reasoning_content (common in proxies)
-        if (chunk?.choices?.[0]?.delta?.detail?.reasoning_content) {
-            return chunk.choices[0].delta.detail.reasoning_content;
+        if (delta.detail && delta.detail.reasoning_content) {
+            return delta.detail.reasoning_content;
         }
         // Try delta.details.reasoning_content (another proxy pattern)
-        if (chunk?.choices?.[0]?.delta?.details?.reasoning_content) {
-            return chunk.choices[0].delta.details.reasoning_content;
+        if (delta.details && delta.details.reasoning_content) {
+            return delta.details.reasoning_content;
         }
         // Fallback to standard delta.reasoning
-        if (chunk?.choices?.[0]?.delta?.reasoning) {
-            return chunk.choices[0].delta.reasoning;
+        if (delta.reasoning) {
+            return delta.reasoning;
         }
         return null;
     },
@@ -41,7 +61,10 @@ export default {
      * Extract text content from SSE chunks.
      */
     extractContent(chunk) {
-        return chunk?.choices?.[0]?.delta?.content || null;
+        if (chunk && chunk.choices && chunk.choices[0] && chunk.choices[0].delta) {
+            return chunk.choices[0].delta.content || null;
+        }
+        return null;
     },
 
     /**

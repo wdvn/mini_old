@@ -683,3 +683,20 @@ pub fn resetThinkState() void {
         renderer.parser.resetAct();
     }
 }
+
+pub fn beginAct(act_id: usize) void {
+    // PSEUDOCODE:
+    // 1. Lock g_renderer_mutex using spin-wait tryLock().
+    // 2. Obtain current_renderer pointer.
+    // 3. Unlock g_renderer_mutex.
+    // 4. If current_renderer exists and act_id > 1, reset act parser state and restart waiting indicator.
+    while (!g_renderer_mutex.tryLock()) {}
+    const r = current_renderer;
+    g_renderer_mutex.unlock();
+    if (r) |renderer| {
+        if (act_id > 1) {
+            renderer.parser.resetAct();
+            renderer.startWaiting();
+        }
+    }
+}
