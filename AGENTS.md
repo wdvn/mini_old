@@ -46,6 +46,30 @@ testcases/            — all test files (standalone, integration, benchmarks, .
 - All test files (scratch experiments, standalone tests, benchmarks...) must be placed in `testcases/` and named `test_*.zig` (do not leave test files in the root directory).
 - Proposals/design docs belong in `docs/`, format: `rfc_NNN_<name>_proposal.md` (RFCs sequentially numbered, snake_case; e.g. `rfc_005_agent_folder_proposal.md`). Reference docs retain standard snake_case naming.
 
+## Code-Writing Workflow (MANDATORY)
+
+When writing or modifying code, follow this 3-step workflow:
+
+1. **Write pseudocode first** — Outline the logic in comments before implementing:
+   ```zig
+   // PSEUDOCODE:
+   // 1. Lock mutex before accessing shared state
+   // 2. Read/modify the protected variable
+   // 3. Unlock mutex (use defer for safety)
+   ```
+
+2. **Verify API against source** — Check the actual Zig standard library before writing:
+   ```bash
+   # Example: Verify std.atomic.Mutex API
+   grep -n "pub fn tryLock\|pub fn unlock" /path/to/zig/lib/std/atomic.zig
+   # Output: pub fn tryLock(m: *Mutex) bool, pub fn unlock(m: *Mutex) void
+   # NO lock() method exists — use tryLock() in spin-wait loop
+   ```
+
+3. **Implement with verified API** — Only write code after steps 1-2 are complete.
+
+**Failure mode prevented**: This workflow prevents "guess-and-check" loops that cause action-loop timeouts.
+
 ## Architecture Notes
 
 - Tool calls preferentially pass through the JS VM (`runtime/js_bindings.zig`) rather than introducing new JSON tool-calling paths.
