@@ -10,6 +10,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const provider_mod = @import("provider.zig");
 const ProviderProfile = provider_mod.ProviderProfile;
+const main = @import("../main.zig");
+const utils = @import("../core/utils.zig");
 
 pub const c = @cImport({
     @cInclude("quickjs.h");
@@ -41,6 +43,17 @@ fn isFunction(ctx: *c.JSContext, v: c.JSValue) bool {
     return c.JS_IsFunction(ctx, v) != 0;
 }
 
+/// Heuristic: input looks like a file path if it ends with .js and
+/// does not contain obvious JS syntax characters.
+fn looksLikeFilePath(input: []const u8) bool {
+    if (input.len == 0 or input.len > 4096) return false;
+    if (!std.mem.endsWith(u8, input, ".js")) return false;
+    for (input) |ch| {
+        if (ch == '{' or ch == '(' or ch == ';' or ch == '\n') return false;
+    }
+    return true;
+}
+
 pub const JsProviderAdapter = struct {
     alloc: Allocator,
     rt: *c.JSRuntime,
@@ -68,8 +81,21 @@ pub const JsProviderAdapter = struct {
         self.deadline_ms = nowMs() + 100;
     }
 
-    /// Initialize adapter from JS source code.
+    /// Initialize adapter from JS source code or file path (auto-detected).
     pub fn initFromSource(alloc: Allocator, source: []const u8) !*JsProviderAdapter {
+        // Auto-detect: if source looks like a file path, load from file.
+        const trimmed_input = std.mem.trim(u8, source, " \t\r\n");
+        if (looksLikeFilePath(trimmed_input)) {
+            return initFromFileWithProfile(alloc, trimmed_input, null);
+        }
+        return initFromSourceWithProfile(alloc, source, null);
+    }
+
+    /// Initialize adapter from JS source code, with an optional
+    /// base profile to inherit from (defaults to "generic" if null).
+    /// This function always treats input as raw JS source (no file path detection).
+    pub fn initFromSourceWithProfile(alloc: Allocator, source: []const u8, base_profile: ?ProviderProfile) !*JsProviderAdapter {
+
         const rt = c.JS_NewRuntime() orelse return error.QuickJSRuntimeInitFailed;
         errdefer c.JS_FreeRuntime(rt);
 
@@ -172,7 +198,7 @@ pub const JsProviderAdapter = struct {
             .rt = rt,
             .ctx = ctx,
             .export_obj = eval_val,
-            .profile = provider_mod.getProfile("generic"),
+            .profile = base_profile orelse provider_mod.getProfile("generic"),
         };
 
         // Transfer ownership before parsing getters (which may execute JS).
@@ -189,13 +215,24 @@ pub const JsProviderAdapter = struct {
 
     /// Initialize adapter from a JS file path.
     pub fn initFromFile(alloc: Allocator, path: []const u8) !*JsProviderAdapter {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        return initFromFileWithProfile(alloc, path, null);
+    }
 
-        const content = try file.readToEndAlloc(alloc, 1024 * 1024);
-        defer alloc.free(content);
+    /// Initialize adapter from a JS file path with optional base profile.
+    fn initFromFileWithProfile(alloc: Allocator, path: []const u8, base_profile: ?ProviderProfile) !*JsProviderAdapter {
+        const io = main.getIo();
+        const cwd = std.Io.Dir.cwd();
+        const file = cwd.openFile(io, path, .{}) catch return error.JsProviderFileNotFound;
+        defer file.close(io);
 
-        return try initFromSource(alloc, content);
+        // Provider JS files are small; 1MB fixed buffer is plenty.
+        var buf: [1024 * 1024]u8 = undefined;
+        const n = utils.readAll(io, file, &buf) catch return error.JsProviderFileReadFailed;
+        if (n == 0) return error.JsProviderExportMissing;
+
+        // Delegate to initFromSourceWithProfile — content won't trigger file-path
+        // auto-detect because it contains JS syntax characters.
+        return try initFromSourceWithProfile(alloc, buf[0..n], base_profile);
     }
 
     fn parseExportedObject(self: *JsProviderAdapter) !void {

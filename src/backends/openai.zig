@@ -100,7 +100,14 @@ pub const Client = struct {
     provider_js: ?[]const u8 = null,
 
     fn loadAdapter(self: *const Client) !?*JsProviderAdapter {
-        return if (self.provider_js) |source| try JsProviderAdapter.initFromSource(self.alloc, source) else null;
+        return if (self.provider_js) |source|
+            try JsProviderAdapter.initFromSourceWithProfile(
+                self.alloc,
+                source,
+                provider.resolveProfile(self.provider_key, self.base_url),
+            )
+        else
+            null;
     }
 
     fn transformBody(self: *const Client, adapter: ?*JsProviderAdapter, body: []const u8) ![]const u8 {
