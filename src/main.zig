@@ -57,6 +57,7 @@ pub const plan_parser_mod = @import("core/plan_parser.zig");
 pub const plan_executor_mod = @import("core/plan_executor.zig");
 pub const plan_monitor_mod = @import("core/plan_monitor.zig");
 pub const plan_store_mod = @import("core/plan_store.zig");
+pub const plan_integration_mod = @import("core/plan_integration.zig");
 pub const cas_mod = @import("core/cas.zig");
 
 pub const VERSION = "1.0.0";
@@ -590,5 +591,6 @@ test {
     _ = plan_executor_mod;
     _ = plan_monitor_mod;
     _ = plan_store_mod;
+    _ = plan_integration_mod;
     _ = cas_mod;
 }

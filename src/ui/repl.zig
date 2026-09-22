@@ -299,12 +299,12 @@ pub fn handleSlashCommand(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentL
     if (std.mem.startsWith(u8, input, "/plan")) {
         const sub = std.mem.trim(u8, input["/plan".len..], " \t");
         if (std.mem.eql(u8, sub, "") or std.mem.eql(u8, sub, "status")) {
-            main.stdoutPrint("[plan] Structured planning: {s}\n", .{if (agent.enable_structured_planning) "ON" else "OFF"});
+            main.stdoutPrint("[plan] Structured planning: {s}\n", .{if (agent.plan.enable_structured_planning) "ON" else "OFF"});
         } else if (std.mem.eql(u8, sub, "on") or std.mem.eql(u8, sub, "true") or std.mem.eql(u8, sub, "1")) {
-            agent.enable_structured_planning = true;
+            agent.plan.enable_structured_planning = true;
             main.stdoutPrint("[plan] Structured planning enabled.\n", .{});
         } else if (std.mem.eql(u8, sub, "off") or std.mem.eql(u8, sub, "false") or std.mem.eql(u8, sub, "0")) {
-            agent.enable_structured_planning = false;
+            agent.plan.enable_structured_planning = false;
             main.stdoutPrint("[plan] Structured planning disabled.\n", .{});
         } else {
             main.stdoutPrint("Usage: /plan on | off | status\n", .{});

@@ -51,6 +51,7 @@ const plan_parser = @import("plan_parser.zig");
 const plan_executor = @import("plan_executor.zig");
 const plan_monitor = @import("plan_monitor.zig");
 const plan_store_mod = @import("plan_store.zig");
+const plan_integration = @import("plan_integration.zig");
 pub const journal_mod = @import("journal.zig");
 pub const act_logger_mod = @import("act_logger.zig");
 pub const signals = @import("signals.zig");
@@ -261,108 +262,21 @@ pub const AgentLoop = struct {
     last_loop_reason: LoopReason = .none,
     /// Flag set when action loop circuit breaker trips to break out of agent loop.
     action_loop_tripped: bool = false,
-    /// Number of times the agent has prompted the model to formulate a plan and execute next step to recover from an action loop in the current turn.
-    loop_plan_retries: usize = 0,
-    /// Flag indicating that a plan has been requested to break an action loop; if the model returns text without tool execution, prompts the model to execute step 1.
-    plan_execution_pending: bool = false,
-    /// Consecutive watchdog directives injected while model keeps answering in text. Caps at 2 to prevent infinite looping.
-    plan_watchdog_retries: usize = 0,
-
     /// Track whether the most recent LLM response had no meaningful content (empty/whitespace only).
     /// Used to prevent premature exit_loop when model returns nothing but also didn't fail.
     response_content_empty: bool = false,
 
-    // Plan Watchdog: Enforces execution of committed plans and prevents action procrastination
-    plan_active: bool = false,
-    plan_summary_buf: [160]u8 = undefined,
-    plan_summary_len: usize = 0,
-    plan_procrastination_count: usize = 0,
-    plan_procrastination_cap: usize = 2,
     current_user_request: ?[]const u8 = null,
-    /// Progress summary from last act (injected as advisory before each new act).
-    progress_summary_buf: [512]u8 = undefined,
-    progress_summary_len: usize = 0,
 
-    // RFC-019 Structured Planning System
-    /// Structured plan (replaces plan_active/plan_summary_buf when enabled)
-    current_plan: ?plan_mod.Plan = null,
-    /// Current step index being executed
-    current_step_idx: usize = 0,
-    /// Plan execution context
-    plan_ctx: plan_executor.ExecutionContext = .{},
-    /// Plan store for cross-turn persistence
-    plan_store: ?*plan_store_mod.PlanStore = null,
-    /// Drift score tracker
-    plan_drift_score: f64 = 0.0,
-    /// Enable structured planning (config-gated; default: true, overridable via /plan)
-    enable_structured_planning: bool = true,
+    /// Consolidated plan state (RFC-019 + legacy watchdog). See plan_integration.zig.
+    plan: plan_integration.PlanState,
 
     /// 3-Thread Coordinator & State Monitor (RFC-015)
     coordinator: *act_queue.ActCoordinator,
     /// Thread 2 Watchdog Monitor
     watchdog: ?*watchdog_mod.Watchdog = null,
 
-    pub fn setStructuredPlan(self: *AgentLoop, plan: plan_mod.Plan) void {
-        if (self.current_plan) |*p| {
-            p.deinit(self.alloc);
-        }
-        self.current_plan = plan;
-        self.plan_ctx = .{};
-        self.plan_drift_score = 0.0;
-        self.plan_active = true;
-    }
 
-    pub fn setPlan(self: *AgentLoop, summary: []const u8) void {
-        if (!self.plan_active) {
-            self.plan_active = true;
-            self.plan_procrastination_count = 0;
-        }
-        const len = @min(summary.len, self.plan_summary_buf.len);
-        @memcpy(self.plan_summary_buf[0..len], summary[0..len]);
-        self.plan_summary_len = len;
-
-        // RFC-019: If structured planning is enabled, attempt to parse structured plan from summary
-        if (self.enable_structured_planning and self.current_plan == null) {
-            if (plan_parser.extractStructuredPlan(summary, self.alloc) catch null) |plan| {
-                if (plan.stepCount() > 0) {
-                    self.setStructuredPlan(plan);
-                } else {
-                    var mut_p = plan;
-                    mut_p.deinit(self.alloc);
-                }
-            }
-        }
-    }
-
-    pub fn clearPlan(self: *AgentLoop) void {
-        self.plan_active = false;
-        self.plan_summary_len = 0;
-        self.plan_procrastination_count = 0;
-        self.plan_execution_pending = false;
-        if (self.current_plan) |*p| {
-            p.deinit(self.alloc);
-            self.current_plan = null;
-        }
-        self.plan_ctx = .{};
-        self.plan_drift_score = 0.0;
-    }
-
-    pub fn getPlanSummary(self: *const AgentLoop) []const u8 {
-        if (self.plan_summary_len > 0) return self.plan_summary_buf[0..self.plan_summary_len];
-        return "active implementation plan";
-    }
-
-    /// Update progress summary after an act completes. Caps at progress_summary_buf.
-    pub fn updateProgress(self: *AgentLoop, summary: []const u8) void {
-        const len = @min(summary.len, self.progress_summary_buf.len);
-        @memcpy(self.progress_summary_buf[0..len], summary[0..len]);
-        self.progress_summary_len = len;
-    }
-
-    /// Clear progress summary (call at start of each turn).
-    pub fn clearProgress(self: *AgentLoop) void {
-        self.progress_summary_len = 0;
-    }
 
     pub const ToolCallRecord = struct {
         name: []u8,
@@ -513,24 +427,7 @@ pub const AgentLoop = struct {
             }
         }
 
-        // RFC-019: Initialize Plan Store
         const cas_ptr: *cas_mod.CAS = &cas;
-        var plan_store_ptr: ?*plan_store_mod.PlanStore = null;
-        if (config.enable_structured_planning) {
-            var plans_path_buf: [512]u8 = undefined;
-            const plans_dir = config.plans_dir orelse (std.fmt.bufPrint(&plans_path_buf, "{s}/.mini/plans", .{home_dir}) catch ".mini/plans");
-            const store = alloc.create(plan_store_mod.PlanStore) catch null;
-            if (store) |st| {
-                if (plan_store_mod.PlanStore.init(alloc, io, cas_ptr, plans_dir)) |val| {
-                    st.* = val;
-                    plan_store_ptr = st;
-                    main.stderrPrint("[agent] Plan Store initialized at: {s}\n", .{plans_dir});
-                } else |e| {
-                    main.stderrPrint("[agent] Warning: Failed to init PlanStore: {s}\n", .{@errorName(e)});
-                    alloc.destroy(st);
-                }
-            }
-        }
 
         const coordinator = act_queue.ActCoordinator.init(alloc);
         const watchdog = watchdog_mod.Watchdog.init(alloc, io, coordinator, .{
@@ -567,8 +464,7 @@ pub const AgentLoop = struct {
             .coordinator = coordinator,
             .watchdog = watchdog,
             .response_content_empty = false,
-            .enable_structured_planning = config.enable_structured_planning,
-            .plan_store = plan_store_ptr,
+            .plan = plan_integration.PlanState.init(alloc, io, config, cas_ptr),
         };
     }
 
@@ -604,15 +500,7 @@ pub const AgentLoop = struct {
         }
         self.recent_tools.deinit(self.alloc);
         self.deinitTurnToolRecords();
-        if (self.plan_store) |ps| {
-            ps.deinit();
-            self.alloc.destroy(ps);
-            self.plan_store = null;
-        }
-        if (self.current_plan) |*p| {
-            p.deinit(self.alloc);
-            self.current_plan = null;
-        }
+        self.plan.deinit();
     }
 
     pub fn isReadOnlyTool(name: []const u8) bool {
@@ -663,71 +551,11 @@ pub const AgentLoop = struct {
     }
 
     pub fn detectPlanInText(text: []const u8) ?[]const u8 {
-        var lines = std.mem.splitScalar(u8, text, '\n');
-        while (lines.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, " \t\r");
-            if (trimmed.len == 0) continue;
-
-            // 1. Markdown heading (# ... ######) containing plan keyword
-            if (trimmed[0] == '#') {
-                var i: usize = 0;
-                while (i < trimmed.len and trimmed[i] == '#') : (i += 1) {}
-                if (i <= 6 and i < trimmed.len and (trimmed[i] == ' ' or trimmed[i] == '\t')) {
-                    const title = std.mem.trim(u8, trimmed[i..], " \t#*`_");
-                    if (plan_parser.isPlanHeaderKeyword(title)) {
-                        const start = @intFromPtr(trimmed.ptr) - @intFromPtr(text.ptr);
-                        const end = @min(text.len, start + 120);
-                        return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
-                    }
-                }
-                continue;
-            }
-
-            // 2. Line label ending with ':' or bold label: "Plan:", "**Plan:**", "Implementation Plan:", "Kế hoạch:"
-            const stripped = std.mem.trim(u8, trimmed, " \t*_`");
-            if (stripped.len > 0 and (std.mem.endsWith(u8, stripped, ":") or std.mem.startsWith(u8, stripped, "**"))) {
-                const title = std.mem.trim(u8, stripped, " \t:*_`");
-                if (plan_parser.isPlanHeaderKeyword(title) or
-                    std.ascii.startsWithIgnoreCase(title, "step 1") or
-                    std.ascii.startsWithIgnoreCase(title, "bước 1"))
-                {
-                    const start = @intFromPtr(trimmed.ptr) - @intFromPtr(text.ptr);
-                    const end = @min(text.len, start + 120);
-                    return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
-                }
-            }
-
-            // 3. Explicit action commitment prefix: "I will implement" / "Tôi sẽ implement"
-            if (std.ascii.indexOfIgnoreCase(trimmed, "i will implement") != null or
-                std.ascii.indexOfIgnoreCase(trimmed, "tôi sẽ implement") != null or
-                std.ascii.indexOfIgnoreCase(trimmed, "implementation plan") != null)
-            {
-                const start = @intFromPtr(trimmed.ptr) - @intFromPtr(text.ptr);
-                const end = @min(text.len, start + 120);
-                return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
-            }
-        }
-        return null;
+        return plan_integration.PlanState.detectPlanInText(text);
     }
 
     pub fn isPlanOnlyRequest(user_text_opt: ?[]const u8) bool {
-        const text = user_text_opt orelse return false;
-        // Check for explicit plan-only intent or negation of file edits/mutations
-        if (std.ascii.indexOfIgnoreCase(text, "only plan") != null or
-            std.ascii.indexOfIgnoreCase(text, "just plan") != null or
-            std.ascii.indexOfIgnoreCase(text, "plan only") != null or
-            std.ascii.indexOfIgnoreCase(text, "do not edit") != null or
-            std.ascii.indexOfIgnoreCase(text, "don't edit") != null or
-            std.ascii.indexOfIgnoreCase(text, "do not modify") != null or
-            std.ascii.indexOfIgnoreCase(text, "don't modify") != null or
-            std.ascii.indexOfIgnoreCase(text, "chỉ lên kế hoạch") != null or
-            std.ascii.indexOfIgnoreCase(text, "chỉ lập kế hoạch") != null or
-            std.ascii.indexOfIgnoreCase(text, "không sửa") != null or
-            std.ascii.indexOfIgnoreCase(text, "không edit") != null)
-        {
-            return true;
-        }
-        return false;
+        return plan_integration.PlanState.isPlanOnlyRequest(user_text_opt);
     }
 
     pub const MacroCycle = struct {
@@ -1193,41 +1021,8 @@ pub const AgentLoop = struct {
         }
 
         // Progress Tracking: inject summary of previous act's work
-        if (self.progress_summary_len > 0 and act_id > 1) {
-            // Enhanced format: include plan context if available (RFC-019)
-            var progress_buf = utils.BufWriter.init(self.alloc);
-            defer progress_buf.deinit();
-
-            try progress_buf.writeAll("[Progress Checkpoint]\n");
-            try progress_buf.print("Previous act ({d}) completed with:\n", .{act_id - 1});
-
-            if (self.enable_structured_planning and self.current_plan != null) {
-                const plan = &self.current_plan.?;
-                const progress_msg = try plan_executor.generateProgressSummary(plan, &self.plan_ctx, self.alloc);
-                defer self.alloc.free(progress_msg);
-                try progress_buf.writeAll(progress_msg);
-                try progress_buf.writeAll("\n");
-
-                if (self.config.plan_drift_detection and self.plan_drift_score > 0.5) {
-                    try progress_buf.writeAll("⚠️ Drift detected: execution diverged from planned step.\n");
-                    try progress_buf.writeAll("Please realign with the active step or update your plan.\n\n");
-                }
-            } else if (self.plan_active and self.plan_summary_len > 0) {
-                // Legacy: show plan summary
-                try progress_buf.writeAll("📋 Plan Status:\n");
-                try progress_buf.writeAll(self.plan_summary_buf[0..self.plan_summary_len]);
-                try progress_buf.writeAll("\n\n");
-            }
-
-            // Show tools used in previous act
-            try progress_buf.writeAll("Tools executed:\n");
-            try progress_buf.writeAll(self.progress_summary_buf[0..self.progress_summary_len]);
-            try progress_buf.writeAll("\n\n");
-
-            // Directive: ask model to continue with next step
-            try progress_buf.writeAll("Next step directive: Proceed with executing the active step using the ReAct cycle (Thought -> Action in ```js block). State your rationale, then execute the tool.");
-
-            progress_text = try progress_buf.toOwnedSlice();
+        if (self.plan.buildProgressBlock(self.alloc, act_id, self.config)) |progress_text_owned| {
+            progress_text = progress_text_owned;
             const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
             blocks[0] = .{ .text = progress_text.? };
             progress_blocks = blocks;
@@ -1336,27 +1131,7 @@ pub const AgentLoop = struct {
             switch (block) {
                 .text => |t| {
                     self.last_turn_completion_tokens += self.token_estimator.estimate(t);
-                    if (self.enable_structured_planning) {
-                        // RFC-019: Canonical structured plan parser
-                        if (self.current_plan == null) {
-                            if (plan_parser.extractStructuredPlan(t, self.alloc) catch null) |plan| {
-                                if (plan.stepCount() > 0) {
-                                    self.setStructuredPlan(plan);
-                                    if (!utils.isSubagent()) {
-                                        main.stderrPrint("[agent] Structured plan detected: {d} steps\n", .{plan.stepCount()});
-                                    }
-                                } else {
-                                    var mut_plan = plan;
-                                    mut_plan.deinit(self.alloc);
-                                }
-                            }
-                        }
-                    } else {
-                        // Legacy plan detection fallback only when structured planning is disabled
-                        if (detectPlanInText(t)) |plan_summary| {
-                            self.setPlan(plan_summary);
-                        }
-                    }
+                    self.plan.tryDetectPlanInResponse(t);
                 },
                 .thinking => |th| {
                     self.last_turn_completion_tokens += self.token_estimator.estimate(th.thinking);
@@ -1394,9 +1169,9 @@ pub const AgentLoop = struct {
 
                 const js_loop_check = self.checkActionLoop("codeact", js_code) catch .allow;
                 if (js_loop_check == .trip) {
-                    if (self.loop_plan_retries < 2) {
-                        self.loop_plan_retries += 1;
-                        self.plan_execution_pending = true;
+                    if (self.plan.loop_plan_retries < 2) {
+                        self.plan.loop_plan_retries += 1;
+                        self.plan.plan_execution_pending = true;
                         if (self.config.action_loop_display) {
                             main.stderrPrint(
                                 "\n\x1b[33m[agent] ⚠️ Action loop detected: identical CodeAct script repeated without progress. Requesting model to formulate plan and execute next step.\x1b[0m\n",
@@ -1428,12 +1203,12 @@ pub const AgentLoop = struct {
                 }
 
                 // Plan completion: mutating CodeAct script means the model is executing its plan.
-                if (self.plan_active and !isPlanOnlyRequest(self.current_user_request)) {
+                if (self.plan.plan_active and !isPlanOnlyRequest(self.current_user_request)) {
                     if (std.mem.indexOf(u8, js_code, "file_edit") != null or
                         std.mem.indexOf(u8, js_code, "file_write") != null or
                         std.mem.indexOf(u8, js_code, "write") != null)
                     {
-                        self.clearPlan();
+                        self.plan.clearPlan();
                     }
                 }
 
@@ -1493,7 +1268,7 @@ pub const AgentLoop = struct {
                         main.stderrPrint("\x1b[32m[ok]\x1b[0m\n", .{});
                     }
                     self.js_retry_count = 0;
-                    self.plan_watchdog_retries = 0;
+                    self.plan.plan_watchdog_retries = 0;
                     self.last_act_failed = false;
 
                     var out_buf = utils.BufWriter.init(self.alloc);
@@ -1577,22 +1352,19 @@ pub const AgentLoop = struct {
                 }
                 self.response_content_empty = false;
 
-                if ((self.plan_active or self.plan_execution_pending) and !isPlanOnlyRequest(self.current_user_request)) {
-                    // Don't clear pending yet — keep it true while we decide what to do
-                    self.plan_watchdog_retries += 1;
-                    const watchdog_max = 2;
-                    if (self.plan_watchdog_retries >= watchdog_max) {
-                        // PSEUDOCODE:
-                        // 1. Log watchdog cap reached warning
-                        // 2. Clear plan state and reset retries
-                        // 3. Conclude turn and return text answer to user (exit loop)
-                        main.stderrPrint(
-                            "\n\x1b[33m[watchdog] ⚠️ Plan Watchdog stopping after {d} consecutive directive injections without tool execution.\x1b[0m\n",
-                            .{watchdog_max},
-                        );
-                        self.clearPlan();
-                        self.plan_execution_pending = false;
-                        self.plan_watchdog_retries = 0;
+                switch (self.plan.handleEndTurnWatchdog(self.current_user_request)) {
+                    .continue_loop => {
+                        if (main.ui_repl.current_renderer) |r| {
+                            r.ensureNewline();
+                            r.write(" \x1b[33m[Plan Watchdog: Plan declared without execution. Enforcing Step 1 execution]\x1b[0m\n");
+                        }
+                        if (self.plan.getWatchdogDirective(self.alloc)) |directive| {
+                            defer self.alloc.free(directive);
+                            try self.history.addUser(directive);
+                        }
+                        return .continue_loop;
+                    },
+                    .exit_loop => {
                         if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
                             main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
                         }
@@ -1602,24 +1374,8 @@ pub const AgentLoop = struct {
                         self.action_loop_tripped = false;
                         self.consecutive_dup_tool_count = 0;
                         return .exit_loop;
-                    }
-                    main.stderrPrint(
-                        "\n\x1b[33m[watchdog] ⚠️ Model emitted text without tool execution while an implementation plan is active. Commanding immediate execution of Step 1...\x1b[0m\n",
-                        .{},
-                    );
-                    if (main.ui_repl.current_renderer) |r| {
-                        r.ensureNewline();
-                        r.write(" \x1b[33m[Plan Watchdog: Plan declared without execution. Enforcing Step 1 execution]\x1b[0m\n");
-                    }
-                    var dir_buf = utils.BufWriter.init(self.alloc);
-                    defer dir_buf.deinit();
-                    try dir_buf.print(
-                        "[Plan Watchdog Directive]: You formulated an active implementation plan ('{s}') but ended your turn with descriptive text only without executing any tools. You MUST now proceed directly to executing Step 1 using tools (e.g. file_edit, bash, etc.). Do not return monologue or explanation without tool actions.",
-                        .{ self.getPlanSummary() },
-                    );
-                    try self.history.addUser(dir_buf.list.items);
-                    self.plan_execution_pending = false;
-                    return .continue_loop;
+                    },
+                    .no_action => {},
                 }
                 if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
                     main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
@@ -1958,33 +1714,13 @@ pub const AgentLoop = struct {
         self.consecutive_dup_tool_count = 0;
         self.consecutive_readonly_count = 0;
         self.action_loop_tripped = false;
-        self.loop_plan_retries = 0;
-        self.plan_execution_pending = false;
-        self.plan_watchdog_retries = 0;
-        self.clearPlan();
-        self.clearProgress();
+        self.plan.resetTurn();
         self.current_user_request = user_text;
 
         // RFC-019: Try to restore plan from store or trigger planning phase
-        if (self.enable_structured_planning and self.plan_store != null) {
-            const req_hash = std.hash.Fnv1a_64.hash(user_text);
-            if (self.plan_store.?.restore(req_hash) catch null) |plan| {
-                self.setStructuredPlan(plan);
-                if (self.current_plan.?.findActiveStepIndex()) |idx| {
-                    self.plan_ctx.current_step_idx = idx;
-                }
-                if (!utils.isSubagent()) {
-                    main.stderrPrint("[agent] Plan restored from store: {d} steps\n", .{self.current_plan.?.stepCount()});
-                }
-            }
-        }
+        self.plan.tryRestoreFromStore(user_text);
 
-        const tool_hint: ?[]const u8 = if (self.enable_structured_planning and self.current_plan != null) blk: {
-            if (self.plan_ctx.current_step_idx < self.current_plan.?.stepCount()) {
-                break :blk self.current_plan.?.steps.items[self.plan_ctx.current_step_idx].tool_hint;
-            }
-            break :blk null;
-        } else null;
+        const tool_hint = self.plan.getToolHint();
 
         // Retrieve relevant tool definitions for user message based on execution_mode
         const raw_tool_defs = switch (self.config.execution_mode) {
@@ -2305,7 +2041,7 @@ pub const AgentLoop = struct {
                         }
                     }
                     const summary = try pb.toOwnedSlice(self.alloc);
-                    self.updateProgress(summary);
+                    self.plan.updateProgress(summary);
                     self.alloc.free(summary);
                 }
 
@@ -2737,9 +2473,9 @@ pub const AgentLoop = struct {
                             else => "called repeatedly with identical parameters",
                         };
 
-                        if (self.loop_plan_retries < 2) {
-                            self.loop_plan_retries += 1;
-                            self.plan_execution_pending = true;
+                        if (self.plan.loop_plan_retries < 2) {
+                            self.plan.loop_plan_retries += 1;
+                            self.plan.plan_execution_pending = true;
                             main.stderrPrint(
                                 "\n\x1b[33m[agent] ⚠️ Action loop detected: {s}. Requesting model to formulate plan and execute next step.\x1b[0m\n",
                                 .{trip_reason_str},
@@ -2834,10 +2570,10 @@ pub const AgentLoop = struct {
                     }
 
                     // Plan completion: non-exploratory tool call means the model is executing its plan.
-                    if (self.plan_active and !isPlanOnlyRequest(self.current_user_request) and
+                    if (self.plan.plan_active and !isPlanOnlyRequest(self.current_user_request) and
                         !isExploratoryToolCall(tu.name, tu.input_json))
                     {
-                        self.clearPlan();
+                        self.plan.clearPlan();
                     }
 
                     // Hard dedupe barrier: serve cached result for repeated read-only
@@ -2942,28 +2678,28 @@ pub const AgentLoop = struct {
                         self.storeToolCache(tu.name, fuzzyArgsHash(tu.input_json), truncated) catch {};
                     }
                     if (!is_err) {
-                        self.loop_plan_retries = 0;
-                        self.plan_execution_pending = false;
-                        self.plan_watchdog_retries = 0;
+                        self.plan.loop_plan_retries = 0;
+                        self.plan.plan_execution_pending = false;
+                        self.plan.plan_watchdog_retries = 0;
                         if (!isExploratoryToolCall(tu.name, tu.input_json)) {
                             // RFC-019: Plan execution tracking
-                            if (self.enable_structured_planning and self.current_plan != null) {
-                                var plan = &self.current_plan.?;
+                            if (self.plan.enable_structured_planning and self.plan.current_plan != null) {
+                                var plan = &self.plan.current_plan.?;
                                 // Check drift
                                 if (self.config.plan_drift_detection) {
                                     const drift = plan_monitor.checkPlanDrift(
                                         plan,
-                                        &self.plan_ctx,
+                                        &self.plan.plan_ctx,
                                         tu.name,
                                     );
                                     if (drift) |d| {
-                                        self.plan_drift_score += d.drift_score;
+                                        self.plan.plan_drift_score += d.drift_score;
                                         // Inject drift correction if score too high
-                                        if (self.plan_drift_score > 0.8) {
+                                        if (self.plan.plan_drift_score > 0.8) {
                                             const correction = plan_monitor.generateReplanSuggestion(
                                                 plan,
-                                                self.plan_ctx.steps_completed,
-                                                self.plan_drift_score,
+                                                self.plan.plan_ctx.steps_completed,
+                                                self.plan.plan_drift_score,
                                                 self.alloc,
                                             ) catch null;
                                             if (correction) |c| {
@@ -2983,11 +2719,11 @@ pub const AgentLoop = struct {
                                 }
 
                                 // Complete current step if tool matches hint
-                                if (self.plan_ctx.current_step_idx < plan.stepCount()) {
-                                    const current_step = &plan.steps.items[self.plan_ctx.current_step_idx];
+                                if (self.plan.plan_ctx.current_step_idx < plan.stepCount()) {
+                                    const current_step = &plan.steps.items[self.plan.plan_ctx.current_step_idx];
                                     if (current_step.tool_hint) |hint| {
                                         if (std.mem.eql(u8, tu.name, hint)) {
-                                            plan_executor.completeStep(plan, &self.plan_ctx);
+                                            plan_executor.completeStep(plan, &self.plan.plan_ctx);
                                             if (!utils.isSubagent()) {
                                                 main.stderrPrint("[agent] Plan step completed: {s}\n", .{current_step.description});
                                             }
@@ -2996,25 +2732,25 @@ pub const AgentLoop = struct {
                                 }
 
                                 // Check if plan is complete
-                                if (self.plan_ctx.is_complete or plan.isComplete()) {
+                                if (self.plan.plan_ctx.is_complete or plan.isComplete()) {
                                     if (!utils.isSubagent()) {
                                         main.stderrPrint("[agent] Plan completed! Saving to store...\n", .{});
                                     }
-                                    if (self.plan_store) |ps| {
+                                    if (self.plan.plan_store) |ps| {
                                         ps.save(plan) catch |e| {
                                             main.stderrPrint("[agent] Warning: Failed to save plan: {s}\n", .{@errorName(e)});
                                         };
                                     }
-                                    self.clearPlan();
+                                    self.plan.clearPlan();
                                 } else {
                                     // Move to next step
-                                    if (self.plan_ctx.current_step_idx + 1 < plan.stepCount()) {
-                                        self.plan_ctx.current_step_idx += 1;
-                                        plan.steps.items[self.plan_ctx.current_step_idx].status = .active;
+                                    if (self.plan.plan_ctx.current_step_idx + 1 < plan.stepCount()) {
+                                        self.plan.plan_ctx.current_step_idx += 1;
+                                        plan.steps.items[self.plan.plan_ctx.current_step_idx].status = .active;
                                     }
                                 }
                             } else {
-                                self.clearPlan();
+                                self.plan.clearPlan();
                             }
                         }
                     }
@@ -3655,13 +3391,12 @@ test "agent - action loop recovery via plan and execute" {
     agent.consecutive_readonly_count = 0;
     agent.last_loop_reason = .none;
     agent.action_loop_tripped = false;
-    agent.loop_plan_retries = 0;
-    agent.plan_execution_pending = false;
+    agent.plan = .{ .alloc = alloc };
     defer agent.deinitTurnToolRecords();
 
     // Call 1: first time
     _ = try agent.checkActionLoop("bash", "{\"command\":\"ls\"}");
-    try std.testing.expectEqual(@as(usize, 0), agent.loop_plan_retries);
+    try std.testing.expectEqual(@as(usize, 0), agent.plan.loop_plan_retries);
 
     // Call 2: reaches cap -> trip
     const res = try agent.checkActionLoop("bash", "{\"command\":\"ls\"}");
@@ -3670,21 +3405,21 @@ test "agent - action loop recovery via plan and execute" {
 
     // Simulate recovery logic in executeTools:
     // First trip: request plan & execution instead of halting
-    if (agent.loop_plan_retries < 2) {
-        agent.loop_plan_retries += 1;
-        agent.plan_execution_pending = true;
+    if (agent.plan.loop_plan_retries < 2) {
+        agent.plan.loop_plan_retries += 1;
+        agent.plan.plan_execution_pending = true;
         agent.action_loop_tripped = false; // Turn continues!
         agent.consecutive_dup_tool_count = 0;
     }
-    try std.testing.expectEqual(@as(usize, 1), agent.loop_plan_retries);
-    try std.testing.expect(agent.plan_execution_pending);
+    try std.testing.expectEqual(@as(usize, 1), agent.plan.loop_plan_retries);
+    try std.testing.expect(agent.plan.plan_execution_pending);
     try std.testing.expect(!agent.action_loop_tripped);
 
     // Model executes mutation tool (file_edit) -> recovery succeeds!
-    agent.loop_plan_retries = 0;
-    agent.plan_execution_pending = false;
-    try std.testing.expectEqual(@as(usize, 0), agent.loop_plan_retries);
-    try std.testing.expect(!agent.plan_execution_pending);
+    agent.plan.loop_plan_retries = 0;
+    agent.plan.plan_execution_pending = false;
+    try std.testing.expectEqual(@as(usize, 0), agent.plan.loop_plan_retries);
+    try std.testing.expect(!agent.plan.plan_execution_pending);
 }
 
 test "agent - plan watchdog enforcement and procrastination intercept" {
@@ -3707,24 +3442,16 @@ test "agent - plan watchdog enforcement and procrastination intercept" {
     agent.consecutive_readonly_count = 0;
     agent.last_loop_reason = .none;
     agent.action_loop_tripped = false;
-    agent.plan_active = false;
-    agent.plan_summary_len = 0;
-    agent.plan_procrastination_count = 0;
-    agent.plan_procrastination_cap = 2;
-    agent.current_plan = null;
-    agent.enable_structured_planning = false;
-    agent.plan_store = null;
-    agent.plan_drift_score = 0.0;
-    agent.plan_ctx = .{};
+    agent.plan = .{ .alloc = alloc, .enable_structured_planning = false };
     agent.current_user_request = null;
     defer agent.deinitTurnToolRecords();
 
     // 1. Detect plan in Vietnamese text
-    const vn_plan = AgentLoop.detectPlanInText("Đúng rồi, tôi sẽ implement fix cho bug này bằng cách thêm guard.");
+    const vn_plan = plan_integration.PlanState.detectPlanInText("Đúng rồi, tôi sẽ implement fix cho bug này bằng cách thêm guard.");
     try std.testing.expect(vn_plan != null);
-    agent.setPlan(vn_plan.?);
-    try std.testing.expect(agent.plan_active);
-    try std.testing.expectEqual(@as(usize, 0), agent.plan_procrastination_count);
+    agent.plan.setPlan(vn_plan.?);
+    try std.testing.expect(agent.plan.plan_active);
+    try std.testing.expectEqual(@as(usize, 0), agent.plan.plan_procrastination_count);
 
     // 2. Exploratory tool call detection
     try std.testing.expect(AgentLoop.isExploratoryToolCall("file_read", "{\"path\":\"src/core/agent.zig\"}"));
@@ -3736,24 +3463,24 @@ test "agent - plan watchdog enforcement and procrastination intercept" {
     try std.testing.expect(!AgentLoop.isExploratoryToolCall("file_edit", "{\"path\":\"a.zig\"}"));
 
     // 3. Procrastination counter increments on exploratory calls
-    agent.plan_procrastination_count += 1;
-    try std.testing.expectEqual(@as(usize, 1), agent.plan_procrastination_count);
-    try std.testing.expect(agent.plan_procrastination_count < agent.plan_procrastination_cap);
+    agent.plan.plan_procrastination_count += 1;
+    try std.testing.expectEqual(@as(usize, 1), agent.plan.plan_procrastination_count);
+    try std.testing.expect(agent.plan.plan_procrastination_count < agent.plan.plan_procrastination_cap);
 
     // 4. At cap, procrastination trips watchdog intercept
-    agent.plan_procrastination_count += 1;
-    try std.testing.expectEqual(@as(usize, 2), agent.plan_procrastination_count);
-    try std.testing.expect(agent.plan_procrastination_count >= agent.plan_procrastination_cap);
+    agent.plan.plan_procrastination_count += 1;
+    try std.testing.expectEqual(@as(usize, 2), agent.plan.plan_procrastination_count);
+    try std.testing.expect(agent.plan.plan_procrastination_count >= agent.plan.plan_procrastination_cap);
 
     // 5. Executing mutating tool clears plan
-    agent.clearPlan();
-    try std.testing.expect(!agent.plan_active);
-    try std.testing.expectEqual(@as(usize, 0), agent.plan_procrastination_count);
+    agent.plan.clearPlan();
+    try std.testing.expect(!agent.plan.plan_active);
+    try std.testing.expectEqual(@as(usize, 0), agent.plan.plan_procrastination_count);
 
     // 6. Test isPlanOnlyRequest
-    try std.testing.expect(AgentLoop.isPlanOnlyRequest("Lập kế hoạch, không sửa file"));
-    try std.testing.expect(AgentLoop.isPlanOnlyRequest("please provide plan only"));
-    try std.testing.expect(!AgentLoop.isPlanOnlyRequest("hãy sửa bug này và chạy test"));
+    try std.testing.expect(plan_integration.PlanState.isPlanOnlyRequest("Lập kế hoạch, không sửa file"));
+    try std.testing.expect(plan_integration.PlanState.isPlanOnlyRequest("please provide plan only"));
+    try std.testing.expect(!plan_integration.PlanState.isPlanOnlyRequest("hãy sửa bug này và chạy test"));
 }
 
 test "agent - parseTimeoutDecision" {
