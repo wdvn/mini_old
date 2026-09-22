@@ -666,3 +666,26 @@ The "simple" versions are:
 - Easier to test
 - Can be refactored later when complexity is actually needed
 
+## Security & Credentials
+
+- **Credential Masking**: When sending data to LLM (prompts, tool outputs, file contents), mark sensitive credentials using `$Name` syntax instead of pasting raw values:
+  - API keys → `$OPENAI_API_KEY`, `$ANTHROPIC_API_KEY`, etc.
+  - Tokens → `$GITHUB_TOKEN`, `$AWS_ACCESS_KEY`, etc.
+  - Secrets → `$DB_PASSWORD`, `$JWT_SECRET`, etc.
+- This prevents leaking real secrets into LLM context, session logs, and history files.
+- Resolve `$Name` placeholders locally in your environment before using them in shell commands or code.
+
+- **Sensitive File Handling**: When reading or sharing content from the following file types, redact or mask sensitive values:
+  - `.env`, `.env.local`, `.env.*.local` files → replace secret values with `$ENV_VAR_NAME`
+  - YAML config files containing secrets (e.g., `config.yaml`, `secrets.yaml`, `values.yaml`) → mask key values that look like passwords, tokens, or API keys
+  - JSON config files with credentials → use `$NAME` placeholders
+- Rule of thumb: if a value looks like a secret (long random string, contains "password"/"secret"/"key"/"token", or is an API key format), mark it as `$VariableName`.
+- Never commit `.env` files or files containing real credentials.
+
+## PR / Commit
+
+- Commit messages must be in English, format: `module: short description` (e.g. `editor: add word motion keybindings`).
+- Do not commit scratch test files outside of `testcases/`, do not commit `zig-cache/`, `zig-out/`.
+
+---
+
