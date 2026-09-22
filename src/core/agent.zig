@@ -609,6 +609,21 @@ pub const AgentLoop = struct {
         return null;
     }
 
+    /// RFC-022 Gate 2: true when the most recent tool call this turn was a
+    /// mutating tool (file write/edit) and the act did not fail — indicating
+    /// the last mutation was verified successful, so a text-only turn is a
+    /// legitimate Final Answer rather than plan stalling.
+    fn hasRecentVerifiedMutation(self: *AgentLoop) bool {
+        if (self.last_act_failed) return false;
+        const recs = self.turn_tool_records.items;
+        if (recs.len == 0) return false;
+        const last = recs[recs.len - 1].name;
+        return std.mem.startsWith(u8, last, "file_write") or
+            std.mem.startsWith(u8, last, "file_edit") or
+            std.mem.startsWith(u8, last, "edit") or
+            std.mem.startsWith(u8, last, "write");
+    }
+
     /// Evaluates whether a tool call constitutes an action loop (consecutive identical, sliding window repeat,
     /// macro-cycle alternating sequence, or read-only exploratory budget exceeded).
     pub fn checkActionLoop(self: *AgentLoop, tool_name: []const u8, input_json: []const u8) !LoopCheckResult {
@@ -1352,7 +1367,7 @@ pub const AgentLoop = struct {
                 }
                 self.response_content_empty = false;
 
-                switch (self.plan.handleEndTurnWatchdog(self.current_user_request)) {
+                switch (self.plan.handleEndTurnWatchdog(self.current_user_request, self.hasRecentVerifiedMutation())) {
                     .continue_loop => {
                         if (main.ui_repl.current_renderer) |r| {
                             r.ensureNewline();

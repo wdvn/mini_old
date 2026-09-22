@@ -344,8 +344,21 @@ pub const PlanState = struct {
 
     /// Check plan watchdog at end_turn. Returns the action the agent loop should take.
     /// If continue_loop, the caller should inject `getWatchdogDirective()` into history.
-    pub fn handleEndTurnWatchdog(self: *PlanState, current_user_request: ?[]const u8) WatchdogAction {
-        if ((self.plan_active or self.plan_execution_pending) and !isPlanOnlyRequest(current_user_request)) {
+    /// RFC-022: `last_mutation_verified` — true when the most recent act was a
+    /// successfully executed mutating tool (file write/edit), meaning a text-only
+    /// turn is a legitimate Final Answer rather than plan stalling.
+    pub fn handleEndTurnWatchdog(self: *PlanState, current_user_request: ?[]const u8, last_mutation_verified: bool) WatchdogAction {
+        // RFC-022 Gate 1 (provenance): only enforce plans with a verifiable origin —
+        // a parsed structured plan, an explicit action-loop recovery request
+        // (plan_execution_pending), or legacy mode (structured planning disabled).
+        // A bare plan_active flag from keyword-only text detection in structured
+        // mode is descriptive text, not an enforceable plan commitment.
+        const enforceable = self.plan_execution_pending or
+            self.current_plan != null or
+            (!self.enable_structured_planning and self.plan_active);
+        // RFC-022 Gate 2 (completion): a verified mutation in the last act means
+        // the model just finished real work — allow the Final Answer through.
+        if (enforceable and !last_mutation_verified and !isPlanOnlyRequest(current_user_request)) {
             self.plan_watchdog_retries += 1;
             const watchdog_max = 2;
             if (self.plan_watchdog_retries >= watchdog_max) {
@@ -469,6 +482,10 @@ pub const PlanState = struct {
                 std.ascii.indexOfIgnoreCase(trimmed, "implementation plan") != null)
             {
                 const start = @intFromPtr(trimmed.ptr) - @intFromPtr(text.ptr);
+                // RFC-022 note: commitment phrases ("i will implement") remain
+                // detected without step markers — detection alone is benign.
+                // False-positive ENFORCEMENT is prevented by Gate 1/2 in
+                // handleEndTurnWatchdog, not here.
                 const end = @min(text.len, start + 120);
                 return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
             }
@@ -491,6 +508,10 @@ pub const PlanState = struct {
         try std.testing.expect(true_positive != null);
     }
 
+
+
+
+
     pub fn isPlanOnlyRequest(user_text_opt: ?[]const u8) bool {
         const text = user_text_opt orelse return false;
         // Check for explicit plan-only intent or negation of file edits/mutations
@@ -509,6 +530,80 @@ pub const PlanState = struct {
             return true;
         }
         return false;
+    }
+
+
+    test "rfc022 - bare keyword plan is not enforceable in structured mode" {
+        // RFC-022 Incident 1: a final answer that merely MENTIONS an
+        // implementation plan may set plan_active via keyword detection,
+        // but Gate 1 (provenance) must prevent watchdog enforcement.
+        // (Detection remains benign by design; see detectPlanInText case 3.)
+        const detected = detectPlanInText(
+            "Implementation plan 4 tuan + success metrics da ghi vao RFC.\n" ++
+                "Buoc tiep theo neu ban muon: implement Week 1 (llama.cpp dependency).\n",
+        );
+        _ = detected; // may be non-null — enforcement is gated, not detection
+    }
+
+    test "rfc022 - watchdog gates: provenance and completion" {
+        // Gate 2: verified mutation in last act -> Final Answer allowed.
+        {
+            var ps = PlanState{
+                .alloc = std.testing.allocator,
+                .plan_active = true,
+                .plan_summary_len = 0,
+            };
+            defer ps.clearPlan();
+            try std.testing.expectEqual(WatchdogAction.no_action, ps.handleEndTurnWatchdog(null, true));
+        }
+
+        // Gate 1: bare plan_active from keyword detection (structured mode on)
+        // is descriptive text, NOT an enforceable plan.
+        {
+            var ps = PlanState{
+                .alloc = std.testing.allocator,
+                .plan_active = true,
+                .plan_summary_len = 0,
+            };
+            defer ps.clearPlan();
+            try std.testing.expectEqual(WatchdogAction.no_action, ps.handleEndTurnWatchdog(null, false));
+        }
+
+        // Enforceable origins still trigger: explicit action-loop recovery request.
+        {
+            var ps = PlanState{
+                .alloc = std.testing.allocator,
+                .plan_active = true,
+                .plan_summary_len = 0,
+                .plan_execution_pending = true,
+            };
+            defer ps.clearPlan();
+            try std.testing.expectEqual(WatchdogAction.continue_loop, ps.handleEndTurnWatchdog(null, false));
+        }
+
+        // Legacy mode (structured planning disabled) keeps enforcing keyword plans.
+        {
+            var ps = PlanState{
+                .alloc = std.testing.allocator,
+                .plan_active = true,
+                .plan_summary_len = 0,
+                .enable_structured_planning = false,
+            };
+            defer ps.clearPlan();
+            try std.testing.expectEqual(WatchdogAction.continue_loop, ps.handleEndTurnWatchdog(null, false));
+        }
+
+        // Plan-only requests are never enforced.
+        {
+            var ps = PlanState{
+                .alloc = std.testing.allocator,
+                .plan_active = true,
+                .plan_summary_len = 0,
+                .plan_execution_pending = true,
+            };
+            defer ps.clearPlan();
+            try std.testing.expectEqual(WatchdogAction.no_action, ps.handleEndTurnWatchdog("plan only, khong sua", false));
+        }
     }
 
 };
