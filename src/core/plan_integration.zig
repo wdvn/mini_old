@@ -402,6 +402,30 @@ pub const PlanState = struct {
     // Static helper functions (migrated from AgentLoop)
     // -----------------------------------------------------------------------
 
+    /// Returns true if any step marker ("1.", "1)", "Step 1", "Bước 1",
+    /// or a checklist item "- [ ]") appears within the first few lines
+    /// starting at `from_offset`. Guards legacy plan detection against
+    /// false positives where a heading merely *mentions* "plan" (e.g.
+    /// "## Fix plan display") without an actual step list.
+    fn hasStepMarkerNearby(text: []const u8, from_offset: usize) bool {
+        var it = std.mem.splitScalar(u8, text[from_offset..], '\n');
+        var scanned: usize = 0;
+        while (it.next()) |raw_line| {
+            if (scanned >= 5) break;
+            scanned += 1;
+            const line = std.mem.trim(u8, raw_line, " \t\r*-#`_");
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, "1.") or std.mem.startsWith(u8, line, "1)") or
+                std.ascii.startsWithIgnoreCase(line, "step 1") or
+                std.ascii.startsWithIgnoreCase(line, "bước 1") or
+                std.mem.startsWith(u8, line, "[ ]"))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     pub fn detectPlanInText(text: []const u8) ?[]const u8 {
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
@@ -416,6 +440,7 @@ pub const PlanState = struct {
                     const title = std.mem.trim(u8, trimmed[i..], " \t#*`_");
                     if (plan_parser.isPlanHeaderKeyword(title)) {
                         const start = @intFromPtr(trimmed.ptr) - @intFromPtr(text.ptr);
+                        if (!hasStepMarkerNearby(text, start)) continue;
                         const end = @min(text.len, start + 120);
                         return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
                     }
@@ -432,6 +457,7 @@ pub const PlanState = struct {
                     std.ascii.startsWithIgnoreCase(title, "bước 1"))
                 {
                     const start = @intFromPtr(trimmed.ptr) - @intFromPtr(text.ptr);
+                    if (!hasStepMarkerNearby(text, start)) continue;
                     const end = @min(text.len, start + 120);
                     return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
                 }
@@ -448,6 +474,21 @@ pub const PlanState = struct {
             }
         }
         return null;
+    }
+
+    test "agent - plan watchdog false-positive guard" {
+        // Heading merely mentioning "plan" without step markers must NOT activate
+        // the legacy plan watchdog (previously caused infinite directive loops).
+        const false_positive = detectPlanInText(
+            "## Hoàn tất: Fix plan không hiển thị trong REPL\nĐã commit và push thay đổi.\n",
+        );
+        try std.testing.expect(false_positive == null);
+
+        // A real plan header followed by a numbered step list must still activate.
+        const true_positive = detectPlanInText(
+            "## Plan\n1. Read the file\n2. Apply the fix\n",
+        );
+        try std.testing.expect(true_positive != null);
     }
 
     pub fn isPlanOnlyRequest(user_text_opt: ?[]const u8) bool {
@@ -469,4 +510,5 @@ pub const PlanState = struct {
         }
         return false;
     }
+
 };
