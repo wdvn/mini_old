@@ -135,6 +135,46 @@ pub const PlanState = struct {
         self.plan_ctx = .{};
         self.plan_drift_score = 0.0;
         self.plan_active = true;
+        self.renderPlanDisplay();
+    }
+
+    /// Render the structured plan to the terminal UI (RFC-019 user visibility).
+    ///
+    /// Previously the plan was only reported as a one-line stderr note
+    /// ("Structured plan detected: N steps") while step contents were
+    /// injected exclusively into LLM history, so the user never saw the
+    /// plan in the REPL. This writes the full step list via the active
+    /// TurnRenderer when available, falling back to stderr otherwise.
+    /// PSEUDOCODE:
+    //  1. Skip rendering entirely for subagents (no terminal UI attached)
+    //  2. Format header + numbered steps (with optional tool hints)
+    //  3. Write through current_renderer if present, else stderrPrint
+    pub fn renderPlanDisplay(self: *PlanState) void {
+        if (utils.isSubagent()) return;
+        const plan = &(self.current_plan orelse return);
+
+        var buf = utils.BufWriter.init(self.alloc);
+        errdefer buf.deinit();
+
+        buf.print("📋 Plan ({d} steps):\n", .{plan.stepCount()}) catch return;
+        for (plan.steps.items, 0..) |step, i| {
+            buf.print("  {d}. {s}", .{ i + 1, step.description }) catch return;
+            if (step.tool_hint) |hint| {
+                buf.print(" \x1b[90m[{s}]\x1b[0m", .{hint}) catch return;
+            }
+            buf.writeAll("\n") catch return;
+        }
+
+        const display = buf.toOwnedSlice() catch return;
+        defer self.alloc.free(display);
+
+        if (main.ui_repl.current_renderer) |r| {
+            r.ensureNewline();
+            r.write(display);
+            r.ensureNewline();
+        } else {
+            main.stderrPrint("{s}", .{display});
+        }
     }
 
     pub fn setPlan(self: *PlanState, summary: []const u8) void {
