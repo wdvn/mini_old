@@ -187,14 +187,14 @@ EOF
 echo -e "  ${GREEN}✓ Created:${NC} $MCP_EXAMPLE"
 echo ""
 
-# 5.5. Sync AGENTS.md from project root to ~/.mini/
-echo -e "${BLUE}[5.5/6] Checking AGENTS.md...${NC}"
-AGENTS_SRC="${PROJECT_ROOT}/AGENTS.md"
+# 5.5. Sync .agent/AGENTS.md (global rules) from project to ~/.mini/
+echo -e "${BLUE}[5.5/6] Checking global AGENTS.md (.agent/)...${NC}"
+AGENTS_SRC="${PROJECT_ROOT}/.agent/AGENTS.md"
 AGENTS_DST="${MINI_HOME}/AGENTS.md"
 if [ -f "$AGENTS_SRC" ]; then
     if [ ! -f "$AGENTS_DST" ] || [ "$FORCE_UPDATE" -eq 1 ]; then
         cp "$AGENTS_SRC" "$AGENTS_DST"
-        echo -e "  ${GREEN}✓ Synced:${NC} AGENTS.md → $AGENTS_DST"
+        echo -e "  ${GREEN}✓ Synced:${NC} .agent/AGENTS.md → $AGENTS_DST"
     else
         echo -e "  • AGENTS.md exists (use -f to update)"
     fi
