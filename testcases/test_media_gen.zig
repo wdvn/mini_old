@@ -225,3 +225,57 @@ test "media_gen: CodeAct mini.media attach integrates with turn attachments" {
     try testing.expectEqualStrings("image/png", msg.content[1].image.media_type);
 }
 
+// PSEUDOCODE:
+// 1. Validate isCompatOrAgnes against openai, openai_compat, agnes, agnesai, proxy-agnes.
+// 2. Ensure only openai returns false, while agnes-related and openai_compat return true.
+test "media_gen: isCompatOrAgnes recognizes agnes and compat providers" {
+    try testing.expect(!media_gen_tool.isCompatOrAgnes("openai"));
+    try testing.expect(media_gen_tool.isCompatOrAgnes("openai_compat"));
+    try testing.expect(media_gen_tool.isCompatOrAgnes("agnes"));
+    try testing.expect(media_gen_tool.isCompatOrAgnes("agnesai"));
+    try testing.expect(media_gen_tool.isCompatOrAgnes("custom-agnes-proxy"));
+}
+
+// PSEUDOCODE:
+// 1. Set environment variables for Agnes video generation.
+// 2. Verify config.Config.load extracts agnes provider and custom video model.
+test "media_gen: config loads agnes provider and custom model from env" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var env_map = std.process.Environ.Map.init(alloc);
+    defer env_map.deinit();
+
+    try env_map.put("MINI_VIDEO_GEN_PROVIDER", "agnes");
+    try env_map.put("MINI_VIDEO_GEN_MODEL", "agnes-video-2.5");
+    try env_map.put("OPENAI_COMPAT_URL", "https://apihub.agnes.ai/v1/chat/completions");
+    try env_map.put("OPENAI_COMPAT_API_KEY", "sk-agnes-test-123");
+
+    var cfg = try mini.config_mod.Config.load(alloc, &env_map, io);
+    defer cfg.deinit(alloc);
+
+    try testing.expectEqualStrings("agnes", cfg.video_gen_provider);
+    try testing.expectEqualStrings("agnes-video-2.5", cfg.video_gen_model);
+    try testing.expectEqualStrings("sk-agnes-test-123", cfg.openai_compat_key.?);
+}
+
+// PSEUDOCODE:
+// 1. Set OPENAI_COMPAT_PROVIDER=agnes without MINI_VIDEO_GEN_PROVIDER.
+// 2. Verify config.Config.load automatically falls back video_gen_provider and image_gen_provider to agnes.
+test "media_gen: config falls back to agnes when OPENAI_COMPAT_PROVIDER is agnes" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var env_map = std.process.Environ.Map.init(alloc);
+    defer env_map.deinit();
+
+    try env_map.put("OPENAI_COMPAT_PROVIDER", "agnes");
+    try env_map.put("OPENAI_COMPAT_URL", "https://apihub.agnes.ai/v1");
+
+    var cfg = try mini.config_mod.Config.load(alloc, &env_map, io);
+    defer cfg.deinit(alloc);
+
+    try testing.expectEqualStrings("agnes", cfg.video_gen_provider);
+    try testing.expectEqualStrings("agnes", cfg.image_gen_provider);
+}
+

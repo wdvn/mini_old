@@ -108,6 +108,28 @@ run_case "tool call bash"         "please use bash to run echo" "mock-tool-ok"
 printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89' > "$TEMP_HOME/test_img.png"
 run_case "media vision ingestion" "@image:$TEMP_HOME/test_img.png Describe this" "[Vision Verified] Image received"
 
+# Agnes AI video generation E2E testcase
+echo "  Testing Agnes AI video generation..."
+out_video=$(timeout 30 env MINI_HOME="$TEMP_HOME" \
+      OPENAI_COMPAT_URL="$MOCK_URL" \
+      OPENAI_COMPAT_MODEL="mock-model" \
+      OPENAI_COMPAT_API_KEY="sk-mock-agnes" \
+      OPENAI_PROTOCOL=chat \
+      MINI_VIDEO_GEN_ENABLED=1 \
+      MINI_VIDEO_GEN_PROVIDER=agnes \
+      MINI_VIDEO_GEN_MODEL="agnes-video-2.5" \
+      MINI_EXECUTION_MODE=auto \
+      MINI_NO_HISTORY=1 \
+      "$BIN" -e "please generate video" 2>&1)
+if echo "$out_video" | grep -F -q "video/mp4"; then
+  echo "  [PASS] agnes video generation"
+  PASS=$((PASS+1))
+else
+  echo "  [FAIL] agnes video generation"
+  echo "$out_video" | head -15 | sed 's/^/         | /'
+  FAIL=$((FAIL+1))
+fi
+
 echo ""
 echo "======================================"
 echo "E2E RESULTS: $PASS pass, $FAIL fail"

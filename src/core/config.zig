@@ -352,7 +352,7 @@ pub const Config = struct {
         const exec_mode = if (env_map.get("MINI_EXECUTION_MODE")) |m| ExecutionMode.fromString(m) else .auto;
         const openai_proto = if (env_map.get("OPENAI_PROTOCOL") orelse env_map.get("MINI_OPENAI_PROTOCOL") orelse env_map.get("OPENAI_COMPAT_PROTOCOL")) |p| OpenAiProtocol.fromString(p) else .auto;
         const openai_url = env_map.get("OPENAI_COMPAT_URL");
-        const openai_key = env_map.get("OPENAI_COMPAT_API_KEY");
+        const openai_key = env_map.get("OPENAI_COMPAT_API_KEY") orelse env_map.get("OPENAI_API_KEY");
         const openai_api_header = env_map.get("OPENAI_COMPAT_API_HEADER") orelse "Authorization";
         const openai_model = env_map.get("OPENAI_COMPAT_MODEL") orelse "gpt-4o-mini";
         const openai_provider_key = blk: {
@@ -605,7 +605,15 @@ pub const Config = struct {
             break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
         };
 
-        const image_gen_provider = env_map.get("MINI_IMAGE_GEN_PROVIDER") orelse "openai";
+        const image_gen_provider = blk: {
+            if (env_map.get("MINI_IMAGE_GEN_PROVIDER")) |p| {
+                if (p.len > 0) break :blk p;
+            }
+            if (std.mem.indexOf(u8, openai_provider_key, "agnes") != null) {
+                break :blk "agnes";
+            }
+            break :blk "openai";
+        };
         const image_gen_model = env_map.get("MINI_IMAGE_GEN_MODEL") orelse "gpt-image-1";
         const image_gen_size = env_map.get("MINI_IMAGE_GEN_SIZE") orelse "1024x1024";
 
@@ -615,7 +623,15 @@ pub const Config = struct {
         };
 
         const video_gen_model = env_map.get("MINI_VIDEO_GEN_MODEL") orelse "sora-2";
-        const video_gen_provider = env_map.get("MINI_VIDEO_GEN_PROVIDER") orelse "openai";
+        const video_gen_provider = blk: {
+            if (env_map.get("MINI_VIDEO_GEN_PROVIDER")) |p| {
+                if (p.len > 0) break :blk p;
+            }
+            if (std.mem.indexOf(u8, openai_provider_key, "agnes") != null) {
+                break :blk "agnes";
+            }
+            break :blk "openai";
+        };
         const media_output_dir = env_map.get("MINI_MEDIA_OUTPUT_DIR");
 
         const video_poll_timeout_secs: u32 = blk: {
@@ -1521,7 +1537,7 @@ fn tryLoadProviderJson(alloc: Allocator, env_map: *std.process.Environ.Map, io: 
     return true;
 }
 
-fn loadActiveProviderConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: std.Io) void {
+pub fn loadActiveProviderConfig(alloc: Allocator, env_map: *std.process.Environ.Map, io: std.Io) void {
     const provider_key = blk: {
         if (env_map.get("OPENAI_COMPAT_PROVIDER") orelse env_map.get("MINI_PROVIDER")) |p| {
             if (p.len > 0) break :blk p;
@@ -1591,7 +1607,7 @@ fn setEnvDefault(env_map: *std.process.Environ.Map, key: []const u8, val: []cons
     return 1;
 }
 
-fn tryLoadFile(env_map: *std.process.Environ.Map, io: std.Io, path: []const u8) void {
+pub fn tryLoadFile(env_map: *std.process.Environ.Map, io: std.Io, path: []const u8) void {
     const cwd = std.Io.Dir.cwd();
     const file = cwd.openFile(io, path, .{}) catch return;
     defer file.close(io);

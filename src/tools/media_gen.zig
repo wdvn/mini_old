@@ -161,6 +161,29 @@ pub fn generateImageTool(alloc: Allocator, io: std.Io, input_json: []const u8) !
     );
 }
 
+// PSEUDOCODE:
+// 1. Detect if provider is OpenAI-compatible or Agnes AI (matches "openai_compat", "agnes", "agnesai").
+// 2. Clean base URL by removing endpoint suffixes (/chat/completions, etc.).
+// 3. Fallback base URL for Agnes to "https://apihub.agnes.ai/v1" if custom URL not specified.
+
+pub fn isCompatOrAgnes(provider: []const u8) bool {
+    return std.mem.eql(u8, provider, "openai_compat") or
+        std.mem.eql(u8, provider, "agnes") or
+        std.mem.eql(u8, provider, "agnesai") or
+        std.mem.indexOf(u8, provider, "agnes") != null;
+}
+
+fn cleanBaseUrl(raw: []const u8) []const u8 {
+    var u = std.mem.trimEnd(u8, raw, "/ \t\r\n");
+    const suffixes = [_][]const u8{ "/chat/completions", "/responses", "/response", "/images/generations", "/videos" };
+    for (suffixes) |suffix| {
+        if (std.mem.endsWith(u8, u, suffix)) {
+            u = std.mem.trimEnd(u8, u[0 .. u.len - suffix.len], "/");
+        }
+    }
+    return u;
+}
+
 pub fn generateImageDirect(
     alloc: Allocator,
     io: std.Io,
@@ -181,15 +204,16 @@ pub fn generateImageDirect(
 
     const model = model_opt orelse g_config.image_gen_model;
     const size = size_opt orelse g_config.image_gen_size;
-    const is_compat = std.mem.eql(u8, g_config.image_gen_provider, "openai_compat");
+    const is_compat = isCompatOrAgnes(g_config.image_gen_provider);
 
-    var base_url: []const u8 = "https://api.openai.com/v1";
+    var base_url: []const u8 = if (is_compat and std.mem.indexOf(u8, g_config.image_gen_provider, "agnes") != null)
+        "https://apihub.agnes.ai/v1"
+    else
+        "https://api.openai.com/v1";
     if (is_compat) {
         if (g_config.openai_compat_url) |u| {
-            base_url = std.mem.trimEnd(u8, u, "/");
+            base_url = cleanBaseUrl(u);
         }
-    } else if (g_config.openai_compat_url) |u| {
-        base_url = std.mem.trimEnd(u8, u, "/");
     }
 
     const api_url = if (std.mem.endsWith(u8, base_url, "/v1"))
@@ -384,14 +408,15 @@ pub fn generateVideoDirect(
     }
 
     const model = model_opt orelse g_config.video_gen_model;
-    const is_compat = std.mem.eql(u8, g_config.video_gen_provider, "openai_compat");
-    var base_url: []const u8 = "https://api.openai.com/v1";
+    const is_compat = isCompatOrAgnes(g_config.video_gen_provider);
+    var base_url: []const u8 = if (is_compat and std.mem.indexOf(u8, g_config.video_gen_provider, "agnes") != null)
+        "https://apihub.agnes.ai/v1"
+    else
+        "https://api.openai.com/v1";
     if (is_compat) {
         if (g_config.openai_compat_url) |u| {
-            base_url = std.mem.trimEnd(u8, u, "/");
+            base_url = cleanBaseUrl(u);
         }
-    } else if (g_config.openai_compat_url) |u| {
-        base_url = std.mem.trimEnd(u8, u, "/");
     }
 
     const create_url = if (std.mem.endsWith(u8, base_url, "/v1"))
@@ -439,7 +464,8 @@ pub fn generateVideoDirect(
     }
 
     const job_id = json.findString(res.body, "id") orelse
-        json.findString(res.body, "task_id") orelse {
+        json.findString(res.body, "task_id") orelse
+        json.findString(res.body, "video_id") orelse {
         return MediaResult{
             .path = "",
             .media_type = "",
@@ -517,7 +543,9 @@ pub fn generateVideoDirect(
     // AgnesAI: use metadata.url from last poll response directly
     // Sora/OpenAI: GET /v1/videos/{id}/content
     if (is_compat and last_poll_body != null) {
-        const vid_url = json.findString(last_poll_body.?, "metadata.url") orelse {
+        const vid_url = json.findString(last_poll_body.?, "url") orelse
+            json.findString(last_poll_body.?, "video_url") orelse
+            json.findString(last_poll_body.?, "metadata.url") orelse {
             return MediaResult{
                 .path = "",
                 .media_type = "",

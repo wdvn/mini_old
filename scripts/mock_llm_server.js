@@ -38,6 +38,25 @@ const CASES = {
     }),
     finish: 'tool_calls',
   },
+  // Case: requests calling generate_video tool
+  video_call: {
+    match: (b) => {
+      if (!Array.isArray(b.messages)) return false;
+      if (b.messages.some(m => m.role === 'tool')) return false;
+      const lastUser = [...b.messages].reverse().find(m => m.role === 'user');
+      return !!lastUser && typeof lastUser.content === 'string' && lastUser.content.toLowerCase().includes('generate video');
+    },
+    sse: (reqBody) => ({
+      id: 'mock-video-call', object: 'chat.completion.chunk', created: Date.now() / 1000 | 0,
+      model: reqBody.model || 'mock-model',
+      choices: [{ index: 0, delta: {
+        role: 'assistant',
+        tool_calls: [{ index: 0, id: 'call_video_1', type: 'function',
+          function: { name: 'generate_video', arguments: JSON.stringify({ prompt: 'cyberpunk drone flight', seconds: '4' }) } }],
+      }, finish_reason: null }],
+    }),
+    finish: 'tool_calls',
+  },
   // Case: vision inspection (detected by presence of image blocks)
   vision: {
     match: (b) => {
@@ -110,7 +129,23 @@ const server = http.createServer((req, res) => {
     }
     if ((url.pathname === '/v1/videos' || url.pathname === '/videos') && req.method === 'POST') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ id: 'mock-video-99', status: 'queued' }));
+      res.end(JSON.stringify({ id: 'mock-video-99', video_id: 'mock-video-99', status: 'queued' }));
+      return;
+    }
+    // AgnesAI compat polling endpoint: /agnesapi or /v1/agnesapi?video_id={id}&model_name={model}
+    if (url.pathname === '/agnesapi' || url.pathname === '/v1/agnesapi') {
+      const videoId = url.searchParams.get('video_id');
+      if (videoId === 'mock-video-99') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          id: 'mock-video-99',
+          status: 'completed',
+          metadata: { url: 'http://127.0.0.1:' + PORT + '/v1/videos/mock-video-99/content' }
+        }));
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'video_id not found' }));
       return;
     }
     if (url.pathname.match(/\/videos\/mock-video-99$/)) {
