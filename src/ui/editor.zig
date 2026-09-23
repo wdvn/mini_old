@@ -691,6 +691,7 @@ pub const LineEditor = struct {
                     _ = self.insertBytes(text);
                 }
             },
+            22 => self.clipboardPaste(io, prompt),
             26 => _ = self.applyUndo(),
             31 => _ = self.applyRedo(),
             else => {},
@@ -1204,6 +1205,42 @@ pub const LineEditor = struct {
             _ = self.insertBytes(tmp_list.items);
             self.redraw(io, prompt);
         }
+    }
+
+    /// Fallback clipboard paste via os-level clipboard tools (xclip/wl-paste/xsel).
+    /// Called when Ctrl+V is pressed and bracketed paste is unavailable.
+    fn clipboardPaste(self: *LineEditor, io: std.Io, prompt: []const u8) void {
+        const tools = [_][]const u8{ "wl-paste", "xclip", "xsel", "pbpaste" };
+        var content: ?[]u8 = null;
+        errdefer {
+            if (content) |c| self.alloc.free(c);
+        }
+        for (tools) |tool| {
+            const argv = [_][]const u8{ tool };
+            var child = std.process.spawn(io, .{
+                .argv = &argv,
+                .stdout = .pipe,
+            }) catch continue;
+            defer {
+                if (child.stdout) |p| p.close(io);
+            }
+            var out_buf: [MAX_INPUT_BYTES]u8 = undefined;
+            var n: usize = 0;
+            while (n < out_buf.len) {
+                const r = child.stdout.?.readStreaming(io, &.{out_buf[n..]}) catch break;
+                if (r == 0) break;
+                n += r;
+            }
+            if (n > 0) {
+                content = self.alloc.dupe(u8, out_buf[0..n]) catch continue;
+                break;
+            }
+        }
+        if (content) |text| {
+            self.pushUndo();
+            _ = self.insertBytes(text);
+        }
+        self.redraw(io, prompt);
     }
 
     /// Add to prompt history (called on submit).
