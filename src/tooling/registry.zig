@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const builtin = @import("builtin");
 const proto = @import("../core/protocol.zig");
 const json = @import("../core/json.zig");
 const utils = @import("../core/utils.zig");
@@ -687,6 +688,52 @@ pub fn interruptActiveBash() void {
 /// Force kill active bash process group with SIGKILL (called on Watchdog escalation).
 pub fn forceKillActiveBash() void {
     bash_tool.forceKillCurrent();
+}
+
+/// Interrupt active MCP server (called on Watchdog timeout or SIGINT).
+pub fn interruptActiveMcp() void {
+    signals.setInterrupted(true);
+    while (!g_registry_mutex.tryLock()) {}
+    const mgr = g_mcp;
+    g_registry_mutex.unlock();
+    if (mgr) |m| {
+        for (m.servers.items) |*srv| {
+            if (srv.child_pid > 0) {
+                if (comptime builtin.os.tag != .windows) {
+                    _ = std.posix.kill(-srv.child_pid, std.posix.SIG.TERM) catch {
+                        _ = std.posix.kill(srv.child_pid, std.posix.SIG.TERM) catch {};
+                    };
+                }
+                srv.child.stdin = null;
+                srv.child.stdout = null;
+                srv.stdin_file.close(main.g_io);
+                srv.stdout_file.close(main.g_io);
+            }
+        }
+    }
+}
+
+/// Force kill active MCP server process group with SIGKILL (called on Watchdog escalation).
+pub fn forceKillActiveMcp() void {
+    signals.setInterrupted(true);
+    while (!g_registry_mutex.tryLock()) {}
+    const mgr = g_mcp;
+    g_registry_mutex.unlock();
+    if (mgr) |m| {
+        for (m.servers.items) |*srv| {
+            if (srv.child_pid > 0) {
+                if (comptime builtin.os.tag != .windows) {
+                    _ = std.posix.kill(-srv.child_pid, std.posix.SIG.KILL) catch {
+                        _ = std.posix.kill(srv.child_pid, std.posix.SIG.KILL) catch {};
+                    };
+                }
+                srv.child.stdin = null;
+                srv.child.stdout = null;
+                srv.stdin_file.close(main.g_io);
+                srv.stdout_file.close(main.g_io);
+            }
+        }
+    }
 }
 
 test "codeact as native tool: codeact in registry" {

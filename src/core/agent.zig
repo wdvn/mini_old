@@ -109,6 +109,7 @@ fn watchdogInterruptHandler() void {
         a.engine.requestInterrupt();
     }
     tools_mod.interruptActiveBash();
+    tools_mod.interruptActiveMcp();
 }
 
 fn watchdogForceKillHandler() void {
@@ -119,6 +120,7 @@ fn watchdogForceKillHandler() void {
         a.engine.requestInterrupt();
     }
     tools_mod.forceKillActiveBash();
+    tools_mod.forceKillActiveMcp();
 }
 
 fn watchdogDecisionHandler(ctx: watchdog_mod.DecisionContext) watchdog_mod.TimeoutDecision {

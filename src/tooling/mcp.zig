@@ -41,6 +41,8 @@ const json = @import("../core/json.zig");
 const utils = @import("../core/utils.zig");
 const main = @import("../main.zig");
 const hooks = @import("../core/hooks.zig");
+const signals = @import("../core/signals.zig");
+const builtin = @import("builtin");
 
 // ---------------------------------------------------------------------------
 // I/O helper
@@ -93,6 +95,7 @@ pub const McpServer = struct {
     /// Server name (from config).
     name: []const u8,
     child: Child,
+    child_pid: std.process.Child.Id = 0,
     stdin_file: std.Io.File,
     stdout_file: std.Io.File,
     /// List of discovered tools.
@@ -106,7 +109,13 @@ pub const McpServer = struct {
     /// Read 1 line from stdout_file (regardless of length), buffering 8KB chunks.
     /// Returns slice owned by caller (must free via self.alloc) or error.McpEof on EOF.
     fn readLine(self: *McpServer) ![]u8 {
+        var loop_count: usize = 0;
         while (true) {
+            if (signals.isInterrupted()) return error.Interrupted;
+            loop_count += 1;
+            if (loop_count % 50 == 0) {
+                std.Io.sleep(main.g_io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+            }
             if (std.mem.indexOfScalar(u8, self.recv_buf.items, '\n')) |idx| {
                 const raw_line = self.recv_buf.items[0..idx];
                 var end = idx;
@@ -335,6 +344,18 @@ pub const McpServer = struct {
 
     /// Shut down server and release resources.
     pub fn shutdown(self: *McpServer) void {
+        if (self.child_pid > 0) {
+            if (comptime builtin.os.tag != .windows) {
+                _ = std.posix.kill(-self.child_pid, std.posix.SIG.TERM) catch {
+                    _ = std.posix.kill(self.child_pid, std.posix.SIG.TERM) catch {};
+                };
+                const deadline = utils.milliTimestamp() + 500;
+                while (utils.milliTimestamp() < deadline) {
+                    if (self.child.wait(main.g_io) catch null) |_| break;
+                    
+                }
+            }
+        }
         for (self.tools.items) |t| {
             self.alloc.free(t.tool_name);
             self.alloc.free(t.prefixed_name);
@@ -483,6 +504,7 @@ pub const McpClientManager = struct {
             .alloc = self.alloc,
             .name = name_copy,
             .child = child,
+            .child_pid = if (child.id) |pid| pid else 0,
             .stdin_file = child.stdin.?,
             .stdout_file = child.stdout.?,
             .tools = .empty,
