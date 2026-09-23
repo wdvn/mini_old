@@ -378,10 +378,13 @@ pub const AgentLoop = struct {
         const store = alloc.create(store_mod.MemoryStore) catch return null;
         if (store_mod.MemoryStore.init(alloc, io, prj_mem_dir)) |val| {
             store.* = val;
-            // Load and discard entries here — they're used later in injectSemanticMemory
-            _ = store.loadIndex(io) catch |e| {
+            // Load index eagerly to fail fast; entries are re-loaded on demand
+            // in injectSemanticMemory — free them here to avoid leaking.
+            if (store.loadIndex(io)) |entries| {
+                store_mod.MemoryStore.freeEntries(alloc, entries);
+            } else |e| {
                 main.stderrPrint("[agent] Warning: Failed to load Memory index: {s}\n", .{@errorName(e)});
-            };
+            }
             return store;
         } else |e| {
             main.stderrPrint("[agent] Warning: Failed to init MemoryStore: {s}\n", .{@errorName(e)});
