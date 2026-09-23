@@ -58,13 +58,22 @@ fn runAgentTurn(
     renderer.parser.thinking_tags = main.backends.provider_mod.getProfile(agent.config.openai_provider).thinking_tags;
     defer renderer.deinit();
 
-    while (!g_renderer_mutex.tryLock()) {}
+    while (!g_renderer_mutex.tryLock()) {
+        if (signals.isInterrupted()) return;
+    }
     current_renderer = &renderer;
     g_renderer_mutex.unlock();
+    var interrupted = false;
     defer {
-        while (!g_renderer_mutex.tryLock()) {}
-        current_renderer = null;
-        g_renderer_mutex.unlock();
+        while (!g_renderer_mutex.tryLock()) {
+            if (signals.isInterrupted()) { interrupted = true; break; }
+        }
+        if (!interrupted) {
+            current_renderer = null;
+            g_renderer_mutex.unlock();
+        } else {
+            g_renderer_mutex.unlock();
+        }
     }
 
     renderer.startTurn(clean_text);
@@ -189,7 +198,9 @@ fn handleProviderSlash(agent: *agent_mod.AgentLoop, key_raw: []const u8) void {
             return;
         },
     }
-    while (!g_renderer_mutex.tryLock()) {}
+    while (!g_renderer_mutex.tryLock()) {
+        if (signals.isInterrupted()) return;
+    }
     const r = current_renderer;
     g_renderer_mutex.unlock();
     if (r) |renderer| {
@@ -680,7 +691,9 @@ test "expandCommandTemplate positional and arguments substitution" {
 // ---------------------------------------------------------------------------
 
 pub fn printThinkText(text: []const u8) void {
-    while (!g_renderer_mutex.tryLock()) {}
+    while (!g_renderer_mutex.tryLock()) {
+        if (signals.isInterrupted()) return;
+    }
     const r = current_renderer;
     g_renderer_mutex.unlock();
     if (r) |renderer| {
@@ -694,7 +707,9 @@ pub fn printThinkText(text: []const u8) void {
 }
 
 pub fn printRawText(text: []const u8) void {
-    while (!g_renderer_mutex.tryLock()) {}
+    while (!g_renderer_mutex.tryLock()) {
+        if (signals.isInterrupted()) return;
+    }
     const r = current_renderer;
     g_renderer_mutex.unlock();
     if (r) {
@@ -706,7 +721,9 @@ pub fn printRawText(text: []const u8) void {
 }
 
 pub fn printText(text: []const u8) void {
-    while (!g_renderer_mutex.tryLock()) {}
+    while (!g_renderer_mutex.tryLock()) {
+        if (signals.isInterrupted()) return;
+    }
     const r = current_renderer;
     g_renderer_mutex.unlock();
     if (r) |renderer| {
@@ -718,7 +735,9 @@ pub fn printText(text: []const u8) void {
 }
 
 pub fn resetThinkState() void {
-    while (!g_renderer_mutex.tryLock()) {}
+    while (!g_renderer_mutex.tryLock()) {
+        if (signals.isInterrupted()) return;
+    }
     const r = current_renderer;
     g_renderer_mutex.unlock();
     if (r) |renderer| {
@@ -738,7 +757,9 @@ pub fn beginAct(act_id: usize) void {
     // 2. Obtain current_renderer pointer.
     // 3. Unlock g_renderer_mutex.
     // 4. If current_renderer exists and act_id > 1, reset act parser state and restart waiting indicator.
-    while (!g_renderer_mutex.tryLock()) {}
+    while (!g_renderer_mutex.tryLock()) {
+        if (signals.isInterrupted()) return;
+    }
     const r = current_renderer;
     g_renderer_mutex.unlock();
     if (r) |renderer| {
