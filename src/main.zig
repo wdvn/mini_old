@@ -297,7 +297,7 @@ fn executeSinglePrompt(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop
 
 fn dispatchExecution(
     alloc: std.mem.Allocator,
-    io: std.process.Init.Io,
+    io: std.Io,
     agent: *agent_mod.AgentLoop,
     cfg: *const config_mod.Config,
     args: *const Args,

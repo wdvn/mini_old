@@ -44,6 +44,7 @@ const quickjs = @import("../runtime/quickjs_engine.zig");
 const js_bindings = @import("../runtime/js_bindings.zig");
 const tokens_mod = @import("memact/tokens.zig");
 const graph_store_mod = @import("memact/graph_store.zig");
+const store_mod = @import("memact/store.zig");
 const snapshot_mod = @import("snapshot.zig");
 const cas_mod = @import("cas.zig");
 const plan_mod = @import("plan.zig");
@@ -194,6 +195,8 @@ pub const AgentLoop = struct {
     dynamic_thinking: bool = true,
     /// Procedural Graph Store (RFC-010).
     pg_store: ?*graph_store_mod.PGraphStore = null,
+    /// Semantic/Episodic Memory Store (RFC-003).
+    memory_store: ?*store_mod.MemoryStore = null,
     /// Last executed tool name (RFC-010 active node anchor).
     last_executed_tool: ?[]u8 = null,
     /// Recent tool execution sequence (w acts window).
@@ -357,6 +360,34 @@ pub const AgentLoop = struct {
         }
     }
 
+    /// Initializes semantic/episodic memory store for the active project (RFC-003).
+    fn initMemoryStore(alloc: Allocator, io: std.Io, config: *const config_mod.Config, home_dir: []const u8) ?*store_mod.MemoryStore {
+        // PSEUDOCODE: Hash cwd, resolve memory path, allocate and initialize MemoryStore
+        if (!config.memact_enabled) return null;
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cur_cwd = if (std.c.getcwd(&cwd_buf, cwd_buf.len)) |ptr| std.mem.sliceTo(ptr, 0) else ".";
+        const prj_hash = std.hash.Fnv1a_64.hash(cur_cwd);
+
+        var mem_path_buf: [512]u8 = undefined;
+        const mem_base = config.memory_dir orelse (utils.getEnvSlice("MINI_HOME") orelse (std.fmt.bufPrint(&mem_path_buf, "{s}/.mini/memory", .{home_dir}) catch ".mini/memory"));
+        const prj_mem_dir = std.fmt.allocPrint(alloc, "{s}/{x}", .{ mem_base, prj_hash }) catch return null;
+        defer alloc.free(prj_mem_dir);
+
+        const store = alloc.create(store_mod.MemoryStore) catch return null;
+        if (store_mod.MemoryStore.init(alloc, io, prj_mem_dir)) |val| {
+            store.* = val;
+            // Load and discard entries here — they're used later in injectSemanticMemory
+            _ = store.loadIndex(io) catch |e| {
+                main.stderrPrint("[agent] Warning: Failed to load Memory index: {s}\n", .{@errorName(e)});
+            };
+            return store;
+        } else |e| {
+            main.stderrPrint("[agent] Warning: Failed to init MemoryStore: {s}\n", .{@errorName(e)});
+            alloc.destroy(store);
+            return null;
+        }
+    }
+
     /// Initializes and starts Watchdog background monitoring thread.
     fn initWatchdog(alloc: Allocator, io: std.Io, coordinator: *act_queue.ActCoordinator, config: *const config_mod.Config) ?*watchdog_mod.Watchdog {
         // PSEUDOCODE: Create watchdog with signal handlers and start thread
@@ -398,6 +429,7 @@ pub const AgentLoop = struct {
         const acts_path = std.fmt.bufPrint(&acts_buf, "{s}/.mini/acts", .{home_dir}) catch "/tmp/mini_acts";
         const act_logger = act_logger_mod.ActLogger.init(alloc, io, acts_path) catch null;
         const pg_store_ptr = initPGraphStore(alloc, io, config, home_dir);
+        const memory_store_ptr = initMemoryStore(alloc, io, config, home_dir);
         const coordinator = act_queue.ActCoordinator.init(alloc);
         const watchdog = initWatchdog(alloc, io, coordinator, config);
         const cas_ptr: *cas_mod.CAS = &cas;
@@ -417,6 +449,7 @@ pub const AgentLoop = struct {
             .act_logger = act_logger,
             .dynamic_thinking = config.dynamic_thinking_enabled,
             .pg_store = pg_store_ptr,
+            .memory_store = memory_store_ptr,
             .last_executed_tool = null,
             .recent_tools = .empty,
             .coordinator = coordinator,
@@ -448,6 +481,11 @@ pub const AgentLoop = struct {
             st.deinit();
             self.alloc.destroy(st);
             self.pg_store = null;
+        }
+        if (self.memory_store) |ms| {
+            ms.deinit();
+            self.alloc.destroy(ms);
+            self.memory_store = null;
         }
         if (self.last_executed_tool) |t| {
             self.alloc.free(t);
@@ -621,12 +659,43 @@ pub const AgentLoop = struct {
 
     /// Processes user input through agentic loop.
     /// Handle tool completion lifecycle event (RFC-010 Procedural Graph tracking)
+    /// Appends episodic memory entry for the completed tool call (RFC-003).
+    fn appendEpisodicMemory(self: *AgentLoop, tool_name: []const u8, is_error: bool) void {
+        // PSEUDOCODE:
+        // 1. Guard check if memory store is enabled and tool execution succeeded
+        // 2. Prepare stack MemoryEntry referencing tool_name
+        // 3. Append to memory store
+        // 4. Free generated entry ID
+        if (self.memory_store == null) return;
+        if (!self.config.memact_enabled) return;
+        if (is_error) return;
+
+        var kw_slice = [_][]u8{@constCast(tool_name)};
+
+        var entry = store_mod.MemoryEntry{
+            .id = &.{},
+            .ts = utils.milliTimestamp(),
+            .type = "episodic",
+            .content = @constCast(tool_name),
+            .keywords = &kw_slice,
+            .source_session = null,
+            .confidence = 0.7,
+            .supersedes = null,
+            .access_count = 0,
+            .last_access = 0,
+        };
+        defer if (entry.id.len > 0) self.alloc.free(entry.id);
+
+        self.memory_store.?.append(self.io, &entry) catch return;
+    }
+
     pub fn onToolCompleted(self: *AgentLoop, tool_name: []const u8, input_json: ?[]const u8, is_error: bool) void {
         if (self.pg_store) |pg| {
             if (self.last_executed_tool) |prev_tool| {
                 pg.recordTransition(self.io, prev_tool, tool_name) catch {};
             }
         }
+        self.appendEpisodicMemory(tool_name, is_error);
 
         if (self.last_executed_tool) |old_t| {
             self.alloc.free(old_t);
@@ -854,6 +923,96 @@ pub const AgentLoop = struct {
         return e;
     }
 
+    /// Injects top-k semantic memories into system prompt based on keyword matching (RFC-003).
+    fn injectSemanticMemory(self: *AgentLoop, alloc: Allocator, current_prompt: []const u8) ![]u8 {
+        // PSEUDOCODE:
+        // 1. Load memory entries from store
+        // 2. Filter entries matching keywords from current prompt/user request
+        // 3. Sort by confidence * access_count, take top_k
+        // 4. Append matching memories to system prompt
+        if (self.memory_store == null) return alloc.dupe(u8, current_prompt);
+        if (!self.config.memact_enabled) return alloc.dupe(u8, current_prompt);
+
+        const entries = self.memory_store.?.loadIndex(self.io) catch return alloc.dupe(u8, current_prompt);
+        defer store_mod.MemoryStore.freeEntries(alloc, entries);
+
+        // Extract keywords from current prompt and user request
+        var keywords = ArrayList([]const u8).empty;
+        defer keywords.deinit(alloc);
+
+        // Add keywords from user request if available
+        if (self.current_user_request) |req| {
+            var it = std.mem.splitScalar(u8, req, ' ');
+            while (it.next()) |word| {
+                const trimmed = std.mem.trim(u8, word, " \t\r\n");
+                if (trimmed.len >= 3 and trimmed.len <= 30) {
+                    try keywords.append(alloc, trimmed);
+                }
+            }
+        }
+
+        // Score and filter entries
+        const ScoredEntry = struct { entry: *store_mod.MemoryEntry, score: f32 };
+        var scored = ArrayList(ScoredEntry).empty;
+        defer scored.deinit(alloc);
+
+        for (entries) |*entry| {
+            var score: f32 = entry.confidence * @as(f32, @floatFromInt(entry.access_count + 1));
+            var matches: usize = 0;
+            for (entry.keywords) |kw| {
+                for (keywords.items) |qkw| {
+                    if (store_mod.matchKeyword(qkw, kw) or store_mod.matchKeyword(kw, qkw)) {
+                        matches += 1;
+                        score += 0.5;
+                    }
+                }
+            }
+            if (matches > 0) {
+                try scored.append(alloc, .{ .entry = entry, .score = score });
+            }
+        }
+
+        // Sort by score descending
+        std.mem.sort(ScoredEntry, scored.items, {}, struct {
+            fn lessThan(_: void, a: ScoredEntry, b: ScoredEntry) bool {
+                return a.score > b.score;
+            }
+        }.lessThan);
+
+        // Take top_k and build memory block
+        const top_k = @min(self.config.memact_top_k, @as(u32, @intCast(scored.items.len)));
+        if (top_k == 0) return alloc.dupe(u8, current_prompt);
+
+        var mem_buf = utils.BufWriter.init(alloc);
+        defer mem_buf.deinit();
+
+        try mem_buf.writeAll("\n[MemAct Semantic Memory]\n");
+        var budget_used: u32 = 0;
+        const budget = self.config.memact_memory_budget;
+
+        var count: u32 = 0;
+        for (scored.items[0..@intCast(top_k)]) |scored_entry| {
+            const entry = scored_entry.entry;
+            const entry_text = entry.content;
+            const tokens = self.token_estimator.estimate(entry_text);
+
+            if (budget_used + tokens > budget) break;
+            budget_used += tokens;
+
+            try mem_buf.print("- [{s}] {s}\n", .{ entry.type, entry_text });
+            count += 1;
+        }
+
+        if (count > 0) {
+            try mem_buf.writeAll("[/MemAct Semantic Memory]\n");
+            const mem_str = try mem_buf.toOwnedSlice();
+            defer alloc.free(mem_str);
+            return try std.fmt.allocPrint(alloc, "{s}{s}", .{ current_prompt, mem_str });
+        }
+
+        return alloc.dupe(u8, current_prompt);
+    }
+
     pub fn sendToBackend(
         self: *AgentLoop,
         act_id: usize,
@@ -871,7 +1030,11 @@ pub const AgentLoop = struct {
 
         self.clearLastErrorContext();
 
-        const primary = self.backend.send(system_prompt, msgs, tool_defs, text_cb, think_cb);
+        const enriched_prompt = self.injectSemanticMemory(self.alloc, system_prompt) catch null;
+        defer if (enriched_prompt) |p| self.alloc.free(p);
+        const active_prompt = enriched_prompt orelse system_prompt;
+
+        const primary = self.backend.send(active_prompt, msgs, tool_defs, text_cb, think_cb);
         if (primary) |resp| return resp else |e| {
             return self.handleBackendSendError(act_id, e);
         }
@@ -1072,7 +1235,14 @@ pub const AgentLoop = struct {
                 try mbw.writeAll("🗺️ Trajectory Scouted: ");
                 for (self.turn_tool_trajectory.items, 0..) |tn, i| {
                     if (i > 0) try mbw.writeAll(" → ");
+                    const desc = desc_blk: {
+                        if (self.pg_store) |pg| {
+                            if (pg.matchNode(tn)) |nid| break :desc_blk pg.graph.nodes.items[nid].desc;
+                        }
+                        break :desc_blk "";
+                    };
                     try mbw.print("`{s}`", .{tn});
+                    if (desc.len > 0) try mbw.print(" [{s}]", .{desc});
                 }
                 try mbw.writeAll("\n⚠️ Exploration has circled in place without forward progress (ΔZ = 0).\n");
                 try mbw.writeAll("Consider a different approach for the next step if appropriate.\n");

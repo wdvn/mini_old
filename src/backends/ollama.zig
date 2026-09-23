@@ -52,7 +52,7 @@ pub const Client = struct {
         return if (disabled) 0 else 30;
     }
 
-    fn finalizeResponse(self: *Client, ctx: *StreamCtx, req_http_code: u16, idle_aborted: bool) !proto.Response {
+    fn finalizeResponse(self: *Client, ctx: *StreamCtx, req_http_code: u32, idle_aborted: bool) !proto.Response {
         _ = self;
         ctx.response.http_code = req_http_code;
         if (idle_aborted) ctx.response.stop_reason = .stream_aborted;

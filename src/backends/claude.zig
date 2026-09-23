@@ -72,7 +72,7 @@ pub const Client = struct {
         return 30;
     }
 
-    fn finalizeClaudeResponse(self: *Client, ctx: *StreamCtx, req_http_code: u16, idle_aborted: bool) !proto.Response {
+    fn finalizeClaudeResponse(self: *Client, ctx: *StreamCtx, req_http_code: u32, idle_aborted: bool) !proto.Response {
         ctx.response.http_code = req_http_code;
         if (idle_aborted) ctx.response.stop_reason = .stream_aborted;
 

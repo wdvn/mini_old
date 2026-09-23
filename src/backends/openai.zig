@@ -203,7 +203,7 @@ pub const Client = struct {
         system_prompt: []const u8,
         msgs: []const proto.Message,
         tools: []const proto.ToolDefinition,
-    ) ![]u8 {
+    ) ![]const u8 {
         // PSEUDOCODE: Build protocol-appropriate JSON request body and run adapter transform.
         const native_body = if (active_protocol == .responses)
             try buildResponsesRequestBody(self.alloc, self.model, self.max_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, system_prompt, msgs, tools, profile)
