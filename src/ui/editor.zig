@@ -563,14 +563,16 @@ pub const LineEditor = struct {
 
     fn handleCtrlC(self: *LineEditor, io: std.Io, stdout_file: std.Io.File, prompt: []const u8) ?bool {
         const now_ms = utils.milliTimestamp();
+        // suppress_redraw also mutes terminal writes so unit tests (undefined io) stay safe.
+        const quiet = self.suppress_redraw;
         if (self.rendered_rows > self.cursor_row) {
             var move_down_buf: [32]u8 = undefined;
             const seq = std.fmt.bufPrint(&move_down_buf, "\x1b[{d}B", .{self.rendered_rows - self.cursor_row}) catch "";
-            stdout_file.writeStreamingAll(io, seq) catch {};
+            if (!quiet) stdout_file.writeStreamingAll(io, seq) catch {};
         }
 
         if (self.buf.items.len > 0) {
-            stdout_file.writeStreamingAll(io, "^C\r\n") catch {};
+            if (!quiet) stdout_file.writeStreamingAll(io, "^C\r\n") catch {};
             self.buf.clearRetainingCapacity();
             self.pos = 0;
             self.rendered_rows = 0;
@@ -582,11 +584,16 @@ pub const LineEditor = struct {
             return true;
         }
         if (now_ms - self.last_ctrl_c_ms <= 2000 and self.last_ctrl_c_ms > 0) {
-            stdout_file.writeStreamingAll(io, "^C\r\n") catch {};
-            return false;
+            // Double-press exit: arm exit_pending instead of returning false.
+            // Returning false made processInputByte return null without advancing
+            // the cursor, so processReadChunk re-processed the same 0x03 byte in
+            // an infinite loop (^C flood) and the exit never reached readLine.
+            if (!quiet) stdout_file.writeStreamingAll(io, "^C\r\n") catch {};
+            self.exit_pending = true;
+            return true;
         }
         self.last_ctrl_c_ms = now_ms;
-        stdout_file.writeStreamingAll(io, "^C\r\n") catch {};
+        if (!quiet) stdout_file.writeStreamingAll(io, "^C\r\n") catch {};
         self.rendered_rows = 0;
         self.cursor_row = 0;
         self.redraw(io, prompt);
@@ -718,8 +725,12 @@ pub const LineEditor = struct {
 
     fn handleCtrlD(self: *LineEditor, io: std.Io, stdout_file: std.Io.File, prompt: []const u8) ?void {
         if (self.buf.items.len == 0) {
-            stdout_file.writeStreamingAll(io, "\r\n") catch {};
-            return null;
+            // EOF exit: arm exit_pending (consumed by the readLine loop) instead
+            // of returning null, which previously re-triggered the same byte in
+            // the processReadChunk loop (infinite "\r\n" flood).
+            if (!self.suppress_redraw) stdout_file.writeStreamingAll(io, "\r\n") catch {};
+            self.exit_pending = true;
+            return;
         }
         if (self.pos < self.buf.items.len) {
             self.pushUndo();
@@ -745,13 +756,14 @@ pub const LineEditor = struct {
         if (c != 3 and c != 27) self.last_ctrl_c_ms = 0;
         switch (c) {
             3 => {
-                if (self.handleCtrlC(io, stdout_file, prompt)) |keep_running| {
-                    if (!keep_running) return null;
-                    i.* += 1;
-                }
+                // handleCtrlC signals exit via exit_pending (consumed by the
+                // readLine loop); always advance past the byte to avoid
+                // re-processing it in the processReadChunk loop.
+                _ = self.handleCtrlC(io, stdout_file, prompt);
+                i.* += 1;
             },
             4 => {
-                if (self.handleCtrlD(io, stdout_file, prompt) == null) return null;
+                _ = self.handleCtrlD(io, stdout_file, prompt);
                 i.* += 1;
             },
             13 => {
@@ -763,6 +775,14 @@ pub const LineEditor = struct {
                 self.cursor_row = 0;
                 self.rendered_rows = 0;
                 self.redraw(io, prompt);
+                i.* += 1;
+            },
+            // Raw legacy Backspace byte: must dispatch to the control-key
+            // handler. 0x7f >= 32 would otherwise fall into handlePrintableText
+            // and insert a literal DEL character into the buffer, which also
+            // blocks the empty-buffer double-Ctrl+C exit (buffer never empty).
+            127, 8 => {
+                self.handleControlKey(io, prompt, c);
                 i.* += 1;
             },
             27 => {
@@ -1643,6 +1663,27 @@ test "Double Ctrl+C: xterm modifyOtherKeys form sets exit_pending" {
     try std.testing.expect(e.exit_pending);
 }
 
+
+test "Backspace: raw legacy 0x7f byte deletes previous grapheme" {
+    const alloc = std.testing.allocator;
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+
+    try e.buf.appendSlice(alloc, "hello");
+    e.pos = e.buf.items.len;
+
+    // Terminals without kitty/modifyOtherKeys send Backspace as raw 0x7f.
+    // It must be routed to handleControlKey, not inserted as printable text.
+    var i: usize = 0;
+    _ = try e.processInputByte(undefined, undefined, undefined, "", "\x7f", &i);
+    try std.testing.expectEqual(@as(usize, 1), i);
+    try std.testing.expectEqualStrings("hell", e.buf.items);
+    try std.testing.expectEqual(@as(usize, 4), e.pos);
+
+    // Clearing the buffer fully must allow the empty-buffer Ctrl+C exit path.
+    try std.testing.expectEqualStrings("hell", e.buf.items);
+}
 
 test "Backspace: Kitty CSI-u escapes delete previous grapheme" {
     const alloc = std.testing.allocator;
