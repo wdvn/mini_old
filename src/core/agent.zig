@@ -940,6 +940,14 @@ pub const AgentLoop = struct {
         var keywords = ArrayList([]const u8).empty;
         defer keywords.deinit(alloc);
 
+        // Extract keywords from current prompt AND user request
+        var prompt_it = std.mem.splitScalar(u8, current_prompt, ' ');
+        while (prompt_it.next()) |word| {
+            const trimmed = std.mem.trim(u8, word, " \t\r\n");
+            if (trimmed.len >= 3 and trimmed.len <= 30) {
+                try keywords.append(alloc, trimmed);
+            }
+        }
         // Add keywords from user request if available
         if (self.current_user_request) |req| {
             var it = std.mem.splitScalar(u8, req, ' ');
@@ -1287,6 +1295,7 @@ pub const AgentLoop = struct {
             }
             self.action_loop_tripped = false;
             self.consecutive_dup_tool_count = 0;
+            self.clearTurnToolRecords();
             return self.formatLoopCheckpointMessage(tu, trip_reason_str);
         } else {
             main.stderrPrint(
