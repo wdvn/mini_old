@@ -72,6 +72,56 @@ pub const Client = struct {
         return 30;
     }
 
+    fn finalizeClaudeResponse(self: *Client, ctx: *StreamCtx, req_http_code: u16, idle_aborted: bool) !proto.Response {
+        ctx.response.http_code = req_http_code;
+        if (idle_aborted) ctx.response.stop_reason = .stream_aborted;
+
+        if (ctx.text_accum.items.len > 0) {
+            const text = try self.alloc.dupe(u8, ctx.text_accum.items);
+            try ctx.response.content.append(self.alloc, .{ .text = text });
+        }
+
+        hooks.dispatch(self.alloc, main.g_io, .{
+            .event = "message_stop",
+            .role = "assistant",
+            .model = self.model,
+            .stop_reason = @tagName(ctx.response.stop_reason),
+        });
+
+        if (ctx.raw_accum_init and ctx.raw_accum.items.len > 0) {
+            ctx.response.raw_debug_info = ctx.raw_accum.toOwnedSlice(self.alloc) catch null;
+        }
+
+        return ctx.response;
+    }
+
+    fn executeStreamRequest(
+        self: *Client,
+        body: []const u8,
+        auth_hdr: []const u8,
+        ctx: *StreamCtx,
+        idle_aborted: *bool,
+    ) !u32 {
+        const headers = [_][]const u8{
+            auth_hdr,
+            "anthropic-version: " ++ CLAUDE_API_VERSION,
+            "anthropic-beta: prompt-caching-2024-07-31",
+            "Content-Type: application/json",
+        };
+        const stream_result = http_lib.postStream(self.alloc, main.g_io, .{
+            .url = CLAUDE_API_URL,
+            .headers = &headers,
+            .body = body,
+            .idle_timeout_secs = self.effectiveIdleTimeout(),
+            .out_idle_aborted = idle_aborted,
+        }, StreamCtx.onChunk, ctx);
+
+        return if (stream_result) |c| c else |e| switch (e) {
+            error.StreamIdleTimeout => 598,
+            else => return e,
+        };
+    }
+
     /// Sends messages and receives streaming response via Claude SSE.
     pub fn sendMessage(
         self: *Client,
@@ -84,15 +134,10 @@ pub const Client = struct {
         const body = try buildRequestBody(self.alloc, self.model, self.max_tokens, self.active_thinking_budget, system_prompt, msgs, tools);
         defer self.alloc.free(body);
 
-        hooks.dispatch(self.alloc, main.g_io, .{
-            .event = "message_start",
-            .role = "assistant",
-            .model = self.model,
-        });
+        hooks.dispatch(self.alloc, main.g_io, .{ .event = "message_start", .role = "assistant", .model = self.model });
 
         var auth_buf: [512]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_buf, "x-api-key: {s}", .{self.api_key}) catch return error.AuthBufOverflow;
-        const api_ver_hdr = "anthropic-version: " ++ CLAUDE_API_VERSION;
 
         var ctx = StreamCtx{
             .alloc = self.alloc,
@@ -109,56 +154,98 @@ pub const Client = struct {
         defer ctx.think_accum.deinit(self.alloc);
         defer ctx.args_accum.deinit(self.alloc);
         errdefer ctx.response.deinit();
-
         errdefer if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
 
-        const headers = [_][]const u8{
-            auth_hdr,
-            api_ver_hdr,
-            "anthropic-beta: prompt-caching-2024-07-31",
-            "Content-Type: application/json",
-        };
         var idle_aborted = false;
-        const stream_result = http_lib.postStream(self.alloc, main.g_io, .{
-            .url = CLAUDE_API_URL,
-            .headers = &headers,
-            .body = body,
-            .idle_timeout_secs = self.effectiveIdleTimeout(),
-            .out_idle_aborted = &idle_aborted,
-        }, StreamCtx.onChunk, &ctx);
-        const req_http_code = if (stream_result) |c| c else |e| switch (e) {
-            error.StreamIdleTimeout => 598,
-            else => return e,
-        };
-
-        ctx.response.http_code = req_http_code;
-        if (idle_aborted) ctx.response.stop_reason = .stream_aborted;
-
-        // Save remaining text if any
-        if (ctx.text_accum.items.len > 0) {
-            const text = try self.alloc.dupe(u8, ctx.text_accum.items);
-            try ctx.response.content.append(self.alloc, .{ .text = text });
-        }
-
-        hooks.dispatch(self.alloc, main.g_io, .{
-            .event = "message_stop",
-            .role = "assistant",
-            .model = self.model,
-            .stop_reason = @tagName(ctx.response.stop_reason),
-        });
-
-        // If server returned error body
-        if (ctx.raw_accum_init and ctx.raw_accum.items.len > 0) {
-            ctx.response.raw_debug_info = ctx.raw_accum.toOwnedSlice(self.alloc) catch null;
-        }
-
-        return ctx.response;
+        const req_http_code = try self.executeStreamRequest(body, auth_hdr, &ctx, &idle_aborted);
+        return self.finalizeClaudeResponse(&ctx, req_http_code, idle_aborted);
     }
 };
 
 // ---------------------------------------------------------------------------
 // Request building
 // ---------------------------------------------------------------------------
+
+
+fn appendClaudeContentBlock(w: *utils.BufWriter, alloc: Allocator, block: proto.ContentBlock) !void {
+    switch (block) {
+        .text => |t| {
+            const e = try json.escape(alloc, t);
+            defer alloc.free(e);
+            try w.print("{{\"type\":\"text\",\"text\":\"{s}\"}}", .{e});
+        },
+        .thinking => |th| {
+            const t = try json.escape(alloc, th.thinking);
+            defer alloc.free(t);
+            const s = try json.escape(alloc, th.signature);
+            defer alloc.free(s);
+            try w.print("{{\"type\":\"thinking\",\"thinking\":\"{s}\",\"signature\":\"{s}\"}}", .{ t, s });
+        },
+        .tool_use => |tu| {
+            try w.print("{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{s}}}", .{ tu.id, tu.name, tu.input_json });
+        },
+        .tool_result => |tr| {
+            const e = try json.escape(alloc, tr.content);
+            defer alloc.free(e);
+            try w.print("{{\"type\":\"tool_result\",\"tool_use_id\":\"{s}\",\"content\":\"{s}\",\"is_error\":{s}}}", .{ tr.tool_use_id, e, if (tr.is_error) "true" else "false" });
+        },
+        .image => |img| {
+            try w.print("{{\"type\":\"image\",\"source\":{{\"type\":\"base64\",\"media_type\":\"{s}\",\"data\":\"{s}\"}}}}", .{ img.media_type, img.data });
+        },
+    }
+}
+
+fn appendClaudeSingleBlock(w: *utils.BufWriter, alloc: Allocator, block: proto.ContentBlock) !void {
+    if (block == .text) {
+        const e = try json.escape(alloc, block.text);
+        defer alloc.free(e);
+        try w.print("\"{s}\"", .{e});
+    } else {
+        try w.writeByte('[');
+        try appendClaudeContentBlock(w, alloc, block);
+        try w.writeByte(']');
+    }
+}
+
+fn appendClaudeMultiBlock(w: *utils.BufWriter, alloc: Allocator, content: []const proto.ContentBlock) !void {
+    try w.writeByte('[');
+    var first_block = true;
+    for (content) |block| {
+        if (block == .text and block.text.len == 0) continue;
+        if (!first_block) try w.writeByte(',');
+        first_block = false;
+        try appendClaudeContentBlock(w, alloc, block);
+    }
+    try w.writeByte(']');
+}
+
+fn appendClaudeMessage(w: *utils.BufWriter, alloc: Allocator, msg: *const proto.Message) !void {
+    try w.print("{{\"role\":\"{s}\",\"content\":", .{msg.role.toJson()});
+    if (msg.content.len == 1) {
+        try appendClaudeSingleBlock(w, alloc, msg.content[0]);
+    } else {
+        try appendClaudeMultiBlock(w, alloc, msg.content);
+    }
+    try w.writeByte('}');
+}
+
+fn appendClaudeTools(w: *utils.BufWriter, tools: []const proto.ToolDefinition) !void {
+    if (tools.len == 0) return;
+    try w.writeAll(",\"tools\":[");
+    for (tools, 0..) |td, ti| {
+        if (ti > 0) try w.writeByte(',');
+        if (ti == tools.len - 1) {
+            try w.print(
+                \\{{"name":"{s}","description":"{s}","input_schema":{s},"cache_control":{{"type":"ephemeral"}}}}
+            , .{ td.name, td.description, td.input_schema_json });
+        } else {
+            try w.print(
+                \\{{"name":"{s}","description":"{s}","input_schema":{s}}}
+            , .{ td.name, td.description, td.input_schema_json });
+        }
+    }
+    try w.writeAll("],\"tool_choice\":{\"type\":\"auto\"}");
+}
 
 pub fn buildRequestBody(
     alloc: Allocator,
@@ -169,11 +256,14 @@ pub fn buildRequestBody(
     msgs: []const proto.Message,
     tools: []const proto.ToolDefinition,
 ) ![]const u8 {
+    // PSEUDOCODE:
+    // 1. Compute effective max tokens and thinking config string
+    // 2. Format model, system prompt with ephemeral caching
+    // 3. Append messages and tools
     var buf = utils.BufWriter.init(alloc);
     errdefer buf.deinit();
     const w = &buf;
 
-    // System prompt (with cache_control for Anthropic Prompt Caching)
     const escaped_sys = try json.escape(alloc, system_prompt);
     defer alloc.free(escaped_sys);
 
@@ -182,9 +272,7 @@ pub fn buildRequestBody(
     const thinking_str: []const u8 = blk: {
         if (thinking_budget) |budget| {
             if (budget >= 1024) {
-                if (effective_max_tokens <= budget) {
-                    effective_max_tokens = budget + 4096;
-                }
+                if (effective_max_tokens <= budget) effective_max_tokens = budget + 4096;
                 break :blk std.fmt.bufPrint(&thinking_str_buf, ",\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}}", .{budget}) catch "";
             }
         }
@@ -195,117 +283,13 @@ pub fn buildRequestBody(
         \\{{"model":"{s}","max_tokens":{d},"stream":true{s},"system":[{{"type":"text","text":"{s}","cache_control":{{"type":"ephemeral"}}}}],"messages":[
     , .{ model, effective_max_tokens, thinking_str, escaped_sys });
 
-    for (msgs, 0..) |msg, mi| {
-        try w.print("{{\"role\":\"{s}\",\"content\":", .{msg.role.toJson()});
-
-        if (msg.content.len == 1) {
-            switch (msg.content[0]) {
-                .text => |t| {
-                    const e = try json.escape(alloc, t);
-                    defer alloc.free(e);
-                    try w.print("\"{s}\"", .{e});
-                },
-                .thinking => |th| {
-                    const t = try json.escape(alloc, th.thinking);
-                    defer alloc.free(t);
-                    const s = try json.escape(alloc, th.signature);
-                    defer alloc.free(s);
-                    try w.print(
-                        \\[{{"type":"thinking","thinking":"{s}","signature":"{s}"}}]
-                    , .{ t, s });
-                },
-                .tool_use => |tu| {
-                    try w.print(
-                        \\[{{"type":"tool_use","id":"{s}","name":"{s}","input":{s}}}]
-                    , .{ tu.id, tu.name, tu.input_json });
-                },
-                .tool_result => |tr| {
-                    const e = try json.escape(alloc, tr.content);
-                    defer alloc.free(e);
-                    try w.print(
-                        \\[{{"type":"tool_result","tool_use_id":"{s}","content":"{s}","is_error":{s}}}]
-                    , .{ tr.tool_use_id, e, if (tr.is_error) "true" else "false" });
-                },
-                .image => |img| {
-                    try w.print(
-                        \\[{{"type":"image","source":{{"type":"base64","media_type":"{s}","data":"{s}"}}}}]
-                    , .{ img.media_type, img.data });
-                },
-            }
-        } else {
-            try w.writeByte('[');
-            var first_block = true;
-            for (msg.content) |block| {
-                switch (block) {
-                    .text => |t| {
-                        if (t.len == 0) continue;
-                        if (!first_block) try w.writeByte(',');
-                        first_block = false;
-                        const e = try json.escape(alloc, t);
-                        defer alloc.free(e);
-                        try w.print("{{\"type\":\"text\",\"text\":\"{s}\"}}", .{e});
-                    },
-                    .thinking => |th| {
-                        if (!first_block) try w.writeByte(',');
-                        first_block = false;
-                        const t = try json.escape(alloc, th.thinking);
-                        defer alloc.free(t);
-                        const s = try json.escape(alloc, th.signature);
-                        defer alloc.free(s);
-                        try w.print(
-                            \\{{"type":"thinking","thinking":"{s}","signature":"{s}"}}
-                        , .{ t, s });
-                    },
-                    .tool_use => |tu| {
-                        if (!first_block) try w.writeByte(',');
-                        first_block = false;
-                        try w.print(
-                            \\{{"type":"tool_use","id":"{s}","name":"{s}","input":{s}}}
-                        , .{ tu.id, tu.name, tu.input_json });
-                    },
-                    .tool_result => |tr| {
-                        if (!first_block) try w.writeByte(',');
-                        first_block = false;
-                        const e = try json.escape(alloc, tr.content);
-                        defer alloc.free(e);
-                        try w.print(
-                            \\{{"type":"tool_result","tool_use_id":"{s}","content":"{s}","is_error":{s}}}
-                        , .{ tr.tool_use_id, e, if (tr.is_error) "true" else "false" });
-                    },
-                    .image => |img| {
-                        if (!first_block) try w.writeByte(',');
-                        first_block = false;
-                        try w.print(
-                            \\{{"type":"image","source":{{"type":"base64","media_type":"{s}","data":"{s}"}}}}
-                        , .{ img.media_type, img.data });
-                    },
-                }
-            }
-            try w.writeByte(']');
-        }
-        try w.writeByte('}');
+    for (msgs, 0..) |*msg, mi| {
+        try appendClaudeMessage(w, alloc, msg);
         if (mi + 1 < msgs.len) try w.writeByte(',');
     }
     try w.writeByte(']');
 
-    if (tools.len > 0) {
-        try w.writeAll(",\"tools\":[");
-        for (tools, 0..) |td, ti| {
-            if (ti > 0) try w.writeByte(',');
-            if (ti == tools.len - 1) {
-                try w.print(
-                    \\{{"name":"{s}","description":"{s}","input_schema":{s},"cache_control":{{"type":"ephemeral"}}}}
-                , .{ td.name, td.description, td.input_schema_json });
-            } else {
-                try w.print(
-                    \\{{"name":"{s}","description":"{s}","input_schema":{s}}}
-                , .{ td.name, td.description, td.input_schema_json });
-            }
-        }
-        try w.writeByte(']');
-        try w.writeAll(",\"tool_choice\":{\"type\":\"auto\"}");
-    }
-
+    try appendClaudeTools(w, tools);
     try w.writeByte('}');
     return buf.toOwnedSlice();
 }
@@ -356,7 +340,111 @@ const StreamCtx = struct {
         }
     }
 
+    fn handleContentBlockStart(self: *StreamCtx, data: []const u8) void {
+        hooks.dispatch(self.alloc, main.g_io, .{ .event = "content_block_start" });
+        const t = json.findString(data, "type") orelse return;
+        if (std.mem.eql(u8, t, "tool_use")) {
+            self.in_tool_block = true;
+            self.args_accum.clearRetainingCapacity();
+            if (json.findString(data, "id")) |id| {
+                const n = @min(id.len, self.current_tool_id.len);
+                @memcpy(self.current_tool_id[0..n], id[0..n]);
+                self.current_tool_id_len = n;
+            }
+            if (json.findString(data, "name")) |name| {
+                const n = @min(name.len, self.current_tool_name.len);
+                @memcpy(self.current_tool_name[0..n], name[0..n]);
+                self.current_tool_name_len = n;
+            }
+        } else if (std.mem.eql(u8, t, "thinking")) {
+            self.in_think_block = true;
+            self.think_accum.clearRetainingCapacity();
+            if (json.findString(data, "signature")) |sig| {
+                const n = @min(sig.len, self.current_think_sig.len);
+                @memcpy(self.current_think_sig[0..n], sig[0..n]);
+                self.current_think_sig_len = n;
+            }
+        }
+    }
+
+    fn handleContentBlockDelta(self: *StreamCtx, data: []const u8) !void {
+        if (self.in_tool_block) {
+            if (json.findString(data, "partial_json")) |pj| {
+                try self.args_accum.appendSlice(self.alloc, pj);
+                hooks.dispatch(self.alloc, main.g_io, .{
+                    .event = "content_block_delta", .block_type = "tool_use", .delta_text = pj,
+                });
+            }
+            return;
+        }
+        if (self.in_think_block) {
+            if (json.findString(data, "thinking")) |thinking| {
+                if (thinking.len > 0) {
+                    const unescaped = json.unescape(self.alloc, thinking) catch thinking;
+                    defer self.alloc.free(unescaped);
+                    try self.think_accum.appendSlice(self.alloc, unescaped);
+                    if (self.think_cb) |cb| cb(unescaped);
+                    hooks.dispatch(self.alloc, main.g_io, .{
+                        .event = "content_block_delta", .block_type = "thinking", .delta_text = unescaped,
+                    });
+                }
+            }
+            return;
+        }
+        if (json.findString(data, "text")) |text| {
+            if (text.len > 0) {
+                const unescaped = json.unescape(self.alloc, text) catch text;
+                defer self.alloc.free(unescaped);
+                try self.text_accum.appendSlice(self.alloc, unescaped);
+                if (self.text_cb) |cb| cb(unescaped);
+                hooks.dispatch(self.alloc, main.g_io, .{
+                    .event = "content_block_delta", .block_type = "text", .delta_text = unescaped,
+                });
+            }
+        }
+    }
+
+    fn handleContentBlockStop(self: *StreamCtx) !void {
+        hooks.dispatch(self.alloc, main.g_io, .{ .event = "content_block_stop" });
+        if (self.in_tool_block) {
+            const id = try self.alloc.dupe(u8, self.current_tool_id[0..self.current_tool_id_len]);
+            const name = try self.alloc.dupe(u8, self.current_tool_name[0..self.current_tool_name_len]);
+            const args = if (self.args_accum.items.len > 0)
+                json.unescape(self.alloc, self.args_accum.items) catch try self.alloc.dupe(u8, self.args_accum.items)
+            else
+                try self.alloc.dupe(u8, "{}");
+            try self.response.content.append(self.alloc, .{ .tool_use = .{
+                .id = id, .name = name, .input_json = args,
+            }});
+            self.in_tool_block = false;
+        } else if (self.in_think_block) {
+            const think_text = try self.alloc.dupe(u8, self.think_accum.items);
+            const sig = try self.alloc.dupe(u8, self.current_think_sig[0..self.current_think_sig_len]);
+            try self.response.content.append(self.alloc, .{ .thinking = .{
+                .thinking = think_text, .signature = sig,
+            }});
+            self.in_think_block = false;
+            self.think_accum.clearRetainingCapacity();
+        } else if (self.text_accum.items.len > 0) {
+            const text = try self.alloc.dupe(u8, self.text_accum.items);
+            try self.response.content.append(self.alloc, .{ .text = text });
+            self.text_accum.clearRetainingCapacity();
+        }
+    }
+
+    fn handleMessageDelta(self: *StreamCtx, data: []const u8) void {
+        if (json.findString(data, "stop_reason")) |reason| {
+            self.response.stop_reason = parseStopReason(reason);
+            hooks.dispatch(self.alloc, main.g_io, .{
+                .event = "message_delta", .stop_reason = reason,
+            });
+        }
+    }
+
     fn processLine(self: *StreamCtx, line: []const u8) !void {
+        // PSEUDOCODE:
+        // 1. Trim line and update event_type if event prefix
+        // 2. Check for data prefix and dispatch to event handler
         const trimmed = std.mem.trim(u8, line, " \t\r");
 
         if (std.mem.startsWith(u8, trimmed, "event: ")) {
@@ -372,113 +460,13 @@ const StreamCtx = struct {
         const ev = self.event_type[0..self.event_type_len];
 
         if (std.mem.eql(u8, ev, "content_block_start")) {
-            hooks.dispatch(self.alloc, main.g_io, .{
-                .event = "content_block_start",
-            });
-            if (json.findString(data, "type")) |t| {
-                if (std.mem.eql(u8, t, "tool_use")) {
-                    self.in_tool_block = true;
-                    self.args_accum.clearRetainingCapacity();
-                    if (json.findString(data, "id")) |id| {
-                        const n = @min(id.len, self.current_tool_id.len);
-                        @memcpy(self.current_tool_id[0..n], id[0..n]);
-                        self.current_tool_id_len = n;
-                    }
-                    if (json.findString(data, "name")) |name| {
-                        const n = @min(name.len, self.current_tool_name.len);
-                        @memcpy(self.current_tool_name[0..n], name[0..n]);
-                        self.current_tool_name_len = n;
-                    }
-                } else if (std.mem.eql(u8, t, "thinking")) {
-                    self.in_think_block = true;
-                    self.think_accum.clearRetainingCapacity();
-                    if (json.findString(data, "signature")) |sig| {
-                        const n = @min(sig.len, self.current_think_sig.len);
-                        @memcpy(self.current_think_sig[0..n], sig[0..n]);
-                        self.current_think_sig_len = n;
-                    }
-                }
-            }
+            self.handleContentBlockStart(data);
         } else if (std.mem.eql(u8, ev, "content_block_delta")) {
-            if (self.in_tool_block) {
-                if (json.findString(data, "partial_json")) |pj| {
-                    try self.args_accum.appendSlice(self.alloc, pj);
-                    hooks.dispatch(self.alloc, main.g_io, .{
-                        .event = "content_block_delta",
-                        .block_type = "tool_use",
-                        .delta_text = pj,
-                    });
-                }
-            } else if (self.in_think_block) {
-                if (json.findString(data, "thinking")) |thinking| {
-                    if (thinking.len > 0) {
-                        const unescaped = json.unescape(self.alloc, thinking) catch thinking;
-                        defer self.alloc.free(unescaped);
-                        try self.think_accum.appendSlice(self.alloc, unescaped);
-                        if (self.think_cb) |cb| cb(unescaped);
-                        hooks.dispatch(self.alloc, main.g_io, .{
-                            .event = "content_block_delta",
-                            .block_type = "thinking",
-                            .delta_text = unescaped,
-                        });
-                    }
-                }
-            } else {
-                if (json.findString(data, "text")) |text| {
-                    if (text.len > 0) {
-                        const unescaped = json.unescape(self.alloc, text) catch text;
-                        defer self.alloc.free(unescaped);
-                        try self.text_accum.appendSlice(self.alloc, unescaped);
-                        if (self.text_cb) |cb| cb(unescaped);
-                        hooks.dispatch(self.alloc, main.g_io, .{
-                            .event = "content_block_delta",
-                            .block_type = "text",
-                            .delta_text = unescaped,
-                        });
-                    }
-                }
-            }
+            try self.handleContentBlockDelta(data);
         } else if (std.mem.eql(u8, ev, "content_block_stop")) {
-            hooks.dispatch(self.alloc, main.g_io, .{
-                .event = "content_block_stop",
-            });
-            if (self.in_tool_block) {
-                const id = try self.alloc.dupe(u8, self.current_tool_id[0..self.current_tool_id_len]);
-                const name = try self.alloc.dupe(u8, self.current_tool_name[0..self.current_tool_name_len]);
-                const args = if (self.args_accum.items.len > 0) blk: {
-                    // partial_json chunks from Claude SSE contain escaped text
-                    // (findString returns raw slice, retaining \" \\n...).
-                    // Unescape here so input_json is consistent with OpenAI/Ollama
-                    // (raw JSON object, unescaped quotes).
-                    break :blk json.unescape(self.alloc, self.args_accum.items) catch
-                        try self.alloc.dupe(u8, self.args_accum.items);
-                } else
-                    try self.alloc.dupe(u8, "{}");
-                try self.response.content.append(self.alloc, .{ .tool_use = .{
-                    .id = id, .name = name, .input_json = args,
-                }});
-                self.in_tool_block = false;
-            } else if (self.in_think_block) {
-                const think_text = try self.alloc.dupe(u8, self.think_accum.items);
-                const sig = try self.alloc.dupe(u8, self.current_think_sig[0..self.current_think_sig_len]);
-                try self.response.content.append(self.alloc, .{ .thinking = .{
-                    .thinking = think_text, .signature = sig,
-                }});
-                self.in_think_block = false;
-                self.think_accum.clearRetainingCapacity();
-            } else if (self.text_accum.items.len > 0) {
-                const text = try self.alloc.dupe(u8, self.text_accum.items);
-                try self.response.content.append(self.alloc, .{ .text = text });
-                self.text_accum.clearRetainingCapacity();
-            }
+            try self.handleContentBlockStop();
         } else if (std.mem.eql(u8, ev, "message_delta")) {
-            if (json.findString(data, "stop_reason")) |reason| {
-                self.response.stop_reason = parseStopReason(reason);
-                hooks.dispatch(self.alloc, main.g_io, .{
-                    .event = "message_delta",
-                    .stop_reason = reason,
-                });
-            }
+            self.handleMessageDelta(data);
         } else if (std.mem.eql(u8, ev, "message_stop")) {
             if (self.response.stop_reason == .unknown) self.response.stop_reason = .end_turn;
         }

@@ -58,56 +58,42 @@ fn looksLikeFilePath(input: []const u8) bool {
     return true;
 }
 
+fn skipJsComment(source: []const u8, i: *usize) bool {
+    const c0 = source[i.*];
+    if (c0 == '/' and i.* + 1 < source.len and source[i.* + 1] == '/') {
+        i.* += 2;
+        while (i.* < source.len and source[i.*] != '\n') : (i.* += 1) {}
+        return true;
+    }
+    if (c0 == '/' and i.* + 1 < source.len and source[i.* + 1] == '*') {
+        i.* += 2;
+        while (i.* + 1 < source.len and !(source[i.*] == '*' and source[i.* + 1] == '/')) : (i.* += 1) {}
+        if (i.* + 1 < source.len) i.* += 2;
+        return true;
+    }
+    return false;
+}
+
+fn skipJsString(source: []const u8, i: *usize) bool {
+    const quote = source[i.*];
+    if (quote != '\'' and quote != '"' and quote != '`') return false;
+    i.* += 1;
+    while (i.* < source.len and source[i.*] != quote) {
+        if (source[i.*] == '\\' and i.* + 1 < source.len) i.* += 1;
+        i.* += 1;
+    }
+    if (i.* < source.len) i.* += 1;
+    return true;
+}
+
 /// Locates "export default" keyword in JavaScript source code outside of
 /// single-line comments (//...), multi-line comments (/*...*/), and string literals.
 fn findExportDefault(source: []const u8) ?usize {
     var i: usize = 0;
     while (i < source.len) {
-        const c0 = source[i];
-        // Single-line comment: // ... \n
-        if (c0 == '/' and i + 1 < source.len and source[i + 1] == '/') {
-            i += 2;
-            while (i < source.len and source[i] != '\n') : (i += 1) {}
-            continue;
-        }
-        // Multi-line comment: /* ... */
-        if (c0 == '/' and i + 1 < source.len and source[i + 1] == '*') {
-            i += 2;
-            while (i + 1 < source.len and !(source[i] == '*' and source[i + 1] == '/')) : (i += 1) {}
-            if (i + 1 < source.len) i += 2;
-            continue;
-        }
-        // Single-quote string: ' ... '
-        if (c0 == '\'') {
-            i += 1;
-            while (i < source.len and source[i] != '\'') {
-                if (source[i] == '\\' and i + 1 < source.len) i += 1;
-                i += 1;
-            }
-            if (i < source.len) i += 1;
-            continue;
-        }
-        // Double-quote string: " ... "
-        if (c0 == '"') {
-            i += 1;
-            while (i < source.len and source[i] != '"') {
-                if (source[i] == '\\' and i + 1 < source.len) i += 1;
-                i += 1;
-            }
-            if (i < source.len) i += 1;
-            continue;
-        }
-        // Template literal: ` ... `
-        if (c0 == '`') {
-            i += 1;
-            while (i < source.len and source[i] != '`') {
-                if (source[i] == '\\' and i + 1 < source.len) i += 1;
-                i += 1;
-            }
-            if (i < source.len) i += 1;
-            continue;
-        }
-        // Check for "export default"
+        if (skipJsComment(source, &i)) continue;
+        if (skipJsString(source, &i)) continue;
+
         if (std.mem.startsWith(u8, source[i..], "export default")) {
             const before_ok = (i == 0) or (!std.ascii.isAlphanumeric(source[i - 1]) and source[i - 1] != '_');
             const after_idx = i + "export default".len;
@@ -222,46 +208,38 @@ pub const JsProviderAdapter = struct {
         return try initFromRawSourceWithProfile(alloc, buf[0..n], base_profile);
     }
 
-    /// Initialize adapter from raw JS source code (always treats input as JS source).
-    fn initFromRawSourceWithProfile(alloc: Allocator, source: []const u8, base_profile: ?ProviderProfile) !*JsProviderAdapter {
-        const rt = c.JS_NewRuntime() orelse return error.QuickJSRuntimeInitFailed;
-        errdefer c.JS_FreeRuntime(rt);
-
-        // Limit RAM for safety (32MB is plenty for provider adapters)
-        c.JS_SetMemoryLimit(rt, 32 * 1024 * 1024);
-        c.JS_SetMaxStackSize(rt, 512 * 1024);
-        var deadline = nowMs() + 100;
-        c.JS_SetInterruptHandler(rt, interrupt, &deadline);
-
-        const ctx = c.JS_NewContext(rt) orelse return error.QuickJSContextInitFailed;
-        errdefer c.JS_FreeContext(ctx);
-
-        // Normalize source: replace "export default" with "return " outside comments/strings,
-        // or wrap raw JSON objects in "return ( ... );"
-        var normalized_source = std.ArrayListUnmanaged(u8).empty;
-        defer normalized_source.deinit(alloc);
-
-        const trimmed_source = std.mem.trim(u8, source, " \t\r\n");
+    /// Normalize source: replace "export default" with "return " outside comments/strings,
+    /// or wrap raw JSON objects in "return ( ... );"
+    fn normalizeSource(alloc: Allocator, source: []const u8) ![]u8 {
+        // PSEUDOCODE:
+        // 1. Allocate buffer for normalized source
+        // 2. If 'export default' found, replace with 'return '
+        // 3. Else if starts with '{', wrap in 'return ( ... );\n'
+        // 4. Else keep original source
+        var buf = std.ArrayListUnmanaged(u8).empty;
+        errdefer buf.deinit(alloc);
+        const trimmed = std.mem.trim(u8, source, " \t\r\n");
         if (findExportDefault(source)) |idx| {
-            try normalized_source.appendSlice(alloc, source[0..idx]);
-            try normalized_source.appendSlice(alloc, "return ");
-            try normalized_source.appendSlice(alloc, source[idx + "export default".len ..]);
-        } else if (std.mem.startsWith(u8, trimmed_source, "{")) {
-            try normalized_source.appendSlice(alloc, "return (");
-            try normalized_source.appendSlice(alloc, trimmed_source);
-            try normalized_source.appendSlice(alloc, ");\n");
+            try buf.appendSlice(alloc, source[0..idx]);
+            try buf.appendSlice(alloc, "return ");
+            try buf.appendSlice(alloc, source[idx + "export default".len ..]);
+        } else if (std.mem.startsWith(u8, trimmed, "{")) {
+            try buf.appendSlice(alloc, "return (");
+            try buf.appendSlice(alloc, trimmed);
+            try buf.appendSlice(alloc, ");\n");
         } else {
-            try normalized_source.appendSlice(alloc, source);
+            try buf.appendSlice(alloc, source);
         }
+        return buf.toOwnedSlice(alloc);
+    }
 
-        // Wrap in self-invoking function that supports:
-        // 1. return { ... }
-        // 2. module.exports = { ... }
-        // 3. provider = { ... }
-        // 4. ({ ... })
+    fn evalWrappedSource(alloc: Allocator, ctx: *c.JSContext, norm: []const u8) !c.JSValue {
+        // PSEUDOCODE:
+        // 1. Build self-invoking function wrapper supporting module.exports / return
+        // 2. Evaluate wrapper in global context
+        // 3. Return JSValue or error on exception
         var wrapper = std.ArrayListUnmanaged(u8).empty;
         defer wrapper.deinit(alloc);
-
         try wrapper.appendSlice(alloc,
             \\(function() {
             \\    var module = { exports: {} };
@@ -270,7 +248,7 @@ pub const JsProviderAdapter = struct {
             \\    var __fn = function() {
             \\
         );
-        try wrapper.appendSlice(alloc, normalized_source.items);
+        try wrapper.appendSlice(alloc, norm);
         try wrapper.appendSlice(alloc,
             \\
             \\    };
@@ -285,39 +263,74 @@ pub const JsProviderAdapter = struct {
         );
         try wrapper.append(alloc, 0);
 
-        // Sentinel null-terminator for QuickJS C eval
-        var eval_val = c.JS_Eval(ctx, wrapper.items.ptr, wrapper.items.len - 1, "<provider_js>", c.JS_EVAL_TYPE_GLOBAL);
+        const eval_val = c.JS_Eval(ctx, wrapper.items.ptr, wrapper.items.len - 1, "<provider_js>", c.JS_EVAL_TYPE_GLOBAL);
         if (isException(eval_val)) {
             logJsException(ctx, "Failed to evaluate provider wrapper");
             return error.JsEvaluationFailed;
         }
+        return eval_val;
+    }
 
-        // If wrapper didn't produce an object, try direct expression `( <source> )`
+    fn evalDirectExpression(alloc: Allocator, ctx: *c.JSContext, source: []const u8) !c.JSValue {
+        // PSEUDOCODE:
+        // 1. Extract expression body after 'export default' or trimmed source
+        // 2. Wrap in parentheses and evaluate
+        // 3. Validate object result, return or free and error
+        const body = if (findExportDefault(source)) |idx|
+            std.mem.trim(u8, source[idx + "export default".len ..], " \t\r\n")
+        else
+            std.mem.trim(u8, source, " \t\r\n");
+        var expr = std.ArrayListUnmanaged(u8).empty;
+        defer expr.deinit(alloc);
+        try expr.append(alloc, '(');
+        try expr.appendSlice(alloc, body);
+        try expr.appendSlice(alloc, ")\x00");
+        const val = c.JS_Eval(ctx, expr.items.ptr, expr.items.len - 1, "<provider_expr>", c.JS_EVAL_TYPE_GLOBAL);
+        if (isException(val)) {
+            logJsException(ctx, "Failed to evaluate provider expression");
+            return error.JsEvaluationFailed;
+        }
+        if (!isObject(val)) {
+            c.JS_FreeValue(ctx, val);
+            return error.JsProviderExportMissing;
+        }
+        return val;
+    }
+
+    fn evalProviderExport(alloc: Allocator, ctx: *c.JSContext, source: []const u8) !c.JSValue {
+        // PSEUDOCODE:
+        // 1. Try evaluating wrapped source
+        // 2. If result not an object, fall back to direct expression eval
+        const norm = try normalizeSource(alloc, source);
+        defer alloc.free(norm);
+        var eval_val = try evalWrappedSource(alloc, ctx, norm);
         if (!isObject(eval_val)) {
             c.JS_FreeValue(ctx, eval_val);
-
-            const expr_body = if (findExportDefault(source)) |idx|
-                std.mem.trim(u8, source[idx + "export default".len..], " \t\r\n")
-            else
-                std.mem.trim(u8, source, " \t\r\n");
-
-            var expr_wrapper = std.ArrayListUnmanaged(u8).empty;
-            defer expr_wrapper.deinit(alloc);
-            try expr_wrapper.append(alloc, '(');
-            try expr_wrapper.appendSlice(alloc, expr_body);
-            try expr_wrapper.appendSlice(alloc, ")\x00");
-
-            eval_val = c.JS_Eval(ctx, expr_wrapper.items.ptr, expr_wrapper.items.len - 1, "<provider_expr>", c.JS_EVAL_TYPE_GLOBAL);
-            if (isException(eval_val)) {
-                logJsException(ctx, "Failed to evaluate provider expression");
-                return error.JsEvaluationFailed;
-            }
-
-            if (!isObject(eval_val)) {
-                c.JS_FreeValue(ctx, eval_val);
-                return error.JsProviderExportMissing;
-            }
+            eval_val = try evalDirectExpression(alloc, ctx, source);
         }
+        return eval_val;
+    }
+
+    /// Initialize adapter from raw JS source code (always treats input as JS source).
+    fn initFromRawSourceWithProfile(alloc: Allocator, source: []const u8, base_profile: ?ProviderProfile) !*JsProviderAdapter {
+        // PSEUDOCODE:
+        // 1. Initialize QuickJS runtime and context with memory limits
+        // 2. Evaluate provider source export
+        // 3. Allocate and initialize JsProviderAdapter struct
+        // 4. Parse exported properties and hooks
+        const rt = c.JS_NewRuntime() orelse return error.QuickJSRuntimeInitFailed;
+        errdefer c.JS_FreeRuntime(rt);
+
+        c.JS_SetMemoryLimit(rt, 32 * 1024 * 1024);
+        c.JS_SetMaxStackSize(rt, 512 * 1024);
+        var deadline = nowMs() + 100;
+        c.JS_SetInterruptHandler(rt, interrupt, &deadline);
+
+        const ctx = c.JS_NewContext(rt) orelse return error.QuickJSContextInitFailed;
+        errdefer c.JS_FreeContext(ctx);
+
+        const eval_val = try evalProviderExport(alloc, ctx, source);
+        errdefer c.JS_FreeValue(ctx, eval_val);
 
         const self = alloc.create(JsProviderAdapter) catch |err| {
             c.JS_FreeValue(ctx, eval_val);
@@ -333,7 +346,6 @@ pub const JsProviderAdapter = struct {
             .profile = base_profile orelse provider_mod.getProfile("generic"),
         };
 
-        // Transfer ownership before parsing getters (which may execute JS).
         c.JS_SetInterruptHandler(rt, interrupt, &self.deadline_ms);
         self.beginCall();
         self.parseExportedObject() catch |err| {
@@ -341,15 +353,16 @@ pub const JsProviderAdapter = struct {
             c.JS_FreeValue(ctx, self.export_obj);
             return err;
         };
-
         return self;
     }
 
-    fn parseExportedObject(self: *JsProviderAdapter) !void {
+    fn parseNameAndProtocol(self: *JsProviderAdapter) !void {
+        // PSEUDOCODE:
+        // 1. Read 'name' property from JS object
+        // 2. Read 'protocol' property and set enum
         const ctx = self.ctx;
         const obj = self.export_obj;
 
-        // 1. Name
         const name_val = c.JS_GetPropertyStr(ctx, obj, "name");
         defer c.JS_FreeValue(ctx, name_val);
         if (isString(name_val)) {
@@ -361,7 +374,6 @@ pub const JsProviderAdapter = struct {
             }
         }
 
-        // 2. Protocol
         const proto_val = c.JS_GetPropertyStr(ctx, obj, "protocol");
         defer c.JS_FreeValue(ctx, proto_val);
         if (isString(proto_val)) {
@@ -378,13 +390,19 @@ pub const JsProviderAdapter = struct {
                 }
             }
         }
+    }
 
-        // 3. Echo Policy
+    fn parsePolicyAndTags(self: *JsProviderAdapter) void {
+        // PSEUDOCODE:
+        // 1. Read echo_policy if present and map to enum
+        // 2. Read thinking_tags if present and map to enum
+        const ctx = self.ctx;
+        const obj = self.export_obj;
+
         const echo_val = c.JS_GetPropertyStr(ctx, obj, "echo_policy");
         defer c.JS_FreeValue(ctx, echo_val);
         if (isString(echo_val)) {
-            const cstr = c.JS_ToCString(ctx, echo_val);
-            if (cstr != null) {
+            if (c.JS_ToCString(ctx, echo_val)) |cstr| {
                 defer c.JS_FreeCString(ctx, cstr);
                 const s = std.mem.span(cstr);
                 if (std.mem.eql(u8, s, "echo_required")) {
@@ -397,12 +415,10 @@ pub const JsProviderAdapter = struct {
             }
         }
 
-        // 4. Thinking Tags
         const tags_val = c.JS_GetPropertyStr(ctx, obj, "thinking_tags");
         defer c.JS_FreeValue(ctx, tags_val);
         if (isString(tags_val)) {
-            const cstr = c.JS_ToCString(ctx, tags_val);
-            if (cstr != null) {
+            if (c.JS_ToCString(ctx, tags_val)) |cstr| {
                 defer c.JS_FreeCString(ctx, cstr);
                 const s = std.mem.span(cstr);
                 if (std.mem.eql(u8, s, "none")) {
@@ -414,23 +430,28 @@ pub const JsProviderAdapter = struct {
                 }
             }
         }
+    }
+
+    fn parseReasoningAndOptions(self: *JsProviderAdapter) !void {
+        // PSEUDOCODE:
+        // 1. Read reasoning_param & reasoning_field
+        // 2. Read supports_stream_options & use_completion_tokens
+        const ctx = self.ctx;
+        const obj = self.export_obj;
 
         const param_val = c.JS_GetPropertyStr(ctx, obj, "reasoning_param");
         defer c.JS_FreeValue(ctx, param_val);
         if (isString(param_val)) {
-            const str = c.JS_ToCString(ctx, param_val);
-            if (str != null) {
+            if (c.JS_ToCString(ctx, param_val)) |str| {
                 defer c.JS_FreeCString(ctx, str);
                 self.profile.reasoning_param = std.meta.stringToEnum(provider_mod.ReasoningParamFormat, std.mem.span(str)) orelse return error.InvalidReasoningParam;
             }
         }
 
-        // Reasoning field
         const rf_val = c.JS_GetPropertyStr(ctx, obj, "reasoning_field");
         defer c.JS_FreeValue(ctx, rf_val);
         if (isString(rf_val)) {
-            const str = c.JS_ToCString(ctx, rf_val);
-            if (str != null) {
+            if (c.JS_ToCString(ctx, rf_val)) |str| {
                 defer c.JS_FreeCString(ctx, str);
                 if (std.meta.stringToEnum(provider_mod.ReasoningField, std.mem.span(str))) |rf| {
                     self.profile.reasoning_field = rf;
@@ -438,21 +459,25 @@ pub const JsProviderAdapter = struct {
             }
         }
 
-        // Supports stream options
         const sso_val = c.JS_GetPropertyStr(ctx, obj, "supports_stream_options");
         defer c.JS_FreeValue(ctx, sso_val);
         if (isBoolean(sso_val)) {
             self.profile.supports_stream_options = (c.JS_ToBool(ctx, sso_val) != 0);
         }
 
-        // Use completion tokens
         const uct_val = c.JS_GetPropertyStr(ctx, obj, "use_completion_tokens");
         defer c.JS_FreeValue(ctx, uct_val);
         if (isBoolean(uct_val)) {
             self.profile.use_completion_tokens = (c.JS_ToBool(ctx, uct_val) != 0);
         }
+    }
 
-        // 5. Hooks: extractReasoning
+    fn parseExportedHooks(self: *JsProviderAdapter) void {
+        // PSEUDOCODE:
+        // 1. Read extractReasoning, extractContent, and transformRequest functions
+        const ctx = self.ctx;
+        const obj = self.export_obj;
+
         const fn_er = c.JS_GetPropertyStr(ctx, obj, "extractReasoning");
         if (isFunction(ctx, fn_er)) {
             self.fn_extract_reasoning = fn_er;
@@ -460,7 +485,6 @@ pub const JsProviderAdapter = struct {
             c.JS_FreeValue(ctx, fn_er);
         }
 
-        // 6. Hooks: extractContent
         const fn_ec = c.JS_GetPropertyStr(ctx, obj, "extractContent");
         if (isFunction(ctx, fn_ec)) {
             self.fn_extract_content = fn_ec;
@@ -468,13 +492,24 @@ pub const JsProviderAdapter = struct {
             c.JS_FreeValue(ctx, fn_ec);
         }
 
-        // 7. Hooks: transformRequest
         const fn_tr = c.JS_GetPropertyStr(ctx, obj, "transformRequest");
         if (isFunction(ctx, fn_tr)) {
             self.fn_transform_request = fn_tr;
         } else {
             c.JS_FreeValue(ctx, fn_tr);
         }
+    }
+
+    fn parseExportedObject(self: *JsProviderAdapter) !void {
+        // PSEUDOCODE:
+        // 1. Parse name and protocol
+        // 2. Parse policy and tags
+        // 3. Parse reasoning params and stream options
+        // 4. Parse custom JS hooks
+        try self.parseNameAndProtocol();
+        self.parsePolicyAndTags();
+        try self.parseReasoningAndOptions();
+        self.parseExportedHooks();
     }
 
     /// Parses a JSON buffer with QuickJS, ensuring null-termination as required by QuickJS.

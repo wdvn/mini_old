@@ -220,7 +220,7 @@ fn handleCodeActEvalError(
 ) !StepResult {
     media_gen_tool.clearTurnAttachments(loop.alloc);
     loop.last_act_failed = true;
-    const end_err_ms = utils.milliTimestamp();
+    const end_err_ms: u64 = @as(u64, @intCast(utils.milliTimestamp()));
     const dur_ms = if (end_err_ms >= start_codeact_ms) @as(u64, @intCast(end_err_ms - start_codeact_ms)) else 0;
     loop.logActDebug(act_id, input_msgs_count, tool_defs, response, js_code, .{
         .exec_type = "codeact",
@@ -341,7 +341,7 @@ pub fn executeCodeActBlock(
     }
 
     notifyCodeActExecution(loop, js_code);
-    const start_codeact_ms = utils.milliTimestamp();
+    const start_codeact_ms: u64 = @as(u64, @intCast(utils.milliTimestamp()));
 
     signals.registerActiveEngine(loop.engine);
     defer signals.registerActiveEngine(null);
@@ -352,7 +352,7 @@ pub fn executeCodeActBlock(
     };
     defer res.deinit();
 
-    const end_codeact_ms = utils.milliTimestamp();
+    const end_codeact_ms: u64 = @as(u64, @intCast(utils.milliTimestamp()));
     const dur_ms = if (end_codeact_ms >= start_codeact_ms) @as(u64, @intCast(end_codeact_ms - start_codeact_ms)) else 0;
 
     loop.logActDebug(act_id, input_msgs_count, tool_defs, response, js_code, .{

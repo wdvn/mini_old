@@ -219,6 +219,60 @@ pub const Engine = struct {
         _ = c.JS_SetPropertyStr(ctx, global_obj, "print", print_func);
     }
 
+    fn drainPendingJobs(self: *Engine) void {
+        var pctx: ?*c.JSContext = null;
+        while (true) {
+            const err = c.JS_ExecutePendingJob(self.rt, &pctx);
+            if (err <= 0) break;
+        }
+    }
+
+    fn extractExceptionResult(self: *Engine, ctx: *c.JSContext) !ExecutionResult {
+        const exc = c.JS_GetException(ctx);
+        defer c.JS_FreeValue(ctx, exc);
+
+        var err_msg: ?[]u8 = null;
+        var stack_trace: ?[]u8 = null;
+
+        const exc_str = c.JS_ToCString(ctx, exc);
+        if (exc_str != null) {
+            defer c.JS_FreeCString(ctx, exc_str);
+            err_msg = try self.alloc.dupe(u8, std.mem.span(exc_str));
+        }
+
+        const stack_val = c.JS_GetPropertyStr(ctx, exc, "stack");
+        defer c.JS_FreeValue(ctx, stack_val);
+        if (c.JS_IsUndefined(stack_val) == 0 and c.JS_IsNull(stack_val) == 0) {
+            const stack_str = c.JS_ToCString(ctx, stack_val);
+            if (stack_str != null) {
+                defer c.JS_FreeCString(ctx, stack_str);
+                stack_trace = try self.alloc.dupe(u8, std.mem.span(stack_str));
+            }
+        }
+
+        const stdout_out = try self.alloc.dupe(u8, self.output_buf.items);
+        return ExecutionResult{
+            .alloc = self.alloc,
+            .stdout = stdout_out,
+            .is_error = true,
+            .return_value_json = null,
+            .error_message = err_msg,
+            .stack_trace = stack_trace,
+        };
+    }
+
+    fn stringifyReturnValue(self: *Engine, ctx: *c.JSContext, val: c.JSValue) !?[]u8 {
+        if (c.JS_IsUndefined(val) != 0) return null;
+        const json_val = c.JS_JSONStringify(ctx, val, JS_UNDEFINED, JS_UNDEFINED);
+        defer c.JS_FreeValue(ctx, json_val);
+        if (c.JS_IsException(json_val) != 0) return null;
+
+        const json_str = c.JS_ToCString(ctx, json_val);
+        if (json_str == null) return null;
+        defer c.JS_FreeCString(ctx, json_str);
+        return try self.alloc.dupe(u8, std.mem.span(json_str));
+    }
+
     /// Execute JavaScript code snippet in engine
     pub fn eval(self: *Engine, code: []const u8, filename: []const u8) !ExecutionResult {
         try self.resetContext();
@@ -241,72 +295,14 @@ pub const Engine = struct {
             c.JS_EVAL_TYPE_GLOBAL,
         );
 
-        // Execute pending Promise jobs if present
-        var pctx: ?*c.JSContext = null;
-        while (true) {
-            const err = c.JS_ExecutePendingJob(self.rt, &pctx);
-            if (err <= 0) {
-                if (err < 0) {
-                    // Error in async job
-                }
-                break;
-            }
+        drainPendingJobs(self);
+
+        if (c.JS_IsException(val) != 0) {
+            return extractExceptionResult(self, ctx);
         }
-
-        const is_exception = c.JS_IsException(val) != 0;
-
-        if (is_exception) {
-            const exc = c.JS_GetException(ctx);
-            defer c.JS_FreeValue(ctx, exc);
-
-            var err_msg: ?[]u8 = null;
-            var stack_trace: ?[]u8 = null;
-
-            // Extract exception message / toString
-            const exc_str = c.JS_ToCString(ctx, exc);
-            if (exc_str != null) {
-                defer c.JS_FreeCString(ctx, exc_str);
-                err_msg = try self.alloc.dupe(u8, std.mem.span(exc_str));
-            }
-
-            // Extract stack trace if present
-            const stack_val = c.JS_GetPropertyStr(ctx, exc, "stack");
-            defer c.JS_FreeValue(ctx, stack_val);
-            if (c.JS_IsUndefined(stack_val) == 0 and c.JS_IsNull(stack_val) == 0) {
-                const stack_str = c.JS_ToCString(ctx, stack_val);
-                if (stack_str != null) {
-                    defer c.JS_FreeCString(ctx, stack_str);
-                    stack_trace = try self.alloc.dupe(u8, std.mem.span(stack_str));
-                }
-            }
-
-            const stdout_out = try self.alloc.dupe(u8, self.output_buf.items);
-            return ExecutionResult{
-                .alloc = self.alloc,
-                .stdout = stdout_out,
-                .is_error = true,
-                .return_value_json = null,
-                .error_message = err_msg,
-                .stack_trace = stack_trace,
-            };
-        }
-
         defer c.JS_FreeValue(ctx, val);
 
-        // Format return value to JSON if not undefined
-        var return_json: ?[]u8 = null;
-        if (c.JS_IsUndefined(val) == 0) {
-            const json_val = c.JS_JSONStringify(ctx, val, JS_UNDEFINED, JS_UNDEFINED);
-            defer c.JS_FreeValue(ctx, json_val);
-            if (c.JS_IsException(json_val) == 0) {
-                const json_str = c.JS_ToCString(ctx, json_val);
-                if (json_str != null) {
-                    defer c.JS_FreeCString(ctx, json_str);
-                    return_json = try self.alloc.dupe(u8, std.mem.span(json_str));
-                }
-            }
-        }
-
+        const return_json = try stringifyReturnValue(self, ctx, val);
         const stdout_out = try self.alloc.dupe(u8, self.output_buf.items);
         return ExecutionResult{
             .alloc = self.alloc,

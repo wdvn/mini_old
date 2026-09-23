@@ -622,68 +622,59 @@ pub fn findInteger(json_text: []const u8, key: []const u8) ?i64 {
     return std.fmt.parseInt(i64, json_text[start..i], 10) catch null;
 }
 
+fn extractTextFromArray(alloc: Allocator, arr: []const u8) !?[]u8 {
+    var result = utils.BufWriter.init(alloc);
+    defer result.deinit();
+
+    var i: usize = 0;
+    while (i < arr.len) : (i += 1) {
+        if (arr[i] != '{') continue;
+        const obj_start = i;
+        var depth: i32 = 0;
+        while (i < arr.len) : (i += 1) {
+            switch (arr[i]) {
+                '"' => {
+                    i += 1;
+                    while (i < arr.len) : (i += 1) {
+                        if (arr[i] == '\\') { i += 1; continue; }
+                        if (arr[i] == '"') break;
+                    }
+                },
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if (depth == 0) break;
+                },
+                else => {},
+            }
+        }
+        if (i < arr.len) {
+            const item_json = arr[obj_start .. i + 1];
+            if (json_mod.findString(item_json, "text")) |txt| {
+                if (result.list.items.len > 0) try result.writeAll("\n");
+                try result.writeAll(txt);
+            }
+        }
+    }
+
+    if (result.list.items.len > 0) {
+        return try alloc.dupe(u8, result.list.items);
+    }
+    return null;
+}
+
 /// Extract text from prompt in params (supports prompt array, content array, or plain string).
 pub fn extractPromptText(alloc: Allocator, params_json: []const u8) ![]u8 {
-    // 1. Check array params.prompt or params.content first
     const arr_json = json_mod.findArray(params_json, "prompt") orelse
         json_mod.findArray(params_json, "content") orelse null;
 
     if (arr_json) |arr| {
-        var result = utils.BufWriter.init(alloc);
-        defer result.deinit();
-
-        var i: usize = 0;
-        while (i < arr.len) : (i += 1) {
-            if (arr[i] != '{') continue;
-            const obj_start = i;
-            var depth: i32 = 0;
-            while (i < arr.len) : (i += 1) {
-                switch (arr[i]) {
-                    '"' => {
-                        i += 1;
-                        while (i < arr.len) : (i += 1) {
-                            if (arr[i] == '\\') { i += 1; continue; }
-                            if (arr[i] == '"') break;
-                        }
-                    },
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if (depth == 0) break;
-                    },
-                    else => {},
-                }
-            }
-            if (i < arr.len) {
-                const item_json = arr[obj_start .. i + 1];
-                if (json_mod.findString(item_json, "text")) |txt| {
-                    if (result.list.items.len > 0) {
-                        try result.writeAll("\n");
-                    }
-                    try result.writeAll(txt);
-                }
-            }
-        }
-
-        if (result.list.items.len > 0) {
-            return try alloc.dupe(u8, result.list.items);
-        }
+        if (try extractTextFromArray(alloc, arr)) |txt| return txt;
     }
 
-    // 2. Check direct params.prompt string
-    if (json_mod.findString(params_json, "prompt")) |pr| {
-        return try alloc.dupe(u8, pr);
-    }
-
-    // 3. Check direct params.message string
-    if (json_mod.findString(params_json, "message")) |msg| {
-        return try alloc.dupe(u8, msg);
-    }
-
-    // 4. Check direct params.text string
-    if (json_mod.findString(params_json, "text")) |txt| {
-        return try alloc.dupe(u8, txt);
-    }
+    if (json_mod.findString(params_json, "prompt")) |pr| return try alloc.dupe(u8, pr);
+    if (json_mod.findString(params_json, "message")) |msg| return try alloc.dupe(u8, msg);
+    if (json_mod.findString(params_json, "text")) |txt| return try alloc.dupe(u8, txt);
 
     return try alloc.dupe(u8, "");
 }
