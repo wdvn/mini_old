@@ -94,29 +94,29 @@ pub fn setPolicy(allowlist: ?[]const u8, blocklist: ?[]const u8) void {
 
 fn executeToolInternal(alloc: Allocator, io: std.Io, name: []const u8, input_json: []const u8) ![]u8 {
     // Built-in tool dispatch
-    if (std.mem.eql(u8, name, "bash"))                  return bash_tool.executeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "file_read"))             return file_tool.readTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "file_write"))            return file_tool.writeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "file_edit"))             return file_tool.editTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "glob"))                  return glob_tool.executeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "grep"))                  return grep_tool.executeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "http_request"))          return http_tool.executeTool(alloc, input_json);
-    if (std.mem.eql(u8, name, "invoke_subagent"))       return subagent.executeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "bash")) return bash_tool.executeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "file_read")) return file_tool.readTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "file_write")) return file_tool.writeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "file_edit")) return file_tool.editTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "glob")) return glob_tool.executeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "grep")) return grep_tool.executeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "http_request")) return http_tool.executeTool(alloc, input_json);
+    if (std.mem.eql(u8, name, "invoke_subagent")) return subagent.executeTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "batch_invoke_subagents")) return batch_subagent.executeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "artifact_write"))        return artifact_tool.writeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "artifact_read"))         return artifact_tool.readTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "artifact_list"))         return artifact_tool.listTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "session_diagnostics"))   return session_diag.executeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "generate_image"))        return media_gen_tool.generateImageTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "generate_video"))        return media_gen_tool.generateVideoTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "image_attach"))          return media_gen_tool.attachImageTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "skills"))                return executeSkills(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "codeact"))               return executeCodeActTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "artifact_write")) return artifact_tool.writeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "artifact_read")) return artifact_tool.readTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "artifact_list")) return artifact_tool.listTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "session_diagnostics")) return session_diag.executeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "generate_image")) return media_gen_tool.generateImageTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "generate_video")) return media_gen_tool.generateVideoTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "image_attach")) return media_gen_tool.attachImageTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "skills")) return executeSkills(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "codeact")) return executeCodeActTool(alloc, io, input_json);
 
     // Common LLM alias fallback normalization
-    if (std.mem.eql(u8, name, "read") or std.mem.eql(u8, name, "read_file"))                  return file_tool.readTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "write_file"))                return file_tool.writeTool(alloc, io, input_json);
-    if (std.mem.eql(u8, name, "edit") or std.mem.eql(u8, name, "edit_file"))                  return file_tool.editTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "read") or std.mem.eql(u8, name, "read_file")) return file_tool.readTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "write_file")) return file_tool.writeTool(alloc, io, input_json);
+    if (std.mem.eql(u8, name, "edit") or std.mem.eql(u8, name, "edit_file")) return file_tool.editTool(alloc, io, input_json);
     if (std.mem.eql(u8, name, "sh") or std.mem.eql(u8, name, "shell") or std.mem.eql(u8, name, "terminal")) return bash_tool.executeTool(alloc, io, input_json);
 
     // MCP fallback: names follow "server__toolname" format
@@ -127,8 +127,10 @@ fn executeToolInternal(alloc: Allocator, io: std.Io, name: []const u8, input_jso
         if (m.callTool(name, input_json)) |result| return result;
     }
 
-    return std.fmt.allocPrint(alloc,
-        "Tool does not exist: '{s}'. Use 'skills' tool to view available tools.", .{name},
+    return std.fmt.allocPrint(
+        alloc,
+        "Tool does not exist: '{s}'. Use 'skills' tool to view available tools.",
+        .{name},
     );
 }
 
@@ -156,7 +158,8 @@ fn executeCodeActTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u
         }
         return alloc.dupe(u8, out_buf.list.items);
     } else {
-        return std.fmt.allocPrint(alloc,
+        return std.fmt.allocPrint(
+            alloc,
             "[CodeAct Error]: {s}\n{s}",
             .{ res.error_message orelse "JS execution error", res.stdout },
         );
@@ -221,13 +224,15 @@ pub const definitions = [_]proto.ToolDefinition{
     .{
         .name = "codeact",
         .description = "Execute JavaScript in an embedded CodeAct VM with mini.* global API (mini.sh, mini.read, mini.write, mini.patch, mini.http, mini.sessions, mini.sessionDetail, mini.sessionKill, mini.setThinking). Use for automating complex multi-step logic or data processing.",
-        .input_schema_json = \\{"type":"object","properties":{"code":{"type":"string","description":"JavaScript code to execute in CodeAct VM"}},"required":["code"]}
+        .input_schema_json =
+        \\{"type":"object","properties":{"code":{"type":"string","description":"JavaScript code to execute in CodeAct VM"}},"required":["code"]}
         ,
     },
     .{
         .name = "bash",
         .description = "Execute shell commands via /bin/sh. Returns stdout and stderr. CWD is the project root. Dangerous commands (rm -rf /, dd, shutdown...) are blocked.",
-        .input_schema_json = \\{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"}},"required":["command"]}
+        .input_schema_json =
+        \\{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"}},"required":["command"]}
         ,
     },
     // NOTE: file_read removed from exposed tool list — force the model to use
@@ -235,13 +240,15 @@ pub const definitions = [_]proto.ToolDefinition{
     .{
         .name = "file_write",
         .description = "Write or overwrite entire file content. Automatically creates parent directories if needed. Do NOT use for small partial edits (use file_edit).",
-        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"File path to write"},"content":{"type":"string","description":"Full file content"}},"required":["path","content"]}
+        .input_schema_json =
+        \\{"type":"object","properties":{"path":{"type":"string","description":"File path to write"},"content":{"type":"string","description":"Full file content"}},"required":["path","content"]}
         ,
     },
     .{
         .name = "file_edit",
         .description = "Edit part of a file by replacing old_string with new_string. old_string must be unique in the file, or use replace_all=true.",
-        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"File path to edit"},"old_string":{"type":"string","description":"Exact substring to replace"},"new_string":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace all occurrences (default: false)"}},"required":["path","old_string","new_string"]}
+        .input_schema_json =
+        \\{"type":"object","properties":{"path":{"type":"string","description":"File path to edit"},"old_string":{"type":"string","description":"Exact substring to replace"},"new_string":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace all occurrences (default: false)"}},"required":["path","old_string","new_string"]}
         ,
     },
     // NOTE: glob and grep removed from exposed tool list — force the model to
@@ -250,67 +257,78 @@ pub const definitions = [_]proto.ToolDefinition{
     .{
         .name = "http_request",
         .description = "Send HTTP/HTTPS requests. Supports GET, POST, PUT, DELETE, PATCH. Returns status code, headers, and response body.",
-        .input_schema_json = \\{"type":"object","properties":{"url":{"type":"string","description":"Full URL (e.g. https://api.example.com/data)"},"method":{"type":"string","enum":["GET","POST","PUT","DELETE","PATCH"],"description":"HTTP method (default: GET)"},"headers":{"type":"object","description":"JSON object with headers (e.g. {\"Content-Type\": \"application/json\"})"},"body":{"type":"string","description":"Request body (for POST, PUT, PATCH)"}},"required":["url"]}
+        .input_schema_json =
+        \\{"type":"object","properties":{"url":{"type":"string","description":"Full URL (e.g. https://api.example.com/data)"},"method":{"type":"string","enum":["GET","POST","PUT","DELETE","PATCH"],"description":"HTTP method (default: GET)"},"headers":{"type":"object","description":"JSON object with headers (e.g. {\"Content-Type\": \"application/json\"})"},"body":{"type":"string","description":"Request body (for POST, PUT, PATCH)"}},"required":["url"]}
         ,
     },
     .{
         .name = "invoke_subagent",
         .description = "Spawn a subagent to perform a complex task (divide-and-conquer). Best for directory exploration, multifile refactorings, or long action sequences.",
-        .input_schema_json = \\{"type":"object","properties":{"task":{"type":"string","description":"Detailed task for subagent"}},"required":["task"]}
+        .input_schema_json =
+        \\{"type":"object","properties":{"task":{"type":"string","description":"Detailed task for subagent"}},"required":["task"]}
         ,
     },
     .{
         .name = "batch_invoke_subagents",
         .description = "Spawn multiple subagents in parallel to process independent tasks. Ideal for batch processing workflows.",
-        .input_schema_json = \\{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"string"},"description":"List of tasks for parallel subagents"}},"required":["tasks"]}
+        .input_schema_json =
+        \\{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"string"},"description":"List of tasks for parallel subagents"}},"required":["tasks"]}
         ,
     },
     .{
         .name = "skills",
         .description = "Inspect available skills (from ~/.mini/skills) and tools. operation=\"list\" lists all, operation=\"detail\" with name=<skill|tool> shows details. Skills are pre-written guidelines (SKILL.md); tools are executable functions.",
-        .input_schema_json = \\{"type":"object","properties":{"operation":{"type":"string","enum":["list","detail"],"description":"list or detail"},"name":{"type":"string","description":"Skill or tool name (for detail)"}},"required":[]}
+        .input_schema_json =
+        \\{"type":"object","properties":{"operation":{"type":"string","enum":["list","detail"],"description":"list or detail"},"name":{"type":"string","description":"Skill or tool name (for detail)"}},"required":[]}
         ,
     },
     .{
         .name = "session_diagnostics",
         .description = "Query process status, subagents, and session logs (Event Sourcing Journal in ~/.mini/sessions). Inspect process liveness, REPL vs Subagent mode, executed acts, operational state, or terminate hanging processes.",
-        .input_schema_json = \\{"type":"object","properties":{"operation":{"type":"string","enum":["list","detail","kill"],"description":"list (session list), detail (session detail by PID), kill (stop process)"},"pid":{"type":"integer","description":"PID of mini-agent or subagent process"},"signal":{"type":"string","description":"Signal for kill (default: SIGTERM or SIGKILL)"}},"required":["operation"]}
+        .input_schema_json =
+        \\{"type":"object","properties":{"operation":{"type":"string","enum":["list","detail","kill"],"description":"list (session list), detail (session detail by PID), kill (stop process)"},"pid":{"type":"integer","description":"PID of mini-agent or subagent process"},"signal":{"type":"string","description":"Signal for kill (default: SIGTERM or SIGKILL)"}},"required":["operation"]}
         ,
     },
     .{
         .name = "artifact_write",
         .description = "Create or update an independent artifact (plan, walkthrough, markdown, html, svg, code diff, mockup). Automatically saves to session artifacts and triggers live preview hooks.",
-        .input_schema_json = \\{"type":"object","properties":{"name":{"type":"string","description":"Artifact filename (e.g., plan.md, walkthrough.md, preview.html, diagram.svg)"},"content":{"type":"string","description":"Artifact content"},"title":{"type":"string","description":"Short title for artifact"},"type":{"type":"string","enum":["markdown","html","svg","code","diff","text"],"description":"Artifact type (default: markdown)"},"summary":{"type":"string","description":"Brief summary of artifact content"},"user_facing":{"type":"string","enum":["true","false"],"description":"true if intended for user presentation"}},"required":["name","content"]}
+        .input_schema_json =
+        \\{"type":"object","properties":{"name":{"type":"string","description":"Artifact filename (e.g., plan.md, walkthrough.md, preview.html, diagram.svg)"},"content":{"type":"string","description":"Artifact content"},"title":{"type":"string","description":"Short title for artifact"},"type":{"type":"string","enum":["markdown","html","svg","code","diff","text"],"description":"Artifact type (default: markdown)"},"summary":{"type":"string","description":"Brief summary of artifact content"},"user_facing":{"type":"string","enum":["true","false"],"description":"true if intended for user presentation"}},"required":["name","content"]}
         ,
     },
     .{
         .name = "artifact_read",
         .description = "Read content of a saved artifact in the current session by name.",
-        .input_schema_json = \\{"type":"object","properties":{"name":{"type":"string","description":"Name of artifact to read (e.g., plan.md)"}},"required":["name"]}
+        .input_schema_json =
+        \\{"type":"object","properties":{"name":{"type":"string","description":"Name of artifact to read (e.g., plan.md)"}},"required":["name"]}
         ,
     },
     .{
         .name = "artifact_list",
         .description = "List all artifacts along with metadata and paths in the current session.",
-        .input_schema_json = \\{"type":"object","properties":{},"required":[]}
+        .input_schema_json =
+        \\{"type":"object","properties":{},"required":[]}
         ,
     },
     .{
         .name = "generate_image",
         .description = "Generate an image from a text prompt using OpenAI Images API or compatible provider, saving to the media output directory.",
-        .input_schema_json = \\{"type":"object","properties":{"prompt":{"type":"string","description":"Detailed image description / prompt"},"size":{"type":"string","enum":["1024x1024","1536x1024","1024x1536","auto"],"description":"Image dimensions (default: 1024x1024)"},"filename":{"type":"string","description":"Optional sanitized target filename"},"model":{"type":"string","description":"Optional image model"}},"required":["prompt"]}
+        .input_schema_json =
+        \\{"type":"object","properties":{"prompt":{"type":"string","description":"Detailed image description / prompt"},"size":{"type":"string","enum":["1024x1024","1536x1024","1024x1536","auto"],"description":"Image dimensions (default: 1024x1024)"},"filename":{"type":"string","description":"Optional sanitized target filename"},"model":{"type":"string","description":"Optional image model"}},"required":["prompt"]}
         ,
     },
     .{
         .name = "generate_video",
         .description = "Generate a video from a text prompt using OpenAI Sora or compatible provider with async polling, saving to media output directory.",
-        .input_schema_json = \\{"type":"object","properties":{"prompt":{"type":"string","description":"Detailed video description / prompt"},"seconds":{"type":"integer","description":"Duration in seconds (default: 4)"},"filename":{"type":"string","description":"Optional sanitized target filename"},"model":{"type":"string","description":"Optional video model"}},"required":["prompt"]}
+        .input_schema_json =
+        \\{"type":"object","properties":{"prompt":{"type":"string","description":"Detailed video description / prompt"},"seconds":{"type":"integer","description":"Duration in seconds (default: 4)"},"filename":{"type":"string","description":"Optional sanitized target filename"},"model":{"type":"string","description":"Optional video model"}},"required":["prompt"]}
         ,
     },
     .{
         .name = "image_attach",
         .description = "Attach a local image file to the conversation for multi-turn inspection and vision loop-back.",
-        .input_schema_json = \\{"type":"object","properties":{"path":{"type":"string","description":"Path to local image file to attach"}},"required":["path"]}
+        .input_schema_json =
+        \\{"type":"object","properties":{"path":{"type":"string","description":"Path to local image file to attach"}},"required":["path"]}
         ,
     },
 };
@@ -320,10 +338,11 @@ pub const definitions = [_]proto.ToolDefinition{
 /// (cat/sed/find/rg) or CodeAct (mini.read/mini.glob/mini.grep) instead.
 /// Internal dispatch for these names is still supported in executeTool().
 const core_tools = [_][]const u8{
-    "bash", "file_write", "file_edit",
-    "http_request", "invoke_subagent", "batch_invoke_subagents", "skills",
-    "session_diagnostics", "artifact_write", "artifact_read", "artifact_list",
-    "generate_image", "generate_video", "image_attach",
+    "bash",           "file_write",          "file_edit",
+    "http_request",   "invoke_subagent",     "batch_invoke_subagents",
+    "skills",         "session_diagnostics", "artifact_write",
+    "artifact_read",  "artifact_list",       "generate_image",
+    "generate_video", "image_attach",
 };
 
 /// Keyword triggers for extended tools (sent conditionally).
@@ -538,7 +557,8 @@ fn containsCI(text: []const u8, kw: []const u8) bool {
         var match = true;
         for (0..kw.len) |j| {
             if (std.ascii.toLower(text[i + j]) != std.ascii.toLower(kw[j])) {
-                match = false; break;
+                match = false;
+                break;
             }
         }
         if (match) return true;
@@ -579,7 +599,8 @@ fn executeSkillDetail(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u
             if (std.mem.eql(u8, s.name, name)) {
                 if (readSkillFile(alloc, io, s.path)) |content| {
                     defer alloc.free(content);
-                    return std.fmt.allocPrint(alloc,
+                    return std.fmt.allocPrint(
+                        alloc,
                         "## Skill: {s}\n\nPath: `{s}`\n\n{s}",
                         .{ s.name, s.path, content },
                     );
@@ -591,7 +612,8 @@ fn executeSkillDetail(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u
 
     for (&definitions) |*td| {
         if (std.mem.eql(u8, td.name, name)) {
-            return std.fmt.allocPrint(alloc,
+            return std.fmt.allocPrint(
+                alloc,
                 "## Tool: {s}\n\n{s}\n\n**Schema:**\n```json\n{s}\n```",
                 .{ td.name, td.description, td.input_schema_json },
             );
@@ -747,4 +769,3 @@ test "registry: plan-aware tool filtering" {
     }
     try std.testing.expect(!has_bash);
 }
-

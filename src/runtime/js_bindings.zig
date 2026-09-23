@@ -30,7 +30,6 @@ const JS_UNDEFINED = quickjs.JS_UNDEFINED;
 const JS_NULL = quickjs.JS_NULL;
 const JS_EXCEPTION = quickjs.JS_EXCEPTION;
 
-
 const bash_tool = @import("../tools/bash.zig");
 const file_tool = @import("../tools/file.zig");
 const glob_tool = @import("../tools/glob.zig");
@@ -57,6 +56,31 @@ const snapshot_mod = @import("../core/snapshot.zig");
 fn guardPolicy(engine: *Engine, tool_name: []const u8) bool {
     _ = engine;
     return !registry.isPermitted(tool_name);
+}
+
+fn guardAndDispatchPre(
+    engine: *Engine,
+    ctx: ?*c.JSContext,
+    tool_name: []const u8,
+    input: []const u8,
+    err_msg: [*c]const u8,
+) ?c.JSValue {
+    if (guardPolicy(engine, tool_name)) {
+        hooks.dispatch(engine.alloc, engine.io, .{
+            .event = "post-tool-use",
+            .tool_name = tool_name,
+            .input_json = input,
+            .tool_result = "blocked by policy",
+            .is_error = true,
+        });
+        return c.JS_ThrowTypeError(ctx, err_msg);
+    }
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "pre-tool-use",
+        .tool_name = tool_name,
+        .input_json = input,
+    });
+    return null;
 }
 
 fn getEngine(ctx: ?*c.JSContext) ?*Engine {
@@ -126,13 +150,18 @@ fn jsMiniGlob(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
 
     if (guardPolicy(engine, "glob")) {
         hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = "glob",
-            .input_json = pattern, .tool_result = "blocked by policy", .is_error = true,
+            .event = "post-tool-use",
+            .tool_name = "glob",
+            .input_json = pattern,
+            .tool_result = "blocked by policy",
+            .is_error = true,
         });
         return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.glob (glob) is blocked");
     }
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = "glob", .input_json = pattern,
+        .event = "pre-tool-use",
+        .tool_name = "glob",
+        .input_json = pattern,
     });
 
     const base_path = if (argc >= 2 and c.JS_IsUndefined(argv[1]) == 0 and c.JS_IsNull(argv[1]) == 0)
@@ -207,13 +236,18 @@ fn jsMiniGrep(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
 
     if (guardPolicy(engine, "grep")) {
         hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = "grep",
-            .input_json = pattern, .tool_result = "blocked by policy", .is_error = true,
+            .event = "post-tool-use",
+            .tool_name = "grep",
+            .input_json = pattern,
+            .tool_result = "blocked by policy",
+            .is_error = true,
         });
         return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.grep (grep) is blocked");
     }
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = "grep", .input_json = pattern,
+        .event = "pre-tool-use",
+        .tool_name = "grep",
+        .input_json = pattern,
     });
 
     const path = if (argc >= 2 and c.JS_IsUndefined(argv[1]) == 0 and c.JS_IsNull(argv[1]) == 0)
@@ -248,13 +282,18 @@ fn jsMiniRead(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
     // M2: policy check — mini.read maps to 'file_read' tool
     if (guardPolicy(engine, "file_read")) {
         hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = "file_read",
-            .input_json = path, .tool_result = "blocked by policy", .is_error = true,
+            .event = "post-tool-use",
+            .tool_name = "file_read",
+            .input_json = path,
+            .tool_result = "blocked by policy",
+            .is_error = true,
         });
         return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.read (file_read) is blocked");
     }
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = "file_read", .input_json = path,
+        .event = "pre-tool-use",
+        .tool_name = "file_read",
+        .input_json = path,
     });
 
     var offset: usize = 1;
@@ -294,43 +333,23 @@ fn jsMiniWrite(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
     const content = jsStringSlice(ctx, argv[1], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid content");
     defer engine.alloc.free(content);
 
-    // M2: policy check — mini.write maps to 'file_write' tool
-    if (guardPolicy(engine, "file_write")) {
-        hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = "file_write",
-            .input_json = path, .tool_result = "blocked by policy", .is_error = true,
-        });
-        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.write (file_write) is blocked");
-    }
-    hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = "file_write", .input_json = path,
-    });
-
-    // M4: snapshot old content to CAS/journal BEFORE writing
+    if (guardAndDispatchPre(engine, ctx, "file_write", path, "Security Policy Error: mini.write (file_write) is blocked")) |v| return v;
     if (snapshot_mod.getTracker()) |t| t.beforeFileWrite(path);
 
     const res = file_tool.writeFile(engine.alloc, engine.io, path, content) catch |e| {
-        const obj = c.JS_NewObject(ctx);
-        _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, 0));
-        const err_name = @errorName(e);
-        _ = c.JS_SetPropertyStr(ctx, obj, "message", c.JS_NewStringLen(ctx, err_name.ptr, err_name.len));
-        return obj;
+        return makeOkResult(ctx, false, @errorName(e));
     };
     defer engine.alloc.free(res);
 
-    // M4: flush snapshot after writing
     if (snapshot_mod.getTracker()) |t| t.afterFileWrite(0, path);
-
-    // M3: post-hook
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "post-tool-use", .tool_name = "file_write",
-        .input_json = path, .tool_result = res,
+        .event = "post-tool-use",
+        .tool_name = "file_write",
+        .input_json = path,
+        .tool_result = res,
     });
 
-    const obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, 1));
-    _ = c.JS_SetPropertyStr(ctx, obj, "message", c.JS_NewStringLen(ctx, res.ptr, res.len));
-    return obj;
+    return makeOkResult(ctx, true, res);
 }
 
 fn makeOkResult(ctx: ?*c.JSContext, ok: bool, msg: []const u8) c.JSValue {
@@ -362,17 +381,7 @@ fn jsMiniPatch(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
     const new_str = jsStringSlice(ctx, argv[2], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid newStr");
     defer engine.alloc.free(new_str);
 
-    if (guardPolicy(engine, "file_edit")) {
-        hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = "file_edit",
-            .input_json = path, .tool_result = "blocked by policy", .is_error = true,
-        });
-        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.patch (file_edit) is blocked");
-    }
-    hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = "file_edit", .input_json = path,
-    });
-
+    if (guardAndDispatchPre(engine, ctx, "file_edit", path, "Security Policy Error: mini.patch (file_edit) is blocked")) |v| return v;
     if (snapshot_mod.getTracker()) |t| t.beforeFileWrite(path);
 
     const res = file_tool.editFile(engine.alloc, engine.io, path, old_str, new_str) catch |e| {
@@ -382,8 +391,10 @@ fn jsMiniPatch(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
 
     if (snapshot_mod.getTracker()) |t| t.afterFileWrite(0, path);
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "post-tool-use", .tool_name = "file_edit",
-        .input_json = path, .tool_result = res,
+        .event = "post-tool-use",
+        .tool_name = "file_edit",
+        .input_json = path,
+        .tool_result = res,
     });
 
     const is_ok = std.mem.indexOf(u8, res, "Modified") != null;
@@ -490,13 +501,18 @@ fn jsMiniSh(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JS
 
     if (guardPolicy(engine, "bash")) {
         hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = "bash",
-            .input_json = command, .tool_result = "blocked by policy", .is_error = true,
+            .event = "post-tool-use",
+            .tool_name = "bash",
+            .input_json = command,
+            .tool_result = "blocked by policy",
+            .is_error = true,
         });
         return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.sh (bash) is blocked");
     }
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = "bash", .input_json = command,
+        .event = "pre-tool-use",
+        .tool_name = "bash",
+        .input_json = command,
     });
 
     snapshotWritablePaths(engine.alloc, command);
@@ -509,8 +525,10 @@ fn jsMiniSh(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JS
     engine.renewActivity();
 
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "post-tool-use", .tool_name = "bash",
-        .input_json = command, .tool_result = out,
+        .event = "post-tool-use",
+        .tool_name = "bash",
+        .input_json = command,
+        .tool_result = out,
     });
 
     return makeShResult(ctx, true, 0, out, "");
@@ -767,16 +785,7 @@ fn jsMiniHttp(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
     var opts = if (argc >= 3) parseHttpJsOptions(ctx, argv[2], engine.alloc) else HttpJsOptions{};
     defer opts.deinit(engine.alloc);
 
-    if (guardPolicy(engine, "http_request")) {
-        hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = "http_request",
-            .input_json = url, .tool_result = "blocked by policy", .is_error = true,
-        });
-        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.http (http_request) is blocked");
-    }
-    hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = "http_request", .input_json = url,
-    });
+    if (guardAndDispatchPre(engine, ctx, "http_request", url, "Security Policy Error: mini.http (http_request) is blocked")) |v| return v;
 
     var res = executeHttpFetch(engine.alloc, engine.io, method, url, &opts) catch |e| {
         return c.JS_ThrowInternalError(ctx, "http error: %s", @errorName(e).ptr);
@@ -786,8 +795,10 @@ fn jsMiniHttp(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
     engine.renewActivity();
 
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "post-tool-use", .tool_name = "http_request",
-        .input_json = url, .tool_result = res.body,
+        .event = "post-tool-use",
+        .tool_name = "http_request",
+        .input_json = url,
+        .tool_result = res.body,
     });
 
     return makeHttpResult(ctx, &res);
@@ -1080,17 +1091,7 @@ fn jsMiniMedia(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
     defer engine.alloc.free(prompt_or_path);
 
     const tool_name = mediaKindToToolName(kind);
-
-    if (guardPolicy(engine, tool_name)) {
-        hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = tool_name,
-            .input_json = prompt_or_path, .tool_result = "blocked by policy", .is_error = true,
-        });
-        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.media is blocked by policy");
-    }
-    hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = tool_name, .input_json = prompt_or_path,
-    });
+    if (guardAndDispatchPre(engine, ctx, tool_name, prompt_or_path, "Security Policy Error: mini.media is blocked by policy")) |v| return v;
 
     var opts = if (argc >= 3) parseMediaJsOptions(ctx, argv[2], engine.alloc) else MediaJsOptions{};
     defer opts.deinit(engine.alloc);
@@ -1105,8 +1106,10 @@ fn jsMiniMedia(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
     }
 
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "post-tool-use", .tool_name = tool_name,
-        .input_json = prompt_or_path, .tool_result = res.path,
+        .event = "post-tool-use",
+        .tool_name = tool_name,
+        .input_json = prompt_or_path,
+        .tool_result = res.path,
         .is_error = !res.ok,
     });
 

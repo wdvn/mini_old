@@ -198,7 +198,3 @@ test "hasWordIgnoreCase word boundary detection" {
     try std.testing.expect(!hasWordIgnoreCase("Here is an explanation of the bug", "plan"));
     try std.testing.expect(!hasWordIgnoreCase("water the plant", "plan"));
 }
-
-
-
-

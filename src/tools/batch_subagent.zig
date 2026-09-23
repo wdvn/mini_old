@@ -101,7 +101,7 @@ fn spawnWorkerThreads(alloc: Allocator, io: std.Io, tasks: []const std.json.Valu
             .error_msg = null,
             .index = i,
         };
-        threads[i] = try std.Thread.spawn(.{}, runSubAgentThread, .{ &contexts[i] });
+        threads[i] = try std.Thread.spawn(.{}, runSubAgentThread, .{&contexts[i]});
     }
 }
 

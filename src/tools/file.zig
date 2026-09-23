@@ -18,7 +18,7 @@ const Allocator = std.mem.Allocator;
 const json = @import("../core/json.zig");
 const utils = @import("../core/utils.zig");
 
-const MAX_READ_SIZE = 1024 * 1024;   // 1MB
+const MAX_READ_SIZE = 1024 * 1024; // 1MB
 const MAX_WRITE_SIZE = 10 * 1024 * 1024; // 10MB
 const MAX_LINES_PER_READ = 2000;
 

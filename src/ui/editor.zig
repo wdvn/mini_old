@@ -1618,5 +1618,3 @@ test "Backslash line continuation: trailing backslash stripped and newline inser
     }
     try std.testing.expectEqualStrings("first line \n", e.buf.items);
 }
-
-

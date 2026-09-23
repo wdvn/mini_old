@@ -636,7 +636,10 @@ fn extractTextFromArray(alloc: Allocator, arr: []const u8) !?[]u8 {
                 '"' => {
                     i += 1;
                     while (i < arr.len) : (i += 1) {
-                        if (arr[i] == '\\') { i += 1; continue; }
+                        if (arr[i] == '\\') {
+                            i += 1;
+                            continue;
+                        }
                         if (arr[i] == '"') break;
                     }
                 },

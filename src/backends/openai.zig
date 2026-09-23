@@ -298,6 +298,33 @@ pub const Client = struct {
         return ctx.response;
     }
 
+    fn shouldRetryRequest(
+        self: *Client,
+        active_protocol: *ProtocolMode,
+        profile: provider.ProviderProfile,
+        req_http_code: u32,
+        raw_resp: []const u8,
+        has_tools: bool,
+    ) bool {
+        // PSEUDOCODE: Check cross-protocol fallback or parameter retry on error.
+        return self.checkProtocolFallback(active_protocol, profile, req_http_code, raw_resp, has_tools) or
+            self.checkParameterRetry(req_http_code, raw_resp);
+    }
+
+    fn executeAttempt(
+        self: *Client,
+        active_protocol: ProtocolMode,
+        body: []const u8,
+        ctx: *StreamCtx,
+        idle_aborted: *bool,
+    ) !u32 {
+        var url_buf: [512]u8 = undefined;
+        const url = formatEndpointUrl(self.base_url, active_protocol, &url_buf);
+        var auth_buf: [512]u8 = undefined;
+        const auth_header = formatAuthHeader(self.api_header, self.api_key, &auth_buf);
+        return self.executeStream(url, auth_header, body, ctx, idle_aborted);
+    }
+
     pub fn sendMessage(
         self: *Client,
         system_prompt: []const u8,
@@ -316,11 +343,6 @@ pub const Client = struct {
             const body = try self.buildActiveRequestBody(active_protocol, profile, adapter, system_prompt, msgs, tools);
             defer self.alloc.free(body);
 
-            var url_buf: [512]u8 = undefined;
-            const url = formatEndpointUrl(self.base_url, active_protocol, &url_buf);
-            var auth_buf: [512]u8 = undefined;
-            const auth_header = formatAuthHeader(self.api_header, self.api_key, &auth_buf);
-
             var ctx = StreamCtx{
                 .alloc = self.alloc,
                 .response = proto.Response.init(self.alloc),
@@ -337,15 +359,10 @@ pub const Client = struct {
             errdefer if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
 
             var idle_aborted = false;
-            const req_http_code = try self.executeStream(url, auth_header, body, &ctx, &idle_aborted);
+            const req_http_code = try self.executeAttempt(active_protocol, body, &ctx, &idle_aborted);
             const raw_resp = if (ctx.raw_accum_init) ctx.raw_accum.items else "";
 
-            if (self.checkProtocolFallback(&active_protocol, profile, req_http_code, raw_resp, tools.len > 0)) {
-                if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
-                ctx.response.deinit();
-                continue;
-            }
-            if (self.checkParameterRetry(req_http_code, raw_resp)) {
+            if (self.shouldRetryRequest(&active_protocol, profile, req_http_code, raw_resp, tools.len > 0)) {
                 if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
                 ctx.response.deinit();
                 continue;
@@ -745,6 +762,33 @@ const PartialToolCall = struct {
     }
 };
 
+const ChatUsagePromptDetails = struct { cached_tokens: ?u64 = null };
+const ChatUsageCompletionDetails = struct { reasoning_tokens: ?u64 = null };
+const ChatUsageJson = struct {
+    prompt_tokens: ?u64 = null,
+    completion_tokens: ?u64 = null,
+    total_tokens: ?u64 = null,
+    prompt_tokens_details: ?ChatUsagePromptDetails = null,
+    completion_tokens_details: ?ChatUsageCompletionDetails = null,
+    prompt_cache_hit_tokens: ?u64 = null,
+};
+const ChatChoiceDeltaToolCallFunction = struct { name: ?[]const u8 = null, arguments: ?[]const u8 = null };
+const ChatChoiceDeltaToolCall = struct { index: ?u32 = null, id: ?[]const u8 = null, type: ?[]const u8 = null, function: ?ChatChoiceDeltaToolCallFunction = null };
+const ChatChoiceDeltaDetail = struct { reasoning_content: ?[]const u8 = null, reasoning: ?[]const u8 = null };
+const ChatChoiceDelta = struct {
+    content: ?[]const u8 = null,
+    reasoning_content: ?[]const u8 = null,
+    reasoning: ?[]const u8 = null,
+    detail: ?ChatChoiceDeltaDetail = null,
+    details: ?ChatChoiceDeltaDetail = null,
+    tool_calls: ?[]ChatChoiceDeltaToolCall = null,
+};
+const ChatChoice = struct { index: ?u32 = null, delta: ?ChatChoiceDelta = null, finish_reason: ?[]const u8 = null };
+const ChatChunk = struct {
+    choices: ?[]ChatChoice = null,
+    usage: ?ChatUsageJson = null,
+};
+
 const StreamCtx = struct {
     alloc: Allocator,
     response: proto.Response,
@@ -812,9 +856,246 @@ const StreamCtx = struct {
         }
     }
 
-    fn processLine(self: *StreamCtx, line: []const u8) !void {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
+    fn parseResponsesUsage(self: *StreamCtx, data: []const u8) void {
+        // PSEUDOCODE: Parse token usage metrics from Responses API payload.
+        if (!std.mem.startsWith(u8, data, "{")) return;
+        const usage_obj = blk: {
+            if (json.findObject(data, "response")) |resp_obj| {
+                if (json.findObject(resp_obj, "usage")) |u| break :blk u;
+            }
+            break :blk json.findObject(data, "usage");
+        };
+        const u_obj = usage_obj orelse return;
+        const pt = if (json.findInt(u_obj, "input_tokens", u64)) |v| v else (json.findInt(u_obj, "prompt_tokens", u64) orelse 0);
+        const ct = if (json.findInt(u_obj, "output_tokens", u64)) |v| v else (json.findInt(u_obj, "completion_tokens", u64) orelse 0);
+        const tt = if (json.findInt(u_obj, "total_tokens", u64)) |v| v else (pt + ct);
+        self.response.usage.prompt_tokens = pt;
+        self.response.usage.completion_tokens = ct;
+        self.response.usage.total_tokens = tt;
+        if (json.findObject(u_obj, "input_tokens_details")) |itd| {
+            if (json.findInt(itd, "cached_tokens", u64)) |cv| self.response.usage.cached_tokens = cv;
+        }
+        if (json.findObject(u_obj, "output_tokens_details")) |otd| {
+            if (json.findInt(otd, "reasoning_tokens", u64)) |rv| self.response.usage.reasoning_tokens = rv;
+        }
+    }
 
+    fn handleDoneEvent(self: *StreamCtx, data: []const u8) !void {
+        // PSEUDOCODE: Finalize stream on [DONE] or response.done: usage, filters, thinking, text, stop_reason.
+        self.parseResponsesUsage(data);
+        try self.filter.finish(self);
+        if (self.think_accum_init and self.think_accum.items.len > 0) {
+            const think_text = try self.alloc.dupe(u8, self.think_accum.items);
+            try self.response.content.append(self.alloc, .{ .thinking = .{ .thinking = think_text, .signature = "" } });
+            self.think_accum.clearRetainingCapacity();
+        }
+        if (self.text_accum_init and self.text_accum.items.len > 0) {
+            const text = try self.alloc.dupe(u8, self.text_accum.items);
+            try self.response.content.append(self.alloc, .{ .text = text });
+            self.text_accum.clearRetainingCapacity();
+        }
+        if (self.response.stop_reason == .unknown and !self.finish_reason_received) {
+            self.response.stop_reason = .end_turn;
+        }
+    }
+
+    fn handleResponsesItemDone(self: *StreamCtx, data: []const u8) !void {
+        // PSEUDOCODE: Finalize tool call from response.output_item.done or response.tool_call.done.
+        if (json.findObject(data, "item")) |item_obj| {
+            const item_type = json.findString(item_obj, "type") orelse "";
+            if (std.mem.eql(u8, item_type, "function_call") or std.mem.eql(u8, item_type, "tool_call")) {
+                const call_id = (try json.findStringOwned(self.alloc, item_obj, "call_id")) orelse (try json.findStringOwned(self.alloc, item_obj, "id"));
+                defer if (call_id) |cid| self.alloc.free(cid);
+                const name = try json.findStringOwned(self.alloc, item_obj, "name");
+                defer if (name) |n| self.alloc.free(n);
+                const args = try json.findStringOwned(self.alloc, item_obj, "arguments");
+                defer if (args) |a| self.alloc.free(a);
+                const index = json.findInt(data, "output_index", u32);
+                try self.setToolCallFinal(index, call_id, name, args);
+            }
+        } else {
+            const call_id = (try json.findStringOwned(self.alloc, data, "call_id")) orelse (try json.findStringOwned(self.alloc, data, "id"));
+            defer if (call_id) |cid| self.alloc.free(cid);
+            const name = try json.findStringOwned(self.alloc, data, "name");
+            defer if (name) |n| self.alloc.free(n);
+            const args = try json.findStringOwned(self.alloc, data, "arguments");
+            defer if (args) |a| self.alloc.free(a);
+            const index = json.findInt(data, "output_index", u32);
+            if (args != null or call_id != null or name != null) {
+                try self.setToolCallFinal(index, call_id, name, args);
+            }
+        }
+    }
+
+    fn handleResponsesDeltaEvent(
+        self: *StreamCtx,
+        ev: []const u8,
+        data: []const u8,
+        custom_text: ?[]const u8,
+        custom_reasoning: ?[]const u8,
+    ) !bool {
+        // PSEUDOCODE: Handle text and reasoning deltas for Responses API.
+        if (std.mem.eql(u8, ev, "response.output_text.delta") or std.mem.eql(u8, ev, "response.text.delta")) {
+            if (json.findString(data, "delta")) |delta_text| {
+                if (delta_text.len > 0) {
+                    const unescaped = json.unescape(self.alloc, delta_text) catch delta_text;
+                    defer if (unescaped.ptr != delta_text.ptr) self.alloc.free(unescaped);
+                    if (!self.text_accum_init) {
+                        self.text_accum = .empty;
+                        self.text_accum_init = true;
+                    }
+                    if (custom_text == null) try self.filter.feed(unescaped, self);
+                }
+            }
+            return true;
+        }
+        if (std.mem.eql(u8, ev, "response.reasoning_text.delta") or std.mem.eql(u8, ev, "response.reasoning.delta")) {
+            if (json.findString(data, "delta")) |delta_text| {
+                if (delta_text.len > 0) {
+                    const unescaped = json.unescape(self.alloc, delta_text) catch delta_text;
+                    defer if (unescaped.ptr != delta_text.ptr) self.alloc.free(unescaped);
+                    if (!self.think_accum_init) {
+                        self.think_accum = .empty;
+                        self.think_accum_init = true;
+                    }
+                    if (custom_reasoning == null) try self.emitNormalized(unescaped, true);
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn handleResponsesToolEvent(self: *StreamCtx, ev: []const u8, data: []const u8) !bool {
+        // PSEUDOCODE: Handle tool call events (added, delta, done) for Responses API.
+        if (std.mem.eql(u8, ev, "response.output_item.added")) {
+            if (json.findObject(data, "item")) |item_obj| {
+                const item_type = json.findString(item_obj, "type") orelse "";
+                if (std.mem.eql(u8, item_type, "function_call") or std.mem.eql(u8, item_type, "tool_call")) {
+                    const call_id = (try json.findStringOwned(self.alloc, item_obj, "call_id")) orelse (try json.findStringOwned(self.alloc, item_obj, "id"));
+                    defer if (call_id) |cid| self.alloc.free(cid);
+                    const name = try json.findStringOwned(self.alloc, item_obj, "name");
+                    defer if (name) |n| self.alloc.free(n);
+                    const index = json.findInt(data, "output_index", u32);
+                    try self.mergeToolCallDelta(index, call_id, name, null);
+                }
+            }
+            return true;
+        }
+        if (std.mem.eql(u8, ev, "response.tool_call.delta") or std.mem.eql(u8, ev, "response.function_call_arguments.delta")) {
+            const index = json.findInt(data, "output_index", u32) orelse json.findInt(data, "index", u32);
+            const call_id = (try json.findStringOwned(self.alloc, data, "call_id")) orelse (try json.findStringOwned(self.alloc, data, "id"));
+            defer if (call_id) |cid| self.alloc.free(cid);
+            const name = try json.findStringOwned(self.alloc, data, "name");
+            defer if (name) |n| self.alloc.free(n);
+            const args = (try json.findStringOwned(self.alloc, data, "delta")) orelse (try json.findStringOwned(self.alloc, data, "arguments"));
+            defer if (args) |a| self.alloc.free(a);
+            try self.mergeToolCallDelta(index, call_id, name, args);
+            return true;
+        }
+        if (std.mem.eql(u8, ev, "response.output_item.done") or std.mem.eql(u8, ev, "response.tool_call.done") or std.mem.eql(u8, ev, "response.function_call_arguments.done")) {
+            try self.handleResponsesItemDone(data);
+            return true;
+        }
+        return false;
+    }
+
+    fn handleResponsesApiEvent(
+        self: *StreamCtx,
+        ev: []const u8,
+        data: []const u8,
+        custom_text: ?[]const u8,
+        custom_reasoning: ?[]const u8,
+    ) !bool {
+        // PSEUDOCODE: Route event to delta or tool handlers, absorbing all response.* events.
+        if (try self.handleResponsesDeltaEvent(ev, data, custom_text, custom_reasoning)) return true;
+        if (try self.handleResponsesToolEvent(ev, data)) return true;
+        return std.mem.startsWith(u8, ev, "response.");
+    }
+
+    fn applyFinishReason(self: *StreamCtx, reason: []const u8) void {
+        // PSEUDOCODE: Map OpenAI finish_reason to proto.StopReason.
+        self.finish_reason_received = true;
+        if (std.mem.eql(u8, reason, "tool_calls") or std.mem.eql(u8, reason, "function")) {
+            self.response.stop_reason = .tool_use;
+        } else if (std.mem.eql(u8, reason, "stop")) {
+            self.response.stop_reason = .end_turn;
+        } else if (std.mem.eql(u8, reason, "length")) {
+            self.response.stop_reason = .max_tokens;
+        } else if (std.mem.eql(u8, reason, "content_filter")) {
+            self.response.stop_reason = .unknown;
+        }
+    }
+
+    fn handleChatChoiceDelta(
+        self: *StreamCtx,
+        delta: anytype,
+        custom_text: ?[]const u8,
+        custom_reasoning: ?[]const u8,
+    ) !void {
+        // PSEUDOCODE: Extract reasoning, text, and tool calls from choice delta.
+        const detail_reasoning = if (delta.detail) |d| (d.reasoning_content orelse d.reasoning) else if (delta.details) |d| (d.reasoning_content orelse d.reasoning) else null;
+        const reasoning = delta.reasoning_content orelse delta.reasoning orelse detail_reasoning;
+        if (if (custom_reasoning == null) reasoning else null) |r| {
+            if (r.len > 0) {
+                if (!self.think_accum_init) {
+                    self.think_accum = .empty;
+                    self.think_accum_init = true;
+                }
+                try self.think_accum.appendSlice(self.alloc, r);
+                if (self.think_cb) |cb| cb(r);
+            }
+        }
+        if (if (custom_text == null) delta.content else null) |text| {
+            if (text.len > 0) {
+                if (!self.text_accum_init) {
+                    self.text_accum = .empty;
+                    self.text_accum_init = true;
+                }
+                try self.filter.feed(text, self);
+            }
+        }
+        if (delta.tool_calls) |tool_calls| {
+            for (tool_calls) |tc_obj| {
+                const fname = if (tc_obj.function) |f| f.name else null;
+                const fargs = if (tc_obj.function) |f| f.arguments else null;
+                try self.mergeToolCallDelta(tc_obj.index, tc_obj.id, fname, fargs);
+            }
+        }
+    }
+
+    fn handleChatChunk(
+        self: *StreamCtx,
+        data: []const u8,
+        custom_text: ?[]const u8,
+        custom_reasoning: ?[]const u8,
+    ) !void {
+        // PSEUDOCODE: Parse OpenAI Chat Completions chunk JSON, update choices, finish_reason, and usage.
+        const parsed = std.json.parseFromSlice(ChatChunk, self.alloc, data, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+
+        if (parsed.value.choices) |choices| {
+            for (choices) |choice| {
+                if (choice.delta) |delta| try self.handleChatChoiceDelta(delta, custom_text, custom_reasoning);
+                if (choice.finish_reason) |reason| self.applyFinishReason(reason);
+            }
+        }
+        if (parsed.value.usage) |u| {
+            const cached = if (u.prompt_tokens_details) |ptd| (ptd.cached_tokens orelse 0) else (u.prompt_cache_hit_tokens orelse 0);
+            const reasoning_tok = if (u.completion_tokens_details) |ctd| (ctd.reasoning_tokens orelse 0) else 0;
+            self.response.usage = .{
+                .prompt_tokens = u.prompt_tokens orelse 0,
+                .completion_tokens = u.completion_tokens orelse 0,
+                .total_tokens = u.total_tokens orelse 0,
+                .cached_tokens = cached,
+                .reasoning_tokens = reasoning_tok,
+            };
+        }
+    }
+
+    fn processLine(self: *StreamCtx, line: []const u8) !void {
+        // PSEUDOCODE: Parse single SSE line, dispatch done, Responses API, or Chat Completions events.
+        const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) {
             self.event_type_len = 0;
             return;
@@ -829,67 +1110,16 @@ const StreamCtx = struct {
         }
 
         if (!std.mem.startsWith(u8, trimmed, "data: ")) return;
-
         const data = trimmed["data: ".len..];
         var ev: []const u8 = self.event_type[0..self.event_type_len];
         if (json.findString(data, "type")) |t| {
-            if (std.mem.startsWith(u8, t, "response.")) {
-                ev = t;
-            }
+            if (std.mem.startsWith(u8, t, "response.")) ev = t;
         }
 
-        // Handle [DONE] or Responses API completion event
         if (std.mem.eql(u8, data, "[DONE]") or std.mem.eql(u8, ev, "response.done") or std.mem.eql(u8, ev, "response.completed")) {
-            // Check usage in Responses API payload if present
-            if (std.mem.startsWith(u8, data, "{")) {
-                const usage_obj = blk: {
-                    if (json.findObject(data, "response")) |resp_obj| {
-                        if (json.findObject(resp_obj, "usage")) |u| break :blk u;
-                    }
-                    break :blk json.findObject(data, "usage");
-                };
-                if (usage_obj) |u_obj| {
-                    const pt = if (json.findInt(u_obj, "input_tokens", u64)) |v| v else (json.findInt(u_obj, "prompt_tokens", u64) orelse 0);
-                    const ct = if (json.findInt(u_obj, "output_tokens", u64)) |v| v else (json.findInt(u_obj, "completion_tokens", u64) orelse 0);
-                    const tt = if (json.findInt(u_obj, "total_tokens", u64)) |v| v else (pt + ct);
-                    self.response.usage.prompt_tokens = pt;
-                    self.response.usage.completion_tokens = ct;
-                    self.response.usage.total_tokens = tt;
-                    if (json.findObject(u_obj, "input_tokens_details")) |itd| {
-                        if (json.findInt(itd, "cached_tokens", u64)) |cv| {
-                            self.response.usage.cached_tokens = cv;
-                        }
-                    }
-                    if (json.findObject(u_obj, "output_tokens_details")) |otd| {
-                        if (json.findInt(otd, "reasoning_tokens", u64)) |rv| {
-                            self.response.usage.reasoning_tokens = rv;
-                        }
-                    }
-                }
-            }
-
-            try self.filter.finish(self);
-            // Save accumulated thinking
-            if (self.think_accum_init and self.think_accum.items.len > 0) {
-                const think_text = try self.alloc.dupe(u8, self.think_accum.items);
-                try self.response.content.append(self.alloc, .{ .thinking = .{ .thinking = think_text, .signature = "" } });
-                self.think_accum.clearRetainingCapacity();
-            }
-            // Save accumulated text into response
-            if (self.text_accum_init and self.text_accum.items.len > 0) {
-                const text = try self.alloc.dupe(u8, self.text_accum.items);
-                try self.response.content.append(self.alloc, .{ .text = text });
-                self.text_accum.clearRetainingCapacity();
-            }
-            // Only set to end_turn if tool_use or max_tokens not already set
-            if (self.response.stop_reason == .unknown and !self.finish_reason_received) {
-                self.response.stop_reason = .end_turn;
-            }
-            return;
+            return self.handleDoneEvent(data);
         }
 
-        // Adapter overrides are evaluated once per JSON event. Null/failed extraction
-        // falls back to native fields; tool calls and usage always use native parsing.
         const custom_text = if (self.adapter) |a| a.extractContent(self.alloc, data) else null;
         defer if (custom_text) |s| self.alloc.free(s);
         const custom_reasoning = if (self.adapter) |a| a.extractReasoning(self.alloc, data) else null;
@@ -897,231 +1127,8 @@ const StreamCtx = struct {
         if (custom_text) |s| try self.filter.feed(s, self);
         if (custom_reasoning) |s| try self.emitNormalized(s, true);
 
-        // Responses API event handlers
-        if (std.mem.eql(u8, ev, "response.output_text.delta") or std.mem.eql(u8, ev, "response.text.delta")) {
-            if (json.findString(data, "delta")) |delta_text| {
-                if (delta_text.len > 0) {
-                    const unescaped = json.unescape(self.alloc, delta_text) catch delta_text;
-                    defer if (unescaped.ptr != delta_text.ptr) self.alloc.free(unescaped);
-                    if (!self.text_accum_init) {
-                        self.text_accum = .empty;
-                        self.text_accum_init = true;
-                    }
-                    if (custom_text == null) try self.filter.feed(unescaped, self);
-                }
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, ev, "response.reasoning_text.delta") or std.mem.eql(u8, ev, "response.reasoning.delta")) {
-            if (json.findString(data, "delta")) |delta_text| {
-                if (delta_text.len > 0) {
-                    const unescaped = json.unescape(self.alloc, delta_text) catch delta_text;
-                    defer if (unescaped.ptr != delta_text.ptr) self.alloc.free(unescaped);
-                    if (!self.think_accum_init) {
-                        self.think_accum = .empty;
-                        self.think_accum_init = true;
-                    }
-                    if (custom_reasoning == null) try self.emitNormalized(unescaped, true);
-                }
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, ev, "response.output_item.added")) {
-            if (json.findObject(data, "item")) |item_obj| {
-                const item_type = json.findString(item_obj, "type") orelse "";
-                if (std.mem.eql(u8, item_type, "function_call") or std.mem.eql(u8, item_type, "tool_call")) {
-                    const call_id = (try json.findStringOwned(self.alloc, item_obj, "call_id")) orelse (try json.findStringOwned(self.alloc, item_obj, "id"));
-                    defer if (call_id) |cid| self.alloc.free(cid);
-                    const name = try json.findStringOwned(self.alloc, item_obj, "name");
-                    defer if (name) |n| self.alloc.free(n);
-                    const index = json.findInt(data, "output_index", u32);
-                    try self.mergeToolCallDelta(index, call_id, name, null);
-                }
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, ev, "response.tool_call.delta") or std.mem.eql(u8, ev, "response.function_call_arguments.delta")) {
-            const index = json.findInt(data, "output_index", u32) orelse json.findInt(data, "index", u32);
-            const call_id = (try json.findStringOwned(self.alloc, data, "call_id")) orelse (try json.findStringOwned(self.alloc, data, "id"));
-            defer if (call_id) |cid| self.alloc.free(cid);
-            const name = try json.findStringOwned(self.alloc, data, "name");
-            defer if (name) |n| self.alloc.free(n);
-            const args = (try json.findStringOwned(self.alloc, data, "delta")) orelse (try json.findStringOwned(self.alloc, data, "arguments"));
-            defer if (args) |a| self.alloc.free(a);
-            try self.mergeToolCallDelta(index, call_id, name, args);
-            return;
-        }
-
-        if (std.mem.eql(u8, ev, "response.output_item.done") or std.mem.eql(u8, ev, "response.tool_call.done") or std.mem.eql(u8, ev, "response.function_call_arguments.done")) {
-            if (json.findObject(data, "item")) |item_obj| {
-                const item_type = json.findString(item_obj, "type") orelse "";
-                if (std.mem.eql(u8, item_type, "function_call") or std.mem.eql(u8, item_type, "tool_call")) {
-                    const call_id = (try json.findStringOwned(self.alloc, item_obj, "call_id")) orelse (try json.findStringOwned(self.alloc, item_obj, "id"));
-                    defer if (call_id) |cid| self.alloc.free(cid);
-                    const name = try json.findStringOwned(self.alloc, item_obj, "name");
-                    defer if (name) |n| self.alloc.free(n);
-                    const args = try json.findStringOwned(self.alloc, item_obj, "arguments");
-                    defer if (args) |a| self.alloc.free(a);
-                    const index = json.findInt(data, "output_index", u32);
-                    try self.setToolCallFinal(index, call_id, name, args);
-                }
-            } else {
-                const call_id = (try json.findStringOwned(self.alloc, data, "call_id")) orelse (try json.findStringOwned(self.alloc, data, "id"));
-                defer if (call_id) |cid| self.alloc.free(cid);
-                const name = try json.findStringOwned(self.alloc, data, "name");
-                defer if (name) |n| self.alloc.free(n);
-                const args = try json.findStringOwned(self.alloc, data, "arguments");
-                defer if (args) |a| self.alloc.free(a);
-                const index = json.findInt(data, "output_index", u32);
-                if (args != null or call_id != null or name != null) {
-                    try self.setToolCallFinal(index, call_id, name, args);
-                }
-            }
-            return;
-        }
-
-        // All other Responses API events (e.g. response.created, response.in_progress, response.content_part.added, etc.)
-        if (std.mem.startsWith(u8, ev, "response.")) return;
-
-        // RFC-006 §3.1: Usage JSON parse struct (nested optional)
-        const UsagePromptDetails = struct {
-            cached_tokens: ?u64 = null,
-        };
-        const UsageCompletionDetails = struct {
-            reasoning_tokens: ?u64 = null,
-        };
-        const UsageJson = struct {
-            prompt_tokens: ?u64 = null,
-            completion_tokens: ?u64 = null,
-            total_tokens: ?u64 = null,
-            prompt_tokens_details: ?UsagePromptDetails = null,
-            completion_tokens_details: ?UsageCompletionDetails = null,
-            // DeepSeek alias (RFC-006 §3.1)
-            prompt_cache_hit_tokens: ?u64 = null,
-        };
-
-        const Chunk = struct {
-            const ChoiceDeltaToolCallFunction = struct {
-                name: ?[]const u8 = null,
-                arguments: ?[]const u8 = null,
-            };
-            const ChoiceDeltaToolCall = struct {
-                index: ?u32 = null,
-                id: ?[]const u8 = null,
-                type: ?[]const u8 = null,
-                function: ?ChoiceDeltaToolCallFunction = null,
-            };
-            const ChoiceDeltaDetail = struct {
-                reasoning_content: ?[]const u8 = null,
-                reasoning: ?[]const u8 = null,
-            };
-            const ChoiceDelta = struct {
-                content: ?[]const u8 = null,
-                reasoning_content: ?[]const u8 = null,
-                // RFC-006 §3.3: OpenAI o-series/GPT-5.x uses field "reasoning"
-                reasoning: ?[]const u8 = null,
-                // Nested proxy/aggregator wrappers: delta.detail.reasoning_content or delta.details
-                detail: ?ChoiceDeltaDetail = null,
-                details: ?ChoiceDeltaDetail = null,
-                tool_calls: ?[]ChoiceDeltaToolCall = null,
-            };
-            const Choice = struct {
-                index: ?u32 = null,
-                delta: ?ChoiceDelta = null,
-                finish_reason: ?[]const u8 = null,
-            };
-            id: ?[]const u8 = null,
-            object: ?[]const u8 = null,
-            created: ?u64 = null,
-            model: ?[]const u8 = null,
-            choices: ?[]Choice = null,
-            // RFC-006 §3.1: usage chunk (sent in last chunk when include_usage=true)
-            usage: ?UsageJson = null,
-        };
-
-        const parsed = std.json.parseFromSlice(Chunk, self.alloc, data, .{ .ignore_unknown_fields = true }) catch return;
-        defer parsed.deinit();
-
-        const chunk = parsed.value;
-        if (chunk.choices) |choices| {
-            for (choices) |choice| {
-                if (choice.delta) |delta| {
-                    // Receive reasoning from variants:
-                    // 1. DeepSeek-style: delta.reasoning_content
-                    // 2. OpenAI o-series/GPT-5.x: delta.reasoning
-                    // 3. Nested proxy/aggregator wrappers: delta.detail.reasoning_content / delta.details
-                    const detail_reasoning = if (delta.detail) |d|
-                        (d.reasoning_content orelse d.reasoning)
-                    else if (delta.details) |d|
-                        (d.reasoning_content orelse d.reasoning)
-                    else
-                        null;
-                    const reasoning = delta.reasoning_content orelse delta.reasoning orelse detail_reasoning;
-                    if (if (custom_reasoning == null) reasoning else null) |r| {
-                        if (r.len > 0) {
-                            if (!self.think_accum_init) {
-                                self.think_accum = .empty;
-                                self.think_accum_init = true;
-                            }
-                            try self.think_accum.appendSlice(self.alloc, r);
-                            if (self.think_cb) |cb| cb(r);
-                        }
-                    }
-                    if (if (custom_text == null) delta.content else null) |text| {
-                        if (text.len > 0) {
-                            if (!self.text_accum_init) {
-                                self.text_accum = .empty;
-                                self.text_accum_init = true;
-                            }
-                            try self.filter.feed(text, self);
-                        }
-                    }
-                    if (delta.tool_calls) |tool_calls| {
-                        // Merge by index (OpenAI streaming standard): DeepSeek and most
-                        // compat providers only send id in the first chunk; subsequent chunks
-                        // have only index + arguments — cannot blindly append to last item.
-                        for (tool_calls) |tc_obj| {
-                            const fname = if (tc_obj.function) |f| f.name else null;
-                            const fargs = if (tc_obj.function) |f| f.arguments else null;
-                            try self.mergeToolCallDelta(tc_obj.index, tc_obj.id, fname, fargs);
-                        }
-                    }
-                }
-                if (choice.finish_reason) |reason| {
-                    self.finish_reason_received = true;
-                    // RFC-006 §3.4: fully map OpenAI finish_reason
-                    if (std.mem.eql(u8, reason, "tool_calls")) {
-                        self.response.stop_reason = .tool_use;
-                    } else if (std.mem.eql(u8, reason, "stop")) {
-                        self.response.stop_reason = .end_turn;
-                    } else if (std.mem.eql(u8, reason, "length")) {
-                        self.response.stop_reason = .max_tokens;
-                    } else if (std.mem.eql(u8, reason, "function")) {
-                        // Legacy function calling → map as tool_calls
-                        self.response.stop_reason = .tool_use;
-                    } else if (std.mem.eql(u8, reason, "content_filter")) {
-                        // Content filter → .unknown + debug info (not end_turn)
-                        self.response.stop_reason = .unknown;
-                    }
-                }
-            }
-        }
-
-        // RFC-006 §3.1: parse usage from last chunk
-        if (chunk.usage) |u| {
-            const cached = if (u.prompt_tokens_details) |ptd| (ptd.cached_tokens orelse 0) else (u.prompt_cache_hit_tokens orelse 0);
-            const reasoning_tok = if (u.completion_tokens_details) |ctd| (ctd.reasoning_tokens orelse 0) else 0;
-            self.response.usage = .{
-                .prompt_tokens = u.prompt_tokens orelse 0,
-                .completion_tokens = u.completion_tokens orelse 0,
-                .total_tokens = u.total_tokens orelse 0,
-                .cached_tokens = cached,
-                .reasoning_tokens = reasoning_tok,
-            };
-        }
+        if (try self.handleResponsesApiEvent(ev, data, custom_text, custom_reasoning)) return;
+        try self.handleChatChunk(data, custom_text, custom_reasoning);
     }
 
     /// Merge 1 tool_call delta into the list, locating slot by index (standard
@@ -1852,4 +1859,3 @@ test "openai sanitizeToolName: strips DSML tags and rejects invalid tool names" 
     try testing.expect(sanitizeToolName("   ") == null);
     try testing.expect(sanitizeToolName("invalid tool with spaces") == null);
 }
-

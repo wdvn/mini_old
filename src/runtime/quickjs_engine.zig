@@ -179,7 +179,7 @@ pub const Engine = struct {
     fn jsConsoleLog(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
         _ = this_val;
         const engine: *Engine = @ptrCast(@alignCast(c.JS_GetContextOpaque(ctx) orelse return JS_UNDEFINED));
-        
+
         var i: usize = 0;
         const count: usize = if (argc > 0) @intCast(argc) else 0;
         while (i < count) : (i += 1) {
@@ -399,7 +399,6 @@ test "quickjs_engine - background job management" {
     try std.testing.expect(std.mem.indexOf(u8, res.stdout, "spawned: true pid: true") != null);
 }
 
-
 // --- Test helper: Single-request HTTP server running on a separate thread for mini.http ---
 
 const HttpTestServer = struct {
@@ -497,7 +496,6 @@ test "quickjs_engine - per-act fresh context isolation (no top-level const colli
     try std.testing.expect(!res2.is_error);
     try std.testing.expectEqualStrings("turn 2\n", res2.stdout);
 }
-
 
 // ---------------------------------------------------------------------------
 // ISSUE-CODEACT-001 M2/M3: policy + hook qua mini.* bindings

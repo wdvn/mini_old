@@ -110,7 +110,214 @@ pub fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
 // Entry point
 // ---------------------------------------------------------------------------
 
+const agent_folder_mod = @import("core/agent_folder.zig");
+
+fn handleHelpOrVersion(args: *const Args) bool {
+    if (args.show_help) {
+        printHelp();
+        return true;
+    }
+    if (args.show_version) {
+        stdoutPrint("mini-agent {s}\nbuild:   {s}\ntarget:  {s} ({s})\nzig:     {s}\n", .{
+            VERSION, BUILD_TIME, BUILD_TARGET, BUILD_OPTIMIZE, ZIG_VERSION,
+        });
+        return true;
+    }
+    return false;
+}
+
+fn setupAgentFolder(alloc: Allocator, io: std.Io, env_map: *std.process.Environ.Map) ?agent_folder_mod.AgentFolder {
+    var folder_opt: ?agent_folder_mod.AgentFolder = null;
+    if (agent_folder_mod.resolveOrInitAgentFolder(alloc, io, env_map)) |folder| {
+        folder_opt = folder;
+        env_map.put("MINI_AGENT_FOLDER", folder.path) catch {};
+        if (std.fs.path.dirname(folder.path)) |ws_root| {
+            env_map.put("MINI_WORKSPACE_ROOT", ws_root) catch {};
+        }
+    } else |err| {
+        stderrPrint("[main] Error finding .agent: {any}\n", .{err});
+    }
+
+    if (env_map.get("MINI_WORKSPACE_ROOT") == null) {
+        if (env_map.get("PWD")) |pwd| {
+            env_map.put("MINI_WORKSPACE_ROOT", pwd) catch {};
+        }
+    }
+    return folder_opt;
+}
+
+fn overrideSystemPromptFromFile(alloc: Allocator, io: std.Io, cfg: *config_mod.Config, sfile: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const file = cwd.openFile(io, sfile, .{}) catch |e| {
+        stderrPrint("Cannot open system file '{s}': {s}\n", .{ sfile, @errorName(e) });
+        std.process.exit(1);
+    };
+    defer file.close(io);
+    const stat = try file.stat(io);
+    const buf = try alloc.alloc(u8, @intCast(stat.size));
+    const n = try utils.readAll(io, file, buf);
+    if (cfg.system_prompt_buf) |old| alloc.free(old);
+    cfg.system_prompt_buf = buf;
+    cfg.system_prompt = buf[0..n];
+}
+
+fn setupConfig(alloc: Allocator, io: std.Io, env_map: *std.process.Environ.Map, args: *const Args) config_mod.Config {
+    config_mod.loadDotEnv(alloc, env_map, io);
+    var cfg = config_mod.Config.load(alloc, env_map, io) catch |e| {
+        stderrPrint("Error loading config: {s}\n", .{@errorName(e)});
+        std.process.exit(1);
+    };
+    if (args.system_file) |sfile| {
+        overrideSystemPromptFromFile(alloc, io, &cfg, sfile) catch |e| {
+            stderrPrint("Error applying system file: {s}\n", .{@errorName(e)});
+            std.process.exit(1);
+        };
+    }
+    if (args.mode) |m| cfg.execution_mode = config_mod.ExecutionMode.fromString(m);
+    if (args.hook_command) |hcmd| cfg.hook_command = hcmd;
+    hooks_mod.setHookCommand(cfg.hook_command);
+    if (hooks_mod.getHookCommand()) |hcmd| {
+        stderrPrint("[main] Hooks: enabled ({s})\n", .{hcmd});
+    }
+    return cfg;
+}
+
+fn setupMcp(io: std.Io, env_map: *std.process.Environ.Map, args: *const Args, cfg: *const config_mod.Config, mcp: *mcp_mod.McpClientManager) void {
+    if (args.no_mcp) return;
+    mcp.loadFromConfig(env_map, io, args.mcp_config orelse cfg.mcp_config_path);
+    tools_mod.setMcpManager(mcp);
+    if (mcp.toolCount() > 0) {
+        stderrPrint("[main] MCP: {d} tools from {d} server(s)\n", .{ mcp.toolCount(), mcp.servers.items.len });
+    }
+}
+
+fn handleCronInstallation(alloc: Allocator, io: std.Io, args: *const Args, exe_arg: []const u8) !bool {
+    const cron_expr = args.cron orelse return false;
+    if (args.prompt == null) {
+        stderrPrint("Error: --install-cron requires -e <prompt>\n", .{});
+        std.process.exit(1);
+    }
+    const exe_path = try getAbsoluteExePath(alloc, io, exe_arg);
+    defer alloc.free(exe_path);
+    cron_mod.installCronjob(alloc, io, cron_expr, exe_path, args.prompt.?) catch |e| {
+        if (e == error.AlreadyExists) {
+            stdoutPrint("This cronjob already exists on the system!\n", .{});
+        } else {
+            stderrPrint("Error installing cronjob: {s}\n", .{@errorName(e)});
+            std.process.exit(1);
+        }
+        return true;
+    };
+    stdoutPrint("Cronjob installed successfully: {s}\n", .{cron_expr});
+    return true;
+}
+
+fn setupSession(
+    alloc: Allocator,
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    agent: *agent_mod.AgentLoop,
+    args: *const Args,
+    cfg: *const config_mod.Config,
+) !?[]const u8 {
+    const session_id_arg = args.session orelse cfg.session_id;
+    const session_file_arg = args.session_file orelse cfg.session_file;
+    artifacts_mod.setSessionId(session_id_arg);
+    const session_path = try resolveSessionPath(alloc, io, env_map, session_id_arg, session_file_arg);
+
+    if (session_path) |spath| {
+        stderrPrint("[main] Session: {s}\n", .{spath});
+        const cwd = std.Io.Dir.cwd();
+        if (cwd.openFile(io, spath, .{})) |f| {
+            f.close(io);
+            agent.history.restoreFromFile(io, spath) catch |e| {
+                stderrPrint("[main] Warning: Error loading session file '{s}': {s}, creating new session.\n", .{ spath, @errorName(e) });
+            };
+        } else |_| {}
+    }
+    return session_path;
+}
+
+fn readPromptFile(alloc: Allocator, io: std.Io, prompt_file: []const u8) ![]u8 {
+    const cwd = std.Io.Dir.cwd();
+    const file = cwd.openFile(io, prompt_file, .{}) catch |e| {
+        stderrPrint("Cannot open prompt file '{s}': {s}\n", .{ prompt_file, @errorName(e) });
+        std.process.exit(1);
+    };
+    defer file.close(io);
+    const stat = try file.stat(io);
+    const file_buf = try alloc.alloc(u8, @intCast(stat.size));
+    errdefer alloc.free(file_buf);
+    const n = try utils.readAll(io, file, file_buf);
+    const trimmed = std.mem.trim(u8, file_buf[0..n], " \t\r\n");
+    const result = try alloc.dupe(u8, trimmed);
+    alloc.free(file_buf);
+    return result;
+}
+
+fn executeSinglePrompt(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, prompt: []const u8) !void {
+    const expanded = try artifacts_mod.expandArtifactReferences(alloc, io, prompt);
+    defer alloc.free(expanded);
+
+    const media_res = if (agent.config.image_input_enabled)
+        media_lib.parsePromptImages(alloc, io, expanded, .{
+            .max_per_turn = agent.config.image_input_max_per_turn,
+            .max_bytes = agent.config.image_input_max_bytes,
+        }) catch |err| {
+            stderrPrint("Failed to process image attachment: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        }
+    else
+        media_lib.PromptParseResult{ .clean_text = try alloc.dupe(u8, expanded), .images = try alloc.alloc(protocol_mod.ImageBlock, 0) };
+    defer media_res.deinit(alloc);
+
+    var renderer = ui_repl.chat_stream.TurnRenderer.init(alloc, io);
+    renderer.parser.thinking_tags = backends.provider_mod.getProfile(agent.config.openai_provider).thinking_tags;
+    defer renderer.deinit();
+    ui_repl.current_renderer = &renderer;
+    defer ui_repl.current_renderer = null;
+
+    renderer.startTurn(media_res.clean_text);
+    const start_ms = utils.milliTimestamp();
+
+    try agent.processInputWithImages(media_res.clean_text, media_res.images, ui_repl.printText, ui_repl.printThinkText);
+    if (signals_mod.isInterrupted()) std.process.exit(130);
+
+    const end_ms = utils.milliTimestamp();
+    const duration = if (end_ms >= start_ms) @as(u64, @intCast(end_ms - start_ms)) else 0;
+    renderer.finishTurn(.{
+        .prompt_tokens = agent.token_estimator.estimate(media_res.clean_text),
+        .completion_tokens = agent.last_turn_completion_tokens,
+        .context_tokens = agent.token_estimator.estimateMessages(agent.history.messages()),
+        .max_context_tokens = agent.config.context_window,
+        .duration_ms = duration,
+        .acts_count = if (agent.last_turn_acts > 0) agent.last_turn_acts else 1,
+    });
+}
+
+fn dispatchExecution(
+    alloc: std.mem.Allocator,
+    io: std.process.Init.Io,
+    agent: *agent_mod.AgentLoop,
+    cfg: *const config_mod.Config,
+    args: *const Args,
+) !void {
+    if (args.acp) return acp_mod.runServer(alloc, io, agent, cfg);
+    if (args.prompt) |prompt| return executeSinglePrompt(alloc, io, agent, prompt);
+    if (args.single) |prompt_file| {
+        const prompt = try readPromptFile(alloc, io, prompt_file);
+        defer alloc.free(prompt);
+        return executeSinglePrompt(alloc, io, agent, prompt);
+    }
+    try ui_repl.runRepl(alloc, io, agent, VERSION);
+}
+
 pub fn main(init: std.process.Init) !void {
+    // PSEUDOCODE:
+    // 1. Initialize signal handlers, debug allocator, and parse CLI args
+    // 2. Setup agent workspace, config, and MCP client manager
+    // 3. Initialize AgentLoop and handle cron installation if requested
+    // 4. Setup session backup/restore and dispatch to ACP, single-shot, or REPL
     signals_mod.initSignalHandlers();
     g_io = init.io;
     g_environ_map = init.environ_map;
@@ -118,262 +325,37 @@ pub fn main(init: std.process.Init) !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    // Parse CLI args
     const args_raw = try init.minimal.args.toSlice(alloc);
     defer alloc.free(args_raw);
     const args = try parseArgs(args_raw[1..]);
+    if (handleHelpOrVersion(&args)) return;
 
-    if (args.show_help) {
-        printHelp();
-        return;
-    }
-    if (args.show_version) {
-        stdoutPrint("mini-agent {s}\nbuild:   {s}\ntarget:  {s} ({s})\nzig:     {s}\n", .{
-            VERSION, BUILD_TIME, BUILD_TARGET, BUILD_OPTIMIZE, ZIG_VERSION,
-        });
-        return;
-    }
-
-    // Init Agent Folder
-    const agent_folder_mod = @import("core/agent_folder.zig");
-    var agent_folder_opt: ?agent_folder_mod.AgentFolder = null;
-    if (agent_folder_mod.resolveOrInitAgentFolder(alloc, init.io, init.environ_map)) |folder| {
-        agent_folder_opt = folder;
-        init.environ_map.put("MINI_AGENT_FOLDER", folder.path) catch {};
-        if (std.fs.path.dirname(folder.path)) |ws_root| {
-            init.environ_map.put("MINI_WORKSPACE_ROOT", ws_root) catch {};
-        }
-    } else |err| {
-        stderrPrint("[main] Error finding .agent: {any}\n", .{err});
-    }
+    var agent_folder_opt = setupAgentFolder(alloc, init.io, init.environ_map);
     defer if (agent_folder_opt) |*f| f.deinit();
 
-    if (init.environ_map.get("MINI_WORKSPACE_ROOT") == null) {
-        if (init.environ_map.get("PWD")) |pwd| {
-            init.environ_map.put("MINI_WORKSPACE_ROOT", pwd) catch {};
-        }
-    }
-
-    // Load environment variables from .env and config.json
-    config_mod.loadDotEnv(alloc, init.environ_map, init.io);
-
-    // Load Config
-    var cfg = config_mod.Config.load(alloc, init.environ_map, init.io) catch |e| {
-        stderrPrint("Error loading config: {s}\n", .{@errorName(e)});
-        std.process.exit(1);
-    };
+    var cfg = setupConfig(alloc, init.io, init.environ_map, &args);
     defer cfg.deinit(alloc);
 
-    // Override system prompt from CLI
-    if (args.system_file) |sfile| {
-        const cwd = std.Io.Dir.cwd();
-        const file = cwd.openFile(init.io, sfile, .{}) catch |e| {
-            stderrPrint("Cannot open system file '{s}': {s}\n", .{ sfile, @errorName(e) });
-            std.process.exit(1);
-        };
-        defer file.close(init.io);
-        const stat = try file.stat(init.io);
-        const buf = try alloc.alloc(u8, @intCast(stat.size));
-        const n = try utils.readAll(init.io, file, buf);
-        if (cfg.system_prompt_buf) |old| alloc.free(old);
-        cfg.system_prompt_buf = buf;
-        cfg.system_prompt = buf[0..n];
-    }
-
-    // Override execution mode from CLI
-    if (args.mode) |m| cfg.execution_mode = config_mod.ExecutionMode.fromString(m);
-
-    // Hooks setup
-    if (args.hook_command) |hcmd| cfg.hook_command = hcmd;
-    hooks_mod.setHookCommand(cfg.hook_command);
-    if (hooks_mod.getHookCommand()) |hcmd| {
-        stderrPrint("[main] Hooks: enabled ({s})\n", .{hcmd});
-    }
-
-    // MCP setup
     var mcp = mcp_mod.McpClientManager.init(alloc);
     defer mcp.deinit();
-    if (!args.no_mcp) {
-        mcp.loadFromConfig(init.environ_map, init.io, args.mcp_config orelse cfg.mcp_config_path);
-        tools_mod.setMcpManager(&mcp);
-        if (mcp.toolCount() > 0) {
-            stderrPrint("[main] MCP: {d} tools from {d} server(s)\n", .{ mcp.toolCount(), mcp.servers.items.len });
-        }
-    }
+    setupMcp(init.io, init.environ_map, &args, &cfg, &mcp);
 
-    // Initialize AgentLoop
     var agent = agent_mod.AgentLoop.init(alloc, init.io, &cfg) catch |e| {
         stderrPrint("Error initializing agent: {s}\n", .{@errorName(e)});
         std.process.exit(1);
     };
     defer agent.deinit();
-
-    // Override backend from CLI
     if (args.backend) |b| agent.switchBackend(b, null);
 
-    // Install cronjob
-    if (args.cron) |cron_expr| {
-        if (args.prompt == null) {
-            stderrPrint("Error: --install-cron requires -e <prompt>\n", .{});
-            std.process.exit(1);
-        }
+    if (try handleCronInstallation(alloc, init.io, &args, args_raw[0])) return;
 
-        const exe_path = try getAbsoluteExePath(alloc, init.io, args_raw[0]);
-        defer alloc.free(exe_path);
-
-        cron_mod.installCronjob(alloc, init.io, cron_expr, exe_path, args.prompt.?) catch |e| {
-            if (e == error.AlreadyExists) {
-                stdoutPrint("This cronjob already exists on the system!\n", .{});
-            } else {
-                stderrPrint("Error installing cronjob: {s}\n", .{@errorName(e)});
-                std.process.exit(1);
-            }
-            return;
-        };
-        stdoutPrint("Cronjob installed successfully: {s}\n", .{cron_expr});
-        return;
-    }
-
-    // Session setup & restore
-    const session_id_arg = args.session orelse cfg.session_id;
-    const session_file_arg = args.session_file orelse cfg.session_file;
-    artifacts_mod.setSessionId(session_id_arg);
-    const session_path = try resolveSessionPath(alloc, init.io, init.environ_map, session_id_arg, session_file_arg);
+    const session_path = try setupSession(alloc, init.io, init.environ_map, &agent, &args, &cfg);
     defer if (session_path) |p| alloc.free(p);
+    defer if (session_path) |spath| agent.history.backupToFile(init.io, spath) catch |e| {
+        stderrPrint("[main] Warning: Unable to save session file: {s}\n", .{@errorName(e)});
+    };
 
-    if (session_path) |spath| {
-        stderrPrint("[main] Session: {s}\n", .{spath});
-        const cwd = std.Io.Dir.cwd();
-        if (cwd.openFile(init.io, spath, .{})) |f| {
-            f.close(init.io);
-            agent.history.restoreFromFile(init.io, spath) catch |e| {
-                stderrPrint("[main] Warning: Error loading session file '{s}': {s}, creating new session.\n", .{ spath, @errorName(e) });
-            };
-        } else |_| {}
-    }
-
-    // Automatically save session on exit
-    defer {
-        if (session_path) |spath| {
-            agent.history.backupToFile(init.io, spath) catch |e| {
-                stderrPrint("[main] Warning: Unable to save session file: {s}\n", .{@errorName(e)});
-            };
-        }
-    }
-
-    // 1. ACP Server Mode (Agent Client Protocol over stdin/stdout)
-    if (args.acp) {
-        try acp_mod.runServer(alloc, init.io, &agent, &cfg);
-        return;
-    }
-
-    // 2. Single-shot prompt mode
-    if (args.prompt) |prompt| {
-        const expanded = try artifacts_mod.expandArtifactReferences(alloc, init.io, prompt);
-        defer alloc.free(expanded);
-
-        const media_res = if (agent.config.image_input_enabled)
-            media_lib.parsePromptImages(alloc, init.io, expanded, .{
-                .max_per_turn = agent.config.image_input_max_per_turn,
-                .max_bytes = agent.config.image_input_max_bytes,
-            }) catch |err| {
-                stderrPrint("Failed to process image attachment: {s}\n", .{@errorName(err)});
-                std.process.exit(1);
-            }
-        else
-            media_lib.PromptParseResult{ .clean_text = try alloc.dupe(u8, expanded), .images = try alloc.alloc(protocol_mod.ImageBlock, 0) };
-        defer media_res.deinit(alloc);
-
-        var renderer = ui_repl.chat_stream.TurnRenderer.init(alloc, init.io);
-        renderer.parser.thinking_tags = backends.provider_mod.getProfile(cfg.openai_provider).thinking_tags;
-        defer renderer.deinit();
-        ui_repl.current_renderer = &renderer;
-        defer ui_repl.current_renderer = null;
-
-        renderer.startTurn(media_res.clean_text);
-        const start_ms = utils.milliTimestamp();
-
-        try agent.processInputWithImages(media_res.clean_text, media_res.images, ui_repl.printText, ui_repl.printThinkText);
-
-        if (signals_mod.isInterrupted()) {
-            std.process.exit(130);
-        }
-
-        const end_ms = utils.milliTimestamp();
-        const duration = if (end_ms >= start_ms) @as(u64, @intCast(end_ms - start_ms)) else 0;
-        const ctx_tokens = agent.token_estimator.estimateMessages(agent.history.messages());
-
-        renderer.finishTurn(.{
-            .prompt_tokens = agent.token_estimator.estimate(media_res.clean_text),
-            .completion_tokens = agent.last_turn_completion_tokens,
-            .context_tokens = ctx_tokens,
-            .max_context_tokens = agent.config.context_window,
-            .duration_ms = duration,
-            .acts_count = if (agent.last_turn_acts > 0) agent.last_turn_acts else 1,
-        });
-        return;
-    }
-
-    // 3. Single-shot prompt from file
-    if (args.single) |prompt_file| {
-        const cwd = std.Io.Dir.cwd();
-        const file = cwd.openFile(init.io, prompt_file, .{}) catch |e| {
-            stderrPrint("Cannot open prompt file '{s}': {s}\n", .{ prompt_file, @errorName(e) });
-            std.process.exit(1);
-        };
-        defer file.close(init.io);
-        const stat = try file.stat(init.io);
-        const file_buf = try alloc.alloc(u8, @intCast(stat.size));
-        defer alloc.free(file_buf);
-        const n = try utils.readAll(init.io, file, file_buf);
-        const file_prompt = std.mem.trim(u8, file_buf[0..n], " \t\r\n");
-        const expanded = try artifacts_mod.expandArtifactReferences(alloc, init.io, file_prompt);
-        defer alloc.free(expanded);
-
-        const media_res = if (agent.config.image_input_enabled)
-            media_lib.parsePromptImages(alloc, init.io, expanded, .{
-                .max_per_turn = agent.config.image_input_max_per_turn,
-                .max_bytes = agent.config.image_input_max_bytes,
-            }) catch |err| {
-                stderrPrint("Failed to process image attachment: {s}\n", .{@errorName(err)});
-                std.process.exit(1);
-            }
-        else
-            media_lib.PromptParseResult{ .clean_text = try alloc.dupe(u8, expanded), .images = try alloc.alloc(protocol_mod.ImageBlock, 0) };
-        defer media_res.deinit(alloc);
-
-        var renderer = ui_repl.chat_stream.TurnRenderer.init(alloc, init.io);
-        renderer.parser.thinking_tags = backends.provider_mod.getProfile(cfg.openai_provider).thinking_tags;
-        defer renderer.deinit();
-        ui_repl.current_renderer = &renderer;
-        defer ui_repl.current_renderer = null;
-
-        renderer.startTurn(media_res.clean_text);
-        const start_ms = utils.milliTimestamp();
-
-        try agent.processInputWithImages(media_res.clean_text, media_res.images, ui_repl.printText, ui_repl.printThinkText);
-
-        if (signals_mod.isInterrupted()) {
-            std.process.exit(130);
-        }
-
-        const end_ms = utils.milliTimestamp();
-        const duration = if (end_ms >= start_ms) @as(u64, @intCast(end_ms - start_ms)) else 0;
-        const ctx_tokens = agent.token_estimator.estimateMessages(agent.history.messages());
-
-        renderer.finishTurn(.{
-            .prompt_tokens = agent.token_estimator.estimate(media_res.clean_text),
-            .completion_tokens = agent.last_turn_completion_tokens,
-            .context_tokens = ctx_tokens,
-            .max_context_tokens = agent.config.context_window,
-            .duration_ms = duration,
-            .acts_count = if (agent.last_turn_acts > 0) agent.last_turn_acts else 1,
-        });
-        return;
-    }
-
-    // 4. Interactive REPL mode
-    try ui_repl.runRepl(alloc, init.io, &agent, VERSION);
+    try dispatchExecution(alloc, init.io, &agent, &cfg, &args);
 }
 
 // ---------------------------------------------------------------------------

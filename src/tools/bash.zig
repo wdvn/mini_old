@@ -101,7 +101,8 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     // Safety check
     for (&BLOCKED_PATTERNS) |pattern| {
         if (std.mem.indexOf(u8, command, pattern) != null) {
-            return std.fmt.allocPrint(alloc,
+            return std.fmt.allocPrint(
+                alloc,
                 "BLOCKED: Command blocked by safety policy.\nCommand: {s}\nPattern: {s}",
                 .{ command, pattern },
             );

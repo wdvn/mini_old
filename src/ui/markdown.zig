@@ -246,11 +246,11 @@ pub const StreamHighlighter = struct {
 
 /// Common code keywords to highlight in magenta/cyan
 const KEYWORDS = [_][]const u8{
-    "fn",       "pub",      "const",   "var",      "return",  "if",       "else",     "while",
-    "for",      "switch",   "struct",  "enum",     "union",   "try",      "catch",    "defer",
-    "errdefer", "import",   "export",  "async",    "await",   "function", "let",      "class",
-    "def",      "import",   "from",    "as",       "true",    "false",    "null",     "nil",
-    "undefined", "break",   "continue","interface","package", "type",
+    "fn",        "pub",    "const",    "var",       "return",  "if",       "else",  "while",
+    "for",       "switch", "struct",   "enum",      "union",   "try",      "catch", "defer",
+    "errdefer",  "import", "export",   "async",     "await",   "function", "let",   "class",
+    "def",       "import", "from",     "as",        "true",    "false",    "null",  "nil",
+    "undefined", "break",  "continue", "interface", "package", "type",
 };
 
 fn scanAndPrintCodeToken(text: []const u8) ?usize {

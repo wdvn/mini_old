@@ -41,7 +41,7 @@ pub fn findString(json: []const u8, key: []const u8) ?[]const u8 {
 
     // Skip whitespace after colon
     while (val_start < json.len and (json[val_start] == ' ' or json[val_start] == '\t' or json[val_start] == '\n')) : (val_start += 1) {}
-    
+
     // Must start with double quote
     if (val_start >= json.len or json[val_start] != '"') return null;
     val_start += 1;
@@ -93,7 +93,10 @@ pub fn findObject(json: []const u8, key: []const u8) ?[]const u8 {
             '"' => {
                 i += 1;
                 while (i < json.len) : (i += 1) {
-                    if (json[i] == '\\') { i += 1; continue; }
+                    if (json[i] == '\\') {
+                        i += 1;
+                        continue;
+                    }
                     if (json[i] == '"') break;
                 }
             },
@@ -128,7 +131,10 @@ pub fn findArray(json: []const u8, key: []const u8) ?[]const u8 {
             '"' => {
                 i += 1;
                 while (i < json.len) : (i += 1) {
-                    if (json[i] == '\\') { i += 1; continue; }
+                    if (json[i] == '\\') {
+                        i += 1;
+                        continue;
+                    }
                     if (json[i] == '"') break;
                 }
             },
@@ -226,7 +232,6 @@ test "Claude partial_json accumulated → unescape → findStringOwned works" {
     defer alloc.free(cmd);
     try std.testing.expectEqualStrings("ls", cmd);
 }
-
 
 // ---------------------------------------------------------------------------
 // Building helpers
@@ -397,7 +402,7 @@ pub fn escape(alloc: Allocator, s: []const u8) ![]u8 {
 fn appendEscaped(alloc: Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
     for (s) |c| {
         switch (c) {
-            '"'  => try buf.appendSlice(alloc, "\\\""),
+            '"' => try buf.appendSlice(alloc, "\\\""),
             '\\' => try buf.appendSlice(alloc, "\\\\"),
             '\n' => try buf.appendSlice(alloc, "\\n"),
             '\r' => try buf.appendSlice(alloc, "\\r"),
@@ -617,4 +622,3 @@ test "prettyPrint formats JSON object and array correctly" {
     ;
     try std.testing.expectEqualStrings(expected, formatted);
 }
-

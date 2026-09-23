@@ -155,7 +155,8 @@ pub fn generateImageTool(alloc: Allocator, io: std.Io, input_json: []const u8) !
         try alloc.dupe(u8, "");
     defer alloc.free(dims_str);
 
-    return std.fmt.allocPrint(alloc,
+    return std.fmt.allocPrint(
+        alloc,
         "Generated image: {s} ({s}{s}, {d} bytes)",
         .{ result.path, result.media_type, dims_str, result.bytes },
     );
@@ -381,7 +382,8 @@ pub fn generateVideoTool(alloc: Allocator, io: std.Io, input_json: []const u8) !
         return std.fmt.allocPrint(alloc, "Error: {s}", .{result.message});
     }
 
-    return std.fmt.allocPrint(alloc,
+    return std.fmt.allocPrint(
+        alloc,
         "Generated video: {s} ({s}, {d} bytes)",
         .{ result.path, result.media_type, result.bytes },
     );
@@ -642,7 +644,8 @@ pub fn attachImageTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]
         return std.fmt.allocPrint(alloc, "Error: {s}", .{res.message});
     }
 
-    return std.fmt.allocPrint(alloc,
+    return std.fmt.allocPrint(
+        alloc,
         "Attached image: {s} ({s}, {d} bytes)",
         .{ res.path, res.media_type, res.bytes },
     );

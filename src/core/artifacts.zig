@@ -296,5 +296,3 @@ test "artifacts write, read and reference expansion" {
     try std.testing.expect(std.mem.indexOf(u8, expanded, "--- [Artifact: test_plan.md] ---") != null);
     try std.testing.expect(std.mem.indexOf(u8, expanded, "Test artifact content") != null);
 }
-
-

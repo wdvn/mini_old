@@ -43,7 +43,8 @@ pub fn writeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         .artifact_title = title orelse name,
     });
 
-    return std.fmt.allocPrint(alloc,
+    return std.fmt.allocPrint(
+        alloc,
         "Successfully saved artifact at: [{s}](file://{s})\nSession: {s} | Type: {s}",
         .{ name, path, artifacts.getSessionId(), art_type },
     );

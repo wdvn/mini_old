@@ -24,25 +24,29 @@ var g_hook_listener: ?HookListener = null;
 
 /// Set global hook command.
 pub fn setHookCommand(cmd: ?[]const u8) void {
-    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
+    while (!g_hooks_mutex.tryLock()) {}
+    defer g_hooks_mutex.unlock();
     g_hook_cmd = cmd;
 }
 
 /// Get current hook command.
 pub fn getHookCommand() ?[]const u8 {
-    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
+    while (!g_hooks_mutex.tryLock()) {}
+    defer g_hooks_mutex.unlock();
     return g_hook_cmd;
 }
 
 /// Set in-memory hook listener.
 pub fn setHookListener(listener: ?HookListener) void {
-    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
+    while (!g_hooks_mutex.tryLock()) {}
+    defer g_hooks_mutex.unlock();
     g_hook_listener = listener;
 }
 
 /// Get current in-memory hook listener.
 pub fn getHookListener() ?HookListener {
-    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
+    while (!g_hooks_mutex.tryLock()) {}
+    defer g_hooks_mutex.unlock();
     return g_hook_listener;
 }
 
@@ -52,13 +56,15 @@ var g_tool_listener: ?ToolListener = null;
 
 /// Set in-memory tool lifecycle listener.
 pub fn setToolListener(listener: ?ToolListener) void {
-    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
+    while (!g_hooks_mutex.tryLock()) {}
+    defer g_hooks_mutex.unlock();
     g_tool_listener = listener;
 }
 
 /// Get current in-memory tool lifecycle listener.
 pub fn getToolListener() ?ToolListener {
-    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
+    while (!g_hooks_mutex.tryLock()) {}
+    defer g_hooks_mutex.unlock();
     return g_tool_listener;
 }
 
@@ -68,13 +74,15 @@ var g_output_listener: ?OutputListener = null;
 
 /// Set in-memory execution output chunk listener.
 pub fn setOutputListener(listener: ?OutputListener) void {
-    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
+    while (!g_hooks_mutex.tryLock()) {}
+    defer g_hooks_mutex.unlock();
     g_output_listener = listener;
 }
 
 /// Get current in-memory execution output chunk listener.
 pub fn getOutputListener() ?OutputListener {
-    while (!g_hooks_mutex.tryLock()) {} defer g_hooks_mutex.unlock();
+    while (!g_hooks_mutex.tryLock()) {}
+    defer g_hooks_mutex.unlock();
     return g_output_listener;
 }
 

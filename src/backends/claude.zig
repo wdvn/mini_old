@@ -166,7 +166,6 @@ pub const Client = struct {
 // Request building
 // ---------------------------------------------------------------------------
 
-
 fn appendClaudeContentBlock(w: *utils.BufWriter, alloc: Allocator, block: proto.ContentBlock) !void {
     switch (block) {
         .text => |t| {
@@ -372,7 +371,9 @@ const StreamCtx = struct {
             if (json.findString(data, "partial_json")) |pj| {
                 try self.args_accum.appendSlice(self.alloc, pj);
                 hooks.dispatch(self.alloc, main.g_io, .{
-                    .event = "content_block_delta", .block_type = "tool_use", .delta_text = pj,
+                    .event = "content_block_delta",
+                    .block_type = "tool_use",
+                    .delta_text = pj,
                 });
             }
             return;
@@ -385,7 +386,9 @@ const StreamCtx = struct {
                     try self.think_accum.appendSlice(self.alloc, unescaped);
                     if (self.think_cb) |cb| cb(unescaped);
                     hooks.dispatch(self.alloc, main.g_io, .{
-                        .event = "content_block_delta", .block_type = "thinking", .delta_text = unescaped,
+                        .event = "content_block_delta",
+                        .block_type = "thinking",
+                        .delta_text = unescaped,
                     });
                 }
             }
@@ -398,7 +401,9 @@ const StreamCtx = struct {
                 try self.text_accum.appendSlice(self.alloc, unescaped);
                 if (self.text_cb) |cb| cb(unescaped);
                 hooks.dispatch(self.alloc, main.g_io, .{
-                    .event = "content_block_delta", .block_type = "text", .delta_text = unescaped,
+                    .event = "content_block_delta",
+                    .block_type = "text",
+                    .delta_text = unescaped,
                 });
             }
         }
@@ -414,15 +419,18 @@ const StreamCtx = struct {
             else
                 try self.alloc.dupe(u8, "{}");
             try self.response.content.append(self.alloc, .{ .tool_use = .{
-                .id = id, .name = name, .input_json = args,
-            }});
+                .id = id,
+                .name = name,
+                .input_json = args,
+            } });
             self.in_tool_block = false;
         } else if (self.in_think_block) {
             const think_text = try self.alloc.dupe(u8, self.think_accum.items);
             const sig = try self.alloc.dupe(u8, self.current_think_sig[0..self.current_think_sig_len]);
             try self.response.content.append(self.alloc, .{ .thinking = .{
-                .thinking = think_text, .signature = sig,
-            }});
+                .thinking = think_text,
+                .signature = sig,
+            } });
             self.in_think_block = false;
             self.think_accum.clearRetainingCapacity();
         } else if (self.text_accum.items.len > 0) {
@@ -436,7 +444,8 @@ const StreamCtx = struct {
         if (json.findString(data, "stop_reason")) |reason| {
             self.response.stop_reason = parseStopReason(reason);
             hooks.dispatch(self.alloc, main.g_io, .{
-                .event = "message_delta", .stop_reason = reason,
+                .event = "message_delta",
+                .stop_reason = reason,
             });
         }
     }

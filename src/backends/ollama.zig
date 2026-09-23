@@ -273,7 +273,7 @@ const StreamCtx = struct {
                         .id = id,
                         .name = try self.alloc.dupe(u8, name),
                         .input_json = try self.alloc.dupe(u8, args),
-                    }});
+                    } });
                     self.response.stop_reason = .tool_use;
                 }
             }

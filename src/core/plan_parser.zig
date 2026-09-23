@@ -359,7 +359,6 @@ pub fn parsePlanMarkdown(text: []const u8, alloc: Allocator) !?Plan {
     return plan;
 }
 
-
 // ---------------------------------------------------------------------------
 // Main Entry Point
 // ---------------------------------------------------------------------------
@@ -560,4 +559,3 @@ test "parsePlanMarkdown - Step N prefix and bracketed metadata" {
     try std.testing.expectEqual(1, plan_opt.?.steps.items[1].dependencies.len);
     try std.testing.expectEqual(@as(u64, 1), plan_opt.?.steps.items[1].dependencies[0]);
 }
-
