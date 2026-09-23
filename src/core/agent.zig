@@ -515,8 +515,8 @@ pub const AgentLoop = struct {
     pub const deinitTurnToolRecords = agent_loop_monitor.deinitTurnToolRecords;
     pub const clearToolCache = agent_loop_monitor.clearToolCache;
     pub const fuzzyArgsHash = agent_loop_monitor.fuzzyArgsHash;
-    const lookupToolCache = agent_loop_monitor.lookupToolCache;
-    const storeToolCache = agent_loop_monitor.storeToolCache;
+    pub const lookupToolCache = agent_loop_monitor.lookupToolCache;
+    pub const storeToolCache = agent_loop_monitor.storeToolCache;
     pub const hasRecentVerifiedMutation = agent_loop_monitor.hasRecentVerifiedMutation;
 
     pub fn detectPlanInText(text: []const u8) ?[]const u8 {
@@ -1582,6 +1582,12 @@ pub const AgentLoop = struct {
 
     /// Executes all tool_use blocks in response.
     /// Returns execution summary for act debug logging.
+    /// Same-response dedupe entry: tool name + whitespace-insensitive args hash.
+    const SeenToolCall = struct {
+        name: []u8,
+        args_hash: u64,
+    };
+
     pub fn executeTools(self: *AgentLoop, act_id: usize, response: *const proto.Response) !ToolExecSummary {
         // PSEUDOCODE: Iterate blocks, dispatch tool uses, record results to history
         var any_tool_err = false;
@@ -1596,10 +1602,44 @@ pub const AgentLoop = struct {
         var total_dur_ms: u64 = 0;
         var tool_count: usize = 0;
 
+        // Same-response duplicate guard: identical tool name + args appearing
+        // multiple times in ONE assistant response is almost always a model
+        // emission glitch; execute the first occurrence and serve a duplicate
+        // note for the rest instead of re-running the tool.
+        var seen_calls = ArrayList(SeenToolCall).empty;
+        defer {
+            for (seen_calls.items) |sc| self.alloc.free(sc.name);
+            seen_calls.deinit(self.alloc);
+        }
+
         for (response.content.items) |block| {
             if (signals.isInterrupted()) return error.Interrupted;
             switch (block) {
                 .tool_use => |tu| {
+                    // PSEUDOCODE: 1. Hash name+args 2. If seen in this response, serve dup note 3. Else record and execute
+                    const args_hash = agent_loop_monitor.fuzzyArgsHash(tu.input_json);
+                    var is_dup = false;
+                    for (seen_calls.items) |sc| {
+                        if (sc.args_hash == args_hash and std.mem.eql(u8, sc.name, tu.name)) {
+                            is_dup = true;
+                            break;
+                        }
+                    }
+                    if (is_dup) {
+                        const note = try std.fmt.allocPrint(
+                            self.alloc,
+                            "[duplicate: identical call already executed in this response — result above]",
+                            .{},
+                        );
+                        try allocated_strings.append(self.alloc, note);
+                        try results.append(self.alloc, .{ .tool_use_id = tu.id, .content = note, .is_error = false });
+                        tool_count += 1;
+                        continue;
+                    }
+                    try seen_calls.append(self.alloc, .{
+                        .name = try self.alloc.dupe(u8, tu.name),
+                        .args_hash = args_hash,
+                    });
                     const outcome = try self.dispatchSingleToolUse(act_id, tu, &results, &allocated_strings, &any_tool_err);
                     total_dur_ms += outcome.dur_ms;
                     if (outcome.should_break) break;

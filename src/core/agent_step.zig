@@ -21,6 +21,7 @@ const agent_parsing = @import("agent_parsing.zig");
 const agent_mod = @import("agent.zig");
 const AgentLoop = agent_mod.AgentLoop;
 const prompts_mod = @import("prompts.zig");
+const agent_loop_monitor = @import("agent_loop_monitor.zig");
 
 pub const StepResult = enum {
     continue_loop,
@@ -341,6 +342,28 @@ pub fn executeCodeActBlock(
         return handleCodeActLoopTrip(loop, act_id);
     }
 
+    // PSEUDOCODE: On .warn (identical script repeated this turn), serve cached
+    // output instead of re-running the script a second time.
+    if (js_loop_check == .warn) {
+        const cache_hash = agent_loop_monitor.fuzzyArgsHash(js_code);
+        if (loop.lookupToolCache("codeact", cache_hash)) |cached| {
+            if (main.ui_repl.current_renderer) |r| {
+                r.startTool("codeact", "{}");
+                r.finishTool("codeact", cached, false, 0, null, null);
+            } else {
+                main.stderrPrint("\x1b[33m[duplicate codeact: serving cached result]\x1b[0m\n", .{});
+            }
+            const note = try std.fmt.allocPrint(
+                loop.alloc,
+                "[duplicate: identical CodeAct script already executed this turn — cached output below]\n{s}",
+                .{cached},
+            );
+            defer loop.alloc.free(note);
+            try loop.history.addUser(note);
+            return .continue_loop;
+        }
+    }
+
     notifyCodeActExecution(loop, js_code);
     const start_codeact_ms: u64 = @as(u64, @intCast(utils.milliTimestamp()));
 
@@ -368,6 +391,9 @@ pub fn executeCodeActBlock(
     if (signals.isInterrupted()) return error.Interrupted;
 
     if (!res.is_error) {
+        // Cache output so an identical script replayed this turn can be served
+        // from cache instead of re-executed (see .warn handling above).
+        loop.storeToolCache("codeact", agent_loop_monitor.fuzzyArgsHash(js_code), if (res.return_value_json) |ret| ret else res.stdout) catch {};
         return handleCodeActSuccess(loop, res, dur_ms);
     } else {
         return handleCodeActScriptError(loop, res, dur_ms);
