@@ -1,3 +1,8 @@
+//! cron.zig — Cron job installation and management for mini-agent.
+//!
+//! Provides utilities to install scheduled cron entries executing mini in
+//! non-interactive single-shot mode (-e) via system crontab.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 pub fn installCronjob(alloc: Allocator, io: std.Io, cron_expr: []const u8, exe_path: []const u8, prompt: []const u8) !void {

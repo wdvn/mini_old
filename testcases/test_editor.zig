@@ -1,8 +1,10 @@
+//! test_editor.zig — Standalone test for terminal raw mode attributes.
+
 const std = @import("std");
 
 pub fn main() !void {
     const fd = std.posix.STDIN_FILENO;
-    var termios = try std.posix.tcgetattr(fd);
+    const termios = try std.posix.tcgetattr(fd);
     
     var raw = termios;
     raw.lflag.ICANON = false;

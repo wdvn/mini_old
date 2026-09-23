@@ -1,6 +1,9 @@
+//! test_rfc000_validation.zig — Unit tests for Unicode grapheme clustering and prompt history.
+
 const std = @import("std");
-const unicode = @import("src/ui/unicode.zig");
-const history = @import("src/ui/history.zig");
+const mini = @import("mini");
+const unicode = mini.ui_unicode;
+const history = mini.ui_history;
 
 test "unicode: grapheme count VN decomposed" {
     const s = "t\u{0065}\u{0302}\u{0301}t"; // t e + circumflex + acute t

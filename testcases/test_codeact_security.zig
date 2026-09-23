@@ -36,6 +36,9 @@ test {
     _ = @import("test_plan_monitor.zig");
     _ = @import("test_plan_store.zig");
     _ = @import("test_plan_integration.zig");
+    _ = @import("test_parse.zig");
+    _ = @import("test_parse2.zig");
+    _ = @import("test_rfc000_validation.zig");
 }
 
 // ---------------------------------------------------------------------------

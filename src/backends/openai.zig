@@ -1266,13 +1266,13 @@ test "js_provider: client loads configured adapter and transforms outgoing body"
     try testing.expectEqualStrings("{\"model\":\"adapted\"}", body);
 }
 
-// --- Tests: streaming tool_calls gop theo index (DeepSeek style) ---
+// --- Tests: streaming tool_calls merged by index (DeepSeek style) ---
 
 fn feedLines(ctx: anytype, lines: []const []const u8) !void {
     for (lines) |ln| try ctx.processLine(ln);
 }
 
-test "openai stream: parallel tool calls gop theo index (DeepSeek style)" {
+test "openai stream: parallel tool calls merged by index (DeepSeek style)" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
         .alloc = alloc,

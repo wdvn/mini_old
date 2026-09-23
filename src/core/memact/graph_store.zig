@@ -342,7 +342,7 @@ pub const PGraphStore = struct {
         orbit_nodes: []const []const u8,
     };
 
-    /// Detects whether the trajectory exhibits signs of orbiting ("quay vòng") in 3D procedural space.
+    /// Detects whether the trajectory exhibits signs of orbiting in 3D procedural space.
     /// An orbit is a repeating closed cycle of length P in [2, 5] with zero code mutation (ΔZ = 0).
     pub fn detectTrajectoryOrbit(trajectory: []const []const u8, current_tool: ?[]const u8) ?OrbitInfo {
         if (trajectory.len < 2) return null;
@@ -461,7 +461,7 @@ pub const PGraphStore = struct {
     }
 
     /// Extract h-hop neighborhood subgraph guidance formatted as markdown (RFC-010 PG-3).
-    /// If an orbit is detected in 3D procedural space ("dấu hiệu quay vòng"), produces a
+    /// If an orbit is detected in 3D procedural space, produces a
     /// Checkpoint & Recap block instead of cyclic forward step suggestions.
     /// `user_request` is the original task prompt — injected to keep the model anchored
     /// to its goal rather than drifting into generic exploration.
@@ -477,7 +477,7 @@ pub const PGraphStore = struct {
         const act_str = last_action orelse return null;
         const start_node_id = self.matchNode(act_str) orelse return null;
 
-        // Check for 3D trajectory orbit (signs of "quay vòng" in procedural space)
+        // Check for 3D trajectory orbit in procedural space
         if (detectTrajectoryOrbit(recent_actions, act_str)) |orbit| {
             var bw = utils.BufWriter.init(alloc);
             errdefer bw.deinit();

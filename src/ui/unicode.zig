@@ -39,7 +39,7 @@ fn isCombining(cp: u21) bool {
         0x0730...0x074A,
         0x07A6...0x07B0,
         0x0900...0x0903,
-        0x093A...0x094F, // включает े ् cho Devanagari
+        0x093A...0x094F, // Includes Devanagari signs and virama (0x093A...0x094F)
         0x0951...0x0957,
         0x0E31,
         0x0E34...0x0E3A, // Thai vowels
@@ -52,7 +52,7 @@ fn isCombining(cp: u21) bool {
         0x101FD,
         0x1D167...0x1D169,
         0x1D17B...0x1D182,
-        0x1F3FB...0x1F3FF, // Emoji skin tone modifiers — zero-width theo UAX #11
+        0x1F3FB...0x1F3FF, // Emoji skin tone modifiers — zero-width per UAX #11
         0xE0100...0xE01EF, => true, // Variation Selectors Supplement
         else => false,
     };

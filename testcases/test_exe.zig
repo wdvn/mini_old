@@ -1,9 +1,11 @@
+//! test_exe.zig — Standalone test for executable self-path resolution via /proc/self/exe.
+
 const std = @import("std");
+
 pub fn main() !void {
-    const alloc = std.heap.page_allocator;
-    const cwd = std.Io.Dir.cwd();
-    // readlink is usually in posix
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.posix.readlink("/proc/self/exe", &buf);
-    std.debug.print("path: {s}\n", .{path});
+    const len = std.os.linux.readlink("/proc/self/exe", &buf, buf.len);
+    if (len > 0 and len <= buf.len) {
+        std.debug.print("path: {s}\n", .{buf[0..len]});
+    }
 }

@@ -604,7 +604,7 @@ pub fn downloadToFile(
 }
 
 // ---------------------------------------------------------------------------
-// postStream — streaming cho SSE / NDJSON (backends AI)
+// postStream — streaming for SSE / NDJSON (AI backends)
 // ---------------------------------------------------------------------------
 
 /// Callback receiving each data chunk from HTTP response (streaming).

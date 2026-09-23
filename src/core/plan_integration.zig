@@ -234,7 +234,9 @@ pub const PlanState = struct {
         self.loop_plan_retries = 0;
         self.plan_execution_pending = false;
         self.plan_watchdog_retries = 0;
-        self.clearPlan();
+        if (self.current_plan == null) {
+            self.clearPlan();
+        }
         self.clearProgress();
     }
 
@@ -271,6 +273,9 @@ pub const PlanState = struct {
     /// Try to restore a plan from the persistent PlanStore for the given user request.
     pub fn tryRestoreFromStore(self: *PlanState, user_text: []const u8) void {
         if (self.enable_structured_planning and self.plan_store != null) {
+            // Do not override an active plan currently in memory
+            if (self.current_plan != null) return;
+
             const req_hash = std.hash.Fnv1a_64.hash(user_text);
             if (self.plan_store.?.restore(req_hash) catch null) |plan| {
                 self.setStructuredPlan(plan);

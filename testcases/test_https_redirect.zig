@@ -2,7 +2,8 @@
 //! panic "attempt to use null value" (arxiv 301 http->https). Run: zig run test_https_redirect.zig
 
 const std = @import("std");
-const http_lib = @import("src/lib/http_request.zig");
+const mini = @import("mini");
+const http_lib = mini.http_request;
 
 pub fn main(init: std.process.Init) !void {
     var gpa = std.heap.DebugAllocator(.{}){};
