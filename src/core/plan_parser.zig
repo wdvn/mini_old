@@ -30,7 +30,56 @@ const registry = @import("../tooling/registry.zig");
 ///     {"id": 2, "description": "Write code", "dependencies": [1], "tool_hint": "file_edit"}
 ///   ]
 /// }
+fn parseJsonStep(alloc: Allocator, step_val: std.json.Value, fallback_id: u64) !?PlanStep {
+    // PSEUDOCODE: Extract step fields (id, description, dependencies, tool_hint, status) from JSON object.
+    const step_obj = switch (step_val) {
+        .object => |o| o,
+        else => return null,
+    };
+
+    const desc_val = step_obj.get("description") orelse return null;
+    const desc = jsonStr(desc_val);
+    if (desc.len == 0) return null;
+
+    var deps_list = std.ArrayListUnmanaged(u64).empty;
+    defer deps_list.deinit(alloc);
+    if (step_obj.get("dependencies")) |dv| {
+        if (dv == .array) {
+            for (dv.array.items) |dep_val| {
+                if (dep_val == .integer and dep_val.integer >= 0) {
+                    try deps_list.append(alloc, @as(u64, @intCast(dep_val.integer)));
+                }
+            }
+        }
+    }
+
+    const tool_hint: ?[]const u8 = if (step_obj.get("tool_hint")) |th| switch (th) {
+        .string => |s| s,
+        else => null,
+    } else null;
+
+    const step_id: u64 = if (step_obj.get("id")) |sid| switch (sid) {
+        .integer => |i| @as(u64, @intCast(if (i >= 0) i else 1)),
+        else => fallback_id,
+    } else fallback_id;
+
+    var step = try PlanStep.initWithId(alloc, step_id, desc, deps_list.items, tool_hint);
+    errdefer step.deinit(alloc);
+
+    if (step_obj.get("status")) |st_val| {
+        if (st_val == .string) {
+            step.status = plan_mod.parseStepStatus(st_val.string);
+        }
+    }
+    return step;
+}
+
 pub fn parsePlanJson(text: []const u8, alloc: Allocator) !Plan {
+    // PSEUDOCODE:
+    // 1. Extract JSON block or use raw text.
+    // 2. Parse JSON tree and extract task description.
+    // 3. Initialize Plan and parse steps array via parseJsonStep.
+    // 4. Validate non-empty plan.
     const json_text = extractJsonBlock(text) orelse text;
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_text, .{});
@@ -41,67 +90,23 @@ pub fn parsePlanJson(text: []const u8, alloc: Allocator) !Plan {
         else => return error.InvalidPlanFormat,
     };
 
-    // Extract task description
     const task_val = obj.get("task") orelse obj.get("task_description") orelse return error.MissingTaskField;
     const task = jsonStr(task_val);
     if (task.len == 0) return error.MissingTaskField;
 
-    // Initialize plan
     var plan = try Plan.init(alloc, task, std.hash.Fnv1a_64.hash(task));
     errdefer plan.deinit(alloc);
 
-    // Extract steps array
     const steps_val = obj.get("steps") orelse return error.MissingStepsField;
     const steps_arr = switch (steps_val) {
         .array => |a| a.items,
         else => return error.InvalidStepsFormat,
     };
 
-    // Parse each step
     for (steps_arr) |step_val| {
-        const step_obj = switch (step_val) {
-            .object => |o| o,
-            else => continue,
-        };
-
-        const desc_val = step_obj.get("description") orelse continue;
-        const desc = jsonStr(desc_val);
-        if (desc.len == 0) continue;
-
-        const deps_val = step_obj.get("dependencies");
-        var deps_list = std.ArrayListUnmanaged(u64).empty;
-        defer deps_list.deinit(alloc);
-
-        if (deps_val) |dv| {
-            if (dv == .array) {
-                for (dv.array.items) |dep_val| {
-                    if (dep_val == .integer and dep_val.integer >= 0) {
-                        try deps_list.append(alloc, @as(u64, @intCast(dep_val.integer)));
-                    }
-                }
-            }
+        if (try parseJsonStep(alloc, step_val, @as(u64, @intCast(plan.stepCount() + 1)))) |step| {
+            try plan.addStepOwned(alloc, step);
         }
-
-        const tool_hint: ?[]const u8 = if (step_obj.get("tool_hint")) |th| switch (th) {
-            .string => |s| s,
-            else => null,
-        } else null;
-
-        const step_id: u64 = if (step_obj.get("id")) |sid| switch (sid) {
-            .integer => |i| @as(u64, @intCast(if (i >= 0) i else 1)),
-            else => @as(u64, @intCast(plan.stepCount() + 1)),
-        } else @as(u64, @intCast(plan.stepCount() + 1));
-
-        var step = try PlanStep.initWithId(alloc, step_id, desc, deps_list.items, tool_hint);
-        errdefer step.deinit(alloc);
-
-        if (step_obj.get("status")) |st_val| {
-            if (st_val == .string) {
-                step.status = plan_mod.parseStepStatus(st_val.string);
-            }
-        }
-
-        try plan.addStepOwned(alloc, step);
     }
 
     if (plan.stepCount() == 0) {
@@ -286,20 +291,46 @@ fn parseDependencyIds(token: []const u8, alloc: Allocator, deps_list: *std.Array
     return false;
 }
 
-pub fn parsePlanMarkdown(text: []const u8, alloc: Allocator) !?Plan {
-    var lines = std.mem.splitScalar(u8, text, '\n');
+fn parseMarkdownStep(alloc: Allocator, trimmed: []const u8, step_id: u64, in_plan_section: *bool) !?PlanStep {
+    // PSEUDOCODE: Parse step prefix, dependencies, and metadata from a markdown list line.
+    const res = parseStepPrefix(trimmed, step_id) orelse return null;
+    if (!in_plan_section.* and !res.is_checklist) return null;
 
+    if (res.is_checklist) {
+        in_plan_section.* = true;
+    }
+
+    const raw_desc = std.mem.trim(u8, trimmed[res.desc_start..], " ");
+    if (raw_desc.len == 0) return null;
+
+    var deps_list = std.ArrayListUnmanaged(u64).empty;
+    defer deps_list.deinit(alloc);
+
+    const tool_hint = extractMetadataFromDesc(alloc, raw_desc, &deps_list);
+    var step = try PlanStep.initWithId(alloc, step_id, raw_desc, deps_list.items, tool_hint);
+    errdefer step.deinit(alloc);
+
+    if (res.is_completed) {
+        step.status = .completed;
+    }
+    return step;
+}
+
+pub fn parsePlanMarkdown(text: []const u8, alloc: Allocator) !?Plan {
+    // PSEUDOCODE:
+    // 1. Iterate through lines to locate Plan headings or checklists.
+    // 2. Terminate plan section when non-plan heading is encountered.
+    // 3. Delegate step parsing to parseMarkdownStep.
+    var lines = std.mem.splitScalar(u8, text, '\n');
     var in_plan_section = false;
     var plan = try Plan.init(alloc, "Extracted from Markdown", std.hash.Fnv1a_64.hash(text));
     errdefer plan.deinit(alloc);
 
     var step_id: u64 = 1;
-
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
         if (trimmed.len == 0) continue;
 
-        // Check if line declares a Plan section
         if (extractPlanHeaderTitle(trimmed)) |title| {
             in_plan_section = true;
             if (std.mem.eql(u8, plan.task_description, "Extracted from Markdown") and title.len > 0) {
@@ -309,52 +340,22 @@ pub fn parsePlanMarkdown(text: []const u8, alloc: Allocator) !?Plan {
             continue;
         }
 
-        // Check if we hit a non-plan markdown heading -> ends active plan section
         if (isMarkdownHeading(trimmed)) {
-            if (in_plan_section and plan.stepCount() > 0) {
-                break; // Plan section completed, subsequent headings are separate sections
-            }
+            if (in_plan_section and plan.stepCount() > 0) break;
             in_plan_section = false;
             continue;
         }
 
-        // Parse step prefix
-        const prefix_res = parseStepPrefix(trimmed, step_id);
-        if (prefix_res == null) continue;
-
-        const res = prefix_res.?;
-        // Numbered list items are ONLY parsed if we are inside an explicit Plan section.
-        // Checklists are self-identifying and can start/continue a plan.
-        if (!in_plan_section and !res.is_checklist) continue;
-
-        if (res.is_checklist) {
-            in_plan_section = true;
+        if (try parseMarkdownStep(alloc, trimmed, step_id, &in_plan_section)) |step| {
+            try plan.addStepOwned(alloc, step);
+            step_id += 1;
         }
-
-        const raw_desc = std.mem.trim(u8, trimmed[res.desc_start..], " ");
-        if (raw_desc.len == 0) continue;
-
-        var deps_list = std.ArrayListUnmanaged(u64).empty;
-        defer deps_list.deinit(alloc);
-
-        const tool_hint = extractMetadataFromDesc(alloc, raw_desc, &deps_list);
-
-        var step = try PlanStep.initWithId(alloc, step_id, raw_desc, deps_list.items, tool_hint);
-        errdefer step.deinit(alloc);
-
-        if (res.is_completed) {
-            step.status = .completed;
-        }
-
-        try plan.addStepOwned(alloc, step);
-        step_id += 1;
     }
 
     if (plan.stepCount() == 0) {
         plan.deinit(alloc);
         return null;
     }
-
     return plan;
 }
 

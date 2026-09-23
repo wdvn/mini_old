@@ -146,10 +146,31 @@ pub fn writeFile(alloc: Allocator, io: std.Io, path: []const u8, content: []cons
     return std.fmt.allocPrint(alloc, "Wrote {d} bytes to '{s}'.", .{ content.len, path });
 }
 
+fn spliceReplacement(alloc: Allocator, content: []const u8, first: usize, old_len: usize, new_str: []const u8) ![]u8 {
+    // PSEUDOCODE: Allocate and splice prefix + new_str + suffix.
+    const new_size = content.len - old_len + new_str.len;
+    const result_buf = try alloc.alloc(u8, new_size);
+    @memcpy(result_buf[0..first], content[0..first]);
+    @memcpy(result_buf[first .. first + new_str.len], new_str);
+    @memcpy(result_buf[first + new_str.len ..], content[first + old_len ..]);
+    return result_buf;
+}
+
+fn overwriteFileContent(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    // PSEUDOCODE: Create/truncate file and stream all bytes.
+    const cwd = std.Io.Dir.cwd();
+    const file_w = try cwd.createFile(io, path, .{ .truncate = true });
+    defer file_w.close(io);
+    try file_w.writeStreamingAll(io, bytes);
+}
+
 /// Find unique old_string in file and replace it with new_string.
 /// Returns an error if old_string occurs multiple times.
 pub fn editFile(alloc: Allocator, io: std.Io, path: []const u8, old_str: []const u8, new_str: []const u8) ![]u8 {
-    // Read file
+    // PSEUDOCODE:
+    // 1. Open file and read content under MAX_READ_SIZE limit.
+    // 2. Locate unique match for old_str; return error if missing or duplicate.
+    // 3. Splice new_str and overwrite file.
     const cwd = std.Io.Dir.cwd();
     const file_r = cwd.openFile(io, path, .{}) catch |e| {
         return std.fmt.allocPrint(alloc, "Error opening '{s}': {s}", .{ path, @errorName(e) });
@@ -164,46 +185,21 @@ pub fn editFile(alloc: Allocator, io: std.Io, path: []const u8, old_str: []const
     const n = utils.readAll(io, file_r, buf) catch return std.fmt.allocPrint(alloc, "Error reading file.", .{});
     const content = buf[0..n];
 
-    // Find old_string
     const first = std.mem.indexOf(u8, content, old_str) orelse {
-        return std.fmt.allocPrint(alloc,
-            "Could not find old_string in '{s}'.\nold_string: {s}",
-            .{ path, old_str[0..@min(old_str.len, 100)] },
-        );
+        return std.fmt.allocPrint(alloc, "Could not find old_string in '{s}'.\nold_string: {s}", .{ path, old_str[0..@min(old_str.len, 100)] });
     };
-
-    // Verify no second occurrence
     if (std.mem.indexOf(u8, content[first + 1 ..], old_str) != null) {
-        return std.fmt.allocPrint(alloc,
-            "old_string is not unique in '{s}'. Please provide a more specific string.",
-            .{path},
-        );
+        return std.fmt.allocPrint(alloc, "old_string is not unique in '{s}'. Please provide a more specific string.", .{path});
     }
 
-    // Build result in a new buffer
-    const new_size = content.len - old_str.len + new_str.len;
-    const result_buf = try alloc.alloc(u8, new_size);
-    errdefer alloc.free(result_buf);
+    const result_buf = try spliceReplacement(alloc, content, first, old_str.len, new_str);
+    defer alloc.free(result_buf);
 
-    // Copy: prefix + new_str + suffix
-    @memcpy(result_buf[0..first], content[0..first]);
-    @memcpy(result_buf[first..first + new_str.len], new_str);
-    @memcpy(result_buf[first + new_str.len..], content[first + old_str.len..]);
-
-    // Write back to same file (truncate then write full new content)
-    const file_w = cwd.createFile(io, path, .{ .truncate = true }) catch |e| {
-        return std.fmt.allocPrint(alloc, "Error writing '{s}': {s}", .{ path, @errorName(e) });
-    };
-    defer file_w.close(io);
-    file_w.writeStreamingAll(io, result_buf) catch |e| {
-        alloc.free(result_buf);
+    overwriteFileContent(io, path, result_buf) catch |e| {
         return std.fmt.allocPrint(alloc, "Error writing '{s}': {s}", .{ path, @errorName(e) });
     };
 
-    // Return success message (caller must free)
-    const msg = try std.fmt.allocPrint(alloc, "Modified '{s}': replaced {d} characters with {d} characters.", .{
+    return std.fmt.allocPrint(alloc, "Modified '{s}': replaced {d} characters with {d} characters.", .{
         path, old_str.len, new_str.len,
     });
-    alloc.free(result_buf);
-    return msg;
 }

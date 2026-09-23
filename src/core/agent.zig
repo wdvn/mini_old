@@ -227,8 +227,6 @@ pub const AgentLoop = struct {
     /// Thread 2 Watchdog Monitor
     watchdog: ?*watchdog_mod.Watchdog = null,
 
-
-
     pub const ToolCallRecord = struct {
         name: []u8,
         args_hash: u64,
@@ -268,14 +266,11 @@ pub const AgentLoop = struct {
         UserCancelled,
     };
 
-    /// Initializes AgentLoop from config.
-    /// Selects backend based on config priority order.
-    pub fn init(alloc: Allocator, io: std.Io, config: *const config_mod.Config) !AgentLoop {
-        // Initialize CodeAct engine (Engine.init automatically registers bindings via resetContext)
-        const engine = try quickjs.Engine.init(alloc, io);
-        errdefer engine.deinit();
-
-        // Select backend in priority order
+    /// Initializes backend based on configuration priority order and applies reasoning effort.
+    fn initBackend(alloc: Allocator, config: *const config_mod.Config) Backend {
+        // PSEUDOCODE:
+        // 1. Select backend: OpenAI-compat > Claude > Ollama fallback
+        // 2. Apply reasoning effort and thinking budget if enabled
         var backend: Backend = blk: {
             if (config.openai_compat_url) |url| {
                 if (!utils.isSubagent()) main.stderrPrint("[agent] Backend: OpenAI-compat @ {s} ({s})\n", .{ url, config.openai_compat_model });
@@ -299,29 +294,22 @@ pub const AgentLoop = struct {
             }
             if (config.anthropic_key) |key| {
                 if (!utils.isSubagent()) main.stderrPrint("[agent] Backend: Claude ({s})\n", .{config.claude_model});
-                break :blk .{ .claude = claude_mod.Client.init(
-                    alloc,
-                    key,
-                    config.claude_model,
-                    config.max_tokens,
-                ) };
+                break :blk .{ .claude = claude_mod.Client.init(alloc, key, config.claude_model, config.max_tokens) };
             }
-            // Fallback: Ollama
             if (!utils.isSubagent()) main.stderrPrint("[agent] Backend: Ollama @ {s} ({s})\n", .{ config.ollama_url, config.ollama_model });
-            break :blk .{ .ollama = ollama_mod.Client.init(
-                alloc,
-                config.ollama_url,
-                config.ollama_model,
-                config.max_tokens,
-            ) };
+            break :blk .{ .ollama = ollama_mod.Client.init(alloc, config.ollama_url, config.ollama_model, config.max_tokens) };
         };
 
         if (!config.reasoning_effort_disabled) {
             backend.setReasoningEffort(config.reasoning_effort);
             backend.setThinkingBudget(config.thinking_budget_tokens);
         }
+        return backend;
+    }
 
-        // Configure tool policy & media capability gates
+    /// Configures tool execution policy and media generation subsystem.
+    fn initMediaAndTools(config: *const config_mod.Config) void {
+        // PSEUDOCODE: Set tool policies and media generation options
         tools_mod.setPolicy(config.tool_allowlist, config.tool_blocklist);
         tools_mod.setMediaConfig(config.image_gen_enabled, config.video_gen_enabled, config.image_input_enabled);
         media_gen_tool.setConfig(.{
@@ -339,48 +327,39 @@ pub const AgentLoop = struct {
             .image_input_max_bytes = config.image_input_max_bytes,
             .image_input_max_per_turn = config.image_input_max_per_turn,
         });
+    }
 
-        var path_buf: [256]u8 = undefined;
-        const home_dir = utils.getEnvSlice("HOME") orelse ".";
-        const cas_path = try std.fmt.bufPrint(&path_buf, "{s}/.mini/cas", .{home_dir});
-        var cas = try cas_mod.CAS.init(alloc, io, cas_path);
+    /// Initializes procedural graph store if enabled for the active project.
+    fn initPGraphStore(alloc: Allocator, io: std.Io, config: *const config_mod.Config, home_dir: []const u8) ?*graph_store_mod.PGraphStore {
+        // PSEUDOCODE: Hash cwd, resolve memory path, allocate and initialize PGraphStore
+        if (!config.memact_pg_enabled) return null;
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cur_cwd = if (std.c.getcwd(&cwd_buf, cwd_buf.len)) |ptr| std.mem.sliceTo(ptr, 0) else ".";
+        const prj_hash = std.hash.Fnv1a_64.hash(cur_cwd);
 
-        var acts_buf: [256]u8 = undefined;
-        const acts_path = std.fmt.bufPrint(&acts_buf, "{s}/.mini/acts", .{home_dir}) catch "/tmp/mini_acts";
-        const act_logger = act_logger_mod.ActLogger.init(alloc, io, acts_path) catch null;
+        var mem_path_buf: [512]u8 = undefined;
+        const mem_base = config.memory_dir orelse (utils.getEnvSlice("MINI_HOME") orelse (std.fmt.bufPrint(&mem_path_buf, "{s}/.mini/memory", .{home_dir}) catch ".mini/memory"));
+        const prj_mem_dir = std.fmt.allocPrint(alloc, "{s}/{x}", .{ mem_base, prj_hash }) catch return null;
+        defer alloc.free(prj_mem_dir);
 
-        var pg_store_ptr: ?*graph_store_mod.PGraphStore = null;
-        if (config.memact_pg_enabled) {
-            var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const cur_cwd = if (std.c.getcwd(&cwd_buf, cwd_buf.len)) |ptr| std.mem.sliceTo(ptr, 0) else ".";
-            const prj_hash = std.hash.Fnv1a_64.hash(cur_cwd);
-
-            var mem_path_buf: [512]u8 = undefined;
-            const mem_base = config.memory_dir orelse (utils.getEnvSlice("MINI_HOME") orelse (std.fmt.bufPrint(&mem_path_buf, "{s}/.mini/memory", .{home_dir}) catch ".mini/memory"));
-
-            const prj_mem_dir = std.fmt.allocPrint(alloc, "{s}/{x}", .{ mem_base, prj_hash }) catch null;
-            if (prj_mem_dir) |pmd| {
-                defer alloc.free(pmd);
-                const store = alloc.create(graph_store_mod.PGraphStore) catch null;
-                if (store) |st| {
-                    if (graph_store_mod.PGraphStore.init(alloc, io, pmd)) |val| {
-                        st.* = val;
-                        st.auto_populate = config.memact_pg_auto_populate;
-                        st.loadIndex(io) catch |e| {
-                            main.stderrPrint("[agent] Warning: Failed to load PGraph index: {s}\n", .{@errorName(e)});
-                        };
-                        pg_store_ptr = st;
-                    } else |e| {
-                        main.stderrPrint("[agent] Warning: Failed to init PGraphStore: {s}\n", .{@errorName(e)});
-                        alloc.destroy(st);
-                    }
-                }
-            }
+        const store = alloc.create(graph_store_mod.PGraphStore) catch return null;
+        if (graph_store_mod.PGraphStore.init(alloc, io, prj_mem_dir)) |val| {
+            store.* = val;
+            store.auto_populate = config.memact_pg_auto_populate;
+            store.loadIndex(io) catch |e| {
+                main.stderrPrint("[agent] Warning: Failed to load PGraph index: {s}\n", .{@errorName(e)});
+            };
+            return store;
+        } else |e| {
+            main.stderrPrint("[agent] Warning: Failed to init PGraphStore: {s}\n", .{@errorName(e)});
+            alloc.destroy(store);
+            return null;
         }
+    }
 
-        const cas_ptr: *cas_mod.CAS = &cas;
-
-        const coordinator = act_queue.ActCoordinator.init(alloc);
+    /// Initializes and starts Watchdog background monitoring thread.
+    fn initWatchdog(alloc: Allocator, io: std.Io, coordinator: *act_queue.ActCoordinator, config: *const config_mod.Config) ?*watchdog_mod.Watchdog {
+        // PSEUDOCODE: Create watchdog with signal handlers and start thread
         const watchdog = watchdog_mod.Watchdog.init(alloc, io, coordinator, .{
             .tracking_interval_s = config.watchdog_tracking_interval_s,
             .act_timeout_secs = config.act_timeout_secs,
@@ -394,6 +373,34 @@ pub const AgentLoop = struct {
         watchdog.start() catch |e| {
             if (!utils.isSubagent()) main.stderrPrint("[agent] Warning: Failed to start Watchdog thread: {s}\n", .{@errorName(e)});
         };
+        return watchdog;
+    }
+
+    /// Initializes AgentLoop from config.
+    /// Selects backend based on config priority order.
+    pub fn init(alloc: Allocator, io: std.Io, config: *const config_mod.Config) !AgentLoop {
+        // PSEUDOCODE:
+        // 1. Initialize CodeAct engine and backend
+        // 2. Configure tool policy, CAS, act logger, PGraph, coordinator, and watchdog
+        // 3. Assemble and return AgentLoop
+        const engine = try quickjs.Engine.init(alloc, io);
+        errdefer engine.deinit();
+
+        const backend = initBackend(alloc, config);
+        initMediaAndTools(config);
+
+        var path_buf: [256]u8 = undefined;
+        const home_dir = utils.getEnvSlice("HOME") orelse ".";
+        const cas_path = try std.fmt.bufPrint(&path_buf, "{s}/.mini/cas", .{home_dir});
+        var cas = try cas_mod.CAS.init(alloc, io, cas_path);
+
+        var acts_buf: [256]u8 = undefined;
+        const acts_path = std.fmt.bufPrint(&acts_buf, "{s}/.mini/acts", .{home_dir}) catch "/tmp/mini_acts";
+        const act_logger = act_logger_mod.ActLogger.init(alloc, io, acts_path) catch null;
+        const pg_store_ptr = initPGraphStore(alloc, io, config, home_dir);
+        const coordinator = act_queue.ActCoordinator.init(alloc);
+        const watchdog = initWatchdog(alloc, io, coordinator, config);
+        const cas_ptr: *cas_mod.CAS = &cas;
 
         return .{
             .alloc = alloc,
@@ -527,6 +534,42 @@ pub const AgentLoop = struct {
     const agent_turn = @import("agent_turn.zig");
     pub const executeTurnWorker = agent_turn.executeTurnWorker;
 
+    const ResponseBlocksSummary = struct {
+        text: ?[]const u8 = null,
+        thinking: ?[]const u8 = null,
+    };
+
+    fn collectResponseBlocks(
+        alloc: Allocator,
+        content: []const proto.ContentBlock,
+        tool_calls: *std.ArrayListUnmanaged(proto.ToolUse),
+    ) ResponseBlocksSummary {
+        var summary = ResponseBlocksSummary{};
+        for (content) |block| {
+            switch (block) {
+                .text => |t| summary.text = t,
+                .thinking => |th| summary.thinking = th.thinking,
+                .tool_use => |tu| tool_calls.append(alloc, tu) catch {},
+                else => {},
+            }
+        }
+        return summary;
+    }
+
+    fn collectSnapshots(
+        alloc: Allocator,
+        tracker: ?snapshot_mod.SnapshotTracker,
+        list: *std.ArrayListUnmanaged(act_logger_mod.ActSnapshotInfo),
+    ) void {
+        const t = tracker orelse return;
+        for (t.tracked.items) |tf| {
+            list.append(alloc, .{
+                .path = tf.path,
+                .previous_content_hash = tf.previous_content_hash,
+            }) catch {};
+        }
+    }
+
     pub fn logActDebug(
         self: *AgentLoop,
         act_id: usize,
@@ -542,30 +585,13 @@ pub const AgentLoop = struct {
         const safe_count = @min(input_msgs_count, msgs.len);
         const input_msgs = msgs[0..safe_count];
 
-        var text_acc: ?[]const u8 = null;
-        var think_acc: ?[]const u8 = null;
         var tool_calls_list = std.ArrayListUnmanaged(proto.ToolUse).empty;
         defer tool_calls_list.deinit(self.alloc);
-
-        for (response.content.items) |block| {
-            switch (block) {
-                .text => |t| text_acc = t,
-                .thinking => |th| think_acc = th.thinking,
-                .tool_use => |tu| tool_calls_list.append(self.alloc, tu) catch {},
-                else => {},
-            }
-        }
+        const summary = collectResponseBlocks(self.alloc, response.content.items, &tool_calls_list);
 
         var snapshots_list = std.ArrayListUnmanaged(act_logger_mod.ActSnapshotInfo).empty;
         defer snapshots_list.deinit(self.alloc);
-        if (self.snapshot_tracker) |t| {
-            for (t.tracked.items) |tf| {
-                snapshots_list.append(self.alloc, .{
-                    .path = tf.path,
-                    .previous_content_hash = tf.previous_content_hash,
-                }) catch {};
-            }
-        }
+        collectSnapshots(self.alloc, self.snapshot_tracker, &snapshots_list);
 
         const pid: u32 = @intCast(std.c.getpid());
         logger.logAct(self.io, .{
@@ -581,8 +607,8 @@ pub const AgentLoop = struct {
             .llm_response = .{
                 .http_code = response.http_code,
                 .stop_reason = @tagName(response.stop_reason),
-                .text = text_acc,
-                .thinking = think_acc,
+                .text = summary.text,
+                .thinking = summary.thinking,
                 .js_code = js_code_opt,
                 .tool_calls = if (tool_calls_list.items.len > 0) tool_calls_list.items else null,
                 .usage = response.usage,
@@ -800,6 +826,34 @@ pub const AgentLoop = struct {
     // Internal
     // -----------------------------------------------------------------------
 
+    fn handleBackendSendError(self: *AgentLoop, act_id: usize, e: anyerror) anyerror {
+        if (e == error.Interrupted or signals.isInterrupted()) {
+            return error.Interrupted;
+        }
+        if (main.ui_repl.current_renderer) |r| {
+            r.stopWaiting();
+            if (r.is_thinking) r.endThinking();
+            r.ensureNewline();
+        }
+        if (self.journal) |*j| {
+            const desc = std.fmt.allocPrint(
+                self.alloc,
+                "{s} backend error ({s})",
+                .{ self.backend.name(), @errorName(e) },
+            ) catch "Backend error";
+            defer self.alloc.free(desc);
+            j.recordError(self.io, act_id, .llm_provider_error, desc, .{
+                .backend = self.backend.name(),
+                .model = self.backend.model(),
+                .error_name = @errorName(e),
+                .http_code = self.last_backend_http_code,
+                .attempt = 1,
+                .raw_snippet = self.last_backend_raw_error,
+            }) catch {};
+        }
+        return e;
+    }
+
     pub fn sendToBackend(
         self: *AgentLoop,
         act_id: usize,
@@ -815,67 +869,22 @@ pub const AgentLoop = struct {
             r.startWaiting();
         }
 
-        // Clear stale HTTP error context (e.g. a previous act's 429/400). Without
-        // this a transport failure below would be mis-attributed to that old
-        // status/body in the journal (see sendToBackend error handling).
         self.clearLastErrorContext();
 
-        // Primary backend.
-        //
-        // Cross-provider fallback (e.g. OpenAI-compat -> Responses API, or
-        // vendor routing) is already handled *inside* the backend / provider
-        // abstraction layer (RFC-012), so there is no second Ollama attempt
-        // here. Blindly falling back to a local Ollama that is usually not
-        // running only added an extra failing round-trip and masked the real
-        // primary error in the journal.
         const primary = self.backend.send(system_prompt, msgs, tool_defs, text_cb, think_cb);
         if (primary) |resp| return resp else |e| {
-            if (e == error.Interrupted or signals.isInterrupted()) {
-                return error.Interrupted;
-            }
-            if (main.ui_repl.current_renderer) |r| {
-                r.stopWaiting();
-                if (r.is_thinking) r.endThinking();
-                r.ensureNewline();
-            }
-            // Journal the transport/parse error using the PRIMARY backend's error
-            // name (previously this was recorded as the Ollama fallback's
-            // ConnectionRefused, which masked the true cause).
-            if (self.journal) |*j| {
-                const desc = std.fmt.allocPrint(
-                    self.alloc,
-                    "{s} backend error ({s})",
-                    .{ self.backend.name(), @errorName(e) },
-                ) catch "Backend error";
-                defer self.alloc.free(desc);
-                j.recordError(self.io, act_id, .llm_provider_error, desc, .{
-                    .backend = self.backend.name(),
-                    .model = self.backend.model(),
-                    .error_name = @errorName(e),
-                    .http_code = self.last_backend_http_code,
-                    .attempt = 1,
-                    .raw_snippet = self.last_backend_raw_error,
-                }) catch {};
-            }
-            return e;
+            return self.handleBackendSendError(act_id, e);
         }
     }
 
     /// 1-call LLM consultation invoked by Thread 2 Watchdog on timeout.
-    /// Evaluates whether the long-running action is making valid progress (WAIT) or stuck/hung (KILL).
-    pub fn consultLlmOnTimeout(self: *AgentLoop, ctx: watchdog_mod.DecisionContext) watchdog_mod.TimeoutDecision {
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        const alloc = arena.allocator();
-
-        const system_prompt =
-            \\You are the Watchdog Supervisor for mini-agent.
-            \\An action is taking longer than the configured timeout limit.
-            \\Your job is to analyze the action and output to decide if it is legitimately working (e.g. compiling, downloading, running a long test suite) or hung/frozen/waiting for input.
-        ;
-
+    /// Builds supervisor decision prompt for watchdog timeout evaluation.
+    fn buildTimeoutSupervisorPrompt(alloc: Allocator, ctx: watchdog_mod.DecisionContext) ![]const u8 {
+        // PSEUDOCODE:
+        // 1. Format action description, elapsed time, and output log tail
+        // 2. Return formatted prompt string
         var prompt_buf = utils.BufWriter.init(alloc);
-        prompt_buf.print(
+        try prompt_buf.print(
             \\Act {d} has been running action '{s}' for {d}s (timeout limit is {d}s).
             \\
             \\Recent execution output tail ({d} bytes):
@@ -899,31 +908,35 @@ pub const AgentLoop = struct {
             ctx.timeout_s,
             ctx.log_tail.len,
             ctx.log_tail,
-        }) catch {
+        });
+        return prompt_buf.list.items;
+    }
+
+    /// Evaluates whether the long-running action is making valid progress (WAIT) or stuck/hung (KILL).
+    pub fn consultLlmOnTimeout(self: *AgentLoop, ctx: watchdog_mod.DecisionContext) watchdog_mod.TimeoutDecision {
+        // PSEUDOCODE:
+        // 1. Initialize arena for prompt construction
+        // 2. Request supervisor evaluation from backend
+        // 3. Fall back to safety wait if request fails
+        // 4. Parse and return timeout decision
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const system_prompt =
+            \\You are the Watchdog Supervisor for mini-agent.
+            \\An action is taking longer than the configured timeout limit.
+            \\Your job is to analyze the action and output to decide if it is legitimately working (e.g. compiling, downloading, running a long test suite) or hung/frozen/waiting for input.
+        ;
+        const prompt_text = buildTimeoutSupervisorPrompt(alloc, ctx) catch {
             return .{ .should_kill = false, .extend_seconds = 60 };
         };
 
-        const blocks = [_]proto.ContentBlock{
-            .{ .text = prompt_buf.list.items },
-        };
-        const msgs = [_]proto.Message{
-            .{
-                .role = .user,
-                .content = &blocks,
-            },
-        };
+        const blocks = [_]proto.ContentBlock{.{ .text = prompt_text }};
+        const msgs = [_]proto.Message{.{ .role = .user, .content = &blocks }};
 
-        var resp = self.backend.send(
-            system_prompt,
-            &msgs,
-            &[_]proto.ToolDefinition{},
-            null,
-            null,
-        ) catch |e| {
-            var fallback = watchdog_mod.TimeoutDecision{
-                .should_kill = false,
-                .extend_seconds = 30,
-            };
+        var resp = self.backend.send(system_prompt, &msgs, &[_]proto.ToolDefinition{}, null, null) catch |e| {
+            var fallback = watchdog_mod.TimeoutDecision{ .should_kill = false, .extend_seconds = 30 };
             const err_msg = std.fmt.bufPrint(&fallback.reason_buf, "LLM decision call failed: {s}, safety wait 30s", .{@errorName(e)}) catch "LLM decision failed";
             fallback.reason_len = err_msg.len;
             return fallback;
@@ -932,17 +945,44 @@ pub const AgentLoop = struct {
 
         var full_text = utils.BufWriter.init(alloc);
         for (resp.content.items) |block| {
-            switch (block) {
-                .text => |t| full_text.writeAll(t) catch {},
-                else => {},
-            }
+            if (block == .text) full_text.writeAll(block.text) catch {};
+        }
+        return parseTimeoutDecision(full_text.list.items);
+    }
+
+    /// Requests context summary from LLM for a given prompt, appending conversation history.
+    fn requestContextSummary(self: *AgentLoop, act_id: usize, prompt: []const u8) !?[]const u8 {
+        // PSEUDOCODE:
+        // 1. Build temporary message sequence: history + system summary prompt
+        // 2. Send request to backend and scan response for summary text block
+        var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+        msg_blocks[0] = .{ .text = try self.alloc.dupe(u8, prompt) };
+        const sys_msg = proto.Message{ .role = .user, .content = msg_blocks };
+        defer {
+            self.alloc.free(sys_msg.content[0].text);
+            self.alloc.free(sys_msg.content);
         }
 
-        return parseTimeoutDecision(full_text.list.items);
+        var temp_msgs = std.ArrayListUnmanaged(proto.Message).empty;
+        defer temp_msgs.deinit(self.alloc);
+        try temp_msgs.appendSlice(self.alloc, self.history.messages());
+        try temp_msgs.append(self.alloc, sys_msg);
+
+        var summary_resp = try self.sendToBackend(act_id, self.config.system_prompt, temp_msgs.items, &[_]proto.ToolDefinition{}, null, null);
+        defer summary_resp.deinit();
+
+        for (summary_resp.content.items) |block| {
+            if (block == .text) return try self.alloc.dupe(u8, block.text);
+        }
+        return null;
     }
 
     /// Performs context compaction (MemAct compaction) when model returns context limit error.
     pub fn compactContext(self: *AgentLoop, act_id: usize) !void {
+        // PSEUDOCODE:
+        // 1. Early-return if history length <= 2
+        // 2. Dispatch MemAct JSON compaction if enabled; fall back to plain compaction if no summary
+        // 3. Otherwise dispatch legacy summary compaction
         if (self.history.messages().len <= 2) {
             self.history.compact();
             return;
@@ -951,76 +991,24 @@ pub const AgentLoop = struct {
         main.stderrPrint("\x1b[33m[agent] Summarizing context (MemAct compaction)...\x1b[0m\n", .{});
 
         if (self.config.memact_enabled) {
-            var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
-            msg_blocks[0] = .{ .text = try self.alloc.dupe(u8, 
+            const memact_prompt =
                 "SYSTEM: You are the MemAct memory engine. Concisely summarize the preceding conversation into JSON, strictly adhering to this stencil:\n" ++
-                "{\n" ++
-                "  \"type\": \"context_summary\",\n" ++
-                "  \"iteration_range\": [1, 99],\n" ++
-                "  \"task_state\": \"progress description\",\n" ++
-                "  \"decisions\": [\"decision 1\"],\n" ++
-                "  \"open_questions\": [],\n" ++
-                "  \"learned_errors\": [],\n" ++
-                "  \"files_touched\": [],\n" ++
-                "  \"next_step\": \"next step\"\n" ++
-                "}\n" ++
-                "If the input conversation already contains a \"[MemAct Context Summary]\" block, merge the previous summary into the new summary, retaining critical details while preserving the JSON stencil above.\n" ++
-                "Output JSON only, with no additional markdown text."
-            ) };
-            const sys_msg = proto.Message{ .role = .user, .content = msg_blocks };
-            defer {
-                self.alloc.free(sys_msg.content[0].text);
-                self.alloc.free(sys_msg.content);
-            }
-            
-            var temp_msgs = std.ArrayListUnmanaged(proto.Message).empty;
-            defer temp_msgs.deinit(self.alloc);
-            try temp_msgs.appendSlice(self.alloc, self.history.messages());
-            try temp_msgs.append(self.alloc, sys_msg);
-
-            var summary_resp = try self.sendToBackend(act_id, self.config.system_prompt, temp_msgs.items, &[_]proto.ToolDefinition{}, null, null);
-            defer summary_resp.deinit();
-
-            var compacted = false;
-            for (summary_resp.content.items) |block| {
-                if (block == .text) {
-                    try self.history.compactMemAct(act_id, block.text);
-                    compacted = true;
-                    break;
-                }
-            }
-            if (!compacted) {
+                "{\n  \"type\": \"context_summary\",\n  \"iteration_range\": [1, 99],\n  \"task_state\": \"progress description\",\n  \"decisions\": [\"decision 1\"],\n  \"open_questions\": [],\n  \"learned_errors\": [],\n  \"files_touched\": [],\n  \"next_step\": \"next step\"\n}\n" ++
+                "If the input conversation already contains a \"[MemAct Context Summary]\" block, merge the previous summary into the new summary, retaining critical details while preserving the JSON stencil above.\nOutput JSON only, with no additional markdown text.";
+            if (try self.requestContextSummary(act_id, memact_prompt)) |summary| {
+                defer self.alloc.free(summary);
+                try self.history.compactMemAct(act_id, summary);
+            } else {
                 main.stderrPrint("[agent] Warning: LLM did not return text summary, fallback.\n", .{});
                 self.history.compact();
             }
         } else {
             main.stderrPrint("\n\x1b[33m[agent] History too long (MemAct disabled), compacting using legacy method...\x1b[0m\n", .{});
-            
-            var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
-            msg_blocks[0] = .{ .text = try self.alloc.dupe(u8, "SYSTEM: History is full. Please summarize the current task state (what has been done, results, next steps). Do not call tools, return summary text only.") };
-            const sys_msg = proto.Message{ .role = .user, .content = msg_blocks };
-            defer {
-                self.alloc.free(sys_msg.content[0].text);
-                self.alloc.free(sys_msg.content);
-            }
-            
-            var temp_msgs = std.ArrayListUnmanaged(proto.Message).empty;
-            defer temp_msgs.deinit(self.alloc);
-            try temp_msgs.appendSlice(self.alloc, self.history.messages());
-            try temp_msgs.append(self.alloc, sys_msg);
-            
-            var summary_resp = try self.sendToBackend(act_id, self.config.system_prompt, temp_msgs.items, &[_]proto.ToolDefinition{}, null, null);
-            defer summary_resp.deinit();
-            
-            var compacted = false;
-            for (summary_resp.content.items) |block| {
-                if (block == .text) {
-                    try self.history.compactWithSummary(block.text);
-                    compacted = true;
-                    break;
-                }
-            }
-            if (!compacted) {
+            const legacy_prompt = "SYSTEM: History is full. Please summarize the current task state (what has been done, results, next steps). Do not call tools, return summary text only.";
+            if (try self.requestContextSummary(act_id, legacy_prompt)) |summary| {
+                defer self.alloc.free(summary);
+                try self.history.compactWithSummary(summary);
+            } else {
                 self.history.compact();
             }
         }
@@ -1070,10 +1058,348 @@ pub const AgentLoop = struct {
         }
     }
 
+    fn formatLoopCheckpointMessage(
+        self: *AgentLoop,
+        tu: proto.ToolUse,
+        trip_reason_str: []const u8,
+    ) ![]u8 {
+        return switch (self.last_loop_reason) {
+            .orbit_cycle, .macro_cycle_2, .macro_cycle_3 => blk: {
+                var mbw = utils.BufWriter.init(self.alloc);
+                errdefer mbw.deinit();
+                try mbw.writeAll("[Action Loop Checkpoint & Trajectory Recap]\n");
+                try mbw.print("📍 Waypoint: Action loop detected ({s}).\n", .{trip_reason_str});
+                try mbw.writeAll("🗺️ Trajectory Scouted: ");
+                for (self.turn_tool_trajectory.items, 0..) |tn, i| {
+                    if (i > 0) try mbw.writeAll(" → ");
+                    try mbw.print("`{s}`", .{tn});
+                }
+                try mbw.writeAll("\n⚠️ Exploration has circled in place without forward progress (ΔZ = 0).\n");
+                try mbw.writeAll("Consider a different approach for the next step if appropriate.\n");
+                break :blk try mbw.toOwnedSlice();
+            },
+            .readonly_budget => try std.fmt.allocPrint(
+                self.alloc,
+                "[Action Loop Checkpoint & Trajectory Recap]\n📍 Waypoint: Read-only exploratory budget exceeded ({d} consecutive search/read actions without mutation).\n\n[Exploration Advisory (Optional Suggestions)]\nCurrent Action: read-only exploration\nObservation: Sufficient context gathered.\n⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed directly to modifying code or concluding.",
+                .{self.consecutive_readonly_count},
+            ),
+            else => try std.fmt.allocPrint(
+                self.alloc,
+                "[Action Loop Checkpoint & Trajectory Recap]\n📍 Waypoint: Repeated invocation of '{s}' with identical parameters.\n\n[Tool Call Advisory (Optional Suggestions)]\nCurrent Action: `{s}`\nObservation: Already invoked with identical arguments. Data is in context.\n⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed directly to modifying code or concluding.",
+                .{ tu.name, tu.name },
+            ),
+        };
+    }
+
+    /// Formats action loop trip advisory message and sets checkpoint/halt state.
+    fn handleActionLoopTripMessage(
+        self: *AgentLoop,
+        act_id: usize,
+        tu: proto.ToolUse,
+        trip_reason_str: []const u8,
+    ) ![]u8 {
+        // PSEUDOCODE:
+        // 1. If retries < 2: increment retries, set checkpoint, format trajectory recap
+        // 2. Else: print halt message, mark tripped, format halt message
+        if (self.plan.loop_plan_retries < 2) {
+            self.plan.loop_plan_retries += 1;
+            self.plan.plan_execution_pending = true;
+            main.stderrPrint(
+                "\n\x1b[33m[agent] ⚠️ Action loop detected: {s}. Requesting model to formulate plan and execute next step.\x1b[0m\n",
+                .{trip_reason_str},
+            );
+            if (main.ui_repl.current_renderer) |r| {
+                r.ensureNewline();
+                r.write(" \x1b[33m[Action Loop Checkpoint: Requesting Plan & Execution]\x1b[0m\n");
+            }
+            if (self.journal) |*j| {
+                j.recordEvent(self.io, act_id, .checkpoint_created, "Action loop detected - requesting plan & execution") catch {};
+            }
+            self.action_loop_tripped = false;
+            self.consecutive_dup_tool_count = 0;
+            return self.formatLoopCheckpointMessage(tu, trip_reason_str);
+        } else {
+            main.stderrPrint(
+                "\n\x1b[33m[agent] ⚠️ Action loop persisted after replanning attempts: {s}. Halting turn.\x1b[0m\n",
+                .{trip_reason_str},
+            );
+            if (main.ui_repl.current_renderer) |r| {
+                r.ensureNewline();
+                r.write(" \x1b[33m[Action loop persisted: halting turn]\x1b[0m\n");
+            }
+            self.action_loop_tripped = true;
+            return try std.fmt.allocPrint(
+                self.alloc,
+                "[Action Loop Halt]: Action loop persisted after multiple replanning requests ({s}). Execution paused. Please explain your status and request user guidance.",
+                .{trip_reason_str},
+            );
+        }
+    }
+
+    /// Constructs warning advisory suffix if loop monitor flagged a repetition warning.
+    fn getLoopWarningSuffix(self: *AgentLoop, tool_name: []const u8) ?[]u8 {
+        // PSEUDOCODE: Format warning text depending on last_loop_reason
+        return switch (self.last_loop_reason) {
+            .orbit_cycle, .macro_cycle_2, .macro_cycle_3 => std.fmt.allocPrint(
+                self.alloc,
+                "\n\n[3D Procedural Map Advisory: Orbit Checkpoint & Recap]\n⚠️ Trajectory Orbit Detected: You are circling around already-scouted nodes in procedural space. If you have gathered sufficient context, consider whether further exploration is needed or if you may proceed to conclude.",
+                .{},
+            ) catch null,
+            .readonly_budget => std.fmt.allocPrint(
+                self.alloc,
+                "\n\n[System Advisory]: You have performed {d} consecutive read-only exploratory actions. If you have gathered sufficient information, proceed to take action or synthesize your response.",
+                .{self.consecutive_readonly_count},
+            ) catch null,
+            else => std.fmt.allocPrint(
+                self.alloc,
+                "\n\n[System Advisory]: Action loop detected. You have called '{s}' with identical arguments multiple times. You already have this data in your context. If you feel you have enough information, you may synthesize your findings and respond to the user.",
+                .{tool_name},
+            ) catch null,
+        };
+    }
+
+    /// Renders tool execution start to interactive REPL or fallback stderr.
+    fn renderToolInvocationStart(self: *AgentLoop, act_id: usize, tu: proto.ToolUse) void {
+        // PSEUDOCODE: Update coordinator status and display starting indicator
+        self.coordinator.updateStatus(act_id, .executing_tool, tu.name);
+        if (main.ui_repl.current_renderer) |r| {
+            r.startTool(tu.name, tu.input_json);
+            return;
+        }
+        if (std.mem.eql(u8, tu.name, "bash")) {
+            if (json_mod.findString(tu.input_json, "command")) |cmd| {
+                var cmd_buf: [100]u8 = undefined;
+                const display_cmd = if (cmd.len > 97) std.fmt.bufPrint(&cmd_buf, "{s}...", .{cmd[0..97]}) catch cmd else cmd;
+                main.stderrPrint("\x1b[90m[bash]\x1b[0m \x1b[35m{s}\x1b[0m ", .{display_cmd});
+            } else {
+                main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
+            }
+        } else if (std.mem.eql(u8, tu.name, "file_read") or std.mem.eql(u8, tu.name, "file_write") or std.mem.eql(u8, tu.name, "file_edit")) {
+            if (json_mod.findString(tu.input_json, "path")) |path| {
+                main.stderrPrint("\x1b[90m[{s}]\x1b[0m \x1b[34m{s}\x1b[0m ", .{ tu.name, path });
+            } else {
+                main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
+            }
+        } else if (std.mem.eql(u8, tu.name, "codeact")) {
+            main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting CodeAct script...\x1b[0m ", .{});
+        } else {
+            main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
+        }
+    }
+
+    /// Renders tool execution completion to interactive REPL or fallback stderr.
+    fn renderToolInvocationFinish(self: *AgentLoop, tu: proto.ToolUse, result: []const u8, is_err: bool, dur_ms: u64) void {
+        // PSEUDOCODE: If renderer present, extract patch info and finish; else print [ok]/[error]
+        _ = self;
+        if (main.ui_repl.current_renderer) |r| {
+            var patch_path: ?[]const u8 = null;
+            var patch_diff: ?[]const u8 = null;
+            if (std.mem.eql(u8, tu.name, "file_edit") or std.mem.eql(u8, tu.name, "file_write")) {
+                patch_path = json_mod.findString(tu.input_json, "path");
+                patch_diff = json_mod.findString(tu.input_json, "patch") orelse json_mod.findString(tu.input_json, "content");
+            }
+            r.finishTool(tu.name, result, is_err, dur_ms, patch_path, patch_diff);
+        } else {
+            if (is_err) {
+                main.stderrPrint("\x1b[31m[error]\x1b[0m\n", .{});
+            } else {
+                main.stderrPrint("\x1b[32m[ok]\x1b[0m\n", .{});
+            }
+        }
+    }
+
+    /// Updates structured plan progress, step completion, and drift monitoring.
+    fn trackPlanToolExecution(self: *AgentLoop, tu: proto.ToolUse) !?[]u8 {
+        // PSEUDOCODE: Check drift, advance step if matching tool hint, save if complete
+        if (!self.plan.enable_structured_planning or self.plan.current_plan == null) return null;
+        var plan = &self.plan.current_plan.?;
+        var drift_advisory: ?[]u8 = null;
+
+        if (self.config.plan_drift_detection) {
+            if (plan_monitor.checkPlanDrift(plan, &self.plan.plan_ctx, tu.name)) |d| {
+                self.plan.plan_drift_score += d.drift_score;
+                if (self.plan.plan_drift_score > 0.8) {
+                    const c = try plan_monitor.generateReplanSuggestion(plan, self.plan.plan_ctx.steps_completed, self.plan.plan_drift_score, self.alloc);
+                    defer self.alloc.free(c);
+                    drift_advisory = try std.fmt.allocPrint(self.alloc, "[System Advisory]: {s}", .{c});
+                }
+            }
+        }
+
+        if (self.plan.plan_ctx.current_step_idx < plan.stepCount()) {
+            const current_step = &plan.steps.items[self.plan.plan_ctx.current_step_idx];
+            if (current_step.tool_hint) |hint| {
+                if (std.mem.eql(u8, tu.name, hint)) {
+                    plan_executor.completeStep(plan, &self.plan.plan_ctx);
+                    if (!utils.isSubagent()) main.stderrPrint("[agent] Plan step completed: {s}\n", .{current_step.description});
+                }
+            }
+        }
+
+        if (self.plan.plan_ctx.is_complete or plan.isComplete()) {
+            if (!utils.isSubagent()) main.stderrPrint("[agent] Plan completed! Saving to store...\n", .{});
+            if (self.plan.plan_store) |ps| {
+                ps.save(plan) catch |e| main.stderrPrint("[agent] Warning: Failed to save plan: {s}\n", .{@errorName(e)});
+            }
+            self.plan.clearPlan();
+        } else if (self.plan.plan_ctx.current_step_idx + 1 < plan.stepCount()) {
+            self.plan.plan_ctx.current_step_idx += 1;
+            plan.steps.items[self.plan.plan_ctx.current_step_idx].status = .active;
+        }
+        return drift_advisory;
+    }
+
+    fn checkToolDedupeCache(
+        self: *AgentLoop,
+        tu: proto.ToolUse,
+        results: *ArrayList(proto.ToolResult),
+        allocated_strings: *ArrayList([]u8),
+    ) !bool {
+        if (!isReadOnlyTool(tu.name)) return false;
+        const cache_hash = fuzzyArgsHash(tu.input_json);
+        const cached = self.lookupToolCache(tu.name, cache_hash) orelse return false;
+
+        main.stderrPrint("\x1b[33m[duplicate: serving cached result]\x1b[0m\n", .{});
+        const note = try std.fmt.allocPrint(self.alloc, "[duplicate: identical call already executed this turn — cached result below]\n{s}", .{cached});
+        try allocated_strings.append(self.alloc, note);
+        try results.append(self.alloc, .{ .tool_use_id = tu.id, .content = note, .is_error = false });
+        return true;
+    }
+
+    fn postProcessToolResult(
+        self: *AgentLoop,
+        tu: proto.ToolUse,
+        result: []const u8,
+        warn_suffix: ?[]const u8,
+        is_err: bool,
+        results: *ArrayList(proto.ToolResult),
+        allocated_strings: *ArrayList([]u8),
+    ) !void {
+        const max_tool_result = 64 * 1024;
+        const truncated = if (result.len > max_tool_result) result[0..max_tool_result] else result;
+        const final_content = if (warn_suffix) |ws| blk: {
+            const merged = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ truncated, ws });
+            try allocated_strings.append(self.alloc, merged);
+            break :blk merged;
+        } else truncated;
+
+        try results.append(self.alloc, .{ .tool_use_id = tu.id, .content = final_content, .is_error = is_err });
+        if (!is_err and isReadOnlyTool(tu.name)) {
+            self.storeToolCache(tu.name, fuzzyArgsHash(tu.input_json), truncated) catch {};
+        }
+
+        if (!is_err) {
+            self.plan.loop_plan_retries = 0;
+            self.plan.plan_execution_pending = false;
+            self.plan.plan_watchdog_retries = 0;
+            if (!isExploratoryToolCall(tu.name, tu.input_json)) {
+                if (try self.trackPlanToolExecution(tu)) |adv| {
+                    try allocated_strings.append(self.alloc, adv);
+                    try results.append(self.alloc, .{ .tool_use_id = tu.id, .content = adv, .is_error = false });
+                }
+            }
+        }
+    }
+
+    /// Executes a single tool call, handles caching, snapshot tracking, output truncation, and returns duration.
+    fn executeSingleTool(
+        self: *AgentLoop,
+        act_id: usize,
+        tu: proto.ToolUse,
+        warn_suffix: ?[]const u8,
+        results: *ArrayList(proto.ToolResult),
+        allocated_strings: *ArrayList([]u8),
+        any_tool_err: *bool,
+    ) !u64 {
+        // PSEUDOCODE:
+        // 1. Check dedupe cache for read-only tools
+        // 2. Snapshot file if mutating, execute tool
+        // 3. Post-process result, plan tracking, render finish, return duration
+        if (try self.checkToolDedupeCache(tu, results, allocated_strings)) return 0;
+
+        const start_tool_ms = utils.milliTimestamp();
+        self.renderToolInvocationStart(act_id, tu);
+
+        if (std.mem.eql(u8, tu.name, "file_edit") or std.mem.eql(u8, tu.name, "file_write")) {
+            if (json_mod.findString(tu.input_json, "path")) |path| {
+                if (self.snapshot_tracker) |*t| t.beforeFileWrite(path);
+            }
+        }
+
+        var is_err = false;
+        const result = tools_mod.executeTool(self.alloc, self.io, tu.name, tu.input_json) catch |e| blk: {
+            if (e == error.Interrupted or signals.isInterrupted()) return error.Interrupted;
+            is_err = true;
+            any_tool_err.* = true;
+            break :blk try std.fmt.allocPrint(self.alloc, "Tool error: {s}", .{@errorName(e)});
+        };
+        if (signals.isInterrupted()) {
+            self.alloc.free(result);
+            return error.Interrupted;
+        }
+        try allocated_strings.append(self.alloc, result);
+
+        try self.postProcessToolResult(tu, result, warn_suffix, is_err, results, allocated_strings);
+
+        const end_tool_ms = utils.milliTimestamp();
+        const dur_ms = if (end_tool_ms >= start_tool_ms) @as(u64, @intCast(end_tool_ms - start_tool_ms)) else 0;
+        self.renderToolInvocationFinish(tu, result, is_err, dur_ms);
+        return dur_ms;
+    }
+
+    /// Flushes tool execution results and any generated media attachments to history.
+    fn recordToolResultsToHistory(self: *AgentLoop, results: []const proto.ToolResult) !void {
+        // PSEUDOCODE: If results non-empty, attach media if available and record in history
+        if (results.len == 0) return;
+        const turn_attached = media_gen_tool.getTurnAttachments();
+        if (turn_attached.len > 0) {
+            try self.history.addToolResultsWithImages(results, turn_attached);
+            media_gen_tool.clearTurnAttachments(self.alloc);
+        } else {
+            try self.history.addToolResults(results);
+        }
+    }
+
+    /// Evaluates loop trip and dispatches single tool execution, returning duration and whether loop tripped.
+    fn dispatchSingleToolUse(
+        self: *AgentLoop,
+        act_id: usize,
+        tu: proto.ToolUse,
+        results: *ArrayList(proto.ToolResult),
+        allocated_strings: *ArrayList([]u8),
+        any_tool_err: *bool,
+    ) !struct { dur_ms: u64, should_break: bool } {
+        // PSEUDOCODE: Check loop -> handle trip or execute single tool with warning suffix
+        const loop_check = self.checkActionLoop(tu.name, tu.input_json) catch .allow;
+        if (loop_check == .trip) {
+            const trip_reason_str = switch (self.last_loop_reason) {
+                .macro_cycle_2 => "alternating tool loop (A ↔ B) repeated",
+                .macro_cycle_3 => "3-step tool cycle (A → B → C) repeated",
+                .orbit_cycle => "closed orbit in 3D procedural map repeated",
+                .readonly_budget => "read-only exploratory budget exceeded without code mutation",
+                else => "called repeatedly with identical parameters",
+            };
+            const trip_msg = try self.handleActionLoopTripMessage(act_id, tu, trip_reason_str);
+            try allocated_strings.append(self.alloc, trip_msg);
+            try results.append(self.alloc, .{ .tool_use_id = tu.id, .content = trip_msg, .is_error = true });
+            return .{ .dur_ms = 0, .should_break = true };
+        }
+
+        const warn_suffix: ?[]u8 = if (loop_check == .warn) self.getLoopWarningSuffix(tu.name) else null;
+        defer if (warn_suffix) |w| self.alloc.free(w);
+
+        if (self.plan.plan_active and !isPlanOnlyRequest(self.current_user_request) and !isExploratoryToolCall(tu.name, tu.input_json)) {
+            self.plan.clearPlan();
+        }
+
+        const dur = try self.executeSingleTool(act_id, tu, warn_suffix, results, allocated_strings, any_tool_err);
+        return .{ .dur_ms = dur, .should_break = false };
+    }
+
     /// Executes all tool_use blocks in response.
     /// Returns execution summary for act debug logging.
-
     pub fn executeTools(self: *AgentLoop, act_id: usize, response: *const proto.Response) !ToolExecSummary {
+        // PSEUDOCODE: Iterate blocks, dispatch tool uses, record results to history
         var any_tool_err = false;
         var results = ArrayList(proto.ToolResult).empty;
         defer results.deinit(self.alloc);
@@ -1090,341 +1416,24 @@ pub const AgentLoop = struct {
             if (signals.isInterrupted()) return error.Interrupted;
             switch (block) {
                 .tool_use => |tu| {
-                    const loop_check = self.checkActionLoop(tu.name, tu.input_json) catch .allow;
-                    if (loop_check == .trip) {
-                        const trip_reason_str = switch (self.last_loop_reason) {
-                            .macro_cycle_2 => "alternating tool loop (A ↔ B) repeated",
-                            .macro_cycle_3 => "3-step tool cycle (A → B → C) repeated",
-                            .orbit_cycle => "closed orbit in 3D procedural map repeated",
-                            .readonly_budget => "read-only exploratory budget exceeded without code mutation",
-                            else => "called repeatedly with identical parameters",
-                        };
-
-                        if (self.plan.loop_plan_retries < 2) {
-                            self.plan.loop_plan_retries += 1;
-                            self.plan.plan_execution_pending = true;
-                            main.stderrPrint(
-                                "\n\x1b[33m[agent] ⚠️ Action loop detected: {s}. Requesting model to formulate plan and execute next step.\x1b[0m\n",
-                                .{trip_reason_str},
-                            );
-                            if (main.ui_repl.current_renderer) |r| {
-                                r.ensureNewline();
-                                r.write(" \x1b[33m[Action Loop Checkpoint: Requesting Plan & Execution]\x1b[0m\n");
-                            }
-                            if (self.journal) |*j| {
-                                j.recordEvent(self.io, act_id, .checkpoint_created, "Action loop detected - requesting plan & execution") catch {};
-                            }
-                            const trip_msg = switch (self.last_loop_reason) {
-                                .orbit_cycle, .macro_cycle_2, .macro_cycle_3 => blk: {
-                                    var mbw = utils.BufWriter.init(self.alloc);
-                                    errdefer mbw.deinit();
-                                    mbw.writeAll("[Action Loop Checkpoint & Trajectory Recap]\n") catch {};
-                                    mbw.print("📍 Waypoint: Action loop detected ({s}).\n", .{trip_reason_str}) catch {};
-                                    mbw.writeAll("🗺️ Trajectory Scouted: ") catch {};
-                                    for (self.turn_tool_trajectory.items, 0..) |tn, i| {
-                                        if (i > 0) mbw.writeAll(" → ") catch {};
-                                        mbw.print("`{s}`", .{tn}) catch {};
-                                    }
-                                    mbw.writeAll("\n⚠️ Exploration has circled in place without forward progress (ΔZ = 0).\n") catch {};
-                                    mbw.writeAll("Consider a different approach for the next step if appropriate.\n") catch {};
-                                    break :blk try mbw.toOwnedSlice();
-                                },
-                                .readonly_budget => try std.fmt.allocPrint(
-                                    self.alloc,
-                                    "[Action Loop Checkpoint & Trajectory Recap]\n📍 Waypoint: Read-only exploratory budget exceeded ({d} consecutive search/read actions without mutation).\n\n[Exploration Advisory (Optional Suggestions)]\nCurrent Action: read-only exploration\nObservation: Sufficient context gathered.\n⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed directly to modifying code or concluding.",
-                                    .{self.consecutive_readonly_count},
-                                ),
-                                else => try std.fmt.allocPrint(
-                                    self.alloc,
-                                    "[Action Loop Checkpoint & Trajectory Recap]\n📍 Waypoint: Repeated invocation of '{s}' with identical parameters.\n\n[Tool Call Advisory (Optional Suggestions)]\nCurrent Action: `{s}`\nObservation: Already invoked with identical arguments. Data is in context.\n⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed directly to modifying code or concluding.",
-                                    .{ tu.name, tu.name },
-                                ),
-                            };
-                            try allocated_strings.append(self.alloc, trip_msg);
-                            try results.append(self.alloc, .{
-                                .tool_use_id = tu.id,
-                                .content = trip_msg,
-                                .is_error = true,
-                            });
-                            self.action_loop_tripped = false;
-                            self.consecutive_dup_tool_count = 0;
-                            break;
-                        } else {
-                            main.stderrPrint(
-                                "\n\x1b[33m[agent] ⚠️ Action loop persisted after replanning attempts: {s}. Halting turn.\x1b[0m\n",
-                                .{trip_reason_str},
-                            );
-                            if (main.ui_repl.current_renderer) |r| {
-                                r.ensureNewline();
-                                r.write(" \x1b[33m[Action loop persisted: halting turn]\x1b[0m\n");
-                            }
-                            const trip_msg = try std.fmt.allocPrint(
-                                self.alloc,
-                                "[Action Loop Halt]: Action loop persisted after multiple replanning requests ({s}). Execution paused. Please explain your status and request user guidance.",
-                                .{trip_reason_str},
-                            );
-                            try allocated_strings.append(self.alloc, trip_msg);
-                            try results.append(self.alloc, .{
-                                .tool_use_id = tu.id,
-                                .content = trip_msg,
-                                .is_error = true,
-                            });
-                            self.action_loop_tripped = true;
-                            break;
-                        }
-                    }
-
-                    var warn_suffix: ?[]u8 = null;
-                    defer if (warn_suffix) |w| self.alloc.free(w);
-                    if (loop_check == .warn) {
-                        warn_suffix = switch (self.last_loop_reason) {
-                            .orbit_cycle, .macro_cycle_2, .macro_cycle_3 => std.fmt.allocPrint(
-                                self.alloc,
-                                "\n\n[3D Procedural Map Advisory: Orbit Checkpoint & Recap]\n⚠️ Trajectory Orbit Detected: You are circling around already-scouted nodes in procedural space. If you have gathered sufficient context, consider whether further exploration is needed or if you may proceed to conclude.",
-                                .{},
-                            ) catch null,
-                            .readonly_budget => std.fmt.allocPrint(
-                                self.alloc,
-                                "\n\n[System Advisory]: You have performed {d} consecutive read-only exploratory actions. If you have gathered sufficient information, proceed to take action or synthesize your response.",
-                                .{self.consecutive_readonly_count},
-                            ) catch null,
-                            else => std.fmt.allocPrint(
-                                self.alloc,
-                                "\n\n[System Advisory]: Action loop detected. You have called '{s}' with identical arguments multiple times. You already have this data in your context. If you feel you have enough information, you may synthesize your findings and respond to the user.",
-                                .{tu.name},
-                            ) catch null,
-                        };
-                    }
-
-                    // Plan completion: non-exploratory tool call means the model is executing its plan.
-                    if (self.plan.plan_active and !isPlanOnlyRequest(self.current_user_request) and
-                        !isExploratoryToolCall(tu.name, tu.input_json))
-                    {
-                        self.plan.clearPlan();
-                    }
-
-                    // Hard dedupe barrier: serve cached result for repeated read-only
-                    // calls instead of re-executing (prevents mechanical replay loops;
-                    // model sees identical data without redundant execution).
-                    if (isReadOnlyTool(tu.name)) {
-                        const cache_hash = fuzzyArgsHash(tu.input_json);
-                        if (self.lookupToolCache(tu.name, cache_hash)) |cached| {
-                            main.stderrPrint(
-                                "\x1b[33m[duplicate: serving cached result]\x1b[0m\n",
-                                .{},
-                            );
-                            const note = try std.fmt.allocPrint(
-                                self.alloc,
-                                "[duplicate: identical call already executed this turn — cached result below]\n{s}",
-                                .{cached},
-                            );
-                            try allocated_strings.append(self.alloc, note);
-                            try results.append(self.alloc, .{
-                                .tool_use_id = tu.id,
-                                .content = note,
-                                .is_error = false,
-                            });
-                            tool_count += 1;
-                            continue;
-                        }
-                    }
-
-                    const start_tool_ms = utils.milliTimestamp();
-                    self.coordinator.updateStatus(act_id, .executing_tool, tu.name);
-                    if (main.ui_repl.current_renderer) |r| {
-                        r.startTool(tu.name, tu.input_json);
-                    } else {
-                        // Display tool name and primary parameters (fallback log)
-                        if (std.mem.eql(u8, tu.name, "bash")) {
-                            if (json_mod.findString(tu.input_json, "command")) |cmd| {
-                                var cmd_buf: [100]u8 = undefined;
-                                const display_cmd = if (cmd.len > 97) std.fmt.bufPrint(&cmd_buf, "{s}...", .{cmd[0..97]}) catch cmd else cmd;
-                                main.stderrPrint("\x1b[90m[bash]\x1b[0m \x1b[35m{s}\x1b[0m ", .{display_cmd});
-                            } else {
-                                main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
-                            }
-                        } else if (std.mem.eql(u8, tu.name, "file_read") or std.mem.eql(u8, tu.name, "file_write") or std.mem.eql(u8, tu.name, "file_edit")) {
-                            if (json_mod.findString(tu.input_json, "path")) |path| {
-                                main.stderrPrint("\x1b[90m[{s}]\x1b[0m \x1b[34m{s}\x1b[0m ", .{tu.name, path});
-                            } else {
-                                main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
-                            }
-                        } else if (std.mem.eql(u8, tu.name, "codeact")) {
-                            main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting CodeAct script...\x1b[0m ", .{});
-                        } else {
-                            main.stderrPrint("\x1b[90m[tool: {s}]\x1b[0m ", .{tu.name});
-                        }
-                    }
-
-                    // Snapshot file if editing tool
-                    if (std.mem.eql(u8, tu.name, "file_edit") or std.mem.eql(u8, tu.name, "file_write")) {
-                        if (json_mod.findString(tu.input_json, "path")) |path| {
-                            if (self.snapshot_tracker) |*t| {
-                                t.beforeFileWrite(path);
-                            }
-                        }
-                    }
-
-                    var is_err = false;
-                    const result = tools_mod.executeTool(self.alloc, self.io, tu.name, tu.input_json) catch |e| blk: {
-                        if (e == error.Interrupted or signals.isInterrupted()) {
-                            return error.Interrupted;
-                        }
-                        is_err = true;
-                        any_tool_err = true;
-                        const msg = try std.fmt.allocPrint(self.alloc, "Tool error: {s}", .{@errorName(e)});
-                        break :blk msg;
-                    };
-                    if (signals.isInterrupted()) {
-                        self.alloc.free(result);
-                        return error.Interrupted;
-                    }
-                    try allocated_strings.append(self.alloc, result);
-
-                    // Truncate if oversized
-                    const max_tool_result = 64 * 1024;
-                    const truncated = if (result.len > max_tool_result) result[0..max_tool_result] else result;
-
-                    var merged_suffix = utils.BufWriter.init(self.alloc);
-                    defer merged_suffix.deinit();
-                    if (warn_suffix) |ws| try merged_suffix.writeAll(ws);
-
-                    const final_content = if (merged_suffix.list.items.len > 0) blk: {
-                        const merged = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ truncated, merged_suffix.list.items });
-                        try allocated_strings.append(self.alloc, merged);
-                        break :blk merged;
-                    } else truncated;
-
-                    try results.append(self.alloc, .{
-                        .tool_use_id = tu.id,
-                        .content = final_content,
-                        .is_error = is_err,
-                    });
-                    // Cache successful read-only results for the dedupe barrier.
-                    if (!is_err and isReadOnlyTool(tu.name)) {
-                        self.storeToolCache(tu.name, fuzzyArgsHash(tu.input_json), truncated) catch {};
-                    }
-                    if (!is_err) {
-                        self.plan.loop_plan_retries = 0;
-                        self.plan.plan_execution_pending = false;
-                        self.plan.plan_watchdog_retries = 0;
-                        if (!isExploratoryToolCall(tu.name, tu.input_json)) {
-                            // RFC-019: Plan execution tracking
-                            if (self.plan.enable_structured_planning and self.plan.current_plan != null) {
-                                var plan = &self.plan.current_plan.?;
-                                // Check drift
-                                if (self.config.plan_drift_detection) {
-                                    const drift = plan_monitor.checkPlanDrift(
-                                        plan,
-                                        &self.plan.plan_ctx,
-                                        tu.name,
-                                    );
-                                    if (drift) |d| {
-                                        self.plan.plan_drift_score += d.drift_score;
-                                        // Inject drift correction if score too high
-                                        if (self.plan.plan_drift_score > 0.8) {
-                                            const correction = plan_monitor.generateReplanSuggestion(
-                                                plan,
-                                                self.plan.plan_ctx.steps_completed,
-                                                self.plan.plan_drift_score,
-                                                self.alloc,
-                                            ) catch null;
-                                            if (correction) |c| {
-                                                defer self.alloc.free(c);
-                                                const adv = std.fmt.allocPrint(self.alloc, "[System Advisory]: {s}", .{c}) catch null;
-                                                if (adv) |a| {
-                                                    try allocated_strings.append(self.alloc, a);
-                                                    try results.append(self.alloc, .{
-                                                        .tool_use_id = tu.id,
-                                                        .content = a,
-                                                        .is_error = false,
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Complete current step if tool matches hint
-                                if (self.plan.plan_ctx.current_step_idx < plan.stepCount()) {
-                                    const current_step = &plan.steps.items[self.plan.plan_ctx.current_step_idx];
-                                    if (current_step.tool_hint) |hint| {
-                                        if (std.mem.eql(u8, tu.name, hint)) {
-                                            plan_executor.completeStep(plan, &self.plan.plan_ctx);
-                                            if (!utils.isSubagent()) {
-                                                main.stderrPrint("[agent] Plan step completed: {s}\n", .{current_step.description});
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Check if plan is complete
-                                if (self.plan.plan_ctx.is_complete or plan.isComplete()) {
-                                    if (!utils.isSubagent()) {
-                                        main.stderrPrint("[agent] Plan completed! Saving to store...\n", .{});
-                                    }
-                                    if (self.plan.plan_store) |ps| {
-                                        ps.save(plan) catch |e| {
-                                            main.stderrPrint("[agent] Warning: Failed to save plan: {s}\n", .{@errorName(e)});
-                                        };
-                                    }
-                                    self.plan.clearPlan();
-                                } else {
-                                    // Move to next step
-                                    if (self.plan.plan_ctx.current_step_idx + 1 < plan.stepCount()) {
-                                        self.plan.plan_ctx.current_step_idx += 1;
-                                        plan.steps.items[self.plan.plan_ctx.current_step_idx].status = .active;
-                                    }
-                                }
-                            } else {
-                                self.plan.clearPlan();
-                            }
-                        }
-                    }
-
-                    const end_tool_ms = utils.milliTimestamp();
-                    const dur_ms = if (end_tool_ms >= start_tool_ms) @as(u64, @intCast(end_tool_ms - start_tool_ms)) else 0;
-                    total_dur_ms += dur_ms;
+                    const outcome = try self.dispatchSingleToolUse(act_id, tu, &results, &allocated_strings, &any_tool_err);
+                    total_dur_ms += outcome.dur_ms;
+                    if (outcome.should_break) break;
                     tool_count += 1;
-
-                    if (main.ui_repl.current_renderer) |r| {
-                        var patch_path: ?[]const u8 = null;
-                        var patch_diff: ?[]const u8 = null;
-                        if (std.mem.eql(u8, tu.name, "file_edit") or std.mem.eql(u8, tu.name, "file_write")) {
-                            patch_path = json_mod.findString(tu.input_json, "path");
-                            patch_diff = json_mod.findString(tu.input_json, "patch") orelse json_mod.findString(tu.input_json, "content");
-                        }
-                        r.finishTool(tu.name, result, is_err, dur_ms, patch_path, patch_diff);
-                    } else {
-                        if (is_err) {
-                            main.stderrPrint("\x1b[31m[error]\x1b[0m\n", .{});
-                        } else {
-                            main.stderrPrint("\x1b[32m[ok]\x1b[0m\n", .{});
-                        }
-                    }
                 },
                 else => {},
             }
         }
 
-        if (results.items.len > 0) {
-            const turn_attached = media_gen_tool.getTurnAttachments();
-            if (turn_attached.len > 0) {
-                try self.history.addToolResultsWithImages(results.items, turn_attached);
-                media_gen_tool.clearTurnAttachments(self.alloc);
-            } else {
-                try self.history.addToolResults(results.items);
-            }
-        }
+        try self.recordToolResultsToHistory(results.items);
         self.last_act_failed = any_tool_err;
-        return ToolExecSummary{
+        return .{
             .any_tool_err = any_tool_err,
             .total_dur_ms = total_dur_ms,
             .tool_count = tool_count,
         };
     }
 };
-
 
 // Parsing helpers moved to agent_parsing.zig; re-exported so existing
 // call sites and unit tests keep working unchanged.
@@ -1929,6 +1938,3 @@ test "agent - parseTimeoutDecision" {
     try std.testing.expect(d4.should_kill);
     try std.testing.expect(std.mem.indexOf(u8, d4.reason(), "Deadlock detected") != null);
 }
-
-
-

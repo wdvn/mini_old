@@ -136,9 +136,10 @@ fn scanSkillsFromDir(arena_alloc: Allocator, io: std.Io, dir_path: []const u8, s
     }
 }
 
-/// Parse frontmatter of SKILL.md.
-/// Spec agentskills.io: `name` must match parent directory name (`dir_name`).
-fn parseSkillFile(alloc: Allocator, io: std.Io, path: []const u8, dir_name: []const u8) !SkillInfo {
+fn readSkillFileContent(alloc: Allocator, io: std.Io, path: []const u8) ![]u8 {
+    // PSEUDOCODE:
+    // 1. Open file and check size (0 < size <= MAX_SKILL_FILE).
+    // 2. Read content into allocated buffer.
     const cwd = std.Io.Dir.cwd();
     const file = try cwd.openFile(io, path, .{});
     defer file.close(io);
@@ -147,55 +148,66 @@ fn parseSkillFile(alloc: Allocator, io: std.Io, path: []const u8, dir_name: []co
     if (stat.size == 0 or stat.size > MAX_SKILL_FILE) return error.InvalidFileSize;
 
     const buf = try alloc.alloc(u8, @intCast(stat.size));
+    errdefer alloc.free(buf);
     const n = try utils.readAll(io, file, buf);
-    const content = buf[0..n];
+    return buf[0..n];
+}
 
-    var name: []const u8 = dir_name;
-    var desc_buf = std.ArrayList(u8).empty;
-    defer desc_buf.deinit(alloc);
+fn parseSkillFrontmatter(alloc: Allocator, content: []const u8, default_name: []const u8, desc_buf: *std.ArrayList(u8)) []const u8 {
+    // PSEUDOCODE:
+    // 1. Check for YAML frontmatter opening "---".
+    // 2. Parse lines for name and single-line/multiline description.
+    var name: []const u8 = default_name;
+    if (!std.mem.startsWith(u8, content, "---\n")) return name;
+
+    const body_start = std.mem.indexOfPos(u8, content, 4, "\n---") orelse content.len;
+    var lines = std.mem.splitScalar(u8, content[4..body_start], '\n');
     var in_desc_multiline = false;
 
-    // Frontmatter must start with "---" on the first line
-    if (std.mem.startsWith(u8, content, "---\n")) {
-        const body_start = std.mem.indexOfPos(u8, content, 4, "\n---") orelse content.len;
-        const fm = content[4..body_start];
-        var lines = std.mem.splitScalar(u8, fm, '\n');
-        while (lines.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, " \t\r");
-            if (in_desc_multiline) {
-                if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) {
-                    if (trimmed.len > 0) {
-                        if (desc_buf.items.len > 0 and desc_buf.items.len < MAX_DESC_LEN) {
-                            desc_buf.append(alloc, ' ') catch {};
-                        }
-                        const to_copy = @min(trimmed.len, if (desc_buf.items.len < MAX_DESC_LEN) MAX_DESC_LEN - desc_buf.items.len else 0);
-                        if (to_copy > 0) {
-                            desc_buf.appendSlice(alloc, trimmed[0..to_copy]) catch {};
-                        }
-                    }
-                    continue;
-                } else {
-                    in_desc_multiline = false;
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (in_desc_multiline) {
+            if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) {
+                if (trimmed.len > 0) {
+                    if (desc_buf.items.len > 0 and desc_buf.items.len < MAX_DESC_LEN) desc_buf.append(alloc, ' ') catch {};
+                    const to_copy = @min(trimmed.len, if (desc_buf.items.len < MAX_DESC_LEN) MAX_DESC_LEN - desc_buf.items.len else 0);
+                    if (to_copy > 0) desc_buf.appendSlice(alloc, trimmed[0..to_copy]) catch {};
                 }
+                continue;
+            } else {
+                in_desc_multiline = false;
             }
-
-            if (std.mem.startsWith(u8, trimmed, "name:")) {
-                name = std.mem.trim(u8, trimmed[5..], " \t\"'");
-            } else if (std.mem.startsWith(u8, trimmed, "description:")) {
-                const rest = std.mem.trim(u8, trimmed[12..], " \t\"'");
-                if (std.mem.eql(u8, rest, ">") or std.mem.eql(u8, rest, ">-") or
-                    std.mem.eql(u8, rest, "|") or std.mem.eql(u8, rest, "|-") or rest.len == 0)
-                {
-                    in_desc_multiline = true;
-                } else {
-                    const to_copy = @min(rest.len, MAX_DESC_LEN);
-                    desc_buf.appendSlice(alloc, rest[0..to_copy]) catch {};
-                }
+        }
+        if (std.mem.startsWith(u8, trimmed, "name:")) {
+            name = std.mem.trim(u8, trimmed[5..], " \t\"'");
+        } else if (std.mem.startsWith(u8, trimmed, "description:")) {
+            const rest = std.mem.trim(u8, trimmed[12..], " \t\"'");
+            if (std.mem.eql(u8, rest, ">") or std.mem.eql(u8, rest, ">-") or std.mem.eql(u8, rest, "|") or std.mem.eql(u8, rest, "|-") or rest.len == 0) {
+                in_desc_multiline = true;
+            } else {
+                const to_copy = @min(rest.len, MAX_DESC_LEN);
+                desc_buf.appendSlice(alloc, rest[0..to_copy]) catch {};
             }
         }
     }
+    return name;
+}
 
-    // Spec validation: name in frontmatter must match directory name
+/// Parse frontmatter of SKILL.md.
+/// Spec agentskills.io: `name` must match parent directory name (`dir_name`).
+fn parseSkillFile(alloc: Allocator, io: std.Io, path: []const u8, dir_name: []const u8) !SkillInfo {
+    // PSEUDOCODE:
+    // 1. Read file content.
+    // 2. Parse frontmatter name and description.
+    // 3. Validate name matches dir_name.
+    // 4. Return duped SkillInfo.
+    const content = try readSkillFileContent(alloc, io, path);
+    defer alloc.free(content);
+
+    var desc_buf = std.ArrayList(u8).empty;
+    defer desc_buf.deinit(alloc);
+
+    var name = parseSkillFrontmatter(alloc, content, dir_name, &desc_buf);
     if (!std.mem.eql(u8, name, dir_name)) {
         main.stderrPrint("[skills] Warning: skill name '{s}' in {s} does not match directory name '{s}', using directory name.\n", .{ name, path, dir_name });
         name = dir_name;
@@ -262,7 +274,6 @@ test "parseSkillFile frontmatter" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(testing.io, "my-skill");
-
 
     try tmp.dir.writeFile(testing.io, .{
         .sub_path = "my-skill/SKILL.md",

@@ -444,56 +444,64 @@ pub const PlanState = struct {
         return false;
     }
 
+    fn matchPlanHeading(trimmed: []const u8, text: []const u8) ?[]const u8 {
+        // PSEUDOCODE: Match '# ...' heading containing plan keyword with nearby step markers
+        if (trimmed.len == 0 or trimmed[0] != '#') return null;
+        var i: usize = 0;
+        while (i < trimmed.len and trimmed[i] == '#') : (i += 1) {}
+        if (i > 6 or i >= trimmed.len or (trimmed[i] != ' ' and trimmed[i] != '\t')) return null;
+
+        const title = std.mem.trim(u8, trimmed[i..], " \t#*`_");
+        if (!plan_parser.isPlanHeaderKeyword(title)) return null;
+
+        const start = @intFromPtr(trimmed.ptr) - @intFromPtr(text.ptr);
+        if (!hasStepMarkerNearby(text, start)) return null;
+        const end = @min(text.len, start + 120);
+        return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
+    }
+
+    fn matchPlanLabel(trimmed: []const u8, text: []const u8) ?[]const u8 {
+        // PSEUDOCODE: Match labeled line ending with ':' or bold label with nearby step markers
+        const stripped = std.mem.trim(u8, trimmed, " \t*_`");
+        if (stripped.len == 0 or (!std.mem.endsWith(u8, stripped, ":") and !std.mem.startsWith(u8, stripped, "**"))) {
+            return null;
+        }
+        const title = std.mem.trim(u8, stripped, " \t:*_`");
+        const is_plan_label = plan_parser.isPlanHeaderKeyword(title) or
+            std.ascii.startsWithIgnoreCase(title, "step 1") or
+            std.ascii.startsWithIgnoreCase(title, "bước 1");
+        if (!is_plan_label) return null;
+
+        const start = @intFromPtr(trimmed.ptr) - @intFromPtr(text.ptr);
+        if (!hasStepMarkerNearby(text, start)) return null;
+        const end = @min(text.len, start + 120);
+        return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
+    }
+
+    fn matchActionCommitment(trimmed: []const u8, text: []const u8) ?[]const u8 {
+        // PSEUDOCODE: Match explicit action commitment prefix without requiring step markers
+        const has_commitment = std.ascii.indexOfIgnoreCase(trimmed, "i will implement") != null or
+            std.ascii.indexOfIgnoreCase(trimmed, "tôi sẽ implement") != null or
+            std.ascii.indexOfIgnoreCase(trimmed, "implementation plan") != null;
+        if (!has_commitment) return null;
+
+        const start = @intFromPtr(trimmed.ptr) - @intFromPtr(text.ptr);
+        const end = @min(text.len, start + 120);
+        return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
+    }
+
     pub fn detectPlanInText(text: []const u8) ?[]const u8 {
+        // PSEUDOCODE:
+        // 1. Iterate text line by line
+        // 2. Early-return matched heading, label, or action commitment
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
             if (trimmed.len == 0) continue;
 
-            // 1. Markdown heading (# ... ######) containing plan keyword
-            if (trimmed[0] == '#') {
-                var i: usize = 0;
-                while (i < trimmed.len and trimmed[i] == '#') : (i += 1) {}
-                if (i <= 6 and i < trimmed.len and (trimmed[i] == ' ' or trimmed[i] == '\t')) {
-                    const title = std.mem.trim(u8, trimmed[i..], " \t#*`_");
-                    if (plan_parser.isPlanHeaderKeyword(title)) {
-                        const start = @intFromPtr(trimmed.ptr) - @intFromPtr(text.ptr);
-                        if (!hasStepMarkerNearby(text, start)) continue;
-                        const end = @min(text.len, start + 120);
-                        return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
-                    }
-                }
-                continue;
-            }
-
-            // 2. Line label ending with ':' or bold label: "Plan:", "**Plan:**", "Implementation Plan:", "Kế hoạch:"
-            const stripped = std.mem.trim(u8, trimmed, " \t*_`");
-            if (stripped.len > 0 and (std.mem.endsWith(u8, stripped, ":") or std.mem.startsWith(u8, stripped, "**"))) {
-                const title = std.mem.trim(u8, stripped, " \t:*_`");
-                if (plan_parser.isPlanHeaderKeyword(title) or
-                    std.ascii.startsWithIgnoreCase(title, "step 1") or
-                    std.ascii.startsWithIgnoreCase(title, "bước 1"))
-                {
-                    const start = @intFromPtr(trimmed.ptr) - @intFromPtr(text.ptr);
-                    if (!hasStepMarkerNearby(text, start)) continue;
-                    const end = @min(text.len, start + 120);
-                    return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
-                }
-            }
-
-            // 3. Explicit action commitment prefix: "I will implement" / "Tôi sẽ implement"
-            if (std.ascii.indexOfIgnoreCase(trimmed, "i will implement") != null or
-                std.ascii.indexOfIgnoreCase(trimmed, "tôi sẽ implement") != null or
-                std.ascii.indexOfIgnoreCase(trimmed, "implementation plan") != null)
-            {
-                const start = @intFromPtr(trimmed.ptr) - @intFromPtr(text.ptr);
-                // RFC-022 note: commitment phrases ("i will implement") remain
-                // detected without step markers — detection alone is benign.
-                // False-positive ENFORCEMENT is prevented by Gate 1/2 in
-                // handleEndTurnWatchdog, not here.
-                const end = @min(text.len, start + 120);
-                return std.mem.trim(u8, text[start..end], " \t\r\n`#*");
-            }
+            if (matchPlanHeading(trimmed, text)) |matched| return matched;
+            if (matchPlanLabel(trimmed, text)) |matched| return matched;
+            if (matchActionCommitment(trimmed, text)) |matched| return matched;
         }
         return null;
     }
@@ -512,10 +520,6 @@ pub const PlanState = struct {
         );
         try std.testing.expect(true_positive != null);
     }
-
-
-
-
 
     pub fn isPlanOnlyRequest(user_text_opt: ?[]const u8) bool {
         const text = user_text_opt orelse return false;
@@ -536,7 +540,6 @@ pub const PlanState = struct {
         }
         return false;
     }
-
 
     test "rfc022 - bare keyword plan is not enforceable in structured mode" {
         // RFC-022 Incident 1: a final answer that merely MENTIONS an
@@ -610,5 +613,4 @@ pub const PlanState = struct {
             try std.testing.expectEqual(WatchdogAction.no_action, ps.handleEndTurnWatchdog("plan only, khong sua", false));
         }
     }
-
 };

@@ -184,97 +184,54 @@ fn cleanBaseUrl(raw: []const u8) []const u8 {
     return u;
 }
 
-pub fn generateImageDirect(
-    alloc: Allocator,
-    io: std.Io,
-    prompt: []const u8,
-    size_opt: ?[]const u8,
-    filename_opt: ?[]const u8,
-    model_opt: ?[]const u8,
-) !MediaResult {
-    if (prompt.len == 0 or prompt.len > 4000) {
-        return MediaResult{
-            .path = "",
-            .media_type = "",
-            .bytes = 0,
-            .ok = false,
-            .message = try alloc.dupe(u8, "Prompt must be between 1 and 4000 characters"),
-        };
-    }
-
-    const model = model_opt orelse g_config.image_gen_model;
-    const size = size_opt orelse g_config.image_gen_size;
-    const is_compat = isCompatOrAgnes(g_config.image_gen_provider);
-
-    var base_url: []const u8 = if (is_compat and std.mem.indexOf(u8, g_config.image_gen_provider, "agnes") != null)
-        "https://apihub.agnes.ai/v1"
-    else
-        "https://api.openai.com/v1";
-    if (is_compat) {
-        if (g_config.openai_compat_url) |u| {
-            base_url = cleanBaseUrl(u);
-        }
-    }
-
-    const api_url = if (std.mem.endsWith(u8, base_url, "/v1"))
-        try std.fmt.allocPrint(alloc, "{s}/images/generations", .{base_url})
-    else
-        try std.fmt.allocPrint(alloc, "{s}/v1/images/generations", .{base_url});
-    defer alloc.free(api_url);
-
-    const api_key = g_config.openai_compat_key;
-    const headers_json = try buildAuthHeaders(alloc, api_key);
-    defer alloc.free(headers_json);
-
-    const escaped_prompt = try json.escape(alloc, prompt);
-    defer alloc.free(escaped_prompt);
-
-    const req_body = try std.fmt.allocPrint(alloc,
-        \\{{"model":"{s}","prompt":"{s}","size":"{s}","n":1,"response_format":"b64_json"}}
-    , .{ model, escaped_prompt, size });
-    defer alloc.free(req_body);
-
-    var res = http_lib.fetch(alloc, io, .{
-        .url = api_url,
-        .method = "POST",
-        .body = req_body,
-        .headers_json = headers_json,
-        .max_body_size = 20 * 1024 * 1024,
-        .timeout_s = 120,
-    }) catch |e| {
-        return MediaResult{
-            .path = "",
-            .media_type = "",
-            .bytes = 0,
-            .ok = false,
-            .message = try std.fmt.allocPrint(alloc, "HTTP request failed: {s}", .{@errorName(e)}),
-        };
+fn makeFailedMediaResult(alloc: Allocator, msg: []const u8) !MediaResult {
+    return MediaResult{
+        .path = "",
+        .media_type = "",
+        .bytes = 0,
+        .ok = false,
+        .message = try alloc.dupe(u8, msg),
     };
-    defer res.deinit(alloc);
+}
 
-    if (res.status < 200 or res.status >= 300) {
-        const body_snippet = if (res.body.len > 256) res.body[0..256] else res.body;
-        return MediaResult{
-            .path = "",
-            .media_type = "",
-            .bytes = 0,
-            .ok = false,
-            .message = try std.fmt.allocPrint(alloc, "Provider returned HTTP {d}: {s}", .{ res.status, body_snippet }),
-        };
+fn makeFailedMediaResultFmt(alloc: Allocator, comptime fmt: []const u8, args: anytype) !MediaResult {
+    return MediaResult{
+        .path = "",
+        .media_type = "",
+        .bytes = 0,
+        .ok = false,
+        .message = try std.fmt.allocPrint(alloc, fmt, args),
+    };
+}
+
+fn resolveBaseUrl(provider: []const u8, compat_url: ?[]const u8) []const u8 {
+    const is_compat = isCompatOrAgnes(provider);
+    if (is_compat and std.mem.indexOf(u8, provider, "agnes") != null) {
+        if (compat_url) |u| return cleanBaseUrl(u);
+        return "https://apihub.agnes.ai/v1";
     }
+    if (is_compat) {
+        if (compat_url) |u| return cleanBaseUrl(u);
+    }
+    return "https://api.openai.com/v1";
+}
 
-    // Parse response: data[0].b64_json or data[0].url
-    var binary_data: ?[]u8 = null;
-    defer if (binary_data) |b| alloc.free(b);
+fn resolveEndpointUrl(alloc: Allocator, base_url: []const u8, suffix: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, base_url, "/v1")) {
+        return std.fmt.allocPrint(alloc, "{s}/{s}", .{ base_url, suffix });
+    }
+    return std.fmt.allocPrint(alloc, "{s}/v1/{s}", .{ base_url, suffix });
+}
 
-    if (json.findString(res.body, "b64_json")) |b64_str| {
+fn extractImageData(alloc: Allocator, io: std.Io, body: []const u8) !?[]u8 {
+    if (json.findString(body, "b64_json")) |b64_str| {
         const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_str);
         const bin_buf = try alloc.alloc(u8, decoded_len);
         errdefer alloc.free(bin_buf);
         try std.base64.standard.Decoder.decode(bin_buf, b64_str);
-        binary_data = bin_buf;
-    } else if (json.findString(res.body, "url")) |img_url| {
-        // Fetch binary from URL
+        return bin_buf;
+    }
+    if (json.findString(body, "url")) |img_url| {
         var img_res = try http_lib.fetch(alloc, io, .{
             .url = img_url,
             .method = "GET",
@@ -283,40 +240,31 @@ pub fn generateImageDirect(
         });
         defer img_res.deinit(alloc);
         if (img_res.status == 200 and img_res.body.len > 0) {
-            binary_data = try alloc.dupe(u8, img_res.body);
+            return try alloc.dupe(u8, img_res.body);
         }
     }
+    return null;
+}
 
-    if (binary_data == null) {
-        return MediaResult{
-            .path = "",
-            .media_type = "",
-            .bytes = 0,
-            .ok = false,
-            .message = try alloc.dupe(u8, "No image data (b64_json or url) returned in provider response"),
-        };
-    }
+fn mimeToImageExtension(mime: []const u8) []const u8 {
+    if (std.mem.eql(u8, mime, "image/jpeg")) return ".jpg";
+    if (std.mem.eql(u8, mime, "image/webp")) return ".webp";
+    if (std.mem.eql(u8, mime, "image/gif")) return ".gif";
+    return ".png";
+}
 
-    const data = binary_data.?;
+fn saveImageResult(
+    alloc: Allocator,
+    io: std.Io,
+    data: []const u8,
+    filename_opt: ?[]const u8,
+) !MediaResult {
     const detected_mime = media_lib.sniffMimeFromMagic(data) orelse "image/png";
     const dims = media_lib.extractDimensions(data, detected_mime);
+    const ext = mimeToImageExtension(detected_mime);
 
-    // Determine extension
-    const ext = if (std.mem.eql(u8, detected_mime, "image/jpeg"))
-        ".jpg"
-    else if (std.mem.eql(u8, detected_mime, "image/webp"))
-        ".webp"
-    else if (std.mem.eql(u8, detected_mime, "image/gif"))
-        ".gif"
-    else
-        ".png";
-
-    const base_filename = if (filename_opt) |f|
-        try sanitizeFilename(alloc, f)
-    else
-        try alloc.dupe(u8, "image");
+    const base_filename = if (filename_opt) |f| try sanitizeFilename(alloc, f) else try alloc.dupe(u8, "image");
     defer alloc.free(base_filename);
-
     const safe_name = if (std.mem.endsWith(u8, base_filename, ext))
         try alloc.dupe(u8, base_filename)
     else
@@ -325,18 +273,15 @@ pub fn generateImageDirect(
 
     const output_dir = g_config.media_output_dir orelse "media";
     try ensureOutputDir(alloc, io, output_dir);
-
     const ts = utils.milliTimestamp();
     const final_path = try std.fmt.allocPrint(alloc, "{s}/{d}_{s}", .{ output_dir, ts, safe_name });
     errdefer alloc.free(final_path);
 
-    // Save binary to file
     const cwd = std.Io.Dir.cwd();
     const file = try cwd.createFile(io, final_path, .{});
     defer file.close(io);
     try file.writeStreamingAll(io, data);
 
-    // Hook dispatch (RFC-011 §3.2 step 6)
     hooks.dispatch(alloc, io, .{
         .event = "media_saved",
         .artifact_path = final_path,
@@ -352,6 +297,59 @@ pub fn generateImageDirect(
         .ok = true,
         .message = try alloc.dupe(u8, "Image generated successfully"),
     };
+}
+
+fn buildImageGenRequestBody(alloc: Allocator, model: []const u8, prompt: []const u8, size: []const u8) ![]u8 {
+    const escaped_prompt = try json.escape(alloc, prompt);
+    defer alloc.free(escaped_prompt);
+    return std.fmt.allocPrint(alloc,
+        \\{{"model":"{s}","prompt":"{s}","size":"{s}","n":1,"response_format":"b64_json"}}
+    , .{ model, escaped_prompt, size });
+}
+
+pub fn generateImageDirect(
+    alloc: Allocator,
+    io: std.Io,
+    prompt: []const u8,
+    size_opt: ?[]const u8,
+    filename_opt: ?[]const u8,
+    model_opt: ?[]const u8,
+) !MediaResult {
+    if (prompt.len == 0 or prompt.len > 4000) {
+        return makeFailedMediaResult(alloc, "Prompt must be between 1 and 4000 characters");
+    }
+
+    const model = model_opt orelse g_config.image_gen_model;
+    const size = size_opt orelse g_config.image_gen_size;
+    const base_url = resolveBaseUrl(g_config.image_gen_provider, g_config.openai_compat_url);
+    const api_url = try resolveEndpointUrl(alloc, base_url, "images/generations");
+    defer alloc.free(api_url);
+
+    const headers_json = try buildAuthHeaders(alloc, g_config.openai_compat_key);
+    defer alloc.free(headers_json);
+    const req_body = try buildImageGenRequestBody(alloc, model, prompt, size);
+    defer alloc.free(req_body);
+
+    var res = http_lib.fetch(alloc, io, .{
+        .url = api_url,
+        .method = "POST",
+        .body = req_body,
+        .headers_json = headers_json,
+        .max_body_size = 20 * 1024 * 1024,
+        .timeout_s = 120,
+    }) catch |e| return makeFailedMediaResultFmt(alloc, "HTTP request failed: {s}", .{@errorName(e)});
+    defer res.deinit(alloc);
+
+    if (res.status < 200 or res.status >= 300) {
+        const body_snippet = if (res.body.len > 256) res.body[0..256] else res.body;
+        return makeFailedMediaResultFmt(alloc, "Provider returned HTTP {d}: {s}", .{ res.status, body_snippet });
+    }
+
+    const binary_data = (try extractImageData(alloc, io, res.body)) orelse
+        return makeFailedMediaResult(alloc, "No image data (b64_json or url) returned in provider response");
+    defer alloc.free(binary_data);
+
+    return saveImageResult(alloc, io, binary_data, filename_opt);
 }
 
 // ---------------------------------------------------------------------------
@@ -389,237 +387,9 @@ pub fn generateVideoTool(alloc: Allocator, io: std.Io, input_json: []const u8) !
     );
 }
 
-pub fn generateVideoDirect(
-    alloc: Allocator,
-    io: std.Io,
-    prompt: []const u8,
-    seconds: u32,
-    filename_opt: ?[]const u8,
-    model_opt: ?[]const u8,
-) !MediaResult {
-    if (prompt.len == 0) {
-        return MediaResult{
-            .path = "",
-            .media_type = "",
-            .bytes = 0,
-            .ok = false,
-            .message = try alloc.dupe(u8, "Prompt cannot be empty"),
-        };
-    }
-
-    const model = model_opt orelse g_config.video_gen_model;
-    const is_compat = isCompatOrAgnes(g_config.video_gen_provider);
-    var base_url: []const u8 = if (is_compat and std.mem.indexOf(u8, g_config.video_gen_provider, "agnes") != null)
-        "https://apihub.agnes.ai/v1"
-    else
-        "https://api.openai.com/v1";
-    if (is_compat) {
-        if (g_config.openai_compat_url) |u| {
-            base_url = cleanBaseUrl(u);
-        }
-    }
-
-    const create_url = if (std.mem.endsWith(u8, base_url, "/v1"))
-        try std.fmt.allocPrint(alloc, "{s}/videos", .{base_url})
-    else
-        try std.fmt.allocPrint(alloc, "{s}/v1/videos", .{base_url});
-    defer alloc.free(create_url);
-
-    const api_key = g_config.openai_compat_key;
-    const headers_json = try buildAuthHeaders(alloc, api_key);
-    defer alloc.free(headers_json);
-
-    const escaped_prompt = try json.escape(alloc, prompt);
-    defer alloc.free(escaped_prompt);
-
-    // AgnesAI: seconds is string, requires mode + size params
-    // Sora/OpenAI: duration is integer, no mode required
-    const req_body = if (is_compat)
-        try std.fmt.allocPrint(alloc,
-            \\{{"model":"{s}","prompt":"{s}","seconds":"{d}","mode":"text","size":"720P","aspect_ratio":"16:9"}}
-        , .{ model, escaped_prompt, seconds })
-    else
-        try std.fmt.allocPrint(alloc,
-            \\{{"model":"{s}","prompt":"{s}","duration":{d}}}
-        , .{ model, escaped_prompt, seconds });
-    defer alloc.free(req_body);
-
-    var res = try http_lib.fetch(alloc, io, .{
-        .url = create_url,
-        .method = "POST",
-        .body = req_body,
-        .headers_json = headers_json,
-        .timeout_s = 60,
-    });
-    defer res.deinit(alloc);
-
-    if (res.status < 200 or res.status >= 300) {
-        return MediaResult{
-            .path = "",
-            .media_type = "",
-            .bytes = 0,
-            .ok = false,
-            .message = try std.fmt.allocPrint(alloc, "Failed to start video job (HTTP {d})", .{res.status}),
-        };
-    }
-
-    const job_id = json.findString(res.body, "id") orelse
-        json.findString(res.body, "task_id") orelse
-        json.findString(res.body, "video_id") orelse {
-        return MediaResult{
-            .path = "",
-            .media_type = "",
-            .bytes = 0,
-            .ok = false,
-            .message = try alloc.dupe(u8, "Video job ID missing from response"),
-        };
-    };
-
-    // AgnesAI returns video_id separate from task id; use video_id for polling if present
-    const video_id = json.findString(res.body, "video_id") orelse job_id;
-
-    // Polling loop
-    // AgnesAI: GET /agnesapi?video_id={id}&model_name={model}
-    // Sora/OpenAI: GET /v1/videos/{id}
-    const poll_url = if (is_compat)
-        try std.fmt.allocPrint(alloc, "{s}/agnesapi?video_id={s}&model_name={s}", .{ base_url, video_id, model })
-    else if (std.mem.endsWith(u8, base_url, "/v1"))
-        try std.fmt.allocPrint(alloc, "{s}/videos/{s}", .{ base_url, job_id })
-    else
-        try std.fmt.allocPrint(alloc, "{s}/v1/videos/{s}", .{ base_url, job_id });
-    defer alloc.free(poll_url);
-
-    const start_time = utils.milliTimestamp();
-    const timeout_ms: i64 = @as(i64, @intCast(g_config.video_poll_timeout_secs)) * 1000;
-
-    var completed = false;
-    // Save the last successful poll response body for metadata.url extraction
-    var last_poll_body: ?[]u8 = null;
-    defer if (last_poll_body) |b| alloc.free(b);
-    while (utils.milliTimestamp() - start_time < timeout_ms) {
-        var poll_res = http_lib.fetch(alloc, io, .{
-            .url = poll_url,
-            .method = "GET",
-            .headers_json = headers_json,
-            .timeout_s = 30,
-        }) catch {
-            std.Io.sleep(io, std.Io.Duration.fromSeconds(2), .awake) catch {};
-            continue;
-        };
-        defer poll_res.deinit(alloc);
-
-        if (poll_res.status == 200) {
-            const status = json.findString(poll_res.body, "status") orelse "queued";
-            if (std.mem.eql(u8, status, "completed")) {
-                completed = true;
-                // Clone body for later use (poll_res will be deinit'd after this iteration)
-                last_poll_body = try alloc.dupe(u8, poll_res.body);
-                break;
-            } else if (std.mem.eql(u8, status, "failed")) {
-                const err_msg = json.findString(poll_res.body, "error") orelse "Video generation job failed";
-                return MediaResult{
-                    .path = "",
-                    .media_type = "",
-                    .bytes = 0,
-                    .ok = false,
-                    .message = try alloc.dupe(u8, err_msg),
-                };
-            }
-        }
-        std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch {};
-    }
-
-    if (!completed) {
-        return MediaResult{
-            .path = "",
-            .media_type = "",
-            .bytes = 0,
-            .ok = false,
-            .message = try alloc.dupe(u8, "Video job polling timed out"),
-        };
-    }
-
-    // Download completed video content
-    // AgnesAI: use metadata.url from last poll response directly
-    // Sora/OpenAI: GET /v1/videos/{id}/content
-    if (is_compat and last_poll_body != null) {
-        const vid_url = json.findString(last_poll_body.?, "url") orelse
-            json.findString(last_poll_body.?, "video_url") orelse
-            json.findString(last_poll_body.?, "metadata.url") orelse {
-            return MediaResult{
-                .path = "",
-                .media_type = "",
-                .bytes = 0,
-                .ok = false,
-                .message = try alloc.dupe(u8, "Video completed but no metadata.url found"),
-            };
-        };
-        const base_filename = if (filename_opt) |f|
-            try sanitizeFilename(alloc, f)
-        else
-            try alloc.dupe(u8, "video");
-        defer alloc.free(base_filename);
-        const safe_name = if (std.mem.endsWith(u8, base_filename, ".mp4"))
-            try alloc.dupe(u8, base_filename)
-        else
-            try std.fmt.allocPrint(alloc, "{s}.mp4", .{base_filename});
-        defer alloc.free(safe_name);
-        const output_dir = g_config.media_output_dir orelse "media";
-        try ensureOutputDir(alloc, io, output_dir);
-        const ts = utils.milliTimestamp();
-        const fp = try std.fmt.allocPrint(alloc, "{s}/{d}_{s}", .{ output_dir, ts, safe_name });
-        errdefer alloc.free(fp);
-        const dl_res = http_lib.downloadToFile(alloc, io, .{
-            .url = vid_url,
-            .method = "GET",
-            .headers_json = headers_json,
-            .max_body_size = 200 * 1024 * 1024,
-            .timeout_s = 300,
-        }, fp) catch |e| {
-            return MediaResult{
-                .path = "",
-                .media_type = "",
-                .bytes = 0,
-                .ok = false,
-                .message = try std.fmt.allocPrint(alloc, "Failed to download video: {s}", .{@errorName(e)}),
-            };
-        };
-        defer if (dl_res.error_message) |m| alloc.free(m);
-        if (dl_res.status != 200 or dl_res.total_bytes == 0) {
-            const err_msg = dl_res.error_message orelse "Failed to download video content";
-            return MediaResult{
-                .path = "",
-                .media_type = "",
-                .bytes = 0,
-                .ok = false,
-                .message = try alloc.dupe(u8, err_msg),
-            };
-        }
-        hooks.dispatch(alloc, io, .{
-            .event = "media_saved",
-            .artifact_path = fp,
-            .artifact_type = "video/mp4",
-        });
-        return MediaResult{
-            .path = fp,
-            .media_type = try alloc.dupe(u8, "video/mp4"),
-            .bytes = dl_res.total_bytes,
-            .ok = true,
-            .message = try alloc.dupe(u8, "Video generated successfully"),
-        };
-    }
-    const content_url = if (std.mem.endsWith(u8, base_url, "/v1"))
-        try std.fmt.allocPrint(alloc, "{s}/videos/{s}/content", .{ base_url, job_id })
-    else
-        try std.fmt.allocPrint(alloc, "{s}/v1/videos/{s}/content", .{ base_url, job_id });
-    defer alloc.free(content_url);
-
-    const base_filename = if (filename_opt) |f|
-        try sanitizeFilename(alloc, f)
-    else
-        try alloc.dupe(u8, "video");
+fn buildVideoFilePath(alloc: Allocator, io: std.Io, filename_opt: ?[]const u8) ![]u8 {
+    const base_filename = if (filename_opt) |f| try sanitizeFilename(alloc, f) else try alloc.dupe(u8, "video");
     defer alloc.free(base_filename);
-
     const safe_name = if (std.mem.endsWith(u8, base_filename, ".mp4"))
         try alloc.dupe(u8, base_filename)
     else
@@ -628,37 +398,34 @@ pub fn generateVideoDirect(
 
     const output_dir = g_config.media_output_dir orelse "media";
     try ensureOutputDir(alloc, io, output_dir);
-
     const ts = utils.milliTimestamp();
-    const final_path = try std.fmt.allocPrint(alloc, "{s}/{d}_{s}", .{ output_dir, ts, safe_name });
+    return std.fmt.allocPrint(alloc, "{s}/{d}_{s}", .{ output_dir, ts, safe_name });
+}
+
+fn downloadAndSaveVideo(
+    alloc: Allocator,
+    io: std.Io,
+    video_url: []const u8,
+    headers_json: []const u8,
+    filename_opt: ?[]const u8,
+) !MediaResult {
+    const final_path = try buildVideoFilePath(alloc, io, filename_opt);
     errdefer alloc.free(final_path);
 
     const dl_res = http_lib.downloadToFile(alloc, io, .{
-        .url = content_url,
+        .url = video_url,
         .method = "GET",
         .headers_json = headers_json,
         .max_body_size = 200 * 1024 * 1024,
         .timeout_s = 300,
     }, final_path) catch |e| {
-        return MediaResult{
-            .path = "",
-            .media_type = "",
-            .bytes = 0,
-            .ok = false,
-            .message = try std.fmt.allocPrint(alloc, "Failed to download video: {s}", .{@errorName(e)}),
-        };
+        return makeFailedMediaResultFmt(alloc, "Failed to download video: {s}", .{@errorName(e)});
     };
     defer if (dl_res.error_message) |m| alloc.free(m);
 
     if (dl_res.status != 200 or dl_res.total_bytes == 0) {
         const err_msg = dl_res.error_message orelse "Failed to download video content";
-        return MediaResult{
-            .path = "",
-            .media_type = "",
-            .bytes = 0,
-            .ok = false,
-            .message = try alloc.dupe(u8, err_msg),
-        };
+        return makeFailedMediaResult(alloc, err_msg);
     }
 
     hooks.dispatch(alloc, io, .{
@@ -674,6 +441,183 @@ pub fn generateVideoDirect(
         .ok = true,
         .message = try alloc.dupe(u8, "Video generated successfully"),
     };
+}
+
+const PollResult = struct {
+    completed: bool,
+    last_body: ?[]u8 = null,
+    error_msg: ?[]u8 = null,
+
+    pub fn deinit(self: *PollResult, alloc: Allocator) void {
+        if (self.last_body) |b| alloc.free(b);
+        if (self.error_msg) |m| alloc.free(m);
+    }
+};
+
+fn pollVideoJob(
+    alloc: Allocator,
+    io: std.Io,
+    poll_url: []const u8,
+    headers_json: []const u8,
+    timeout_secs: u32,
+) !PollResult {
+    const start_time = utils.milliTimestamp();
+    const timeout_ms: i64 = @as(i64, @intCast(timeout_secs)) * 1000;
+    while (utils.milliTimestamp() - start_time < timeout_ms) {
+        var poll_res = http_lib.fetch(alloc, io, .{
+            .url = poll_url,
+            .method = "GET",
+            .headers_json = headers_json,
+            .timeout_s = 30,
+        }) catch {
+            std.Io.sleep(io, std.Io.Duration.fromSeconds(2), .awake) catch {};
+            continue;
+        };
+        defer poll_res.deinit(alloc);
+
+        if (poll_res.status == 200) {
+            const status = json.findString(poll_res.body, "status") orelse "queued";
+            if (std.mem.eql(u8, status, "completed")) {
+                return PollResult{ .completed = true, .last_body = try alloc.dupe(u8, poll_res.body) };
+            } else if (std.mem.eql(u8, status, "failed")) {
+                const err_msg = json.findString(poll_res.body, "error") orelse "Video generation job failed";
+                return PollResult{ .completed = false, .error_msg = try alloc.dupe(u8, err_msg) };
+            }
+        }
+        std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch {};
+    }
+    return PollResult{ .completed = false, .error_msg = try alloc.dupe(u8, "Video job polling timed out") };
+}
+
+fn buildVideoPollUrl(
+    alloc: Allocator,
+    base_url: []const u8,
+    job_id: []const u8,
+    video_id: []const u8,
+    model: []const u8,
+    is_compat: bool,
+) ![]u8 {
+    if (is_compat) {
+        return std.fmt.allocPrint(alloc, "{s}/agnesapi?video_id={s}&model_name={s}", .{ base_url, video_id, model });
+    }
+    const path = try std.fmt.allocPrint(alloc, "videos/{s}", .{job_id});
+    defer alloc.free(path);
+    return resolveEndpointUrl(alloc, base_url, path);
+}
+
+fn resolveVideoDownloadUrl(
+    alloc: Allocator,
+    base_url: []const u8,
+    job_id: []const u8,
+    is_compat: bool,
+    last_body: ?[]const u8,
+) !?[]u8 {
+    if (is_compat and last_body != null) {
+        const vid_url = json.findString(last_body.?, "url") orelse
+            json.findString(last_body.?, "video_url") orelse
+            json.findString(last_body.?, "metadata.url");
+        if (vid_url) |u| return try alloc.dupe(u8, u);
+        return null;
+    }
+    const path = try std.fmt.allocPrint(alloc, "videos/{s}/content", .{job_id});
+    defer alloc.free(path);
+    return try resolveEndpointUrl(alloc, base_url, path);
+}
+
+fn buildVideoGenRequestBody(alloc: Allocator, model: []const u8, prompt: []const u8, seconds: u32, is_compat: bool) ![]u8 {
+    const escaped_prompt = try json.escape(alloc, prompt);
+    defer alloc.free(escaped_prompt);
+
+    if (is_compat) {
+        return std.fmt.allocPrint(alloc,
+            \\{{"model":"{s}","prompt":"{s}","seconds":"{d}","mode":"text","size":"720P","aspect_ratio":"16:9"}}
+        , .{ model, escaped_prompt, seconds });
+    }
+    return std.fmt.allocPrint(alloc,
+        \\{{"model":"{s}","prompt":"{s}","duration":{d}}}
+    , .{ model, escaped_prompt, seconds });
+}
+
+const VideoJobIds = struct {
+    job_id: []const u8,
+    video_id: []const u8,
+};
+
+fn extractVideoJobIds(body: []const u8) ?VideoJobIds {
+    const job_id = json.findString(body, "id") orelse
+        json.findString(body, "task_id") orelse
+        json.findString(body, "video_id") orelse
+        return null;
+    const video_id = json.findString(body, "video_id") orelse job_id;
+    return VideoJobIds{ .job_id = job_id, .video_id = video_id };
+}
+
+fn pollAndDownloadVideo(
+    alloc: Allocator,
+    io: std.Io,
+    base_url: []const u8,
+    ids: VideoJobIds,
+    model: []const u8,
+    is_compat: bool,
+    headers_json: []const u8,
+    filename_opt: ?[]const u8,
+) !MediaResult {
+    const poll_url = try buildVideoPollUrl(alloc, base_url, ids.job_id, ids.video_id, model, is_compat);
+    defer alloc.free(poll_url);
+
+    var poll_res = try pollVideoJob(alloc, io, poll_url, headers_json, g_config.video_poll_timeout_secs);
+    defer poll_res.deinit(alloc);
+    if (!poll_res.completed) {
+        return makeFailedMediaResult(alloc, poll_res.error_msg orelse "Video job polling timed out");
+    }
+
+    const vid_url = (try resolveVideoDownloadUrl(alloc, base_url, ids.job_id, is_compat, poll_res.last_body)) orelse
+        return makeFailedMediaResult(alloc, "Video completed but no metadata.url found");
+    defer alloc.free(vid_url);
+
+    return downloadAndSaveVideo(alloc, io, vid_url, headers_json, filename_opt);
+}
+
+pub fn generateVideoDirect(
+    alloc: Allocator,
+    io: std.Io,
+    prompt: []const u8,
+    seconds: u32,
+    filename_opt: ?[]const u8,
+    model_opt: ?[]const u8,
+) !MediaResult {
+    if (prompt.len == 0) {
+        return makeFailedMediaResult(alloc, "Prompt cannot be empty");
+    }
+
+    const model = model_opt orelse g_config.video_gen_model;
+    const is_compat = isCompatOrAgnes(g_config.video_gen_provider);
+    const base_url = resolveBaseUrl(g_config.video_gen_provider, g_config.openai_compat_url);
+    const create_url = try resolveEndpointUrl(alloc, base_url, "videos");
+    defer alloc.free(create_url);
+
+    const headers_json = try buildAuthHeaders(alloc, g_config.openai_compat_key);
+    defer alloc.free(headers_json);
+    const req_body = try buildVideoGenRequestBody(alloc, model, prompt, seconds, is_compat);
+    defer alloc.free(req_body);
+
+    var res = try http_lib.fetch(alloc, io, .{
+        .url = create_url,
+        .method = "POST",
+        .body = req_body,
+        .headers_json = headers_json,
+        .timeout_s = 60,
+    });
+    defer res.deinit(alloc);
+
+    if (res.status < 200 or res.status >= 300) {
+        return makeFailedMediaResultFmt(alloc, "Failed to start video job (HTTP {d})", .{res.status});
+    }
+
+    const ids = extractVideoJobIds(res.body) orelse
+        return makeFailedMediaResult(alloc, "Video job ID missing from response");
+
+    return pollAndDownloadVideo(alloc, io, base_url, ids, model, is_compat, headers_json, filename_opt);
 }
 
 // ---------------------------------------------------------------------------

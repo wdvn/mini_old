@@ -66,8 +66,7 @@ fn isJoinControl(cp: u21) bool {
     return cp == 0x200C or cp == 0x200D;
 }
 
-/// Check if codepoint belongs to emoji group (wide presentation, width 2).
-fn isEmojiWide(cp: u21) bool {
+fn isBmpEmojiWide(cp: u21) bool {
     return switch (cp) {
         0x231A...0x231B, // watch, hourglass
         0x23E9...0x23EC,
@@ -101,7 +100,13 @@ fn isEmojiWide(cp: u21) bool {
         0x27BF,
         0x2B1B...0x2B1C,
         0x2B50,
-        0x2B55,
+        0x2B55, => true,
+        else => false,
+    };
+}
+
+fn isSmpEmojiWide(cp: u21) bool {
+    return switch (cp) {
         0x1F004,
         0x1F0CF,
         0x1F18E,
@@ -149,6 +154,15 @@ fn isEmojiWide(cp: u21) bool {
         0x1FA90...0x1FA95, => true,
         else => false,
     };
+}
+
+/// Check if codepoint belongs to emoji group (wide presentation, width 2).
+fn isEmojiWide(cp: u21) bool {
+    // PSEUDOCODE:
+    // 1. If cp is in Basic Multilingual Plane (< 0x10000), check BMP emoji ranges.
+    // 2. Otherwise check Supplementary Multilingual Plane emoji ranges.
+    if (cp < 0x10000) return isBmpEmojiWide(cp);
+    return isSmpEmojiWide(cp);
 }
 
 /// East Asian Wide / Fullwidth → width 2.

@@ -566,42 +566,63 @@ fn readSkillFile(alloc: Allocator, io: std.Io, skill_path: []const u8) ?[]u8 {
     return buf[0..n];
 }
 
-fn executeSkills(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
-    const operation = json.findString(input_json, "operation") orelse "list";
+fn executeSkillDetail(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
+    // PSEUDOCODE:
+    // 1. Extract required 'name' argument.
+    // 2. Search matched skill file in ~/.mini/skills and return content.
+    // 3. Fallback to tool definitions in registry.
+    const name = json.findString(input_json, "name") orelse
+        return std.fmt.allocPrint(alloc, "Error: 'name' field required for detail operation", .{});
 
-    if (std.mem.eql(u8, operation, "detail")) {
-        const name = json.findString(input_json, "name") orelse
-            return std.fmt.allocPrint(alloc, "Error: 'name' field required for detail operation", .{});
+    if (skills_mod.getSkills()) |skills| {
+        for (skills) |s| {
+            if (std.mem.eql(u8, s.name, name)) {
+                if (readSkillFile(alloc, io, s.path)) |content| {
+                    defer alloc.free(content);
+                    return std.fmt.allocPrint(alloc,
+                        "## Skill: {s}\n\nPath: `{s}`\n\n{s}",
+                        .{ s.name, s.path, content },
+                    );
+                }
+                return std.fmt.allocPrint(alloc, "Skill '{s}' exists but could not read `{s}`.", .{ s.name, s.path });
+            }
+        }
+    }
 
-        // 1. Try matching real skill in ~/.mini/skills
-        if (skills_mod.getSkills()) |skills| {
-            for (skills) |s| {
-                if (std.mem.eql(u8, s.name, name)) {
-                    if (readSkillFile(alloc, io, s.path)) |content| {
-                        defer alloc.free(content);
-                        return std.fmt.allocPrint(alloc,
-                            "## Skill: {s}\n\nPath: `{s}`\n\n{s}",
-                            .{ s.name, s.path, content },
-                        );
-                    }
-                    return std.fmt.allocPrint(alloc, "Skill '{s}' exists but could not read `{s}`.", .{ s.name, s.path });
+    for (&definitions) |*td| {
+        if (std.mem.eql(u8, td.name, name)) {
+            return std.fmt.allocPrint(alloc,
+                "## Tool: {s}\n\n{s}\n\n**Schema:**\n```json\n{s}\n```",
+                .{ td.name, td.description, td.input_schema_json },
+            );
+        }
+    }
+    return std.fmt.allocPrint(alloc, "Skill or tool '{s}' not found.", .{name});
+}
+
+fn appendMcpToolsList(w: *utils.BufWriter) !void {
+    // PSEUDOCODE: Lock registry mutex, inspect registered MCP tools, and print active list.
+    while (!g_registry_mutex.tryLock()) {}
+    const mgr = g_mcp;
+    g_registry_mutex.unlock();
+
+    if (mgr) |m| {
+        if (m.servers.items.len > 0) {
+            try w.writeAll("\n## MCP Tools\n\n");
+            for (m.servers.items) |*server| {
+                for (server.tools.items) |t| {
+                    try w.print("  ✓ **{s}** — {s}\n", .{ t.prefixed_name, t.description });
                 }
             }
         }
-
-        // 2. Fallback: match tool in registry
-        for (&definitions) |*td| {
-            if (std.mem.eql(u8, td.name, name)) {
-                return std.fmt.allocPrint(alloc,
-                    "## Tool: {s}\n\n{s}\n\n**Schema:**\n```json\n{s}\n```",
-                    .{ td.name, td.description, td.input_schema_json },
-                );
-            }
-        }
-        return std.fmt.allocPrint(alloc, "Skill or tool '{s}' not found.", .{name});
     }
+}
 
-    // List all: skills first, tools next
+fn executeSkillList(alloc: Allocator) ![]u8 {
+    // PSEUDOCODE:
+    // 1. Print discovered skills from ~/.mini/skills.
+    // 2. Print built-in tools with permission status.
+    // 3. Print MCP tools via appendMcpToolsList.
     var buf = utils.BufWriter.init(alloc);
     errdefer buf.deinit();
     const w = &buf;
@@ -621,20 +642,19 @@ fn executeSkills(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         const status = if (permitted) "✓" else "✗";
         try w.print("  {s} **{s}** — {s}\n", .{ status, td.name, td.description });
     }
-    while (!g_registry_mutex.tryLock()) {}
-    const mgr = g_mcp;
-    g_registry_mutex.unlock();
-    if (mgr) |m| {
-        if (m.servers.items.len > 0) {
-            try w.writeAll("\n## MCP Tools\n\n");
-            for (m.servers.items) |*server| {
-                for (server.tools.items) |t| {
-                    try w.print("  ✓ **{s}** — {s}\n", .{ t.prefixed_name, t.description });
-                }
-            }
-        }
-    }
+    try appendMcpToolsList(w);
     return buf.toOwnedSlice();
+}
+
+fn executeSkills(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
+    // PSEUDOCODE:
+    // 1. Determine requested operation (detail vs list).
+    // 2. Dispatch to dedicated sub-handler.
+    const operation = json.findString(input_json, "operation") orelse "list";
+    if (std.mem.eql(u8, operation, "detail")) {
+        return executeSkillDetail(alloc, io, input_json);
+    }
+    return executeSkillList(alloc);
 }
 
 /// Interrupt active bash process (called on Watchdog timeout or SIGINT).

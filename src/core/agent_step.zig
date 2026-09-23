@@ -15,6 +15,8 @@ const main = @import("../main.zig");
 const js_bindings = @import("../runtime/js_bindings.zig");
 const chat_stream = @import("../ui/chat_stream.zig");
 const media_gen_tool = @import("../tools/media_gen.zig");
+const quickjs_engine = @import("../runtime/quickjs_engine.zig");
+const ExecutionResult = quickjs_engine.ExecutionResult;
 const agent_parsing = @import("agent_parsing.zig");
 const agent_mod = @import("agent.zig");
 const AgentLoop = agent_mod.AgentLoop;
@@ -172,6 +174,159 @@ pub fn scanResponseContent(loop: *AgentLoop, response: *const proto.Response, wa
 }
 
 /// Executes a CodeAct JavaScript script in QuickJS engine with loop protection and output formatting.
+fn handleCodeActLoopTrip(loop: *AgentLoop, act_id: usize) !StepResult {
+    if (loop.plan.loop_plan_retries < 2) {
+        loop.plan.loop_plan_retries += 1;
+        loop.plan.plan_execution_pending = true;
+        if (loop.config.action_loop_display) {
+            main.stderrPrint(
+                "\n\x1b[33m[agent] ⚠️ Action loop detected: identical CodeAct script repeated without progress. Requesting model to formulate plan and execute next step.\x1b[0m\n",
+                .{},
+            );
+        }
+        if (main.ui_repl.current_renderer) |r| {
+            r.ensureNewline();
+            r.write(" \x1b[33m[Action Loop Detected: Requesting Plan & Execution]\x1b[0m\n");
+        }
+        if (loop.journal) |*j| {
+            j.recordEvent(loop.io, act_id, .checkpoint_created, "CodeAct action loop - requesting plan & execution") catch {};
+        }
+        const trip_msg = "[CodeAct Checkpoint & Recap]: Action loop detected.\n\n[CodeAct Advisory (Optional Suggestions)]\nCurrent Action: repeated identical CodeAct script\nObservation: Identical script executed without progress.\n⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed at your discretion.";
+        try loop.history.addUser(trip_msg);
+        loop.action_loop_tripped = false;
+        loop.consecutive_dup_tool_count = 0;
+        return .continue_loop;
+    } else {
+        main.stderrPrint(
+            "\n\x1b[33m[agent] ⚠️ Action loop persisted after replanning attempts: identical CodeAct script repeated. Halting loop.\x1b[0m\n",
+            .{},
+        );
+        const trip_msg = "[CodeAct System Intervention]: Action loop persisted after multiple replanning attempts. Halting execution. Synthesize your findings and answer the user now.";
+        try loop.history.addUser(trip_msg);
+        loop.action_loop_tripped = true;
+        return .exit_loop;
+    }
+}
+
+fn handleCodeActEvalError(
+    loop: *AgentLoop,
+    act_id: usize,
+    input_msgs_count: usize,
+    tool_defs: []const proto.ToolDefinition,
+    response: *const proto.Response,
+    js_code: []const u8,
+    start_codeact_ms: u64,
+    e: anyerror,
+) !StepResult {
+    media_gen_tool.clearTurnAttachments(loop.alloc);
+    loop.last_act_failed = true;
+    const end_err_ms = utils.milliTimestamp();
+    const dur_ms = if (end_err_ms >= start_codeact_ms) @as(u64, @intCast(end_err_ms - start_codeact_ms)) else 0;
+    loop.logActDebug(act_id, input_msgs_count, tool_defs, response, js_code, .{
+        .exec_type = "codeact",
+        .is_error = true,
+        .duration_ms = dur_ms,
+        .error_message = @errorName(e),
+    });
+    if (signals.isInterrupted()) return error.Interrupted;
+    if (main.ui_repl.current_renderer) |r| {
+        r.finishTool("codeact", @errorName(e), true, dur_ms, null, null);
+    } else {
+        main.stderrPrint("\x1b[31m[engine error: {s}]\x1b[0m\n", .{@errorName(e)});
+    }
+    const err_msg = try std.fmt.allocPrint(loop.alloc, "[CodeAct System Error]: {s}", .{@errorName(e)});
+    defer loop.alloc.free(err_msg);
+    try loop.history.addUser(err_msg);
+    return .continue_loop;
+}
+
+fn handleCodeActSuccess(loop: *AgentLoop, res: ExecutionResult, dur_ms: u64) !StepResult {
+    if (main.ui_repl.current_renderer) |r| {
+        r.finishTool("codeact", if (res.return_value_json) |ret| ret else res.stdout, false, dur_ms, null, null);
+    } else {
+        main.stderrPrint("\x1b[32m[ok]\x1b[0m\n", .{});
+    }
+    loop.js_retry_count = 0;
+    loop.plan.plan_watchdog_retries = 0;
+    loop.last_act_failed = false;
+
+    var out_buf = utils.BufWriter.init(loop.alloc);
+    defer out_buf.deinit();
+
+    try out_buf.writeAll("[CodeAct Execution Output]\n");
+    if (res.stdout.len > 0) {
+        try out_buf.print("stdout:\n{s}\n", .{res.stdout});
+    }
+    if (res.return_value_json) |ret| {
+        try out_buf.print("return value:\n{s}\n", .{ret});
+    }
+    if (res.stdout.len == 0 and res.return_value_json == null) {
+        try out_buf.writeAll("(Code executed successfully with no output)\n");
+    }
+
+    const turn_attached = media_gen_tool.getTurnAttachments();
+    if (turn_attached.len > 0) {
+        try loop.history.addUserWithImages(out_buf.list.items, turn_attached);
+        media_gen_tool.clearTurnAttachments(loop.alloc);
+    } else {
+        try loop.history.addUser(out_buf.list.items);
+    }
+    return .continue_loop;
+}
+
+fn handleCodeActScriptError(loop: *AgentLoop, res: ExecutionResult, dur_ms: u64) !StepResult {
+    media_gen_tool.clearTurnAttachments(loop.alloc);
+    if (main.ui_repl.current_renderer) |r| {
+        r.finishTool("codeact", if (res.error_message) |m| m else "JS Error", true, dur_ms, null, null);
+    } else {
+        main.stderrPrint("\x1b[31m[error]\x1b[0m\n", .{});
+    }
+    loop.js_retry_count += 1;
+    loop.last_act_failed = true;
+
+    var err_buf = utils.BufWriter.init(loop.alloc);
+    defer err_buf.deinit();
+
+    try err_buf.writeAll("[CodeAct JavaScript Error]\n");
+    if (res.error_message) |m| {
+        try err_buf.print("Error: {s}\n", .{m});
+    }
+    if (res.stack_trace) |st| {
+        try err_buf.print("Stack trace:\n{s}\n", .{st});
+    }
+    if (res.stdout.len > 0) {
+        try err_buf.print("stdout before error:\n{s}\n", .{res.stdout});
+    }
+    if (loop.js_retry_count >= 3) {
+        try err_buf.writeAll("Notice: 3 consecutive JavaScript execution errors occurred. You may fall back to standard tool calling or simplify your code.\n");
+    } else {
+        try err_buf.writeAll("Please analyze the error and retry by outputting corrected JavaScript code inside ```js ... ``` block.\n");
+    }
+
+    try loop.history.addUser(err_buf.list.items);
+    return .continue_loop;
+}
+
+// PSEUDOCODE:
+// 1. notifyCodeActExecution: Clear plan if mutating file operations exist, announce tool start.
+// 2. executeCodeActBlock: Check loop trip, announce, eval JS, log debug, handle error or success.
+fn notifyCodeActExecution(loop: *AgentLoop, js_code: []const u8) void {
+    if (loop.plan.plan_active and !AgentLoop.isPlanOnlyRequest(loop.current_user_request)) {
+        if (std.mem.indexOf(u8, js_code, "file_edit") != null or
+            std.mem.indexOf(u8, js_code, "file_write") != null or
+            std.mem.indexOf(u8, js_code, "write") != null)
+        {
+            loop.plan.clearPlan();
+        }
+    }
+    if (main.ui_repl.current_renderer) |r| {
+        r.startTool("codeact", "{}");
+    } else {
+        main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting CodeAct script...\x1b[0m ", .{});
+    }
+}
+
+/// Executes a CodeAct JavaScript script in QuickJS engine with loop protection and output formatting.
 pub fn executeCodeActBlock(
     loop: *AgentLoop,
     act_id: usize,
@@ -182,81 +337,18 @@ pub fn executeCodeActBlock(
 ) !StepResult {
     const js_loop_check = loop.checkActionLoop("codeact", js_code) catch .allow;
     if (js_loop_check == .trip) {
-        if (loop.plan.loop_plan_retries < 2) {
-            loop.plan.loop_plan_retries += 1;
-            loop.plan.plan_execution_pending = true;
-            if (loop.config.action_loop_display) {
-                main.stderrPrint(
-                    "\n\x1b[33m[agent] ⚠️ Action loop detected: identical CodeAct script repeated without progress. Requesting model to formulate plan and execute next step.\x1b[0m\n",
-                    .{},
-                );
-            }
-            if (main.ui_repl.current_renderer) |r| {
-                r.ensureNewline();
-                r.write(" \x1b[33m[Action Loop Detected: Requesting Plan & Execution]\x1b[0m\n");
-            }
-            if (loop.journal) |*j| {
-                j.recordEvent(loop.io, act_id, .checkpoint_created, "CodeAct action loop - requesting plan & execution") catch {};
-            }
-            const trip_msg = "[CodeAct Checkpoint & Recap]: Action loop detected.\n\n[CodeAct Advisory (Optional Suggestions)]\nCurrent Action: repeated identical CodeAct script\nObservation: Identical script executed without progress.\n⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed at your discretion.";
-            try loop.history.addUser(trip_msg);
-            loop.action_loop_tripped = false;
-            loop.consecutive_dup_tool_count = 0;
-            return .continue_loop;
-        } else {
-            main.stderrPrint(
-                "\n\x1b[33m[agent] ⚠️ Action loop persisted after replanning attempts: identical CodeAct script repeated. Halting loop.\x1b[0m\n",
-                .{},
-            );
-            const trip_msg = "[CodeAct System Intervention]: Action loop persisted after multiple replanning attempts. Halting execution. Synthesize your findings and answer the user now.";
-            try loop.history.addUser(trip_msg);
-            loop.action_loop_tripped = true;
-            return .exit_loop;
-        }
+        return handleCodeActLoopTrip(loop, act_id);
     }
 
-    // Plan completion: mutating CodeAct script means the model is executing its plan.
-    if (loop.plan.plan_active and !AgentLoop.isPlanOnlyRequest(loop.current_user_request)) {
-        if (std.mem.indexOf(u8, js_code, "file_edit") != null or
-            std.mem.indexOf(u8, js_code, "file_write") != null or
-            std.mem.indexOf(u8, js_code, "write") != null)
-        {
-            loop.plan.clearPlan();
-        }
-    }
-
+    notifyCodeActExecution(loop, js_code);
     const start_codeact_ms = utils.milliTimestamp();
-    if (main.ui_repl.current_renderer) |r| {
-        r.startTool("codeact", "{}");
-    } else {
-        main.stderrPrint("\x1b[90m[codeact]\x1b[0m \x1b[35mExecuting CodeAct script...\x1b[0m ", .{});
-    }
 
     signals.registerActiveEngine(loop.engine);
     defer signals.registerActiveEngine(null);
     loop.coordinator.updateStatus(act_id, .executing_codeact, "Running QuickJS script");
 
     var res = loop.engine.eval(js_code, "agent_codeact.js") catch |e| {
-        media_gen_tool.clearTurnAttachments(loop.alloc);
-        loop.last_act_failed = true;
-        const end_err_ms = utils.milliTimestamp();
-        const dur_ms = if (end_err_ms >= start_codeact_ms) @as(u64, @intCast(end_err_ms - start_codeact_ms)) else 0;
-        loop.logActDebug(act_id, input_msgs_count, tool_defs, response, js_code, .{
-            .exec_type = "codeact",
-            .is_error = true,
-            .duration_ms = dur_ms,
-            .error_message = @errorName(e),
-        });
-        if (signals.isInterrupted()) return error.Interrupted;
-        if (main.ui_repl.current_renderer) |r| {
-            r.finishTool("codeact", @errorName(e), true, dur_ms, null, null);
-        } else {
-            main.stderrPrint("\x1b[31m[engine error: {s}]\x1b[0m\n", .{@errorName(e)});
-        }
-        const err_msg = try std.fmt.allocPrint(loop.alloc, "[CodeAct System Error]: {s}", .{@errorName(e)});
-        defer loop.alloc.free(err_msg);
-        try loop.history.addUser(err_msg);
-        return .continue_loop;
+        return handleCodeActEvalError(loop, act_id, input_msgs_count, tool_defs, response, js_code, start_codeact_ms, e);
     };
     defer res.deinit();
 
@@ -275,69 +367,253 @@ pub fn executeCodeActBlock(
     if (signals.isInterrupted()) return error.Interrupted;
 
     if (!res.is_error) {
-        if (main.ui_repl.current_renderer) |r| {
-            r.finishTool("codeact", if (res.return_value_json) |ret| ret else res.stdout, false, dur_ms, null, null);
-        } else {
-            main.stderrPrint("\x1b[32m[ok]\x1b[0m\n", .{});
-        }
-        loop.js_retry_count = 0;
-        loop.plan.plan_watchdog_retries = 0;
-        loop.last_act_failed = false;
-
-        var out_buf = utils.BufWriter.init(loop.alloc);
-        defer out_buf.deinit();
-
-        try out_buf.writeAll("[CodeAct Execution Output]\n");
-        if (res.stdout.len > 0) {
-            try out_buf.print("stdout:\n{s}\n", .{res.stdout});
-        }
-        if (res.return_value_json) |ret| {
-            try out_buf.print("return value:\n{s}\n", .{ret});
-        }
-        if (res.stdout.len == 0 and res.return_value_json == null) {
-            try out_buf.writeAll("(Code executed successfully with no output)\n");
-        }
-
-        const turn_attached = media_gen_tool.getTurnAttachments();
-        if (turn_attached.len > 0) {
-            try loop.history.addUserWithImages(out_buf.list.items, turn_attached);
-            media_gen_tool.clearTurnAttachments(loop.alloc);
-        } else {
-            try loop.history.addUser(out_buf.list.items);
-        }
-        return .continue_loop;
+        return handleCodeActSuccess(loop, res, dur_ms);
     } else {
-        media_gen_tool.clearTurnAttachments(loop.alloc);
-        if (main.ui_repl.current_renderer) |r| {
-            r.finishTool("codeact", if (res.error_message) |m| m else "JS Error", true, dur_ms, null, null);
-        } else {
-            main.stderrPrint("\x1b[31m[error]\x1b[0m\n", .{});
-        }
-        loop.js_retry_count += 1;
-        loop.last_act_failed = true;
+        return handleCodeActScriptError(loop, res, dur_ms);
+    }
+}
 
-        var err_buf = utils.BufWriter.init(loop.alloc);
-        defer err_buf.deinit();
+fn handleEmptyResponseAdvisory(loop: *AgentLoop) !void {
+    main.stderrPrint(
+        "\n\x1b[33m[agent] ⚠️ Empty response detected (whitespace only), requesting continuation...\x1b[0m\n",
+        .{},
+    );
+    if (main.ui_repl.current_renderer) |r| {
+        r.ensureNewline();
+        r.write(" \x1b[33m[Agent Advisory]: Your previous response contained no actionable content. Please proceed with tool execution or provide a substantive answer.\x1b[0m\n");
+    }
+    try loop.history.addUser(
+        "[System] Your previous response contained only whitespace or empty content. You must either execute tools to make progress, or provide a substantive text answer to the user's request.",
+    );
+    loop.response_content_empty = false;
+}
 
-        try err_buf.writeAll("[CodeAct JavaScript Error]\n");
-        if (res.error_message) |m| {
-            try err_buf.print("Error: {s}\n", .{m});
-        }
-        if (res.stack_trace) |st| {
-            try err_buf.print("Stack trace:\n{s}\n", .{st});
-        }
-        if (res.stdout.len > 0) {
-            try err_buf.print("stdout before error:\n{s}\n", .{res.stdout});
-        }
-        if (loop.js_retry_count >= 3) {
-            try err_buf.writeAll("Notice: 3 consecutive JavaScript execution errors occurred. You may fall back to standard tool calling or simplify your code.\n");
-        } else {
-            try err_buf.writeAll("Please analyze the error and retry by outputting corrected JavaScript code inside ```js ... ``` block.\n");
-        }
+fn handleEndTurnStop(
+    loop: *AgentLoop,
+    act_id: usize,
+    input_msgs_count: usize,
+    tool_defs: []const proto.ToolDefinition,
+    response: *const proto.Response,
+    has_tool_use_blocks: bool,
+) !StepResult {
+    loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{ .exec_type = "none" });
 
-        try loop.history.addUser(err_buf.list.items);
+    if (loop.response_content_empty and !has_tool_use_blocks) {
+        try handleEmptyResponseAdvisory(loop);
         return .continue_loop;
     }
+    loop.response_content_empty = false;
+
+    switch (loop.plan.handleEndTurnWatchdog(loop.current_user_request, loop.hasRecentVerifiedMutation())) {
+        .continue_loop => {
+            if (main.ui_repl.current_renderer) |r| {
+                r.ensureNewline();
+                r.write(" \x1b[33m[Plan Watchdog: Plan declared without execution. Enforcing Step 1 execution]\x1b[0m\n");
+            }
+            if (loop.plan.getWatchdogDirective(loop.alloc)) |directive| {
+                defer loop.alloc.free(directive);
+                try loop.history.addUser(directive);
+            }
+            return .continue_loop;
+        },
+        .exit_loop => {
+            if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
+                main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
+            }
+            if (loop.journal) |*j| {
+                j.recordEvent(loop.io, act_id, .task_completed, "Model responded with text after plan watchdog retries") catch {};
+            }
+            loop.action_loop_tripped = false;
+            loop.consecutive_dup_tool_count = 0;
+            return .exit_loop;
+        },
+        .no_action => {},
+    }
+    if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
+        main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
+    }
+    return .exit_loop;
+}
+
+fn handleMaxTokensStop(
+    loop: *AgentLoop,
+    act_id: usize,
+    input_msgs_count: usize,
+    tool_defs: []const proto.ToolDefinition,
+    response: *const proto.Response,
+) !StepResult {
+    loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{ .exec_type = "max_tokens" });
+    loop.max_tokens_continues += 1;
+    if (loop.max_tokens_continues > 5) {
+        main.stderrPrint("\n\x1b[31m[agent] ⛔ Continued max_tokens {d} consecutive times without completion. Stopping to prevent infinite loop.\x1b[0m\n", .{loop.max_tokens_continues});
+        return .exit_loop;
+    }
+    main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response truncated (max_tokens), requesting continuation ({d}/5)...\x1b[0m\n", .{loop.max_tokens_continues});
+    try loop.closeOrphanedToolUses(response);
+    var buf = utils.BufWriter.init(loop.alloc);
+    defer buf.deinit();
+    try buf.print(
+        "[System] The previous response was truncated due to reaching the max_tokens limit (attempt {d}). Please continue EXACTLY from where it stopped — do not repeat already written content, do not re-introduce. If a ```js ... ``` block or tool call was in progress, complete the remainder.",
+        .{loop.max_tokens_continues},
+    );
+    try loop.history.addUser(buf.list.items);
+    return .continue_loop;
+}
+
+fn handleToolUseStop(
+    loop: *AgentLoop,
+    act_id: usize,
+    input_msgs_count: usize,
+    tool_defs: []const proto.ToolDefinition,
+    response: *const proto.Response,
+    has_tool_use_blocks: bool,
+) !StepResult {
+    if (has_tool_use_blocks) {
+        const exec_summary = try loop.executeTools(act_id, response);
+        loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{
+            .exec_type = "tool_call",
+            .is_error = exec_summary.any_tool_err,
+            .duration_ms = exec_summary.total_dur_ms,
+        });
+        main.stderrPrint("\n", .{});
+        if (loop.action_loop_tripped) {
+            return .exit_loop;
+        }
+        return .continue_loop;
+    }
+    loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{ .exec_type = "none" });
+    return .exit_loop;
+}
+
+fn handleStreamAbortedStop(
+    loop: *AgentLoop,
+    act_id: usize,
+    input_msgs_count: usize,
+    tool_defs: []const proto.ToolDefinition,
+    response: *const proto.Response,
+) !StepResult {
+    loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{
+        .exec_type = "stream_idle_timeout",
+        .is_error = true,
+        .error_message = "stream aborted by idle watchdog",
+    });
+    var has_tool_use = false;
+    for (response.content.items) |block| {
+        if (block == .tool_use) {
+            has_tool_use = true;
+            break;
+        }
+    }
+    if (has_tool_use) {
+        loop.last_act_failed = true;
+        const exec_summary = try loop.executeTools(act_id, response);
+        loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{
+            .exec_type = "tool_call",
+            .is_error = exec_summary.any_tool_err,
+            .duration_ms = exec_summary.total_dur_ms,
+        });
+        if (loop.action_loop_tripped) {
+            return .exit_loop;
+        }
+        return .continue_loop;
+    }
+    if (response.content.items.len == 0) {
+        loop.last_act_failed = true;
+        main.stderrPrint("\n\x1b[33m[agent] ⚠️ Stream stalled (idle watchdog), retrying...\x1b[0m\n", .{});
+        return error.LLMProviderUnavailable;
+    }
+    loop.last_act_failed = true;
+    main.stderrPrint("\n\x1b[33m[agent] ⚠️ Stream stalled mid-response, requesting continuation...\x1b[0m\n", .{});
+    try loop.closeOrphanedToolUses(response);
+    const note = "[System] The previous response was interrupted because the model stream went silent (idle watchdog). Continue EXACTLY from where it stopped — do not repeat already written content.";
+    try loop.history.addUser(note);
+    return .continue_loop;
+}
+
+fn checkContextExceededHttp400(raw: []const u8) !void {
+    const is_param_max_tokens = std.mem.indexOf(u8, raw, "\"param\":\"max_tokens\"") != null or
+        std.mem.indexOf(u8, raw, "\"param\": \"max_tokens\"") != null or
+        std.mem.indexOf(u8, raw, "`max_tokens` must be less than") != null;
+
+    if (!is_param_max_tokens) {
+        if (std.mem.indexOf(u8, raw, "context_length_exceeded") != null or
+            std.mem.indexOf(u8, raw, "maximum context length") != null or
+            std.mem.indexOf(u8, raw, "context length") != null or
+            std.mem.indexOf(u8, raw, "prompt is too long") != null or
+            (std.mem.indexOf(u8, raw, "context_window") != null and std.mem.indexOf(u8, raw, "exceeded") != null))
+        {
+            return error.LLMContextWindowExceeded;
+        }
+    }
+}
+
+fn checkRoleCompatibilityHttp400(loop: *AgentLoop, raw: []const u8) ?StepResult {
+    const has_first_msg = std.mem.indexOf(u8, raw, "first message") != null;
+    const has_role_and_assistant = std.mem.indexOf(u8, raw, "role") != null and
+        std.mem.indexOf(u8, raw, "assistant") != null;
+    if (has_first_msg or has_role_and_assistant) {
+        main.stderrPrint("\n\x1b[33m[agent] Claude rejected due to role ordering (HTTP 400). Fixing history...\x1b[0m\n", .{});
+        _ = loop.history.ensureClaudeCompatible();
+        if (loop.role_fix_attempts < 2) {
+            loop.role_fix_attempts += 1;
+            return .continue_loop;
+        }
+    }
+
+    const has_orphan_tool = std.mem.indexOf(u8, raw, "No tool call found for function call output") != null or
+        std.mem.indexOf(u8, raw, "tool_call_id") != null;
+    if (has_orphan_tool) {
+        main.stderrPrint("\n\x1b[33m[agent] OpenAI rejected due to orphan tool_result (HTTP 400). Fixing history...\x1b[0m\n", .{});
+        _ = loop.history.ensureOpenAICompatible();
+        if (loop.role_fix_attempts < 2) {
+            loop.role_fix_attempts += 1;
+            return .continue_loop;
+        }
+    }
+    return null;
+}
+
+fn handleUnknownStopReason(
+    loop: *AgentLoop,
+    act_id: usize,
+    input_msgs_count: usize,
+    tool_defs: []const proto.ToolDefinition,
+    response: *const proto.Response,
+) !StepResult {
+    loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{
+        .exec_type = "error",
+        .is_error = true,
+        .error_message = response.raw_debug_info,
+    });
+    if (response.http_code >= 400) {
+        loop.setLastErrorContext(response.http_code, response.raw_debug_info);
+    }
+    if (response.http_code == 401 or response.http_code == 403) return error.LLMAuthenticationError;
+    if (response.http_code == 429) return error.LLMRateLimitExceeded;
+    if (response.http_code >= 500 and response.http_code < 600) return error.LLMProviderUnavailable;
+
+    if (response.http_code == 400) {
+        if (response.raw_debug_info) |raw| {
+            try checkContextExceededHttp400(raw);
+            if (checkRoleCompatibilityHttp400(loop, raw)) |step_res| {
+                return step_res;
+            }
+        }
+    }
+
+    if (response.raw_debug_info) |raw| {
+        if (std.mem.indexOf(u8, raw, "rate_limit") != null) return error.LLMRateLimitExceeded;
+    }
+
+    if (main.ui_repl.current_renderer) |r| {
+        r.stopWaiting();
+        if (r.is_thinking) r.endThinking();
+        r.ensureNewline();
+    }
+    main.stderrPrint("[agent] Warning: unknown stop_reason (HTTP {d})\n", .{response.http_code});
+    AgentLoop.printRawBackendResponse(response.raw_debug_info, response.http_code);
+    loop.setLastErrorContext(response.http_code, response.raw_debug_info);
+    return error.UnknownStopReason;
 }
 
 /// Dispatches stop reasons (.end_turn, .max_tokens, .tool_use, .stream_aborted, .unknown)
@@ -350,224 +626,17 @@ pub fn dispatchStopReason(
     has_tool_use_blocks: bool,
 ) !StepResult {
     switch (response.stop_reason) {
-        .end_turn, .stop_sequence => {
-            loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{ .exec_type = "none" });
-
-            // Fix: If response has no meaningful content (empty/whitespace only),
-            // treat it like a failed response and request the model to continue.
-            if (loop.response_content_empty and !has_tool_use_blocks) {
-                main.stderrPrint(
-                    "\n\x1b[33m[agent] ⚠️ Empty response detected (whitespace only), requesting continuation...\x1b[0m\n",
-                    .{},
-                );
-                if (main.ui_repl.current_renderer) |r| {
-                    r.ensureNewline();
-                    r.write(" \x1b[33m[Agent Advisory]: Your previous response contained no actionable content. Please proceed with tool execution or provide a substantive answer.\x1b[0m\n");
-                }
-                try loop.history.addUser(
-                    "[System] Your previous response contained only whitespace or empty content. You must either execute tools to make progress, or provide a substantive text answer to the user's request.",
-                );
-                loop.response_content_empty = false;
-                return .continue_loop;
-            }
-            loop.response_content_empty = false;
-
-            switch (loop.plan.handleEndTurnWatchdog(loop.current_user_request, loop.hasRecentVerifiedMutation())) {
-                .continue_loop => {
-                    if (main.ui_repl.current_renderer) |r| {
-                        r.ensureNewline();
-                        r.write(" \x1b[33m[Plan Watchdog: Plan declared without execution. Enforcing Step 1 execution]\x1b[0m\n");
-                    }
-                    if (loop.plan.getWatchdogDirective(loop.alloc)) |directive| {
-                        defer loop.alloc.free(directive);
-                        try loop.history.addUser(directive);
-                    }
-                    return .continue_loop;
-                },
-                .exit_loop => {
-                    if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
-                        main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
-                    }
-                    if (loop.journal) |*j| {
-                        j.recordEvent(loop.io, act_id, .task_completed, "Model responded with text after plan watchdog retries") catch {};
-                    }
-                    loop.action_loop_tripped = false;
-                    loop.consecutive_dup_tool_count = 0;
-                    return .exit_loop;
-                },
-                .no_action => {},
-            }
-            if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
-                main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
-            }
-            return .exit_loop;
-        },
-        .max_tokens => {
-            loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{ .exec_type = "max_tokens" });
-            loop.max_tokens_continues += 1;
-            if (loop.max_tokens_continues > 5) {
-                main.stderrPrint("\n\x1b[31m[agent] ⛔ Continued max_tokens {d} consecutive times without completion. Stopping to prevent infinite loop.\x1b[0m\n", .{loop.max_tokens_continues});
-                return .exit_loop;
-            }
-            main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response truncated (max_tokens), requesting continuation ({d}/5)...\x1b[0m\n", .{loop.max_tokens_continues});
-            try loop.closeOrphanedToolUses(response);
-            var buf = utils.BufWriter.init(loop.alloc);
-            defer buf.deinit();
-            try buf.print(
-                "[System] The previous response was truncated due to reaching the max_tokens limit (attempt {d}). Please continue EXACTLY from where it stopped — do not repeat already written content, do not re-introduce. If a ```js ... ``` block or tool call was in progress, complete the remainder.",
-                .{loop.max_tokens_continues},
-            );
-            try loop.history.addUser(buf.list.items);
-            return .continue_loop;
-        },
-        .tool_use => {
-            if (has_tool_use_blocks) {
-                const exec_summary = try loop.executeTools(act_id, response);
-                loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{
-                    .exec_type = "tool_call",
-                    .is_error = exec_summary.any_tool_err,
-                    .duration_ms = exec_summary.total_dur_ms,
-                });
-                main.stderrPrint("\n", .{});
-                if (loop.action_loop_tripped) {
-                    return .exit_loop;
-                }
-                return .continue_loop;
-            }
-            loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{ .exec_type = "none" });
-            return .exit_loop;
-        },
-        .stream_aborted => {
-            loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{
-                .exec_type = "stream_idle_timeout",
-                .is_error = true,
-                .error_message = "stream aborted by idle watchdog",
-            });
-            var has_tool_use = false;
-            for (response.content.items) |block| {
-                if (block == .tool_use) {
-                    has_tool_use = true;
-                    break;
-                }
-            }
-            if (has_tool_use) {
-                loop.last_act_failed = true;
-                const exec_summary = try loop.executeTools(act_id, response);
-                loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{
-                    .exec_type = "tool_call",
-                    .is_error = exec_summary.any_tool_err,
-                    .duration_ms = exec_summary.total_dur_ms,
-                });
-                if (loop.action_loop_tripped) {
-                    return .exit_loop;
-                }
-                return .continue_loop;
-            }
-            if (response.content.items.len == 0) {
-                loop.last_act_failed = true;
-                main.stderrPrint("\n\x1b[33m[agent] ⚠️ Stream stalled (idle watchdog), retrying...\x1b[0m\n", .{});
-                return error.LLMProviderUnavailable;
-            }
-            loop.last_act_failed = true;
-            main.stderrPrint("\n\x1b[33m[agent] ⚠️ Stream stalled mid-response, requesting continuation...\x1b[0m\n", .{});
-            try loop.closeOrphanedToolUses(response);
-            const note = "[System] The previous response was interrupted because the model stream went silent (idle watchdog). Continue EXACTLY from where it stopped — do not repeat already written content.";
-            try loop.history.addUser(note);
-            return .continue_loop;
-        },
-        .unknown => {
-            loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{
-                .exec_type = "error",
-                .is_error = true,
-                .error_message = response.raw_debug_info,
-            });
-            if (response.http_code >= 400) {
-                loop.setLastErrorContext(response.http_code, response.raw_debug_info);
-            }
-            if (response.http_code == 401 or response.http_code == 403) return error.LLMAuthenticationError;
-            if (response.http_code == 429) return error.LLMRateLimitExceeded;
-            if (response.http_code >= 500 and response.http_code < 600) return error.LLMProviderUnavailable;
-
-            if (response.http_code == 400) {
-                if (response.raw_debug_info) |raw| {
-                    const is_param_max_tokens = std.mem.indexOf(u8, raw, "\"param\":\"max_tokens\"") != null or
-                        std.mem.indexOf(u8, raw, "\"param\": \"max_tokens\"") != null or
-                        std.mem.indexOf(u8, raw, "`max_tokens` must be less than") != null;
-
-                    if (!is_param_max_tokens) {
-                        if (std.mem.indexOf(u8, raw, "context_length_exceeded") != null or
-                            std.mem.indexOf(u8, raw, "maximum context length") != null or
-                            std.mem.indexOf(u8, raw, "context length") != null or
-                            std.mem.indexOf(u8, raw, "prompt is too long") != null or
-                            (std.mem.indexOf(u8, raw, "context_window") != null and std.mem.indexOf(u8, raw, "exceeded") != null))
-                        {
-                            return error.LLMContextWindowExceeded;
-                        }
-                    }
-                }
-            }
-
-            if (response.raw_debug_info) |raw| {
-                if (std.mem.indexOf(u8, raw, "rate_limit") != null) return error.LLMRateLimitExceeded;
-            }
-
-            // Detect role/first-message error: Claude rejects due to role ordering
-            if (response.http_code == 400) {
-                if (response.raw_debug_info) |raw| {
-                    const has_first_msg = std.mem.indexOf(u8, raw, "first message") != null;
-                    const has_role_and_assistant = std.mem.indexOf(u8, raw, "role") != null and
-                        std.mem.indexOf(u8, raw, "assistant") != null;
-                    if (has_first_msg or has_role_and_assistant) {
-                        main.stderrPrint("\n\x1b[33m[agent] Claude rejected due to role ordering (HTTP 400). Fixing history...\x1b[0m\n", .{});
-                        _ = loop.history.ensureClaudeCompatible();
-                        if (loop.role_fix_attempts < 2) {
-                            loop.role_fix_attempts += 1;
-                            return .continue_loop;
-                        }
-                    }
-
-                    const has_orphan_tool = std.mem.indexOf(u8, raw, "No tool call found for function call output") != null or
-                        std.mem.indexOf(u8, raw, "tool_call_id") != null;
-                    if (has_orphan_tool) {
-                        main.stderrPrint("\n\x1b[33m[agent] OpenAI rejected due to orphan tool_result (HTTP 400). Fixing history...\x1b[0m\n", .{});
-                        _ = loop.history.ensureOpenAICompatible();
-                        if (loop.role_fix_attempts < 2) {
-                            loop.role_fix_attempts += 1;
-                            return .continue_loop;
-                        }
-                    }
-                }
-            }
-
-            if (main.ui_repl.current_renderer) |r| {
-                r.stopWaiting();
-                if (r.is_thinking) r.endThinking();
-                r.ensureNewline();
-            }
-            main.stderrPrint("[agent] Warning: unknown stop_reason (HTTP {d})\n", .{response.http_code});
-            AgentLoop.printRawBackendResponse(response.raw_debug_info, response.http_code);
-            loop.setLastErrorContext(response.http_code, response.raw_debug_info);
-            return error.UnknownStopReason;
-        },
+        .end_turn, .stop_sequence => return handleEndTurnStop(loop, act_id, input_msgs_count, tool_defs, response, has_tool_use_blocks),
+        .max_tokens => return handleMaxTokensStop(loop, act_id, input_msgs_count, tool_defs, response),
+        .tool_use => return handleToolUseStop(loop, act_id, input_msgs_count, tool_defs, response, has_tool_use_blocks),
+        .stream_aborted => return handleStreamAbortedStop(loop, act_id, input_msgs_count, tool_defs, response),
+        .unknown => return handleUnknownStopReason(loop, act_id, input_msgs_count, tool_defs, response),
     }
 }
 
-/// Executes a single agent step:
-/// 1. Status and history preparation (watchdog recap, guidance, plan progress)
-/// 2. Dynamic reasoning effort modulation
-/// 3. AI backend streaming communication
-/// 4. Plan detection & token tracking
-/// 5. Tool execution or CodeAct evaluation or stop reason dispatching
-pub fn executeStep(
-    self: *AgentLoop,
-    act_id: usize,
-    tool_defs: []const proto.ToolDefinition,
-    text_cb: ?*const fn ([]const u8) void,
-    think_cb: ?*const fn ([]const u8) void,
-) !StepResult {
+fn renderStepHeader(self: *AgentLoop, act_id: usize) !void {
     if (signals.isInterrupted() or self.coordinator.isTimedOut()) return error.Interrupted;
 
-    // Check for Watchdog 3-act recap advisory
     if (self.coordinator.popPendingRecapAdvisory()) |advisory| {
         defer self.alloc.free(advisory);
         try self.history.addUser(advisory);
@@ -583,24 +652,88 @@ pub fn executeStep(
         }
         main.stderrPrint("\x1b[36m[agent]\x1b[0m \x1b[93mThinking / Analyzing request... \x1b[0m\n", .{});
     }
+}
 
-    // Sanitize history according to backend formatting requirements.
+fn prepareStepInputMessages(
+    self: *AgentLoop,
+    act_id: usize,
+    temp_msgs: *std.ArrayListUnmanaged(proto.Message),
+    input_msgs_count: *usize,
+) !GuidanceProgressContext {
     _ = self.backend.sanitizeHistory(&self.history);
-
-    const input_msgs_count = self.history.len();
-    const input_msgs = self.history.messages()[0..input_msgs_count];
-
-    var temp_input_msgs = std.ArrayListUnmanaged(proto.Message).empty;
-    defer temp_input_msgs.deinit(self.alloc);
-    try temp_input_msgs.appendSlice(self.alloc, input_msgs);
+    input_msgs_count.* = self.history.len();
+    const input_msgs = self.history.messages()[0..input_msgs_count.*];
+    try temp_msgs.appendSlice(self.alloc, input_msgs);
 
     var guidance_ctx = GuidanceProgressContext.init();
-    defer guidance_ctx.deinit(self.alloc);
-    try guidance_ctx.inject(self, act_id, &temp_input_msgs);
-
+    try guidance_ctx.inject(self, act_id, temp_msgs);
     modulateReasoningEffort(self, act_id);
+    return guidance_ctx;
+}
 
-    // Send to AI backend (streaming)
+fn executeNativeToolCalling(
+    self: *AgentLoop,
+    act_id: usize,
+    input_msgs_count: usize,
+    tool_defs: []const proto.ToolDefinition,
+    response: *const proto.Response,
+) !StepResult {
+    const exec_summary = try self.executeTools(act_id, response);
+    self.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{
+        .exec_type = "tool_call",
+        .is_error = exec_summary.any_tool_err,
+        .duration_ms = exec_summary.total_dur_ms,
+    });
+    main.stderrPrint("\n", .{});
+    if (self.action_loop_tripped) {
+        return .exit_loop;
+    }
+    return .continue_loop;
+}
+
+/// Executes a single agent step:
+/// 1. Status and history preparation (watchdog recap, guidance, plan progress)
+/// 2. Dynamic reasoning effort modulation
+/// 3. AI backend streaming communication
+/// 4. Plan detection & token tracking
+/// 5. Tool execution or CodeAct evaluation or stop reason dispatching
+fn tryExecuteCodeAct(
+    self: *AgentLoop,
+    act_id: usize,
+    input_msgs_count: usize,
+    tool_defs: []const proto.ToolDefinition,
+    response: *const proto.Response,
+) !?StepResult {
+    if (self.config.execution_mode == .tools) return null;
+    if (agent_parsing.findJsCodeInResponse(self.alloc, response)) |js_code| {
+        defer self.alloc.free(js_code);
+        return try executeCodeActBlock(self, act_id, input_msgs_count, tool_defs, response, js_code);
+    }
+    return null;
+}
+
+/// Executes a single agent step:
+/// 1. Status and history preparation (watchdog recap, guidance, plan progress)
+/// 2. Dynamic reasoning effort modulation
+/// 3. AI backend streaming communication
+/// 4. Plan detection & token tracking
+/// 5. Tool execution or CodeAct evaluation or stop reason dispatching
+pub fn executeStep(
+    self: *AgentLoop,
+    act_id: usize,
+    tool_defs: []const proto.ToolDefinition,
+    text_cb: ?*const fn ([]const u8) void,
+    think_cb: ?*const fn ([]const u8) void,
+) !StepResult {
+    try renderStepHeader(self, act_id);
+
+    var input_msgs_count: usize = 0;
+    var temp_input_msgs = std.ArrayListUnmanaged(proto.Message).empty;
+    defer temp_input_msgs.deinit(self.alloc);
+
+    var guidance_ctx = try prepareStepInputMessages(self, act_id, &temp_input_msgs, &input_msgs_count);
+    defer guidance_ctx.deinit(self.alloc);
+
     var response = try self.sendToBackend(
         act_id,
         self.config.system_prompt,
@@ -616,38 +749,20 @@ pub fn executeStep(
     }
     defer response.deinit();
 
-    // Newline after stream finishes
     if (main.ui_repl.current_renderer == null) {
         try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
     }
 
-    // Append response to history (if has content)
     const was_added = try self.history.addAssistantResponse(&response);
     const has_tool_use_blocks = scanResponseContent(self, &response, was_added);
 
-    // 1. Native Tool Calling
     if (has_tool_use_blocks) {
-        const exec_summary = try self.executeTools(act_id, &response);
-        self.logActDebug(act_id, input_msgs_count, tool_defs, &response, null, .{
-            .exec_type = "tool_call",
-            .is_error = exec_summary.any_tool_err,
-            .duration_ms = exec_summary.total_dur_ms,
-        });
-        main.stderrPrint("\n", .{});
-        if (self.action_loop_tripped) {
-            return .exit_loop;
-        }
-        return .continue_loop;
+        return executeNativeToolCalling(self, act_id, input_msgs_count, tool_defs, &response);
     }
 
-    // 2. CodeAct: Check if JavaScript code block is present in response
-    if (self.config.execution_mode != .tools) {
-        if (agent_parsing.findJsCodeInResponse(self.alloc, &response)) |js_code| {
-            defer self.alloc.free(js_code);
-            return executeCodeActBlock(self, act_id, input_msgs_count, tool_defs, &response, js_code);
-        }
+    if (try tryExecuteCodeAct(self, act_id, input_msgs_count, tool_defs, &response)) |res| {
+        return res;
     }
 
-    // 3. Stop reason handling
     return dispatchStopReason(self, act_id, input_msgs_count, tool_defs, &response, has_tool_use_blocks);
 }

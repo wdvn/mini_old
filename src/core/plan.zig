@@ -288,125 +288,197 @@ pub const Plan = struct {
         return count;
     }
 
-    // PSEUDOCODE:
-    // 1. Initialize ArrayList for JSON buffer
-    // 2. Write plan-level fields: id, task, request_hash, created_at, completed_at, parent_plan_id
-    // 3. Write steps array: serialize each step with id, description, dependencies, status, tool_hint, estimated_acts, actual_acts, created_at, completed_at
-    // 4. Return toOwnedSlice
-    pub fn toJson(self: *const Plan, alloc: Allocator) ![]u8 {
-        var buf = std.ArrayListUnmanaged(u8).empty;
-        errdefer buf.deinit(alloc);
+    fn appendStepMetricsJson(step: PlanStep, alloc: Allocator, buf: *std.ArrayListUnmanaged(u8)) !void {
+        var num_buf: [32]u8 = undefined;
+        try buf.appendSlice(alloc, ",\"estimated_acts\":");
+        try buf.appendSlice(alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{step.estimated_acts}));
+        try buf.appendSlice(alloc, ",\"actual_acts\":");
+        try buf.appendSlice(alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{step.actual_acts}));
+        try buf.appendSlice(alloc, ",\"created_at\":");
+        try buf.appendSlice(alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{step.created_at}));
 
+        if (step.completed_at) |cmp_at| {
+            try buf.appendSlice(alloc, ",\"completed_at\":");
+            try buf.appendSlice(alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{cmp_at}));
+        } else {
+            try buf.appendSlice(alloc, ",\"completed_at\":null");
+        }
+    }
+
+    fn appendStepJson(step: PlanStep, alloc: Allocator, buf: *std.ArrayListUnmanaged(u8)) !void {
+        // PSEUDOCODE: Serialize a single step with id, description, dependencies, status, hints, and metrics.
+        var num_buf: [32]u8 = undefined;
+        try buf.append(alloc, '{');
+
+        try buf.appendSlice(alloc, "\"id\":");
+        try buf.appendSlice(alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{step.id}));
+
+        const esc_desc = try json.escape(alloc, step.description);
+        defer alloc.free(esc_desc);
+        try buf.appendSlice(alloc, ",\"description\":\"");
+        try buf.appendSlice(alloc, esc_desc);
+        try buf.append(alloc, '"');
+
+        try buf.appendSlice(alloc, ",\"dependencies\":[");
+        for (step.dependencies, 0..) |dep_id, di| {
+            if (di > 0) try buf.append(alloc, ',');
+            try buf.appendSlice(alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{dep_id}));
+        }
+        try buf.append(alloc, ']');
+
+        try buf.appendSlice(alloc, ",\"status\":\"");
+        try buf.appendSlice(alloc, @tagName(step.status));
+        try buf.append(alloc, '"');
+
+        if (step.tool_hint) |th| {
+            const esc_th = try json.escape(alloc, th);
+            defer alloc.free(esc_th);
+            try buf.appendSlice(alloc, ",\"tool_hint\":\"");
+            try buf.appendSlice(alloc, esc_th);
+            try buf.append(alloc, '"');
+        } else {
+            try buf.appendSlice(alloc, ",\"tool_hint\":null");
+        }
+
+        try appendStepMetricsJson(step, alloc, buf);
+        try buf.append(alloc, '}');
+    }
+
+    fn appendPlanHeaderJson(self: *const Plan, alloc: Allocator, buf: *std.ArrayListUnmanaged(u8)) !void {
+        // PSEUDOCODE: Serialize top-level plan attributes (id, task, hashes, and timestamps).
+        var num_buf: [32]u8 = undefined;
         const esc_task = try json.escape(alloc, self.task_description);
         defer alloc.free(esc_task);
 
-        var num_buf: [32]u8 = undefined;
-
         try buf.append(alloc, '{');
         try buf.appendSlice(alloc, "\"id\":");
-        const id_str = try std.fmt.bufPrint(&num_buf, "{d}", .{self.id});
-        try buf.appendSlice(alloc, id_str);
-
+        try buf.appendSlice(alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{self.id}));
         try buf.appendSlice(alloc, ",\"task\":\"");
         try buf.appendSlice(alloc, esc_task);
         try buf.append(alloc, '"');
 
         try buf.appendSlice(alloc, ",\"request_hash\":");
-        const hash_str = try std.fmt.bufPrint(&num_buf, "{d}", .{self.request_hash});
-        try buf.appendSlice(alloc, hash_str);
-
+        try buf.appendSlice(alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{self.request_hash}));
         try buf.appendSlice(alloc, ",\"created_at\":");
-        const ca_str = try std.fmt.bufPrint(&num_buf, "{d}", .{self.created_at});
-        try buf.appendSlice(alloc, ca_str);
+        try buf.appendSlice(alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{self.created_at}));
 
         if (self.completed_at) |ca| {
             try buf.appendSlice(alloc, ",\"completed_at\":");
-            const comp_str = try std.fmt.bufPrint(&num_buf, "{d}", .{ca});
-            try buf.appendSlice(alloc, comp_str);
+            try buf.appendSlice(alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{ca}));
         } else {
             try buf.appendSlice(alloc, ",\"completed_at\":null");
         }
 
         if (self.parent_plan_id) |pid| {
             try buf.appendSlice(alloc, ",\"parent_plan_id\":");
-            const pid_str = try std.fmt.bufPrint(&num_buf, "{d}", .{pid});
-            try buf.appendSlice(alloc, pid_str);
+            try buf.appendSlice(alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{pid}));
         } else {
             try buf.appendSlice(alloc, ",\"parent_plan_id\":null");
         }
 
         try buf.appendSlice(alloc, ",\"steps\":[");
+    }
+
+    // PSEUDOCODE:
+    // 1. Initialize ArrayList for JSON buffer
+    // 2. Write plan-level fields via appendPlanHeaderJson
+    // 3. Write steps array via appendStepJson
+    // 4. Return toOwnedSlice
+    pub fn toJson(self: *const Plan, alloc: Allocator) ![]u8 {
+        var buf = std.ArrayListUnmanaged(u8).empty;
+        errdefer buf.deinit(alloc);
+
+        try self.appendPlanHeaderJson(alloc, &buf);
 
         for (self.steps.items, 0..) |step, i| {
             if (i > 0) try buf.append(alloc, ',');
-            try buf.append(alloc, '{');
-
-            try buf.appendSlice(alloc, "\"id\":");
-            const sid_str = try std.fmt.bufPrint(&num_buf, "{d}", .{step.id});
-            try buf.appendSlice(alloc, sid_str);
-
-            const esc_desc = try json.escape(alloc, step.description);
-            defer alloc.free(esc_desc);
-            try buf.appendSlice(alloc, ",\"description\":\"");
-            try buf.appendSlice(alloc, esc_desc);
-            try buf.append(alloc, '"');
-
-            try buf.appendSlice(alloc, ",\"dependencies\":[");
-            for (step.dependencies, 0..) |dep_id, di| {
-                if (di > 0) try buf.append(alloc, ',');
-                const dep_str = try std.fmt.bufPrint(&num_buf, "{d}", .{dep_id});
-                try buf.appendSlice(alloc, dep_str);
-            }
-            try buf.append(alloc, ']');
-
-            try buf.appendSlice(alloc, ",\"status\":\"");
-            try buf.appendSlice(alloc, @tagName(step.status));
-            try buf.append(alloc, '"');
-
-            if (step.tool_hint) |th| {
-                const esc_th = try json.escape(alloc, th);
-                defer alloc.free(esc_th);
-                try buf.appendSlice(alloc, ",\"tool_hint\":\"");
-                try buf.appendSlice(alloc, esc_th);
-                try buf.append(alloc, '"');
-            } else {
-                try buf.appendSlice(alloc, ",\"tool_hint\":null");
-            }
-
-            try buf.appendSlice(alloc, ",\"estimated_acts\":");
-            const ea_str = try std.fmt.bufPrint(&num_buf, "{d}", .{step.estimated_acts});
-            try buf.appendSlice(alloc, ea_str);
-
-            try buf.appendSlice(alloc, ",\"actual_acts\":");
-            const aa_str = try std.fmt.bufPrint(&num_buf, "{d}", .{step.actual_acts});
-            try buf.appendSlice(alloc, aa_str);
-
-            try buf.appendSlice(alloc, ",\"created_at\":");
-            const sca_str = try std.fmt.bufPrint(&num_buf, "{d}", .{step.created_at});
-            try buf.appendSlice(alloc, sca_str);
-
-            if (step.completed_at) |cmp_at| {
-                try buf.appendSlice(alloc, ",\"completed_at\":");
-                const scmp_str = try std.fmt.bufPrint(&num_buf, "{d}", .{cmp_at});
-                try buf.appendSlice(alloc, scmp_str);
-            } else {
-                try buf.appendSlice(alloc, ",\"completed_at\":null");
-            }
-
-            try buf.append(alloc, '}');
+            try appendStepJson(step, alloc, &buf);
         }
 
-        try buf.append(alloc, ']');
-        try buf.append(alloc, '}');
-
+        try buf.appendSlice(alloc, "]}");
         return try buf.toOwnedSlice(alloc);
+    }
+
+    fn populatePlanMetadata(plan: *Plan, root_obj: std.json.ObjectMap) void {
+        // PSEUDOCODE: Extract optional id and timestamps into plan.
+        if (root_obj.get("id")) |id_val| {
+            if (id_val == .integer and id_val.integer > 0) plan.id = @as(u64, @intCast(id_val.integer));
+        }
+        if (root_obj.get("created_at")) |ca_val| {
+            if (ca_val == .integer) plan.created_at = ca_val.integer;
+        }
+        if (root_obj.get("completed_at")) |ca_val| {
+            if (ca_val == .integer) plan.completed_at = ca_val.integer;
+        }
+        if (root_obj.get("parent_plan_id")) |pid_val| {
+            if (pid_val == .integer and pid_val.integer > 0) plan.parent_plan_id = @as(u64, @intCast(pid_val.integer));
+        }
+    }
+
+    fn populateStepAttributes(step: *PlanStep, s_obj: std.json.ObjectMap) void {
+        if (s_obj.get("status")) |st_val| {
+            if (st_val == .string) step.status = parseStepStatus(st_val.string);
+        }
+        if (s_obj.get("estimated_acts")) |ea_val| {
+            if (ea_val == .integer and ea_val.integer > 0) step.estimated_acts = @as(usize, @intCast(ea_val.integer));
+        }
+        if (s_obj.get("actual_acts")) |aa_val| {
+            if (aa_val == .integer and aa_val.integer >= 0) step.actual_acts = @as(usize, @intCast(aa_val.integer));
+        }
+        if (s_obj.get("created_at")) |sca_val| {
+            if (sca_val == .integer) step.created_at = sca_val.integer;
+        }
+        if (s_obj.get("completed_at")) |scmp_val| {
+            if (scmp_val == .integer) step.completed_at = scmp_val.integer;
+        }
+    }
+
+    fn parseStepFromJson(alloc: Allocator, item: std.json.Value, fallback_id: u64) !?PlanStep {
+        // PSEUDOCODE: Deserialize a single plan step object from JSON value.
+        const s_obj = switch (item) {
+            .object => |o| o,
+            else => return null,
+        };
+        const desc_val = s_obj.get("description") orelse return null;
+        const desc_str = switch (desc_val) {
+            .string => |s| s,
+            else => return null,
+        };
+
+        const step_id: u64 = if (s_obj.get("id")) |sid| switch (sid) {
+            .integer => |i| @as(u64, @intCast(if (i >= 0) i else 1)),
+            else => fallback_id,
+        } else fallback_id;
+
+        var deps_list = std.ArrayListUnmanaged(u64).empty;
+        defer deps_list.deinit(alloc);
+        if (s_obj.get("dependencies")) |deps_val| {
+            if (deps_val == .array) {
+                for (deps_val.array.items) |dep_val| {
+                    if (dep_val == .integer and dep_val.integer >= 0) {
+                        try deps_list.append(alloc, @as(u64, @intCast(dep_val.integer)));
+                    }
+                }
+            }
+        }
+
+        const tool_hint: ?[]const u8 = if (s_obj.get("tool_hint")) |th| switch (th) {
+            .string => |s| s,
+            else => null,
+        } else null;
+
+        var step = try PlanStep.initWithId(alloc, step_id, desc_str, deps_list.items, tool_hint);
+        errdefer step.deinit(alloc);
+
+        populateStepAttributes(&step, s_obj);
+        return step;
     }
 
     // PSEUDOCODE:
     // 1. Parse JSON slice into Value tree
     // 2. Read task string and request_hash
-    // 3. Initialize plan, set id, timestamps, parent_plan_id
-    // 4. Iterate over steps array, parse each step object, and append to plan
+    // 3. Initialize plan, set id, timestamps, parent_plan_id via populatePlanMetadata
+    // 4. Iterate over steps array, parse each step object via parseStepFromJson
     // 5. Return reconstructed plan
     pub fn fromJson(alloc: Allocator, json_text: []const u8) !Plan {
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_text, .{});
@@ -431,22 +503,7 @@ pub const Plan = struct {
         var plan = try Plan.init(alloc, task_str, req_hash);
         errdefer plan.deinit(alloc);
 
-        if (root_obj.get("id")) |id_val| {
-            if (id_val == .integer and id_val.integer > 0) {
-                plan.id = @as(u64, @intCast(id_val.integer));
-            }
-        }
-        if (root_obj.get("created_at")) |ca_val| {
-            if (ca_val == .integer) plan.created_at = ca_val.integer;
-        }
-        if (root_obj.get("completed_at")) |ca_val| {
-            if (ca_val == .integer) plan.completed_at = ca_val.integer;
-        }
-        if (root_obj.get("parent_plan_id")) |pid_val| {
-            if (pid_val == .integer and pid_val.integer > 0) {
-                plan.parent_plan_id = @as(u64, @intCast(pid_val.integer));
-            }
-        }
+        populatePlanMetadata(&plan, root_obj);
 
         if (root_obj.get("steps")) |steps_val| {
             const step_items = switch (steps_val) {
@@ -455,67 +512,10 @@ pub const Plan = struct {
             };
 
             for (step_items) |item| {
-                const s_obj = switch (item) {
-                    .object => |o| o,
-                    else => continue,
-                };
-
-                const desc_val = s_obj.get("description") orelse continue;
-                const desc_str = switch (desc_val) {
-                    .string => |s| s,
-                    else => continue,
-                };
-
-                const step_id: u64 = if (s_obj.get("id")) |sid| switch (sid) {
-                    .integer => |i| @as(u64, @intCast(if (i >= 0) i else 1)),
-                    else => @as(u64, @intCast(plan.steps.items.len + 1)),
-                } else @as(u64, @intCast(plan.steps.items.len + 1));
-
-                // Parse dependencies
-                var deps_list = std.ArrayListUnmanaged(u64).empty;
-                defer deps_list.deinit(alloc);
-
-                if (s_obj.get("dependencies")) |deps_val| {
-                    if (deps_val == .array) {
-                        for (deps_val.array.items) |dep_val| {
-                            if (dep_val == .integer and dep_val.integer >= 0) {
-                                try deps_list.append(alloc, @as(u64, @intCast(dep_val.integer)));
-                            }
-                        }
-                    }
+                const fallback_id = @as(u64, @intCast(plan.steps.items.len + 1));
+                if (try parseStepFromJson(alloc, item, fallback_id)) |step| {
+                    try plan.addStepOwned(alloc, step);
                 }
-
-                const tool_hint: ?[]const u8 = if (s_obj.get("tool_hint")) |th| switch (th) {
-                    .string => |s| s,
-                    else => null,
-                } else null;
-
-                var step = try PlanStep.initWithId(alloc, step_id, desc_str, deps_list.items, tool_hint);
-                errdefer step.deinit(alloc);
-
-                if (s_obj.get("status")) |st_val| {
-                    if (st_val == .string) {
-                        step.status = parseStepStatus(st_val.string);
-                    }
-                }
-                if (s_obj.get("estimated_acts")) |ea_val| {
-                    if (ea_val == .integer and ea_val.integer > 0) {
-                        step.estimated_acts = @as(usize, @intCast(ea_val.integer));
-                    }
-                }
-                if (s_obj.get("actual_acts")) |aa_val| {
-                    if (aa_val == .integer and aa_val.integer >= 0) {
-                        step.actual_acts = @as(usize, @intCast(aa_val.integer));
-                    }
-                }
-                if (s_obj.get("created_at")) |sca_val| {
-                    if (sca_val == .integer) step.created_at = sca_val.integer;
-                }
-                if (s_obj.get("completed_at")) |scmp_val| {
-                    if (scmp_val == .integer) step.completed_at = scmp_val.integer;
-                }
-
-                try plan.addStepOwned(alloc, step);
             }
         }
 

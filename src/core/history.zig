@@ -24,8 +24,6 @@ const proto = @import("protocol.zig");
 const main = @import("../main.zig");
 const utils = @import("utils.zig");
 
-
-
 /// Maximum messages before auto-compaction.
 const DEFAULT_MAX_MESSAGES = 40;
 
@@ -97,8 +95,46 @@ pub const History = struct {
         try file.writeStreamingAll(io, out_buf.items);
     }
 
+    fn cloneContentBlock(alloc: Allocator, block: proto.ContentBlock) !proto.ContentBlock {
+        // PSEUDOCODE: Deep-clone a ContentBlock using the provided allocator.
+        return switch (block) {
+            .text => |t| .{ .text = try alloc.dupe(u8, t) },
+            .thinking => |th| .{ .thinking = .{
+                .thinking = try alloc.dupe(u8, th.thinking),
+                .signature = try alloc.dupe(u8, th.signature),
+            } },
+            .tool_use => |tu| .{ .tool_use = .{
+                .id = try alloc.dupe(u8, tu.id),
+                .name = try alloc.dupe(u8, tu.name),
+                .input_json = try alloc.dupe(u8, tu.input_json),
+            } },
+            .tool_result => |tr| .{ .tool_result = .{
+                .tool_use_id = try alloc.dupe(u8, tr.tool_use_id),
+                .content = try alloc.dupe(u8, tr.content),
+                .is_error = tr.is_error,
+            } },
+            .image => |img| .{ .image = .{
+                .data = try alloc.dupe(u8, img.data),
+                .media_type = try alloc.dupe(u8, img.media_type),
+            } },
+        };
+    }
+
+    fn cloneContent(alloc: Allocator, content: []const proto.ContentBlock) ![]proto.ContentBlock {
+        // PSEUDOCODE: Allocate and clone all ContentBlocks in a slice.
+        const copy = try alloc.alloc(proto.ContentBlock, content.len);
+        for (content, 0..) |block, i| {
+            copy[i] = try cloneContentBlock(alloc, block);
+        }
+        return copy;
+    }
+
     /// Restores history from a JSON file.
     pub fn restoreFromFile(self: *History, io: std.Io, path: []const u8) !void {
+        // PSEUDOCODE:
+        // 1. Read file content into buffer.
+        // 2. Parse JSON into []proto.Message.
+        // 3. Clear existing history and deep-clone parsed messages.
         const cwd = std.Io.Dir.cwd();
         const file = try cwd.openFile(io, path, .{});
         defer file.close(io);
@@ -108,40 +144,14 @@ pub const History = struct {
         defer self.alloc.free(buf);
 
         const n = try utils.readAll(io, file, buf);
-        const json_data = buf[0..n];
-
-        const parsed = try std.json.parseFromSlice([]proto.Message, self.alloc, json_data, .{
+        const parsed = try std.json.parseFromSlice([]proto.Message, self.alloc, buf[0..n], .{
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();
 
         self.clear();
-
         for (parsed.value) |msg| {
-            const content_copy = try self.alloc.alloc(proto.ContentBlock, msg.content.len);
-            for (msg.content, 0..) |block, i| {
-                content_copy[i] = switch (block) {
-                    .text => |t| .{ .text = try self.alloc.dupe(u8, t) },
-                    .thinking => |th| .{ .thinking = .{
-                        .thinking = try self.alloc.dupe(u8, th.thinking),
-                        .signature = try self.alloc.dupe(u8, th.signature),
-                    } },
-                    .tool_use => |tu| .{ .tool_use = .{
-                        .id = try self.alloc.dupe(u8, tu.id),
-                        .name = try self.alloc.dupe(u8, tu.name),
-                        .input_json = try self.alloc.dupe(u8, tu.input_json),
-                    } },
-                    .tool_result => |tr| .{ .tool_result = .{
-                        .tool_use_id = try self.alloc.dupe(u8, tr.tool_use_id),
-                        .content = try self.alloc.dupe(u8, tr.content),
-                        .is_error = tr.is_error,
-                    } },
-                    .image => |img| .{ .image = .{
-                        .data = try self.alloc.dupe(u8, img.data),
-                        .media_type = try self.alloc.dupe(u8, img.media_type),
-                    } },
-                };
-            }
+            const content_copy = try cloneContent(self.alloc, msg.content);
             try self.msgs.append(self.alloc, .{
                 .role = msg.role,
                 .content = content_copy,
@@ -149,7 +159,6 @@ pub const History = struct {
             });
         }
     }
-
 
     /// Appends user message.
     /// `text` is copied into memory owned by History.
@@ -204,16 +213,16 @@ pub const History = struct {
                     .id = try self.alloc.dupe(u8, tu.id),
                     .name = try self.alloc.dupe(u8, tu.name),
                     .input_json = try self.alloc.dupe(u8, tu.input_json),
-                }},
+                } },
                 .tool_result => |tr| .{ .tool_result = .{
                     .tool_use_id = try self.alloc.dupe(u8, tr.tool_use_id),
                     .content = try self.alloc.dupe(u8, tr.content),
                     .is_error = tr.is_error,
-                }},
+                } },
                 .image => |img| .{ .image = .{
                     .data = try self.alloc.dupe(u8, img.data),
                     .media_type = try self.alloc.dupe(u8, img.media_type),
-                }},
+                } },
             };
         }
         try self.msgs.append(self.alloc, .{ .role = .assistant, .content = blocks, .tier = .recent });
@@ -229,7 +238,7 @@ pub const History = struct {
                 .tool_use_id = try self.alloc.dupe(u8, r.tool_use_id),
                 .content = try self.alloc.dupe(u8, r.content),
                 .is_error = r.is_error,
-            }};
+            } };
         }
         try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks, .tier = .recent });
     }
@@ -244,13 +253,13 @@ pub const History = struct {
                 .tool_use_id = try self.alloc.dupe(u8, r.tool_use_id),
                 .content = try self.alloc.dupe(u8, r.content),
                 .is_error = r.is_error,
-            }};
+            } };
         }
         for (images, 0..) |img, j| {
             blocks[results.len + j] = .{ .image = .{
                 .data = try self.alloc.dupe(u8, img.data),
                 .media_type = try self.alloc.dupe(u8, img.media_type),
-            }};
+            } };
         }
         try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks, .tier = .recent });
     }
@@ -390,102 +399,122 @@ pub const History = struct {
         return false;
     }
 
+    fn collectToolAndResultIds(
+        self: *History,
+        valid_tool_ids: *std.StringHashMap(void),
+        valid_result_ids: *std.StringHashMap(void),
+    ) void {
+        // PSEUDOCODE:
+        // 1. Scan assistant messages for tool_use IDs.
+        // 2. Scan other messages for tool_result IDs.
+        for (self.msgs.items) |msg| {
+            if (msg.role == .assistant) {
+                for (msg.content) |block| {
+                    if (block == .tool_use) valid_tool_ids.put(block.tool_use.id, {}) catch {};
+                }
+            } else {
+                for (msg.content) |block| {
+                    if (block == .tool_result) valid_result_ids.put(block.tool_result.tool_use_id, {}) catch {};
+                }
+            }
+        }
+    }
+
+    fn convertOrphanToolCalls(self: *History, valid_result_ids: *const std.StringHashMap(void)) bool {
+        // PSEUDOCODE:
+        // 1. Iterate over assistant messages.
+        // 2. If message contains tool_use without matching tool_result, convert to text block.
+        var modified = false;
+        for (self.msgs.items) |*msg| {
+            if (msg.role != .assistant) continue;
+            var has_orphan = false;
+            for (msg.content) |block| {
+                if (block == .tool_use and !valid_result_ids.contains(block.tool_use.id)) {
+                    has_orphan = true;
+                    break;
+                }
+            }
+            if (!has_orphan) continue;
+
+            var new_blocks = self.alloc.alloc(proto.ContentBlock, msg.content.len) catch continue;
+            for (msg.content, 0..) |block, bi| {
+                if (block == .tool_use and !valid_result_ids.contains(block.tool_use.id)) {
+                    const formatted = std.fmt.allocPrint(self.alloc, "[Tool Call: {s}({s})]", .{ block.tool_use.name, block.tool_use.input_json }) catch {
+                        new_blocks[bi] = block;
+                        continue;
+                    };
+                    self.alloc.free(block.tool_use.id);
+                    self.alloc.free(block.tool_use.name);
+                    self.alloc.free(block.tool_use.input_json);
+                    new_blocks[bi] = .{ .text = formatted };
+                } else {
+                    new_blocks[bi] = block;
+                }
+            }
+            self.alloc.free(msg.content);
+            msg.content = new_blocks;
+            modified = true;
+        }
+        return modified;
+    }
+
+    fn convertOrphanToolResults(self: *History, valid_tool_ids: *const std.StringHashMap(void)) bool {
+        // PSEUDOCODE:
+        // 1. Iterate over non-assistant messages.
+        // 2. If message contains tool_result without matching tool_use, convert to [Observation] text.
+        var modified = false;
+        for (self.msgs.items) |*msg| {
+            if (msg.role == .assistant) continue;
+            var has_orphan = false;
+            for (msg.content) |block| {
+                if (block == .tool_result and !valid_tool_ids.contains(block.tool_result.tool_use_id)) {
+                    has_orphan = true;
+                    break;
+                }
+            }
+            if (!has_orphan) continue;
+
+            var new_blocks = self.alloc.alloc(proto.ContentBlock, msg.content.len) catch continue;
+            for (msg.content, 0..) |block, bi| {
+                if (block == .tool_result and !valid_tool_ids.contains(block.tool_result.tool_use_id)) {
+                    const formatted = std.fmt.allocPrint(self.alloc, "[Observation]: {s}", .{block.tool_result.content}) catch {
+                        new_blocks[bi] = block;
+                        continue;
+                    };
+                    self.alloc.free(block.tool_result.content);
+                    self.alloc.free(block.tool_result.tool_use_id);
+                    new_blocks[bi] = .{ .text = formatted };
+                } else {
+                    new_blocks[bi] = block;
+                }
+            }
+            self.alloc.free(msg.content);
+            msg.content = new_blocks;
+            msg.role = .user;
+            modified = true;
+        }
+        return modified;
+    }
+
     /// Ensures history compatibility with OpenAI API:
     /// 1. Strips/converts orphan tool_result blocks (without preceding assistant message holding corresponding tool_use).
     ///    Prevents OpenAI 400 error: "No tool call found for function call output with call_id ...".
     /// 2. Strips/converts orphan tool_use blocks (without succeeding user message holding corresponding tool_result).
     ///    Prevents OpenAI 400 error: "No tool output found for function call ...".
     pub fn ensureOpenAICompatible(self: *History) bool {
-        var modified = false;
+        // PSEUDOCODE:
+        // 1. Collect valid tool and result IDs across history.
+        // 2. Convert orphan tool calls in assistant messages to plain text.
+        // 3. Convert orphan tool results in user messages to plain observation text.
         var valid_tool_ids = std.StringHashMap(void).init(self.alloc);
         defer valid_tool_ids.deinit();
         var valid_result_ids = std.StringHashMap(void).init(self.alloc);
         defer valid_result_ids.deinit();
 
-        for (self.msgs.items) |msg| {
-            if (msg.role == .assistant) {
-                for (msg.content) |block| {
-                    if (block == .tool_use) {
-                        valid_tool_ids.put(block.tool_use.id, {}) catch {};
-                    }
-                }
-            } else {
-                for (msg.content) |block| {
-                    if (block == .tool_result) {
-                        valid_result_ids.put(block.tool_result.tool_use_id, {}) catch {};
-                    }
-                }
-            }
-        }
-
-        // Pass 1: Handle assistant messages containing tool_use without succeeding tool_result
-        for (self.msgs.items) |*msg| {
-            if (msg.role == .assistant) {
-                var has_orphan_call = false;
-                for (msg.content) |block| {
-                    if (block == .tool_use and !valid_result_ids.contains(block.tool_use.id)) {
-                        has_orphan_call = true;
-                        break;
-                    }
-                }
-
-                if (has_orphan_call) {
-                    var new_blocks = self.alloc.alloc(proto.ContentBlock, msg.content.len) catch continue;
-                    for (msg.content, 0..) |block, bi| {
-                        if (block == .tool_use and !valid_result_ids.contains(block.tool_use.id)) {
-                            const formatted = std.fmt.allocPrint(self.alloc, "[Tool Call: {s}({s})]", .{ block.tool_use.name, block.tool_use.input_json }) catch {
-                                new_blocks[bi] = block;
-                                continue;
-                            };
-                            self.alloc.free(block.tool_use.id);
-                            self.alloc.free(block.tool_use.name);
-                            self.alloc.free(block.tool_use.input_json);
-                            new_blocks[bi] = .{ .text = formatted };
-                        } else {
-                            new_blocks[bi] = block;
-                        }
-                    }
-                    self.alloc.free(msg.content);
-                    msg.content = new_blocks;
-                    modified = true;
-                }
-            }
-        }
-
-        // Pass 2: Handle user messages containing tool_result without preceding tool_use
-        for (self.msgs.items) |*msg| {
-            if (msg.role != .assistant) {
-                var has_orphan_res = false;
-                for (msg.content) |block| {
-                    if (block == .tool_result and !valid_tool_ids.contains(block.tool_result.tool_use_id)) {
-                        has_orphan_res = true;
-                        break;
-                    }
-                }
-
-                if (has_orphan_res) {
-                    var new_blocks = self.alloc.alloc(proto.ContentBlock, msg.content.len) catch continue;
-                    for (msg.content, 0..) |block, bi| {
-                        if (block == .tool_result and !valid_tool_ids.contains(block.tool_result.tool_use_id)) {
-                            const formatted = std.fmt.allocPrint(self.alloc, "[Observation]: {s}", .{block.tool_result.content}) catch {
-                                new_blocks[bi] = block;
-                                continue;
-                            };
-                            self.alloc.free(block.tool_result.content);
-                            self.alloc.free(block.tool_result.tool_use_id);
-                            new_blocks[bi] = .{ .text = formatted };
-                        } else {
-                            new_blocks[bi] = block;
-                        }
-                    }
-                    self.alloc.free(msg.content);
-                    msg.content = new_blocks;
-                    msg.role = .user;
-                    modified = true;
-                }
-            }
-        }
-        return modified;
+        self.collectToolAndResultIds(&valid_tool_ids, &valid_result_ids);
+        const mod1 = self.convertOrphanToolCalls(&valid_result_ids);
+        const mod2 = self.convertOrphanToolResults(&valid_tool_ids);
+        return mod1 or mod2;
     }
 };
 

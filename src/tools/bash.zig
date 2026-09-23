@@ -224,7 +224,8 @@ test "bash tool: process group interruption terminates sleeping command promptly
 // 3. Concurrently drain stdout and stderr using interrupt-aware drainPipe
 // 4. If signals.isInterrupted(), force-kill process group before waiting
 // 5. Wait for child and return output or error.Interrupted
-fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: ?[]const u8) ![]u8 {
+fn spawnBashChild(io: std.Io, command: []const u8, stdin_str: ?[]const u8) !std.process.Child {
+    // PSEUDOCODE: Spawn /bin/sh with pgid = 0 and deliver stdin if provided.
     const argv = [_][]const u8{ "/bin/sh", "-c", command };
     var child = try std.process.spawn(io, .{
         .argv = &argv,
@@ -233,10 +234,11 @@ fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: 
         .stdout = .pipe,
         .stderr = .pipe,
     });
-    if (child.id) |pid| {
-        g_active_pid.store(pid, .release);
+    errdefer {
+        if (child.stdin) |in_pipe| in_pipe.close(io);
+        if (child.stdout) |out_pipe| out_pipe.close(io);
+        if (child.stderr) |err_pipe| err_pipe.close(io);
     }
-    defer g_active_pid.store(0, .release);
 
     if (stdin_str) |s| {
         if (child.stdin) |in_pipe| {
@@ -245,69 +247,39 @@ fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: 
             child.stdin = null;
         }
     }
+    return child;
+}
 
-    // Heap-allocate buffers
-    const stdout_buf = try alloc.alloc(u8, MAX_OUTPUT);
-    defer alloc.free(stdout_buf);
-    const stderr_buf = try alloc.alloc(u8, MAX_OUTPUT);
-    defer alloc.free(stderr_buf);
-
-    var stdolen: usize = 0;
-    var stdelen: usize = 0;
-
-    // Spawn thread to read stderr concurrently
+fn drainChildPipesConcurrently(io: std.Io, child: *std.process.Child, stdout_buf: []u8, stderr_buf: []u8, stdolen: *usize, stdelen: *usize) void {
+    // PSEUDOCODE: Read stderr in worker thread while main thread reads stdout.
     const stderr_thread = if (child.stderr) |err_pipe|
-        std.Thread.spawn(.{}, drainStderrThread, .{ io, err_pipe, stderr_buf, &stdelen }) catch null
+        std.Thread.spawn(.{}, drainStderrThread, .{ io, err_pipe, stderr_buf, stdelen }) catch null
     else
         null;
 
-    // Main thread reads stdout
     if (child.stdout) |out_pipe| {
-        stdolen = drainPipe(io, out_pipe, stdout_buf);
+        stdolen.* = drainPipe(io, out_pipe, stdout_buf);
     }
 
-    // Await stderr thread completion
     if (stderr_thread) |t| {
         t.join();
     } else if (child.stderr) |err_pipe| {
-        // Fallback sequential if thread spawn fails
-        stdelen = drainPipe(io, err_pipe, stderr_buf);
+        stdelen.* = drainPipe(io, err_pipe, stderr_buf);
     }
+}
 
-    // If interrupted while draining pipes, ensure process group is terminated
-    if (signals.isInterrupted()) {
-        forceKillCurrent();
-    }
-
-    // Await child process termination after draining pipes
-    const term = child.wait(io) catch |e| {
-        if (signals.isInterrupted()) return error.Interrupted;
-        return std.fmt.allocPrint(alloc, "Wait error: {s}", .{@errorName(e)});
-    };
-
-    if (signals.isInterrupted()) {
-        return error.Interrupted;
-    }
-
-    const exit_code: u8 = switch (term) {
-        .exited => |code| code,
-        .signal => |sig| {
-            return std.fmt.allocPrint(alloc, "Killed by signal {d}", .{@intFromEnum(sig)});
-        },
-        else => 1,
-    };
-
-    // Build result
+fn formatCommandOutput(alloc: Allocator, stdout_slice: []const u8, stderr_slice: []const u8, exit_code: u8) ![]u8 {
+    // PSEUDOCODE: Assemble stdout, newline delimiter, stderr, or fallback exit status into result slice.
     var result = utils.BufWriter.init(alloc);
     errdefer result.deinit();
     const w = &result;
 
-    if (stdolen > 0) {
-        try w.writeAll(stdout_buf[0..stdolen]);
+    if (stdout_slice.len > 0) {
+        try w.writeAll(stdout_slice);
     }
-    if (stdelen > 0) {
-        if (stdolen > 0) try w.writeByte('\n');
-        try w.writeAll(stderr_buf[0..stdelen]);
+    if (stderr_slice.len > 0) {
+        if (stdout_slice.len > 0) try w.writeByte('\n');
+        try w.writeAll(stderr_slice);
     }
     if (exit_code != 0 and result.list.items.len == 0) {
         try w.print("Exit code: {d}", .{exit_code});
@@ -315,6 +287,39 @@ fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: 
     if (result.list.items.len == 0) {
         try w.writeAll("(no output)");
     }
-
     return result.toOwnedSlice();
+}
+
+fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: ?[]const u8) ![]u8 {
+    // PSEUDOCODE:
+    // 1. Spawn /bin/sh child and track pid.
+    // 2. Concurrently drain pipes into allocated buffers.
+    // 3. Check for interrupts, await child termination, and format output.
+    var child = try spawnBashChild(io, command, stdin_str);
+    if (child.id) |pid| g_active_pid.store(pid, .release);
+    defer g_active_pid.store(0, .release);
+
+    const stdout_buf = try alloc.alloc(u8, MAX_OUTPUT);
+    defer alloc.free(stdout_buf);
+    const stderr_buf = try alloc.alloc(u8, MAX_OUTPUT);
+    defer alloc.free(stderr_buf);
+
+    var stdolen: usize = 0;
+    var stdelen: usize = 0;
+    drainChildPipesConcurrently(io, &child, stdout_buf, stderr_buf, &stdolen, &stdelen);
+
+    if (signals.isInterrupted()) forceKillCurrent();
+
+    const term = child.wait(io) catch |e| {
+        if (signals.isInterrupted()) return error.Interrupted;
+        return std.fmt.allocPrint(alloc, "Wait error: {s}", .{@errorName(e)});
+    };
+    if (signals.isInterrupted()) return error.Interrupted;
+
+    const exit_code: u8 = switch (term) {
+        .exited => |code| code,
+        .signal => |sig| return std.fmt.allocPrint(alloc, "Killed by signal {d}", .{@intFromEnum(sig)}),
+        else => 1,
+    };
+    return formatCommandOutput(alloc, stdout_buf[0..stdolen], stderr_buf[0..stdelen], exit_code);
 }

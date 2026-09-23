@@ -53,27 +53,10 @@ pub const ActErrorResolution = enum {
     stop_turn,
 };
 
-/// Initializes turn metrics, appends the user query, restores plans, and retrieves filtered tool definitions.
-pub fn prepareTurnState(
-    self: *AgentLoop,
-    turn_alloc: std.mem.Allocator,
-    user_text: []const u8,
-    images: []const proto.ImageBlock,
-) ![]const proto.ToolDefinition {
-    // Append user message to history
-    if (images.len > 0) {
-        try self.history.addUserWithImages(user_text, images);
-    } else {
-        try self.history.addUser(user_text);
-    }
-
-    // Reset turn metrics
+fn resetTurnMetrics(self: *AgentLoop, user_text: []const u8) void {
     self.last_turn_acts = 0;
     self.last_turn_completion_tokens = 0;
-
-    // Reset role fix retry counter for new turn
     self.role_fix_attempts = 0;
-    // Reset continue-max_tokens counter for new turn
     self.max_tokens_continues = 0;
     self.last_act_failed = false;
     self.js_retry_count = 0;
@@ -83,15 +66,16 @@ pub fn prepareTurnState(
     self.action_loop_tripped = false;
     self.plan.resetTurn();
     self.current_user_request = user_text;
-
-    // RFC-019: Try to restore plan from store or trigger planning phase
     self.plan.tryRestoreFromStore(user_text);
+}
 
-    const tool_hint = self.plan.getToolHint();
-
-    // Retrieve relevant tool definitions for user message based on execution_mode
+fn resolveTurnToolDefinitions(
+    self: *AgentLoop,
+    turn_alloc: std.mem.Allocator,
+    user_text: []const u8,
+) []const proto.ToolDefinition {
     const raw_tool_defs = switch (self.config.execution_mode) {
-        .codeact => &[_]proto.ToolDefinition{}, // Disable 100% of tools sent to API in codeact mode to force LLM to write CodeAct JS
+        .codeact => &[_]proto.ToolDefinition{},
         .tools => blk: {
             const all_defs = tools_mod.getRelevantDefinitions(turn_alloc, user_text);
             var list = std.ArrayListUnmanaged(proto.ToolDefinition).empty;
@@ -105,11 +89,13 @@ pub fn prepareTurnState(
         .auto => tools_mod.getRelevantDefinitions(turn_alloc, user_text),
     };
 
-    const tool_defs = if (tool_hint != null)
-        tools_mod.filterDefinitionsForPlan(turn_alloc, raw_tool_defs, tool_hint)
-    else
-        raw_tool_defs;
+    if (self.plan.getToolHint()) |hint| {
+        return tools_mod.filterDefinitionsForPlan(turn_alloc, raw_tool_defs, hint);
+    }
+    return raw_tool_defs;
+}
 
+fn ensureJournalAndSnapshotTracker(self: *AgentLoop) void {
     if (self.journal == null) {
         var path_buf: [256]u8 = undefined;
         const home_dir = utils.getEnvSlice("HOME") orelse ".";
@@ -117,18 +103,36 @@ pub fn prepareTurnState(
         self.journal = journal_mod.ActJournal.init(self.alloc, self.io, journal_path) catch null;
     }
 
-    // ISSUE-CODEACT-001 M4: shared CAS snapshot tracker, global for mini.* bindings
     if (self.snapshot_tracker == null) {
         self.snapshot_tracker = snapshot_mod.SnapshotTracker.init(self.alloc, self.io, &self.cas, if (self.journal != null) &self.journal.? else null);
         snapshot_mod.setTracker(if (self.snapshot_tracker != null) &self.snapshot_tracker.? else null);
     }
+}
 
+/// Initializes turn metrics, appends the user query, restores plans, and retrieves filtered tool definitions.
+pub fn prepareTurnState(
+    self: *AgentLoop,
+    turn_alloc: std.mem.Allocator,
+    user_text: []const u8,
+    images: []const proto.ImageBlock,
+) ![]const proto.ToolDefinition {
+    if (images.len > 0) {
+        try self.history.addUserWithImages(user_text, images);
+    } else {
+        try self.history.addUser(user_text);
+    }
+
+    resetTurnMetrics(self, user_text);
+    const tool_defs = resolveTurnToolDefinitions(self, turn_alloc, user_text);
+    ensureJournalAndSnapshotTracker(self);
     return tool_defs;
 }
 
-/// Flushes tracked file snapshots, records act completion in journal, and summarizes progress into plan state.
-pub fn flushActProgress(self: *AgentLoop, act_id: usize) !void {
-    // Flush all mini.write/patch/sh snapshots tracked during this act (M4)
+/// Flushes all mini.write/patch/sh snapshots and writes completion record to journal.
+fn flushSnapshotsAndJournal(self: *AgentLoop, act_id: usize) void {
+    // PSEUDOCODE:
+    // 1. Flush snapshot tracker if there are tracked files
+    // 2. Record act completion in journal if no file delta was recorded
     var recorded_delta = false;
     if (self.snapshot_tracker) |*t| {
         if (t.tracked.items.len > 0) {
@@ -137,7 +141,6 @@ pub fn flushActProgress(self: *AgentLoop, act_id: usize) !void {
         }
         t.reset();
     }
-
     if (!recorded_delta) {
         if (self.journal) |*j| {
             j.recordActComplete(self.io, act_id, .{
@@ -146,24 +149,28 @@ pub fn flushActProgress(self: *AgentLoop, act_id: usize) !void {
             }) catch {};
         }
     }
+}
 
-    // Build progress summary from act results
+/// Builds progress summary string from modified files and recent unique tool invocations.
+fn buildActProgressSummary(self: *AgentLoop, alloc: std.mem.Allocator) ![]u8 {
+    // PSEUDOCODE:
+    // 1. Append modified files
+    // 2. Deduplicate and append up to 5 most recent tool names
+    // 3. Return owned slice
     var pb = std.ArrayListUnmanaged(u8).empty;
-    defer pb.deinit(self.alloc);
+    errdefer pb.deinit(alloc);
 
-    // File changes
     if (self.snapshot_tracker) |*t| {
         for (t.tracked.items) |tf| {
             if (tf.previous_content_hash) |_| {
-                const line = try std.fmt.allocPrint(self.alloc, "Modified: {s}\n", .{tf.path});
-                defer self.alloc.free(line);
-                pb.appendSlice(self.alloc, line) catch {};
+                const line = try std.fmt.allocPrint(alloc, "Modified: {s}\n", .{tf.path});
+                defer alloc.free(line);
+                pb.appendSlice(alloc, line) catch {};
             }
         }
         t.reset();
     }
 
-    // Tool summary (last 5 unique tools used)
     if (self.turn_tool_records.items.len > 0) {
         var seen_tools: [5][]const u8 = undefined;
         var seen_count: usize = 0;
@@ -181,15 +188,24 @@ pub fn flushActProgress(self: *AgentLoop, act_id: usize) !void {
                 seen_tools[seen_count] = rec.name;
                 seen_count += 1;
             }
-            const line = try std.fmt.allocPrint(self.alloc, "Tool: {s}\n", .{rec.name});
-            defer self.alloc.free(line);
-            pb.appendSlice(self.alloc, line) catch {};
+            const line = try std.fmt.allocPrint(alloc, "Tool: {s}\n", .{rec.name});
+            defer alloc.free(line);
+            pb.appendSlice(alloc, line) catch {};
         }
     }
 
-    const summary = try pb.toOwnedSlice(self.alloc);
+    return pb.toOwnedSlice(alloc);
+}
+
+/// Flushes tracked file snapshots, records act completion in journal, and summarizes progress into plan state.
+pub fn flushActProgress(self: *AgentLoop, act_id: usize) !void {
+    // PSEUDOCODE:
+    // 1. Flush snapshots and journal
+    // 2. Build progress summary and forward to plan state
+    flushSnapshotsAndJournal(self, act_id);
+    const summary = try buildActProgressSummary(self, self.alloc);
+    defer self.alloc.free(summary);
     self.plan.updateProgress(summary);
-    self.alloc.free(summary);
 }
 
 /// Dispatches classified error handling during act loop execution.

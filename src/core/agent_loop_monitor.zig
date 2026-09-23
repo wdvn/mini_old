@@ -122,26 +122,19 @@ pub fn hasRecentVerifiedMutation(self: *AgentLoop) bool {
         std.mem.startsWith(u8, last, "write");
 }
 
-/// Evaluates whether a tool call constitutes an action loop (consecutive identical, sliding window repeat,
-/// macro-cycle alternating sequence, or read-only exploratory budget exceeded).
-pub fn checkActionLoop(self: *AgentLoop, tool_name: []const u8, input_json: []const u8) !AgentLoop.LoopCheckResult {
-    const trimmed = std.mem.trim(u8, input_json, " \t\r\n");
-    // Whitespace-insensitive hash: replays after truncation often re-serialize
-    // the same JSON with different formatting; treat them as identical calls.
-    const args_hash = fuzzyArgsHash(trimmed);
-
-    // 1. Update read-only exploratory counter
+/// Records tool invocation into turn records and trajectory history, returning sliding window occurrences.
+fn recordToolCallHistory(self: *AgentLoop, tool_name: []const u8, args_hash: u64) !usize {
+    // PSEUDOCODE:
+    // 1. Update read-only counter
+    // 2. Update consecutive duplicate counter
+    // 3. Count occurrences in sliding window (max 10 recent items)
+    // 4. Append to turn records (cap 16) and trajectory (cap 32)
     if (isReadOnlyTool(tool_name)) {
         self.consecutive_readonly_count += 1;
     } else {
-        // Any non-readonly tool resets the read-only counter (dropping rule requiring file mutation)
         self.consecutive_readonly_count = 0;
     }
 
-    // 2. Check macro-cycle (alternating tool names across consecutive calls)
-    const macro_cycle = detectMacroCycle(self.turn_tool_records.items, tool_name);
-
-    // 3. Check consecutive duplicates (identical arguments)
     if (self.turn_tool_records.items.len > 0) {
         const last = self.turn_tool_records.items[self.turn_tool_records.items.len - 1];
         if (std.mem.eql(u8, last.name, tool_name) and last.args_hash == args_hash) {
@@ -153,8 +146,7 @@ pub fn checkActionLoop(self: *AgentLoop, tool_name: []const u8, input_json: []co
         self.consecutive_dup_tool_count = 1;
     }
 
-    // 4. Count occurrences in sliding window of recent tool executions
-    var window_count: usize = 0;
+    var window_count: usize = 1;
     const window_size = @min(self.turn_tool_records.items.len, 10);
     const start_idx = self.turn_tool_records.items.len - window_size;
     for (self.turn_tool_records.items[start_idx..]) |rec| {
@@ -162,21 +154,15 @@ pub fn checkActionLoop(self: *AgentLoop, tool_name: []const u8, input_json: []co
             window_count += 1;
         }
     }
-    window_count += 1; // including current
 
-    // 5. Append to turn records (cap at 16 items)
     if (self.turn_tool_records.items.len >= 16) {
         const oldest = self.turn_tool_records.orderedRemove(0);
         self.alloc.free(oldest.name);
     }
     const dup_name = try self.alloc.dupe(u8, tool_name);
     errdefer self.alloc.free(dup_name);
-    try self.turn_tool_records.append(self.alloc, .{
-        .name = dup_name,
-        .args_hash = args_hash,
-    });
+    try self.turn_tool_records.append(self.alloc, .{ .name = dup_name, .args_hash = args_hash });
 
-    // Also append to 3D trajectory (cap at 32 items)
     if (self.turn_tool_trajectory.items.len >= 32) {
         const oldest_t = self.turn_tool_trajectory.orderedRemove(0);
         self.alloc.free(oldest_t);
@@ -185,61 +171,92 @@ pub fn checkActionLoop(self: *AgentLoop, tool_name: []const u8, input_json: []co
     errdefer self.alloc.free(dup_traj);
     try self.turn_tool_trajectory.append(self.alloc, dup_traj);
 
-    // Check 3D procedural map orbit
-    const traj_orbit = graph_store_mod.PGraphStore.detectTrajectoryOrbit(self.turn_tool_trajectory.items, tool_name);
+    return window_count;
+}
 
-    // 6. Evaluate circuit breaker thresholds (TRIP)
+/// Evaluates circuit-breaker trip thresholds across repetitions, macro-cycles, and orbits.
+fn evaluateLoopTrip(
+    self: *AgentLoop,
+    window_count: usize,
+    macro_cycle: ?MacroCycle,
+    traj_orbit: ?graph_store_mod.PGraphStore.OrbitInfo,
+) bool {
+    // PSEUDOCODE: Check consecutive or window caps -> macro-cycle >= 3 -> orbit >= orbit_cap
     if (self.consecutive_dup_tool_count >= self.config.action_loop_consecutive_cap or
         window_count >= self.config.action_loop_window_cap)
     {
         self.action_loop_tripped = true;
-        self.last_loop_reason = if (self.consecutive_dup_tool_count >= self.config.action_loop_consecutive_cap) .identical_repeat else .window_repeat;
-        return .trip;
+        self.last_loop_reason = if (self.consecutive_dup_tool_count >= self.config.action_loop_consecutive_cap)
+            .identical_repeat
+        else
+            .window_repeat;
+        return true;
     }
-
     if (macro_cycle) |mc| {
         if (mc.repetitions >= 3) {
             self.action_loop_tripped = true;
             self.last_loop_reason = if (mc.period == 2) .macro_cycle_2 else .macro_cycle_3;
-            return .trip;
+            return true;
         }
     }
-
     if (traj_orbit) |orbit| {
         if (orbit.revolutions >= self.config.action_loop_orbit_cap) {
             self.action_loop_tripped = true;
             self.last_loop_reason = .orbit_cycle;
-            return .trip;
+            return true;
         }
     }
+    return false;
+}
 
-    // Note: readonly actions do not trip circuit breaker alone unless repetitive (handled by window/consecutive/orbit checks)
-    // or procrastinating on an active plan (handled by Plan Watchdog).
-
-    // 7. Evaluate warning thresholds (WARN)
+/// Evaluates warning thresholds across repetitions, macro-cycles, orbits, and read-only budgets.
+fn evaluateLoopWarn(
+    self: *AgentLoop,
+    window_count: usize,
+    macro_cycle: ?MacroCycle,
+    traj_orbit: ?graph_store_mod.PGraphStore.OrbitInfo,
+) bool {
+    // PSEUDOCODE: Check consecutive >= 2 or window >= 3 -> macro-cycle cap -> orbit >= 1 -> readonly warn cap
     if (self.consecutive_dup_tool_count >= 2 or window_count >= 3) {
         self.last_loop_reason = if (self.consecutive_dup_tool_count >= 2) .identical_repeat else .window_repeat;
-        return .warn;
+        return true;
     }
-
     if (macro_cycle) |mc| {
         if (mc.repetitions >= self.config.action_loop_macro_cycle_cap) {
             self.last_loop_reason = if (mc.period == 2) .macro_cycle_2 else .macro_cycle_3;
-            return .warn;
+            return true;
         }
     }
-
     if (traj_orbit) |orbit| {
         if (orbit.revolutions >= 1) {
             self.last_loop_reason = .orbit_cycle;
-            return .warn;
+            return true;
         }
     }
-
     if (self.consecutive_readonly_count >= self.config.action_loop_readonly_warn_cap) {
         self.last_loop_reason = .readonly_budget;
-        return .warn;
+        return true;
     }
+    return false;
+}
+
+/// Evaluates whether a tool call constitutes an action loop (consecutive identical, sliding window repeat,
+/// macro-cycle alternating sequence, or read-only exploratory budget exceeded).
+pub fn checkActionLoop(self: *AgentLoop, tool_name: []const u8, input_json: []const u8) !AgentLoop.LoopCheckResult {
+    // PSEUDOCODE:
+    // 1. Hash trimmed arguments and record tool call telemetry
+    // 2. Detect macro-cycles and 3D trajectory orbits
+    // 3. Early-return .trip if circuit breaker trips
+    // 4. Early-return .warn if warning threshold met
+    // 5. Otherwise return .allow
+    const trimmed = std.mem.trim(u8, input_json, " \t\r\n");
+    const args_hash = fuzzyArgsHash(trimmed);
+    const macro_cycle = detectMacroCycle(self.turn_tool_records.items, tool_name);
+    const window_count = try recordToolCallHistory(self, tool_name, args_hash);
+    const traj_orbit = graph_store_mod.PGraphStore.detectTrajectoryOrbit(self.turn_tool_trajectory.items, tool_name);
+
+    if (evaluateLoopTrip(self, window_count, macro_cycle, traj_orbit)) return .trip;
+    if (evaluateLoopWarn(self, window_count, macro_cycle, traj_orbit)) return .warn;
 
     self.last_loop_reason = .none;
     return .allow;

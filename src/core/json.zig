@@ -339,6 +339,33 @@ test "reserializeJson: raw tab + nested object" {
 /// to backend is always valid JSON/UTF-8. Without sanitization, the server may
 /// reject the request with misleading errors (e.g. "missing model" HTTP 400).
 /// Caller must free result.
+fn sanitizeMultibyte(alloc: Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const u8, i: *usize, pending: *usize) !void {
+    if (pending.* > 0) {
+        try appendEscaped(alloc, buf, s[i.* - pending.* .. i.*]);
+        pending.* = 0;
+    }
+    const b = s[i.*];
+    const seq_len = std.unicode.utf8ByteSequenceLength(b) catch {
+        try buf.appendSlice(alloc, "\u{FFFD}");
+        i.* += 1;
+        return;
+    };
+    if (i.* + seq_len > s.len) {
+        try buf.appendSlice(alloc, "\u{FFFD}");
+        i.* = s.len;
+        return;
+    }
+    if (std.unicode.utf8Decode(s[i.* .. i.* + seq_len])) |_| {
+        try buf.appendSlice(alloc, s[i.* .. i.* + seq_len]);
+        i.* += seq_len;
+    } else |_| {
+        try buf.appendSlice(alloc, "\u{FFFD}");
+        var j = i.* + 1;
+        while (j < s.len and (s[j] & 0xC0) == 0x80) : (j += 1) {}
+        i.* = j;
+    }
+}
+
 pub fn escape(alloc: Allocator, s: []const u8) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
@@ -351,54 +378,13 @@ pub fn escape(alloc: Allocator, s: []const u8) ![]u8 {
 
     // Sanitize path: decode each codepoint, invalid bytes → U+FFFD.
     var i: usize = 0;
-    var pending: usize = 0; // count of consecutive scanned ASCII bytes, unflushed
+    var pending: usize = 0;
     while (i < s.len) {
-        const b = s[i];
-        if (b < 0x80) {
+        if (s[i] < 0x80) {
             i += 1;
             pending += 1;
-            continue;
-        }
-        const seq_len = std.unicode.utf8ByteSequenceLength(b) catch {
-            // Invalid lead byte — replace with 1 U+FFFD, skip 1 byte.
-            if (pending > 0) {
-                try appendEscaped(alloc, &buf, s[i - pending .. i]);
-                pending = 0;
-            }
-            try buf.appendSlice(alloc, "\u{FFFD}");
-            i += 1;
-            continue;
-        };
-        // Truncated sequence at end of string (missing continuation bytes)
-        if (i + seq_len > s.len) {
-            if (pending > 0) {
-                try appendEscaped(alloc, &buf, s[i - pending .. i]);
-                pending = 0;
-            }
-            try buf.appendSlice(alloc, "\u{FFFD}");
-            i = s.len;
-            continue;
-        }
-        if (std.unicode.utf8Decode(s[i .. i + seq_len])) |_| {
-            // Valid codepoint — preserve, flush preceding ASCII.
-            if (pending > 0) {
-                try appendEscaped(alloc, &buf, s[i - pending .. i]);
-                pending = 0;
-            }
-            try buf.appendSlice(alloc, s[i .. i + seq_len]);
-            i += seq_len;
-        } else |_| {
-            // Corrupted sequence (truncated, overlong, surrogate...)
-            // — using maximal subpart strategy: consume contiguous
-            // continuation bytes and replace with 1 U+FFFD.
-            if (pending > 0) {
-                try appendEscaped(alloc, &buf, s[i - pending .. i]);
-                pending = 0;
-            }
-            try buf.appendSlice(alloc, "\u{FFFD}");
-            var j = i + 1;
-            while (j < s.len and (s[j] & 0xC0) == 0x80) : (j += 1) {}
-            i = j;
+        } else {
+            try sanitizeMultibyte(alloc, &buf, s, &i, &pending);
         }
     }
     if (pending > 0) {
@@ -428,6 +414,36 @@ fn appendEscaped(alloc: Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const 
 
 /// Unescape a JSON string (content inside double quotes).
 /// Caller must free result.
+fn appendUnicodeEscape(alloc: Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const u8, i: *usize) !void {
+    if (i.* + 4 >= s.len) {
+        try buf.appendSlice(alloc, "\\u");
+        return;
+    }
+    const hex1 = s[i.* + 1 .. i.* + 5];
+    const cp1 = std.fmt.parseInt(u21, hex1, 16) catch {
+        try buf.appendSlice(alloc, "\\u");
+        return;
+    };
+    i.* += 4;
+    var codepoint: u21 = cp1;
+    if (cp1 >= 0xD800 and cp1 <= 0xDBFF and i.* + 6 < s.len and s[i.* + 1] == '\\' and s[i.* + 2] == 'u') {
+        const hex2 = s[i.* + 3 .. i.* + 7];
+        if (std.fmt.parseInt(u21, hex2, 16)) |cp2| {
+            if (cp2 >= 0xDC00 and cp2 <= 0xDFFF) {
+                codepoint = 0x10000 + (((cp1 - 0xD800) << 10) | (cp2 - 0xDC00));
+                i.* += 6;
+            }
+        } else |_| {}
+    }
+    var utf8_buf: [4]u8 = undefined;
+    const len = std.unicode.utf8Encode(codepoint, &utf8_buf) catch 0;
+    if (len > 0) {
+        try buf.appendSlice(alloc, utf8_buf[0..len]);
+    } else {
+        try buf.appendSlice(alloc, "\\u");
+    }
+}
+
 pub fn unescape(alloc: Allocator, s: []const u8) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
@@ -436,45 +452,16 @@ pub fn unescape(alloc: Allocator, s: []const u8) ![]u8 {
         if (s[i] == '\\' and i + 1 < s.len) {
             i += 1;
             switch (s[i]) {
-                '"'  => try buf.append(alloc, '"'),
+                '"' => try buf.append(alloc, '"'),
                 '\\' => try buf.append(alloc, '\\'),
-                'n'  => try buf.append(alloc, '\n'),
-                'r'  => try buf.append(alloc, '\r'),
-                't'  => try buf.append(alloc, '\t'),
-                'u'  => {
-                    if (i + 4 < s.len) {
-                        const hex1 = s[i + 1 .. i + 5];
-                        if (std.fmt.parseInt(u21, hex1, 16)) |cp1| {
-                            i += 4;
-                            var codepoint: u21 = cp1;
-                            // Check for UTF-16 surrogate pair (\uD800-\uDBFF followed by \uDC00-\uDFFF)
-                            if (cp1 >= 0xD800 and cp1 <= 0xDBFF and i + 6 < s.len and s[i + 1] == '\\' and s[i + 2] == 'u') {
-                                const hex2 = s[i + 3 .. i + 7];
-                                if (std.fmt.parseInt(u21, hex2, 16)) |cp2| {
-                                    if (cp2 >= 0xDC00 and cp2 <= 0xDFFF) {
-                                        codepoint = 0x10000 + (((cp1 - 0xD800) << 10) | (cp2 - 0xDC00));
-                                        i += 6;
-                                    }
-                                } else |_| {}
-                            }
-                            var utf8_buf: [4]u8 = undefined;
-                            const len = std.unicode.utf8Encode(codepoint, &utf8_buf) catch 0;
-                            if (len > 0) {
-                                try buf.appendSlice(alloc, utf8_buf[0..len]);
-                            } else {
-                                try buf.append(alloc, '\\');
-                                try buf.append(alloc, 'u');
-                            }
-                        } else |_| {
-                            try buf.append(alloc, '\\');
-                            try buf.append(alloc, 'u');
-                        }
-                    } else {
-                        try buf.append(alloc, '\\');
-                        try buf.append(alloc, 'u');
-                    }
+                'n' => try buf.append(alloc, '\n'),
+                'r' => try buf.append(alloc, '\r'),
+                't' => try buf.append(alloc, '\t'),
+                'u' => try appendUnicodeEscape(alloc, &buf, s, &i),
+                else => {
+                    try buf.append(alloc, '\\');
+                    try buf.append(alloc, s[i]);
                 },
-                else => { try buf.append(alloc, '\\'); try buf.append(alloc, s[i]); },
             }
         } else {
             try buf.append(alloc, s[i]);
@@ -522,6 +509,49 @@ test "escape replaces invalid UTF-8 bytes with U+FFFD" {
 /// Supports object {}, array [], and strings with escaped special characters.
 /// Returns newly allocated string via `alloc` (owned by caller).
 /// If string is not JSON (does not start with { or [), returns unmodified dupe.
+fn appendIndent(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), level: usize) !void {
+    try out.append(alloc, '\n');
+    try out.appendNTimes(alloc, ' ', level * 2);
+}
+
+fn handlePrettyOpenBracket(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    trimmed: []const u8,
+    i: *usize,
+    c: u8,
+    indent_level: *usize,
+) !void {
+    try out.append(alloc, c);
+    var next_idx = i.* + 1;
+    while (next_idx < trimmed.len and (trimmed[next_idx] == ' ' or trimmed[next_idx] == '\t' or trimmed[next_idx] == '\r' or trimmed[next_idx] == '\n')) : (next_idx += 1) {}
+    const closing_char: u8 = if (c == '{') '}' else ']';
+    if (next_idx < trimmed.len and trimmed[next_idx] == closing_char) {
+        try out.append(alloc, closing_char);
+        i.* = next_idx;
+    } else {
+        indent_level.* += 1;
+        try appendIndent(alloc, out, indent_level.*);
+    }
+}
+
+fn handlePrettyStringChar(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), c: u8, in_str: *bool, is_escape: *bool) !void {
+    try out.append(alloc, c);
+    if (is_escape.*) {
+        is_escape.* = false;
+    } else if (c == '\\') {
+        is_escape.* = true;
+    } else if (c == '"') {
+        in_str.* = false;
+    }
+}
+
+fn handlePrettyCloseBracket(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), c: u8, indent_level: *usize) !void {
+    if (indent_level.* > 0) indent_level.* -= 1;
+    try appendIndent(alloc, out, indent_level.*);
+    try out.append(alloc, c);
+}
+
 pub fn prettyPrint(alloc: Allocator, raw_json: []const u8) ![]u8 {
     const trimmed = std.mem.trim(u8, raw_json, " \t\r\n");
     if (trimmed.len == 0 or (trimmed[0] != '{' and trimmed[0] != '[')) {
@@ -540,21 +570,11 @@ pub fn prettyPrint(alloc: Allocator, raw_json: []const u8) ![]u8 {
         const c = trimmed[i];
 
         if (in_str) {
-            try out.append(alloc, c);
-            if (is_escape) {
-                is_escape = false;
-            } else if (c == '\\') {
-                is_escape = true;
-            } else if (c == '"') {
-                in_str = false;
-            }
+            try handlePrettyStringChar(alloc, &out, c, &in_str, &is_escape);
             continue;
         }
 
-        // Skip whitespace outside string literals
-        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
-            continue;
-        }
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') continue;
 
         switch (c) {
             '"' => {
@@ -562,38 +582,14 @@ pub fn prettyPrint(alloc: Allocator, raw_json: []const u8) ![]u8 {
                 is_escape = false;
                 try out.append(alloc, c);
             },
-            '{', '[' => {
-                try out.append(alloc, c);
-                // Check if object is empty: {} or []
-                var next_idx = i + 1;
-                while (next_idx < trimmed.len and (trimmed[next_idx] == ' ' or trimmed[next_idx] == '\t' or trimmed[next_idx] == '\r' or trimmed[next_idx] == '\n')) : (next_idx += 1) {}
-                const closing_char: u8 = if (c == '{') '}' else ']';
-                if (next_idx < trimmed.len and trimmed[next_idx] == closing_char) {
-                    try out.append(alloc, closing_char);
-                    i = next_idx;
-                } else {
-                    indent_level += 1;
-                    try out.append(alloc, '\n');
-                    try out.appendNTimes(alloc, ' ', indent_level * 2);
-                }
-            },
-            '}', ']' => {
-                if (indent_level > 0) indent_level -= 1;
-                try out.append(alloc, '\n');
-                try out.appendNTimes(alloc, ' ', indent_level * 2);
-                try out.append(alloc, c);
-            },
+            '{', '[' => try handlePrettyOpenBracket(alloc, &out, trimmed, &i, c, &indent_level),
+            '}', ']' => try handlePrettyCloseBracket(alloc, &out, c, &indent_level),
             ',' => {
                 try out.append(alloc, c);
-                try out.append(alloc, '\n');
-                try out.appendNTimes(alloc, ' ', indent_level * 2);
+                try appendIndent(alloc, &out, indent_level);
             },
-            ':' => {
-                try out.appendSlice(alloc, ": ");
-            },
-            else => {
-                try out.append(alloc, c);
-            },
+            ':' => try out.appendSlice(alloc, ": "),
+            else => try out.append(alloc, c),
         }
     }
 
