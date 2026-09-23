@@ -20,6 +20,7 @@ const repairCycles = graph_mod.repairCycles;
 const checkTerminalReachability = graph_mod.checkTerminalReachability;
 const applyEventJson = graph_mod.applyEventJson;
 const utils = @import("../utils.zig");
+const prompts_mod = @import("../prompts.zig");
 
 pub const PGraphStore = struct {
     alloc: Allocator,
@@ -487,19 +488,15 @@ pub const PGraphStore = struct {
         try bw.writeAll("\n⚠️ Navigation Checkpoint (ΔZ = 0, zero code mutation in orbit):\n");
         try bw.print("You have scouted this region of the procedural map. All immediate forward paths from `{s}` have already been explored in this trajectory.\n\n", .{act_str});
 
-        try bw.writeAll("⚡ Orbit Break Directive:\n");
-        try bw.writeAll("Do NOT repeat this exploratory cycle. You have already gathered sufficient context in your context window.\n");
+        try bw.writeAll("\n⚡ Orbit Break Directive:\n");
+        try bw.writeAll(prompts_mod.pg_orbit_break_directive);
 
         if (user_request) |req| {
             const trunc = if (req.len > 180) req[0..180] ++ "..." else req;
             try bw.print("🎯 Your task: \"{s}\"\n\n", .{trunc});
         }
 
-        try bw.writeAll("You MUST:\n");
-        try bw.writeAll("1. Summarize the key findings from your exploration in 1-2 sentences.\n");
-        try bw.writeAll("2. Use those findings to make DIRECT PROGRESS on the task — e.g. edit code with `file_edit`/`file_write`, run a targeted test, or conclude with a direct answer.\n");
-        try bw.writeAll("3. Execute the first concrete step NOW — do NOT output another exploratory tool call.\n");
-        try bw.writeAll("4. If you already have enough information, skip further exploration and answer the user's question directly.\n");
+        try bw.writeAll(prompts_mod.pg_orbit_must_list);
 
         return try bw.toOwnedSlice();
     }
@@ -563,15 +560,14 @@ pub const PGraphStore = struct {
                 bw.deinit();
                 return null;
             }
-            try bw.writeAll("- No new untried recovery steps found in procedural neighborhood.\n");
-            try bw.writeAll("⚠️ Note: You have already attempted the standard exploratory tools for this failure. Do NOT repeat previous searches; formulate a direct fix and proceed to modify code.\n");
+            try bw.writeAll(prompts_mod.pg_no_recovery_note);
             return try bw.toOwnedSlice();
         }
 
-        try bw.writeAll("⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed directly to modifying code or concluding.\n");
+        try bw.writeAll(prompts_mod.advisory_note_strong ++ "\n");
         if (user_request) |req| {
             const trunc = if (req.len > 200) req[0..200] ++ "..." else req;
-            try bw.print("\n🎯 Current task reminder: \"{s}\" — tailor your next step to make direct progress on this task.\n", .{trunc});
+            try bw.print(prompts_mod.pg_task_reminder_fmt, .{trunc});
         }
         return try bw.toOwnedSlice();
     }

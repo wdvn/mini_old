@@ -14,7 +14,7 @@ const Allocator = std.mem.Allocator;
 const act_queue = @import("act_queue.zig");
 const utils = @import("utils.zig");
 const signals = @import("signals.zig");
-
+const prompts_mod = @import("prompts.zig");
 fn printStderr(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
     var w = std.Io.File.stderr().writer(io, &buf);
@@ -282,25 +282,25 @@ pub const Watchdog = struct {
         // PSEUDOCODE: Determine diagnostic assessment and guidance message based on detected pattern.
         if (has_dup) {
             return .{
-                .diagnosis = "Duplicate action detected: identical tool call repeated with identical parameters.",
-                .advisory = "⚠️ Trajectory Warning: You appear to be repeating actions without forward progress. Re-assess findings, break out of this loop, and proceed to modify files or respond to the user.",
+                .diagnosis = prompts_mod.watchdog_diag_dup,
+                .advisory = prompts_mod.watchdog_adv_repeat,
             };
         }
         if (has_cycle) {
             return .{
-                .diagnosis = "Alternating cycle detected: tool usage appears to oscillate back and forth.",
-                .advisory = "⚠️ Trajectory Warning: You appear to be repeating actions without forward progress. Re-assess findings, break out of this loop, and proceed to modify files or respond to the user.",
-            };
+                .diagnosis = prompts_mod.watchdog_diag_cycle,
+                .advisory = prompts_mod.watchdog_adv_repeat,
+        };
         }
         if (count >= 3 and read_only_count == count) {
             return .{
-                .diagnosis = "Exploration saturation: multiple consecutive read-only operations without code mutation.",
-                .advisory = "💡 Exploration Note: Sufficient context may have been gathered. Consider transitioning directly to code changes or synthesizing your final answer.",
+                .diagnosis = prompts_mod.watchdog_diag_readonly,
+                .advisory = prompts_mod.watchdog_adv_explore,
             };
         }
         return .{
-            .diagnosis = "Normal progression: actions are advancing across the workspace.",
-            .advisory = "✅ Progress Assessment: Continue with your planned next step, or deliver findings if the request has been fulfilled.",
+            .diagnosis = prompts_mod.watchdog_diag_normal,
+            .advisory = prompts_mod.watchdog_adv_normal,
         };
     }
 
@@ -326,11 +326,11 @@ pub const Watchdog = struct {
 
         const pattern = detectTrajectoryPattern(eval_slice, self.config.recap_interval_acts);
         const diag = getRecapDiagnosis(pattern.has_dup, pattern.has_cycle, count, read_only_count);
-        const display_traj = if (traj_writer.list.items.len > 0) traj_writer.list.items else "No tool calls (pure reasoning / text response)";
+        const display_traj = if (traj_writer.list.items.len > 0) traj_writer.list.items else prompts_mod.watchdog_no_tools_traj;
 
         const full_message = try std.fmt.allocPrint(
             self.alloc,
-            "[Watchdog Checkpoint & Recap (Act {d})]\n📍 Trajectory (last {d} acts): {s}\n🔍 Observation: {s}\n{s}\n",
+            prompts_mod.watchdog_recap_fmt,
             .{ completed_acts, self.config.recap_interval_acts, display_traj, diag.diagnosis, diag.advisory },
         );
         defer self.alloc.free(full_message);

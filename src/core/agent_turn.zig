@@ -14,6 +14,7 @@ const main = @import("../main.zig");
 const tools_mod = @import("../tooling/registry.zig");
 const snapshot_mod = @import("snapshot.zig");
 const journal_mod = @import("journal.zig");
+const prompts_mod = @import("prompts.zig");
 const media_gen_tool = @import("../tools/media_gen.zig");
 const hooks_mod = @import("hooks.zig");
 const agent_mod = @import("agent.zig");
@@ -227,7 +228,7 @@ fn handleInterruptedActError(self: *AgentLoop, act_id: usize) !ActErrorResolutio
         self.coordinator.setTimedOut(false);
         self.last_act_failed = true;
 
-        const err_msg = try std.fmt.allocPrint(self.alloc, "[Watchdog Timeout]: The previous action timed out and was terminated (LLM decision: KILL). Reason: {s}. Please adjust your strategy or command.", .{reason});
+        const err_msg = try std.fmt.allocPrint(self.alloc, prompts_mod.watchdog_timeout_fmt, .{reason});
         defer self.alloc.free(err_msg);
         try self.history.addUser(err_msg);
         self.coordinator.finishAct(act_id, false);

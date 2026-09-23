@@ -18,6 +18,7 @@ const plan_store_mod = @import("plan_store.zig");
 const cas_mod = @import("cas.zig");
 const config_mod = @import("config.zig");
 const utils = @import("utils.zig");
+const prompts_mod = @import("prompts.zig");
 const main = @import("../main.zig");
 
 /// Result of plan watchdog check at end_turn.
@@ -311,8 +312,7 @@ pub const PlanState = struct {
         var progress_buf = utils.BufWriter.init(alloc);
         errdefer progress_buf.deinit();
 
-        progress_buf.writeAll("[Progress Checkpoint]\n") catch return null;
-        progress_buf.print("Previous act ({d}) completed with:\n", .{act_id - 1}) catch return null;
+        progress_buf.print(prompts_mod.progress_checkpoint_header_fmt, .{act_id - 1}) catch return null;
 
         if (self.enable_structured_planning and self.current_plan != null) {
             const plan = &self.current_plan.?;
@@ -322,23 +322,22 @@ pub const PlanState = struct {
             progress_buf.writeAll("\n") catch return null;
 
             if (config.plan_drift_detection and self.plan_drift_score > 0.5) {
-                progress_buf.writeAll("⚠️ Drift detected: execution diverged from planned step.\n") catch return null;
-                progress_buf.writeAll("Please realign with the active step or update your plan.\n\n") catch return null;
+                progress_buf.writeAll(prompts_mod.progress_drift_warn) catch return null;
             }
         } else if (self.plan_active and self.plan_summary_len > 0) {
             // Legacy: show plan summary
-            progress_buf.writeAll("📋 Plan Status:\n") catch return null;
+            progress_buf.writeAll(prompts_mod.progress_plan_status_header) catch return null;
             progress_buf.writeAll(self.plan_summary_buf[0..self.plan_summary_len]) catch return null;
             progress_buf.writeAll("\n\n") catch return null;
         }
 
         // Show tools used in previous act
-        progress_buf.writeAll("Tools executed:\n") catch return null;
+        progress_buf.writeAll(prompts_mod.progress_tools_header) catch return null;
         progress_buf.writeAll(self.progress_summary_buf[0..self.progress_summary_len]) catch return null;
         progress_buf.writeAll("\n\n") catch return null;
 
         // Directive: ask model to continue with next step
-        progress_buf.writeAll("Next step directive: Proceed with executing the active step using the ReAct cycle (Thought -> Action in ```js block). State your rationale, then execute the tool.") catch return null;
+        progress_buf.writeAll(prompts_mod.progress_next_directive) catch return null;
 
         return progress_buf.toOwnedSlice() catch null;
     }

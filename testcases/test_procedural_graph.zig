@@ -474,7 +474,7 @@ test "pg: serializeGuidance suppresses recent actions in trajectory window" {
     defer alloc.free(g_retry.?);
     try testing.expect(std.mem.indexOf(u8, g_retry.?, "`bash` →") == null); // bash is NOT suggested as next step
     try testing.expect(std.mem.indexOf(u8, g_retry.?, "No new untried recovery steps found") != null);
-    try testing.expect(std.mem.indexOf(u8, g_retry.?, "Do NOT repeat previous searches") != null);
+    try testing.expect(std.mem.indexOf(u8, g_retry.?, "do NOT repeat previous searches") != null);
 }
 
 test "pg: detectTrajectoryOrbit identifies 3D exploratory loops and respects mutation displacement" {

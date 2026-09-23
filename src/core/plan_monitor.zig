@@ -17,6 +17,7 @@ const PlanDrift = plan_mod.PlanDrift;
 const StepStatus = plan_mod.StepStatus;
 const plan_executor = @import("plan_executor.zig");
 const utils = @import("utils.zig");
+const prompts_mod = @import("prompts.zig");
 
 // ---------------------------------------------------------------------------
 // Drift Detection
@@ -163,12 +164,12 @@ pub fn generateDriftCorrection(
     if (drift.drift_score > 0.7) {
         try bw.writeAll("\n⚠️ Significant deviation detected.\n");
         if (drift.expected_tool) |et| {
-            try bw.print("Consider: Execute the expected tool '{s}' now, or update your plan if the deviation is intentional.\n", .{et});
+            try bw.print(prompts_mod.plan_drift_significant_tool_fmt, .{et});
         }
     } else if (drift.drift_score > 0.3) {
-        try bw.writeAll("\nNote: Slight deviation from plan. Proceed with caution or adjust plan if needed.\n");
+        try bw.writeAll(prompts_mod.plan_drift_minor);
     } else {
-        try bw.writeAll("\nMinor deviation — likely acceptable.\n");
+        try bw.writeAll(prompts_mod.plan_drift_trivial);
     }
 
     return try bw.toOwnedSlice();
@@ -190,15 +191,15 @@ pub fn generateStepEnforcement(
     var bw = utils.BufWriter.init(alloc);
     errdefer bw.deinit();
 
-    try bw.writeAll("[Plan Enforcement]\n");
+    try bw.writeAll(prompts_mod.plan_step_enforcement_head);
     try bw.print("Step {d}/{d}: {s}\n", .{ steps_completed + 1, plan.stepCount(), current.description });
-    try bw.writeAll("Status: Active (waiting for execution)\n");
+    try bw.writeAll("Status: active (waiting for execution)\n");
 
     if (current.tool_hint) |hint| {
-        try bw.print("Required tool: {s}\n", .{hint});
+        try bw.print(prompts_mod.plan_step_required_tool_fmt, .{hint});
     }
 
-    try bw.writeAll("\nPlease execute the required tool now. Do not return explanatory text without tool execution.\n");
+    try bw.writeAll(prompts_mod.plan_step_enforcement_directive);
     return try bw.toOwnedSlice();
 }
 
@@ -212,14 +213,7 @@ pub fn generateReplanSuggestion(
     var bw = utils.BufWriter.init(alloc);
     errdefer bw.deinit();
 
-    try bw.writeAll("[Re-plan Required]\n");
-    try bw.print("Progress: {d}/{d} steps (drift score: {d:.2})\n", .{ steps_completed, plan.stepCount(), drift_score });
-    try bw.writeAll("Your execution has significantly deviated from the plan.\n");
-    try bw.writeAll("Consider:\n");
-    try bw.writeAll("1. Summarizing what you've accomplished so far\n");
-    try bw.writeAll("2. Re-evaluating the remaining steps\n");
-    try bw.writeAll("3. Outputting an updated plan if the approach has changed\n");
-    try bw.writeAll("4. Or concluding if the task is complete\n");
+    try bw.print(prompts_mod.plan_replan_suggestion_fmt, .{ steps_completed, plan.stepCount(), drift_score });
 
     return try bw.toOwnedSlice();
 }

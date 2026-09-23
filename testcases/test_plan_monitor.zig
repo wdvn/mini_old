@@ -105,5 +105,5 @@ test "plan_monitor: step enforcement and replan suggestion" {
     defer alloc.free(replan);
 
     try std.testing.expect(std.mem.indexOf(u8, replan, "[Re-plan Required]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, replan, "deviated from the plan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replan, "deviated from the active plan") != null);
 }

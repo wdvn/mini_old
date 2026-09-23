@@ -47,7 +47,7 @@ const graph_store_mod = @import("memact/graph_store.zig");
 const store_mod = @import("memact/store.zig");
 const snapshot_mod = @import("snapshot.zig");
 const cas_mod = @import("cas.zig");
-const plan_mod = @import("plan.zig");
+const prompts_mod = @import("prompts.zig");
 const plan_parser = @import("plan_parser.zig");
 const plan_executor = @import("plan_executor.zig");
 const plan_monitor = @import("plan_monitor.zig");
@@ -1243,8 +1243,8 @@ pub const AgentLoop = struct {
             .orbit_cycle, .macro_cycle_2, .macro_cycle_3 => blk: {
                 var mbw = utils.BufWriter.init(self.alloc);
                 errdefer mbw.deinit();
-                try mbw.writeAll("[Action Loop Checkpoint & Trajectory Recap]\n");
-                try mbw.print("📍 Waypoint: Action loop detected ({s}).\n", .{trip_reason_str});
+                try mbw.writeAll(prompts_mod.loop_checkpoint_header);
+                try mbw.print(prompts_mod.loop_checkpoint_orbit_waypoint_fmt, .{trip_reason_str});
                 try mbw.writeAll("🗺️ Trajectory Scouted: ");
                 for (self.turn_tool_trajectory.items, 0..) |tn, i| {
                     if (i > 0) try mbw.writeAll(" → ");
@@ -1263,12 +1263,12 @@ pub const AgentLoop = struct {
             },
             .readonly_budget => try std.fmt.allocPrint(
                 self.alloc,
-                "[Action Loop Checkpoint & Trajectory Recap]\n📍 Waypoint: Read-only exploratory budget exceeded ({d} consecutive search/read actions without mutation).\n\n[Exploration Advisory (Optional Suggestions)]\nCurrent Action: read-only exploration\nObservation: Sufficient context gathered.\n⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed directly to modifying code or concluding.",
+                prompts_mod.loop_checkpoint_readonly_budget_fmt,
                 .{self.consecutive_readonly_count},
             ),
             else => try std.fmt.allocPrint(
                 self.alloc,
-                "[Action Loop Checkpoint & Trajectory Recap]\n📍 Waypoint: Repeated invocation of '{s}' with identical parameters.\n\n[Tool Call Advisory (Optional Suggestions)]\nCurrent Action: `{s}`\nObservation: Already invoked with identical arguments. Data is in context.\n⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed directly to modifying code or concluding.",
+                prompts_mod.loop_checkpoint_dup_tool_fmt,
                 .{ tu.name, tu.name },
             ),
         };
@@ -1314,7 +1314,7 @@ pub const AgentLoop = struct {
             self.action_loop_tripped = true;
             return try std.fmt.allocPrint(
                 self.alloc,
-                "[Action Loop Halt]: Action loop persisted after multiple replanning requests ({s}). Execution paused. Please explain your status and request user guidance.",
+                prompts_mod.loop_halt_fmt,
                 .{trip_reason_str},
             );
         }
@@ -1326,17 +1326,17 @@ pub const AgentLoop = struct {
         return switch (self.last_loop_reason) {
             .orbit_cycle, .macro_cycle_2, .macro_cycle_3 => std.fmt.allocPrint(
                 self.alloc,
-                "\n\n[3D Procedural Map Advisory: Orbit Checkpoint & Recap]\n⚠️ Trajectory Orbit Detected: You are circling around already-scouted nodes in procedural space. If you have gathered sufficient context, consider whether further exploration is needed or if you may proceed to conclude.",
+                prompts_mod.loop_warning_orbit,
                 .{},
             ) catch null,
             .readonly_budget => std.fmt.allocPrint(
                 self.alloc,
-                "\n\n[System Advisory]: You have performed {d} consecutive read-only exploratory actions. If you have gathered sufficient information, proceed to take action or synthesize your response.",
+                prompts_mod.loop_warning_readonly_fmt,
                 .{self.consecutive_readonly_count},
             ) catch null,
             else => std.fmt.allocPrint(
                 self.alloc,
-                "\n\n[System Advisory]: Action loop detected. You have called '{s}' with identical arguments multiple times. You already have this data in your context. If you feel you have enough information, you may synthesize your findings and respond to the user.",
+                prompts_mod.loop_warning_dup_tool_fmt,
                 .{tool_name},
             ) catch null,
         };
@@ -1405,7 +1405,7 @@ pub const AgentLoop = struct {
                 if (self.plan.plan_drift_score > 0.8) {
                     const c = try plan_monitor.generateReplanSuggestion(plan, self.plan.plan_ctx.steps_completed, self.plan.plan_drift_score, self.alloc);
                     defer self.alloc.free(c);
-                    drift_advisory = try std.fmt.allocPrint(self.alloc, "[System Advisory]: {s}", .{c});
+                    drift_advisory = try std.fmt.allocPrint(self.alloc, prompts_mod.plan_drift_advisory_prefix, .{c});
                 }
             }
         }

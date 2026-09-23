@@ -22,7 +22,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const utils = @import("utils.zig");
-
+const prompts_mod = @import("prompts.zig");
 /// Maximum number of skills injected into prompt.
 const MAX_SKILLS = 32;
 
@@ -242,16 +242,7 @@ pub fn buildSkillsBlock(alloc: Allocator) !?[]u8 {
     var buf = utils.BufWriter.init(alloc);
     errdefer buf.deinit();
 
-    try buf.writeAll(
-        \\
-        \\## Available skills
-        \\
-        \\When a task clearly matches the trigger conditions in a skill description below, read the corresponding SKILL.md file using `mini.read` (or file_read) BEFORE taking action, then follow the instructions within. No need to re-ask the user about conventions.
-        \\IMPORTANT: Only read a skill ONCE per task. If a skill's content is already present in the conversation history above, DO NOT re-read or cat its SKILL.md file; proceed directly to executing its steps.
-        \\NOTE: Only read a skill when strictly necessary for the current request. Never invoke skills outside the scope of the requested task.
-        \\
-        \\
-    );
+    try buf.writeAll(prompts_mod.skills_guidance_header);
     for (skills) |s| {
         if (s.description.len > 0) {
             try buf.print("- **{s}**: {s} — read `{s}`\n", .{ s.name, s.description, s.path });

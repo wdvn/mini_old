@@ -20,6 +20,7 @@ const ExecutionResult = quickjs_engine.ExecutionResult;
 const agent_parsing = @import("agent_parsing.zig");
 const agent_mod = @import("agent.zig");
 const AgentLoop = agent_mod.AgentLoop;
+const prompts_mod = @import("prompts.zig");
 
 pub const StepResult = enum {
     continue_loop,
@@ -191,7 +192,7 @@ fn handleCodeActLoopTrip(loop: *AgentLoop, act_id: usize) !StepResult {
         if (loop.journal) |*j| {
             j.recordEvent(loop.io, act_id, .checkpoint_created, "CodeAct action loop - requesting plan & execution") catch {};
         }
-        const trip_msg = "[CodeAct Checkpoint & Recap]: Action loop detected.\n\n[CodeAct Advisory (Optional Suggestions)]\nCurrent Action: repeated identical CodeAct script\nObservation: Identical script executed without progress.\n⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed at your discretion.";
+        const trip_msg = prompts_mod.codeact_checkpoint;
         try loop.history.addUser(trip_msg);
         loop.action_loop_tripped = false;
         loop.consecutive_dup_tool_count = 0;
@@ -234,7 +235,7 @@ fn handleCodeActEvalError(
     } else {
         main.stderrPrint("\x1b[31m[engine error: {s}]\x1b[0m\n", .{@errorName(e)});
     }
-    const err_msg = try std.fmt.allocPrint(loop.alloc, "[CodeAct System Error]: {s}", .{@errorName(e)});
+    const err_msg = try std.fmt.allocPrint(loop.alloc, prompts_mod.codeact_system_error_fmt, .{@errorName(e)});
     defer loop.alloc.free(err_msg);
     try loop.history.addUser(err_msg);
     return .continue_loop;
@@ -383,7 +384,7 @@ fn handleEmptyResponseAdvisory(loop: *AgentLoop) !void {
         r.write(" \x1b[33m[Agent Advisory]: Your previous response contained no actionable content. Please proceed with tool execution or provide a substantive answer.\x1b[0m\n");
     }
     try loop.history.addUser(
-        "[System] Your previous response contained only whitespace or empty content. You must either execute tools to make progress, or provide a substantive text answer to the user's request.",
+        prompts_mod.empty_response_advisory,
     );
     loop.response_content_empty = false;
 }
