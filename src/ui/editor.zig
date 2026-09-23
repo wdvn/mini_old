@@ -739,7 +739,10 @@ pub const LineEditor = struct {
         i: *usize,
     ) !?[]const u8 {
         const c = buf[i.*];
-        if (c != 3) self.last_ctrl_c_ms = 0;
+        // Only a real non-Ctrl+C key resets the double-press timer. The first
+        // byte of an escape sequence (0x1b) must not reset it, otherwise Ctrl+C
+        // delivered as CSI-u/modifyOtherKeys can never register a double press.
+        if (c != 3 and c != 27) self.last_ctrl_c_ms = 0;
         switch (c) {
             3 => {
                 if (self.handleCtrlC(io, stdout_file, prompt)) |keep_running| {
@@ -827,7 +830,9 @@ pub const LineEditor = struct {
             std.posix.tcsetattr(stdin_fd, .FLUSH, orig_termios) catch {};
         }
 
-        stdout_file.writeStreamingAll(io, "\x1b[>4;1m\x1b[>1u\x1b[?2004h") catch {};
+        // modifyOtherKeys=2: re-encode ALL keys incl. Shift+Enter (level 1 skips
+        // keys with legacy encoding, so Shift+Enter would arrive as bare "\r").
+        stdout_file.writeStreamingAll(io, "\x1b[>4;2m\x1b[>1u\x1b[?2004h") catch {};
 
         self.initReadLineState();
         self.redraw(io, prompt);
@@ -899,29 +904,27 @@ pub const LineEditor = struct {
         }
     }
 
-    fn handleCsiU(self: *LineEditor, io: std.Io, prompt: []const u8, params: []const usize, n_params: usize) void {
-        const code = params[0];
-        const modv = if (n_params > 1) params[1] else 1;
-        if (code == 13) {
-            self.insertNewlineAtCursor(io, prompt);
-            return;
-        }
-        if (code == 3 or (code == 99 and modv >= 5)) {
-            const now_ms = utils.milliTimestamp();
-            const out = std.Io.File.stdout();
-            if (self.buf.items.len > 0) {
-                out.writeStreamingAll(io, "^C\r\n") catch {};
-                self.buf.clearRetainingCapacity();
-                self.pos = 0;
-                self.rendered_rows = 0;
-                self.cursor_row = 0;
-                self.last_ctrl_c_ms = now_ms;
-                self.redraw(io, prompt);
-            } else if (now_ms - self.last_ctrl_c_ms <= 2000 and self.last_ctrl_c_ms > 0) {
-                out.writeStreamingAll(io, "^C\r\n") catch {};
-                self.exit_pending = true;
-            } else {
-                self.last_ctrl_c_ms = now_ms;
+    /// Shared double-press Ctrl+C exit handler for escaped forms (kitty CSI-u,
+    /// xterm modifyOtherKeys). Mirrors the legacy raw-byte path in handleCtrlC.
+    fn handleEscapedCtrlC(self: *LineEditor, io: std.Io, prompt: []const u8) void {
+        const now_ms = utils.milliTimestamp();
+        const out = std.Io.File.stdout();
+        // suppress_redraw also mutes terminal writes so unit tests (undefined io) stay safe.
+        const quiet = self.suppress_redraw;
+        if (self.buf.items.len > 0) {
+            if (!quiet) out.writeStreamingAll(io, "^C\r\n") catch {};
+            self.buf.clearRetainingCapacity();
+            self.pos = 0;
+            self.rendered_rows = 0;
+            self.cursor_row = 0;
+            self.last_ctrl_c_ms = now_ms;
+            self.redraw(io, prompt);
+        } else if (now_ms - self.last_ctrl_c_ms <= 2000 and self.last_ctrl_c_ms > 0) {
+            if (!quiet) out.writeStreamingAll(io, "^C\r\n") catch {};
+            self.exit_pending = true;
+        } else {
+            self.last_ctrl_c_ms = now_ms;
+            if (!quiet) {
                 out.writeStreamingAll(io, "^C\r\n") catch {};
                 self.rendered_rows = 0;
                 self.cursor_row = 0;
@@ -930,9 +933,76 @@ pub const LineEditor = struct {
         }
     }
 
+    fn handleCsiU(self: *LineEditor, io: std.Io, prompt: []const u8, params: []const usize, n_params: usize) void {
+        const code = params[0];
+        const modv = if (n_params > 1) params[1] else 1;
+        if (code == 13) {
+            self.insertNewlineAtCursor(io, prompt);
+            return;
+        }
+        // PSEUDOCODE:
+        // 1. Under the kitty keyboard protocol (ESC[>1u), Backspace may arrive as
+        //    CSI-u ESC[127u (Alt+Backspace: ESC[127;3u) instead of the raw 0x7f byte.
+        // 2. Dispatch to the same handlers as the xterm modifyOtherKeys path in
+        //    handleCsiTilde, otherwise the key is silently dropped.
+        if (code == 127 or code == 8) {
+            if (modv & 2 != 0) {
+                self.handleAltEscape(io, prompt, 127);
+            } else {
+                self.handleControlKey(io, prompt, 127);
+            }
+            return;
+        }
+        if (code == 3 or (code == 99 and modv & 4 != 0)) {
+            self.handleEscapedCtrlC(io, prompt);
+        }
+    }
+
     fn handleCsiTilde(self: *LineEditor, io: std.Io, prompt: []const u8, params: []const usize, n_params: usize) void {
+        // PSEUDOCODE:
+        // 1. xterm modifyOtherKeys level 2 re-encodes all keys as CSI 27;<mods>;<key>~
+        //    (raw control bytes such as Ctrl+letter are no longer sent), so translate
+        //    each modified key back to its legacy behavior via existing handlers.
+        // 2. Bare CSI <n>~ keeps legacy meaning (Enter/Ctrl+J newline, Delete, Home, End).
         if (params[0] == 27 and n_params >= 3) {
-            if (params[2] == 13) self.insertNewlineAtCursor(io, prompt);
+            const key = params[2];
+            const mods = params[1];
+            // Backspace: modifyOtherKeys=2 re-encodes it as CSI 27;<mods>;127~
+            // (legacy raw byte 0x7f is no longer sent at this level), so
+            // dispatch to the existing handlers or it would be silently dropped.
+            if (key == 127) {
+                if (mods & 2 != 0) {
+                    self.handleAltEscape(io, prompt, 127);
+                } else {
+                    self.handleControlKey(io, prompt, 127);
+                }
+                return;
+            }
+            // Modified Enter (any modifier) inserts newline.
+            if (key == 13) {
+                self.insertNewlineAtCursor(io, prompt);
+                return;
+            }
+            // Ctrl+C arrives as CSI 27;5;99~ (key = 'c'): route through the
+            // shared double-press exit handler instead of handleControlKey,
+            // which has no Ctrl+C binding.
+            if (mods & 4 != 0 and (key == 3 or key == 99)) {
+                self.handleEscapedCtrlC(io, prompt);
+                return;
+            }
+            // Ctrl (mod & 4) re-encodes the control byte: dispatch to control handler
+            // so Ctrl+B/F/D/U/W/K/A/E keep their bindings.
+            if (mods & 4 != 0 and key >= 1 and key <= 31) {
+                self.handleControlKey(io, prompt, @intCast(key));
+                return;
+            }
+            // Alt (mod & 2) dispatches to Alt handler (Alt+Enter newline, Alt+B/F/D/Backspace).
+            if (mods & 2 != 0 and key >= 32 and key < 127) {
+                self.handleAltEscape(io, prompt, @intCast(key));
+                return;
+            }
+            // Shift (mod & 1) alone has no legacy binding for printable keys: ignore.
+            return;
         } else if (params[0] == 13) {
             self.insertNewlineAtCursor(io, prompt);
         } else if (params[0] == 3) {
@@ -1216,7 +1286,7 @@ pub const LineEditor = struct {
             if (content) |c| self.alloc.free(c);
         }
         for (tools) |tool| {
-            const argv = [_][]const u8{ tool };
+            const argv = [_][]const u8{tool};
             var child = std.process.spawn(io, .{
                 .argv = &argv,
                 .stdout = .pipe,
@@ -1539,6 +1609,79 @@ test "paste ending mid-chunk: bytes after END marker are not swallowed" {
     e.endPaste(undefined, "");
     try std.testing.expectEqualStrings("abc", e.buf.items);
     // "xyz" (returned offset) must remain for caller to process as regular input.
+}
+
+test "Double Ctrl+C: escaped kitty CSI-u form sets exit_pending" {
+    const alloc = std.testing.allocator;
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+
+    // Kitty Ctrl+C (ctrl mod): \x1b[99;5u — first press arms the timer.
+    const seq = "\x1b[99;5u";
+    _ = e.handleEscapeSlice(undefined, undefined, "", seq);
+    try std.testing.expect(!e.exit_pending);
+
+    // Second press within 2s (empty buffer): pending exit.
+    _ = e.handleEscapeSlice(undefined, undefined, "", seq);
+    try std.testing.expect(e.exit_pending);
+}
+
+test "Double Ctrl+C: xterm modifyOtherKeys form sets exit_pending" {
+    const alloc = std.testing.allocator;
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+
+    // xterm Ctrl+C: CSI 27;5;99~ — first press arms the timer.
+    const seq = "\x1b[27;5;99~";
+    _ = e.handleEscapeSlice(undefined, undefined, "", seq);
+    try std.testing.expect(!e.exit_pending);
+
+    // Second press within 2s: pending exit.
+    _ = e.handleEscapeSlice(undefined, undefined, "", seq);
+    try std.testing.expect(e.exit_pending);
+}
+
+
+test "Backspace: Kitty CSI-u escapes delete previous grapheme" {
+    const alloc = std.testing.allocator;
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+
+    try e.buf.appendSlice(alloc, "hello");
+    e.pos = e.buf.items.len;
+
+    // Kitty Backspace (protocol active): \x1b[127u
+    const seq_bs = "\x1b[127u";
+    const consumed1 = e.handleEscapeSlice(undefined, undefined, "", seq_bs);
+    try std.testing.expectEqual(seq_bs.len, consumed1);
+    try std.testing.expectEqualStrings("hell", e.buf.items);
+
+    // Kitty Alt+Backspace deletes word: \x1b[127;3u
+    try e.buf.appendSlice(alloc, " world");
+    e.pos = e.buf.items.len;
+    const seq_alt_bs = "\x1b[127;3u";
+    const consumed2 = e.handleEscapeSlice(undefined, undefined, "", seq_alt_bs);
+    try std.testing.expectEqual(seq_alt_bs.len, consumed2);
+    try std.testing.expectEqualStrings("hell ", e.buf.items);
+}
+
+test "Backspace: xterm modifyOtherKeys CSI 27;<mods>;127~ deletes grapheme" {
+    const alloc = std.testing.allocator;
+    var e = LineEditor.init(alloc);
+    defer e.deinit();
+    e.suppress_redraw = true;
+
+    try e.buf.appendSlice(alloc, "hello");
+    e.pos = e.buf.items.len;
+
+    // xterm modifyOtherKeys=2 Backspace: \x1b[27;1;127~
+    const seq_bs = "\x1b[27;1;127~";
+    const consumed = e.handleEscapeSlice(undefined, undefined, "", seq_bs);
+    try std.testing.expectEqual(seq_bs.len, consumed);
+    try std.testing.expectEqualStrings("hell", e.buf.items);
 }
 
 test "Shift+Enter / Ctrl+Enter: Kitty CSI-u escapes insert newline" {
