@@ -523,7 +523,6 @@ fn printBasicConfigHelp(io: std.Io) void {
         \\
         \\### Execution Mode
         \\  MINI_EXECUTION_MODE   Agent execution mode: codeact|tools|auto (default: auto)
-        \\  MINI_MAX_ACTS         Max acts per turn before yielding (default: 30)
         \\  MINI_LOOP_CONSECUTIVE_CAP  Max consecutive identical tool calls (default: 3)
         \\  MINI_LOOP_WINDOW_CAP    Max identical tool calls in sliding window (default: 4)
         \\

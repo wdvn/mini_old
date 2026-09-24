@@ -173,8 +173,6 @@ pub const Config = struct {
     budget_max_tokens: usize,
 
     // Execution & Action Loop Limits
-    /// Maximum acts allowed per turn before yielding control to user (default: 30).
-    max_acts_per_turn: usize = 30,
     /// Maximum consecutive identical tool calls before circuit breaker trips (default: 3).
     action_loop_consecutive_cap: usize = 3,
     /// Maximum occurrences of identical tool call within sliding window before circuit breaker trips (default: 4).
@@ -393,7 +391,6 @@ pub const Config = struct {
         max_tokens: u32,
         budget_max_tokens: usize,
         history_enabled: bool,
-        max_acts_per_turn: usize,
         action_loop_consecutive_cap: usize,
         action_loop_window_cap: usize,
         action_loop_readonly_warn_cap: usize,
@@ -417,7 +414,6 @@ pub const Config = struct {
             .max_tokens = if (env_map.get("MINI_MAX_TOKENS")) |s| std.fmt.parseInt(u32, s, 10) catch 24000 else 24000,
             .budget_max_tokens = if (env_map.get("MINI_BUDGET_MAX_TOKENS")) |s| std.fmt.parseInt(usize, s, 10) catch 10_000_000 else 10_000_000,
             .history_enabled = hist_en,
-            .max_acts_per_turn = if (env_map.get("MINI_MAX_ACTS")) |s| std.fmt.parseInt(usize, s, 10) catch 30 else 30,
             .action_loop_consecutive_cap = if (env_map.get("MINI_LOOP_CONSECUTIVE_CAP")) |s| std.fmt.parseInt(usize, s, 10) catch 3 else 3,
             .action_loop_window_cap = if (env_map.get("MINI_LOOP_WINDOW_CAP")) |s| std.fmt.parseInt(usize, s, 10) catch 4 else 4,
             .action_loop_readonly_warn_cap = if (env_map.get("MINI_LOOP_READONLY_WARN")) |s| std.fmt.parseInt(usize, s, 10) catch 5 else 5,
@@ -599,7 +595,6 @@ pub const Config = struct {
         cfg.max_tokens = l.max_tokens;
         cfg.budget_max_tokens = l.budget_max_tokens;
         cfg.history_enabled = l.history_enabled;
-        cfg.max_acts_per_turn = l.max_acts_per_turn;
         cfg.action_loop_consecutive_cap = l.action_loop_consecutive_cap;
         cfg.action_loop_window_cap = l.action_loop_window_cap;
         cfg.action_loop_readonly_warn_cap = l.action_loop_readonly_warn_cap;
@@ -1051,7 +1046,6 @@ pub const JsonConfig = struct {
     // Budget Limits (RFC-002)
     budget_max_tokens: ?usize = null,
     // Execution & Action Loop Limits
-    max_acts_per_turn: ?usize = null,
     action_loop_consecutive_cap: ?usize = null,
     action_loop_window_cap: ?usize = null,
     action_loop_readonly_warn_cap: ?usize = null,
@@ -1269,7 +1263,6 @@ fn applyThinkingAndMemActJsonConfig(cfg: *const JsonConfig, env_map: *std.proces
 fn applyActionLoopAndMediaJsonConfig(cfg: *const JsonConfig, env_map: *std.process.Environ.Map) usize {
     var count: usize = 0;
     if (cfg.budget_max_tokens) |val| count += setEnvInt(usize, env_map, "MINI_BUDGET_MAX_TOKENS", val);
-    if (cfg.max_acts_per_turn) |val| count += setEnvInt(usize, env_map, "MINI_MAX_ACTS", val);
     if (cfg.action_loop_consecutive_cap) |val| count += setEnvInt(usize, env_map, "MINI_LOOP_CONSECUTIVE_CAP", val);
     if (cfg.action_loop_window_cap) |val| count += setEnvInt(usize, env_map, "MINI_LOOP_WINDOW_CAP", val);
     if (cfg.action_loop_readonly_warn_cap) |val| count += setEnvInt(usize, env_map, "MINI_LOOP_READONLY_WARN", val);
