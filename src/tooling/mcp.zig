@@ -344,6 +344,12 @@ pub const McpServer = struct {
 
     /// Shut down server and release resources.
     pub fn shutdown(self: *McpServer) void {
+        // Close pipes first so the kernel doesn't re-close them on child exit.
+        self.stdin_file.close(main.g_io);
+        self.stdout_file.close(main.g_io);
+        self.child.stdin = null;
+        self.child.stdout = null;
+
         if (self.child_pid > 0) {
             if (comptime builtin.os.tag != .windows) {
                 _ = std.posix.kill(-self.child_pid, std.posix.SIG.TERM) catch {
@@ -352,10 +358,10 @@ pub const McpServer = struct {
                 const deadline = utils.milliTimestamp() + 500;
                 while (utils.milliTimestamp() < deadline) {
                     if (self.child.wait(main.g_io) catch null) |_| break;
-                    
                 }
             }
         }
+        _ = self.child.wait(main.g_io) catch {};
         for (self.tools.items) |t| {
             self.alloc.free(t.tool_name);
             self.alloc.free(t.prefixed_name);
@@ -363,13 +369,6 @@ pub const McpServer = struct {
             self.alloc.free(t.input_schema_json);
         }
         self.tools.deinit(self.alloc);
-
-        // Close pipes then null-out handle on child
-        self.stdin_file.close(main.g_io);
-        self.stdout_file.close(main.g_io);
-        self.child.stdin = null;
-        self.child.stdout = null;
-        _ = self.child.wait(main.g_io) catch {};
 
         // Free argv items, recv_buf, and server name.
         self.recv_buf.deinit(self.alloc);
