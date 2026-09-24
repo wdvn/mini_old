@@ -55,6 +55,7 @@ const utils = @import("utils.zig");
 pub const skills_mod = @import("skills.zig");
 const main = @import("../main.zig");
 const provider_mod = @import("../backends/provider.zig");
+const prompts_mod = @import("prompts.zig");
 
 // ---------------------------------------------------------------------------
 // Config struct
@@ -257,7 +258,6 @@ pub const Config = struct {
     /// Default system prompt when MINI_SYSTEM_FILE is not configured.
     /// The literal content lives in prompts.zig (centralized prompt library).
     pub const default_system_prompt = @import("prompts.zig").default_system_prompt;
-
 
     /// Load configuration from environment variables (after calling loadDotEnv).
     /// `alloc` is used to read system prompt file if needed.
@@ -665,7 +665,26 @@ pub const Config = struct {
         applyBackendAndMemActToConfig(&cfg, env_map, &b, &m, sp_result);
         applyLoopAndSessionToConfig(&cfg, env_map, &l);
         applyReasoningMediaPlanningToConfig(&cfg, &r, &p);
+        cfg.appendCodeActInstructions(alloc);
         return cfg;
+    }
+
+    // PSEUDOCODE:
+    // 1. Stop unless the active execution mode is explicitly CodeAct.
+    // 2. Stop when CodeAct instructions were already appended.
+    // 3. Combine the current system prompt with the dedicated instructions.
+    // 4. Replace and release the previous owned prompt buffer.
+    pub fn appendCodeActInstructions(self: *Config, alloc: Allocator) void {
+        if (self.execution_mode != .codeact) return;
+        if (std.mem.indexOf(u8, self.system_prompt, "## CodeAct Execution Instructions") != null) return;
+
+        const combined = std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{
+            self.system_prompt,
+            prompts_mod.codeact_execution_instructions,
+        }) catch return;
+        if (self.system_prompt_buf) |buf| alloc.free(buf);
+        self.system_prompt_buf = combined;
+        self.system_prompt = combined;
     }
 
     /// Releases allocated memory (system_prompt_buf + skills arena).

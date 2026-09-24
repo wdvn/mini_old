@@ -62,3 +62,26 @@ test "workspace_context: loadSystemPrompt injects context and loads root AGENTS.
     try std.testing.expect(std.mem.indexOf(u8, sp.text, "<RULE[AGENTS.md]>") != null);
     try std.testing.expect(std.mem.indexOf(u8, sp.text, "mini-agent") != null);
 }
+
+test "system prompt: codeact instructions are enabled only for codeact mode" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    for ([_]struct { mode: config_mod.ExecutionMode, expected: bool }{
+        .{ .mode = .codeact, .expected = true },
+        .{ .mode = .tools, .expected = false },
+        .{ .mode = .auto, .expected = false },
+    }) |case| {
+        var env_map = std.process.Environ.Map.init(alloc);
+        defer env_map.deinit();
+
+        try env_map.put("OPENAI_COMPAT_URL", "http://127.0.0.1:1/v1");
+        try env_map.put("MINI_EXECUTION_MODE", @tagName(case.mode));
+
+        var cfg = try config_mod.Config.load(alloc, &env_map, io);
+        defer cfg.deinit(alloc);
+
+        const has_instructions = std.mem.indexOf(u8, cfg.system_prompt, "## CodeAct Execution Instructions") != null;
+        try std.testing.expectEqual(case.expected, has_instructions);
+    }
+}

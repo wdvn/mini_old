@@ -163,6 +163,7 @@ fn overrideSystemPromptFromFile(alloc: Allocator, io: std.Io, cfg: *config_mod.C
 
 fn setupConfig(alloc: Allocator, io: std.Io, env_map: *std.process.Environ.Map, args: *const Args) config_mod.Config {
     config_mod.loadDotEnv(alloc, env_map, io);
+    if (args.mode) |m| env_map.put("MINI_EXECUTION_MODE", m) catch {};
     var cfg = config_mod.Config.load(alloc, env_map, io) catch |e| {
         stderrPrint("Error loading config: {s}\n", .{@errorName(e)});
         std.process.exit(1);
@@ -173,7 +174,7 @@ fn setupConfig(alloc: Allocator, io: std.Io, env_map: *std.process.Environ.Map, 
             std.process.exit(1);
         };
     }
-    if (args.mode) |m| cfg.execution_mode = config_mod.ExecutionMode.fromString(m);
+    cfg.appendCodeActInstructions(alloc);
     if (args.hook_command) |hcmd| cfg.hook_command = hcmd;
     hooks_mod.setHookCommand(cfg.hook_command);
     if (hooks_mod.getHookCommand()) |hcmd| {
@@ -546,6 +547,7 @@ fn printHelp() void {
 test {
     _ = @import("core/artifacts.zig");
     _ = @import("core/agent.zig");
+    _ = @import("core/agent_step.zig");
     _ = @import("core/history.zig");
     _ = @import("backends/openai.zig");
     _ = @import("core/journal.zig");

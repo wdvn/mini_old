@@ -404,6 +404,14 @@ pub fn executeCodeActBlock(
     }
 }
 
+fn responseRecoveryBackoffSeconds(recovery_class: proto.RecoveryClass, attempt: usize) u64 {
+    // PSEUDOCODE:
+    // 1. Retry an empty missing-terminal stream once after a short delay.
+    // 2. Keep the other response recovery paths immediate.
+    if (recovery_class == .missing_terminal and attempt > 0) return 1;
+    return 0;
+}
+
 fn nextResponseRecoveryTransition(
     validity: proto.ResponseValidity,
     gen_stop: proto.GenerationStop,
@@ -412,10 +420,14 @@ fn nextResponseRecoveryTransition(
     // PSEUDOCODE:
     // 1. Resolve the independent failure-class recovery budget.
     // 2. Preserve Act identity for retries that still have capacity.
-    // 3. Return a typed stall after the matching budget is exhausted.
+    // 3. Fail repeated empty missing-terminal streams as provider unavailability.
+    // 4. Return a typed stall when another recovery class is exhausted.
     const class = proto.responseRecoveryClass(validity, gen_stop) orelse return null;
     if (budget.consume(class) == .retry) {
         return proto.ActTransition{ .retry_same_act = {} };
+    }
+    if (class == .missing_terminal and validity == .empty and gen_stop == .missing_terminal_event) {
+        return proto.ActTransition{ .fail = .provider_unavailable };
     }
     return proto.ActTransition{ .stall = .recovery_budget_exhausted };
 }
@@ -439,14 +451,39 @@ test "RFC-023: Act 52 provider failure recovers twice then stalls" {
 }
 
 test "RFC-023: recovery exhaustion records transient retry while stalling" {
-    var loop: AgentLoop = .{};
+    var loop: AgentLoop = undefined;
     markRecoveryExhausted(&loop);
     try std.testing.expectEqual(proto.StepOutcome.transient_retry, loop.last_step_outcome);
     try std.testing.expectEqual(proto.TurnOutcome.stalled, loop.last_turn_outcome);
 }
 
+test "RFC-023: missing-terminal recovery uses a one-second retry backoff" {
+    try std.testing.expectEqual(@as(u64, 1), responseRecoveryBackoffSeconds(.missing_terminal, 1));
+    try std.testing.expectEqual(@as(u64, 0), responseRecoveryBackoffSeconds(.empty_response, 1));
+}
+
+test "RFC-023: repeated empty missing-terminal response fails as provider unavailable" {
+    var budget = proto.ResponseRecoveryBudget{};
+
+    try std.testing.expectEqual(
+        proto.RecoveryDecision.retry,
+        budget.consume(.missing_terminal),
+    );
+    try std.testing.expectEqual(
+        proto.RecoveryDecision.stalled,
+        budget.consume(.missing_terminal),
+    );
+
+    const transition = (try nextResponseRecoveryTransition(
+        .empty,
+        .missing_terminal_event,
+        &budget,
+    )).?;
+    try std.testing.expectEqual(proto.FailureReason.provider_unavailable, transition.fail);
+}
+
 test "RFC-023: valid action resets max-token continuation budget" {
-    var loop: AgentLoop = .{};
+    var loop: AgentLoop = undefined;
     loop.max_tokens_continues = 5;
     markValidActionProgress(&loop);
     try std.testing.expectEqual(@as(usize, 0), loop.max_tokens_continues);
@@ -523,12 +560,23 @@ fn handleResponseRecovery(
             .stream_aborted => "The model response stream was interrupted or aborted due to idle timeout. Please resume from where execution stopped.",
         };
         try loop.history.addUser(advisory);
-        return transition;
-    } else {
-        loop.last_agent_decision = .fail_stalled;
-        markRecoveryExhausted(loop);
+
+        const backoff_s = responseRecoveryBackoffSeconds(recovery_class, loop.turn_recovery_attempts);
+        if (backoff_s > 0) {
+            try loop.waitWithInplaceCountdown(backoff_s, loop.turn_recovery_attempts, 1);
+        }
         return transition;
     }
+
+    if (transition == .fail) {
+        loop.last_step_outcome = .provider_failure;
+        loop.last_turn_outcome = .failed;
+        return transition;
+    }
+
+    loop.last_agent_decision = .fail_stalled;
+    markRecoveryExhausted(loop);
+    return transition;
 }
 
 fn finalAnswerWatchdogTransition(watchdog_action: anytype) proto.ActTransition {
