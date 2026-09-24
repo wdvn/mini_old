@@ -300,7 +300,7 @@ pub const AcpServer = struct {
         };
         defer result.deinit(self.agent.alloc);
         if (self.is_cancelled) return "cancelled";
-        return acpStopReason(result.outcome);
+        return acpStopReason(result.outcome, result.failure_reason);
     }
 
     fn backupCurrentSession(self: *AcpServer) void {
@@ -693,25 +693,37 @@ pub fn runServer(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, conf
 // Unit Tests
 // ---------------------------------------------------------------------------
 
-pub fn acpStopReason(outcome: proto.TurnOutcome) []const u8 {
+pub fn acpStopReason(outcome: proto.TurnOutcome, failure_reason: ?proto.FailureReason) []const u8 {
     // PSEUDOCODE:
     // 1. Map each terminal turn outcome to a deterministic ACP stop reason.
     // 2. Never infer completion from provider generation termination.
     return switch (outcome) {
         .completed => "end_turn",
         .stalled => "stalled",
-        .failed => "error",
-        .blocked => "refused",
+        .failed => if (failure_reason) |reason| switch (reason) {
+            .rate_limit_exhausted => "rate_limited",
+            .provider_unavailable => "provider_unavailable",
+            else => "error",
+        } else "error",
+        .blocked => "blocked",
         .cancelled => "cancelled",
     };
 }
 
 test "ACP maps every RFC-023 turn outcome" {
-    try std.testing.expectEqualStrings("end_turn", acpStopReason(.completed));
-    try std.testing.expectEqualStrings("stalled", acpStopReason(.stalled));
-    try std.testing.expectEqualStrings("error", acpStopReason(.failed));
-    try std.testing.expectEqualStrings("refused", acpStopReason(.blocked));
-    try std.testing.expectEqualStrings("cancelled", acpStopReason(.cancelled));
+    try std.testing.expectEqualStrings("end_turn", acpStopReason(.completed, null));
+    try std.testing.expectEqualStrings("stalled", acpStopReason(.stalled, null));
+    try std.testing.expectEqualStrings("error", acpStopReason(.failed, null));
+    try std.testing.expectEqualStrings("blocked", acpStopReason(.blocked, null));
+    try std.testing.expectEqualStrings("cancelled", acpStopReason(.cancelled, null));
+    try std.testing.expectEqualStrings(
+        "rate_limited",
+        acpStopReason(.failed, .rate_limit_exhausted),
+    );
+    try std.testing.expectEqualStrings(
+        "provider_unavailable",
+        acpStopReason(.failed, .provider_unavailable),
+    );
 }
 
 test "ACP JSON-RPC message parser" {

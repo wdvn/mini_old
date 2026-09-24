@@ -33,7 +33,7 @@ test "act_logger: logAct writes full JSON to act_<pid>_<act_id>_<attempt>.json" 
         .tool_definitions = &.{},
         .llm_response = .{
             .http_code = 200,
-            .stop_reason = "end_turn",
+            .stop_reason = "natural_end",
             .generation_stop = "natural_end",
             .response_validity = "final_text",
             .agent_decision = "deliver_final_answer",
@@ -73,6 +73,7 @@ test "act_logger: logAct writes full JSON to act_<pid>_<act_id>_<attempt>.json" 
 
     try testing.expect(std.mem.indexOf(u8, buf, "\"session_pid\": 99999") != null);
     try testing.expect(std.mem.indexOf(u8, buf, "\"act_id\": 1") != null);
+    try testing.expect(std.mem.indexOf(u8, buf, "\"stop_reason\": \"natural_end\"") != null);
     try testing.expect(std.mem.indexOf(u8, buf, "\"generation_stop\": \"natural_end\"") != null);
     try testing.expect(std.mem.indexOf(u8, buf, "\"response_validity\": \"final_text\"") != null);
     try testing.expect(std.mem.indexOf(u8, buf, "\"agent_decision\": \"deliver_final_answer\"") != null);

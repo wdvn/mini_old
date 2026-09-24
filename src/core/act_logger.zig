@@ -19,7 +19,7 @@ pub const ActExecutionInfo = struct {
 
 pub const ActLlmResponseInfo = struct {
     http_code: u32 = 0,
-    stop_reason: []const u8 = "unknown",
+    stop_reason: []const u8 = "missing_terminal_event",
     generation_stop: []const u8 = "unknown",
     response_validity: []const u8 = "empty",
     agent_decision: []const u8 = "request_continuation",

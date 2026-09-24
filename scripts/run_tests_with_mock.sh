@@ -104,6 +104,41 @@ run_case "simple text response"   "Say hello"                 "Hello from mock L
 run_case "long text streaming"    "read long text help me"    "AAAAAAAAAAAAAAAAAAAA"
 run_case "tool call bash"         "please use bash to run echo" "mock-tool-ok"
 
+
+run_act52_regression() {
+  local out rc journal act_started_count=0
+  local regression_home="$TEMP_HOME/rfc023-home"
+  mkdir -p "$regression_home"
+  out=$(timeout 30 env HOME="$regression_home" MINI_HOME="$TEMP_HOME" \
+        OPENAI_COMPAT_URL="$MOCK_URL" \
+        OPENAI_COMPAT_MODEL="mock-model" \
+        OPENAI_COMPAT_API_KEY="sk-mock" \
+        OPENAI_PROTOCOL=chat \
+        MINI_EXECUTION_MODE=auto \
+        MINI_NO_HISTORY=1 \
+        "$BIN" -e "RFC023-ACT52-REGRESSION" 2>&1)
+  rc=$?
+  journal=$(find "$regression_home/.mini/sessions" -maxdepth 1 -type f -name 'journal_*.jsonl' 2>/dev/null | head -1)
+  if [[ $rc -eq 1 && -n "$journal" ]] && grep -F -q '"event_type":"task_stalled"' "$journal"; then
+    act_started_count=$(grep -c '"act_id":1,"event_type":"act_started"' "$journal" || true)
+    if [[ "$act_started_count" -ge 4 ]] &&
+       grep -F -q '"attempt":1' "$journal" &&
+       grep -F -q '"attempt":2' "$journal" &&
+       grep -F -q '"attempt":3' "$journal" &&
+       grep -F -q '"attempt":4' "$journal"; then
+      echo "  [PASS] RFC-023 Act 52 recovery regression"
+      PASS=$((PASS+1))
+      return
+    fi
+  fi
+  echo "  [FAIL] RFC-023 Act 52 recovery regression (rc=$rc, journal=$journal, act_started=$act_started_count)"
+  FAIL=$((FAIL+1))
+  echo "$out" | head -15 | sed 's/^/         | /'
+  [[ -n "$journal" ]] && tail -n 12 "$journal" | sed 's/^/         | /'
+}
+run_act52_regression
+
+
 # Media vision ingestion testcase
 printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89' > "$TEMP_HOME/test_img.png"
 run_case "media vision ingestion" "@image:$TEMP_HOME/test_img.png Describe this" "[Vision Verified] Image received"

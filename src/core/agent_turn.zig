@@ -59,6 +59,8 @@ pub const ActErrorResolution = enum {
     retry_act,
     next_act,
     fail_turn,
+    fail_rate_limited,
+    fail_provider_unavailable,
     stop_turn,
 };
 
@@ -78,8 +80,10 @@ fn resetTurnMetrics(self: *AgentLoop, user_text: []const u8) void {
     self.last_turn_outcome = .completed;
     self.current_act_attempt = 0;
     self.last_recovery_class = null;
+    self.last_failure_reason = null;
     self.role_fix_attempts = 0;
     self.max_tokens_continues = 0;
+    self.stop_sequence_continues = 0;
     self.last_act_failed = false;
     self.js_retry_count = 0;
     self.clearTurnToolRecords();
@@ -324,6 +328,13 @@ fn recordThrottledJournal(self: *AgentLoop, act_id: usize, e: anyerror) void {
     }
 }
 
+fn exhaustedActErrorResolution(e: anyerror) ActErrorResolution {
+    // PSEUDOCODE:
+    // 1. Preserve the exhausted backend category for ACP mapping.
+    // 2. Do not collapse rate limiting into generic provider failure.
+    return if (e == error.LLMRateLimitExceeded) .fail_rate_limited else .fail_provider_unavailable;
+}
+
 fn handleThrottledActError(
     self: *AgentLoop,
     act_id: usize,
@@ -346,7 +357,7 @@ fn handleThrottledActError(
         self.last_generation_stop = .provider_error;
         self.last_step_outcome = .provider_failure;
         self.last_turn_outcome = .failed;
-        return .fail_turn;
+        return exhaustedActErrorResolution(e);
     }
 
     const raw_backoff: u64 = (@as(u64, 1) << @as(u6, @intCast(rate_limit_retries.*))) * 2;
@@ -515,6 +526,8 @@ pub fn actErrorTransition(resolution: ActErrorResolution) proto.ActTransition {
         .retry_act => .{ .retry_same_act = {} },
         .next_act => .{ .next_act = {} },
         .fail_turn => .{ .fail = .provider_error },
+        .fail_rate_limited => .{ .fail = .rate_limit_exhausted },
+        .fail_provider_unavailable => .{ .fail = .provider_unavailable },
         .stop_turn => .{ .cancel = {} },
     };
 }
@@ -523,6 +536,28 @@ test "RFC-023: terminal Act errors become failed turns" {
     try std.testing.expect(actErrorTransition(.fail_turn) == .fail);
     try std.testing.expectEqual(proto.FailureReason.provider_error, actErrorTransition(.fail_turn).fail);
     try std.testing.expect(actErrorTransition(.stop_turn) == .cancel);
+}
+
+test "RFC-023: exhausted backend error keeps rate-limit versus provider cause" {
+    try std.testing.expectEqual(
+        ActErrorResolution.fail_rate_limited,
+        exhaustedActErrorResolution(error.LLMRateLimitExceeded),
+    );
+    try std.testing.expectEqual(
+        ActErrorResolution.fail_provider_unavailable,
+        exhaustedActErrorResolution(error.LLMProviderUnavailable),
+    );
+}
+
+test "RFC-023: terminal Act errors preserve ACP exhaustion reason" {
+    try std.testing.expectEqual(
+        proto.FailureReason.rate_limit_exhausted,
+        actErrorTransition(.fail_rate_limited).fail,
+    );
+    try std.testing.expectEqual(
+        proto.FailureReason.provider_unavailable,
+        actErrorTransition(.fail_provider_unavailable).fail,
+    );
 }
 
 fn executeSingleActAttempt(
@@ -673,6 +708,13 @@ pub fn executeTurnWorker(
         else => .failed,
     };
     self.last_turn_outcome = outcome;
+    // PSEUDOCODE:
+    // 1. Preserve the business outcome independently from its failure cause.
+    // 2. Publish the typed cause only for terminal failed transitions.
+    self.last_failure_reason = switch (final_transition) {
+        .fail => |reason| reason,
+        else => null,
+    };
 
     // Outer lifecycle is the single authority writing terminal task events:
     if (self.journal) |*j| {
@@ -700,6 +742,7 @@ pub fn executeTurnWorker(
         .generation_stop = self.last_generation_stop,
         .response_validity = self.last_response_validity,
         .step_outcome = self.last_step_outcome,
+        .failure_reason = self.last_failure_reason,
         .last_agent_message = duped_last_message,
         .act_count = self.last_turn_acts,
         .recovery_attempts = self.turn_recovery_attempts,

@@ -169,6 +169,7 @@ pub const AgentLoop = struct {
     role_fix_attempts: usize = 0,
     /// Consecutive response continuations due to max_tokens in current turn.
     max_tokens_continues: usize = 0,
+    stop_sequence_continues: usize = 0,
     /// Token estimator (MemAct).
     token_estimator: tokens_mod.TokenEstimator,
     /// Content-Addressed Storage (RFC-002).
@@ -232,6 +233,7 @@ pub const AgentLoop = struct {
     last_turn_outcome: proto.TurnOutcome = .completed,
     current_act_attempt: usize = 1,
     last_recovery_class: ?proto.RecoveryClass = null,
+    last_failure_reason: ?proto.FailureReason = null,
 
     current_user_request: ?[]const u8 = null,
 
@@ -667,8 +669,9 @@ pub const AgentLoop = struct {
         defer snapshots_list.deinit(self.alloc);
         collectSnapshots(self.alloc, self.snapshot_tracker, &snapshots_list);
 
+        const normalized_stop = @tagName(response.getGenerationStop());
         if (self.last_stop_reason) |old| self.alloc.free(old);
-        self.last_stop_reason = self.alloc.dupe(u8, @tagName(response.stop_reason)) catch null;
+        self.last_stop_reason = self.alloc.dupe(u8, normalized_stop) catch null;
         const pid: u32 = @intCast(std.c.getpid());
         logger.logAct(self.io, .{
             .session_pid = pid,
@@ -682,7 +685,7 @@ pub const AgentLoop = struct {
             .tool_definitions = tool_defs,
             .llm_response = .{
                 .http_code = response.http_code,
-                .stop_reason = @tagName(response.stop_reason),
+                .stop_reason = normalized_stop,
                 .generation_stop = @tagName(self.last_generation_stop),
                 .response_validity = @tagName(self.last_response_validity),
                 .agent_decision = @tagName(self.last_agent_decision),

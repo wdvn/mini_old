@@ -340,6 +340,7 @@ pub const TurnResult = struct {
     generation_stop: GenerationStop,
     response_validity: ResponseValidity,
     step_outcome: StepOutcome,
+    failure_reason: ?FailureReason = null,
     last_agent_message: ?[]const u8,
     act_count: usize,
     recovery_attempts: usize,
@@ -383,6 +384,8 @@ pub const StallReason = enum {
 pub const FailureReason = enum {
     protocol_error,
     provider_error,
+    rate_limit_exhausted,
+    provider_unavailable,
     tool_error,
 };
 
@@ -466,8 +469,8 @@ pub fn responseRecoveryClass(validity: ResponseValidity, gen_stop: GenerationSto
     // 2. Use content-shape budgets only for thinking-only and empty responses.
     // 3. Leave valid final/action responses outside response recovery.
     return switch (gen_stop) {
-        .stream_aborted => .stream_aborted,
-        .missing_terminal_event => .missing_terminal,
+        .stream_aborted => if (validity == .partial_text) null else .stream_aborted,
+        .missing_terminal_event => if (validity == .partial_text) null else .missing_terminal,
         else => switch (validity) {
             .thinking_only => .thinking_only,
             .empty, .whitespace_only => .empty_response,
@@ -520,6 +523,13 @@ pub fn classifyResponse(response: *const Response, has_codeact: bool) ResponseVa
         }
         return .partial_text;
     }
+    // PSEUDOCODE:
+    // 1. An interrupted tool payload cannot be executed safely.
+    // 2. Preserve it as partial response state so the agent can continue.
+    if (has_malformed_tools and switch (gen_stop) {
+        .max_tokens, .stop_sequence, .missing_terminal_event, .stream_aborted => true,
+        else => false,
+    }) return .partial_text;
     if (has_meaningful_text) {
         return .partial_text;
     }
@@ -557,6 +567,7 @@ pub fn decideAgentAction(
         return .fail_protocol;
     }
     if (validity == .thinking_only or validity == .whitespace_only or validity == .empty) {
+        if (generation_stop == .stop_sequence) return .fail_stalled;
         if (generation_stop == .natural_end or
             generation_stop == .stream_aborted or
             generation_stop == .missing_terminal_event or
@@ -680,17 +691,13 @@ test "RFC-023: whitespace-only and empty responses never become final answers" {
     try std.testing.expectEqual(AgentDecision.retry_transient, decideAgentAction(.natural_end, .empty, false));
 }
 
-test "RFC-023: partial transport responses use bounded recovery classes" {
-    try std.testing.expectEqual(
-        RecoveryClass.missing_terminal,
-        responseRecoveryClass(.partial_text, .missing_terminal_event) orelse unreachable,
-    );
-    try std.testing.expectEqual(
-        RecoveryClass.stream_aborted,
-        responseRecoveryClass(.partial_text, .stream_aborted) orelse unreachable,
-    );
+test "RFC-023: resumable partial transport text stays outside recovery budget" {
+    try std.testing.expectEqual(@as(?RecoveryClass, null), responseRecoveryClass(.partial_text, .missing_terminal_event));
+    try std.testing.expectEqual(@as(?RecoveryClass, null), responseRecoveryClass(.partial_text, .stream_aborted));
     try std.testing.expectEqual(@as(?RecoveryClass, null), responseRecoveryClass(.partial_text, .max_tokens));
     try std.testing.expectEqual(@as(?RecoveryClass, null), responseRecoveryClass(.partial_text, .stop_sequence));
+    try std.testing.expectEqual(RecoveryClass.missing_terminal, responseRecoveryClass(.thinking_only, .missing_terminal_event) orelse unreachable);
+    try std.testing.expectEqual(RecoveryClass.stream_aborted, responseRecoveryClass(.empty, .stream_aborted) orelse unreachable);
 }
 
 test "RFC-023: tool arguments must be valid JSON objects" {
@@ -722,6 +729,47 @@ test "RFC-023: malformed tool call yields malformed_tool_call and fail_protocol"
 
     try std.testing.expectEqual(ResponseValidity.malformed_tool_call, classifyResponse(&response, false));
     try std.testing.expectEqual(AgentDecision.fail_protocol, decideAgentAction(.tool_call, .malformed_tool_call, false));
+}
+
+test "RFC-023: incomplete max-tokens tool call requests continuation" {
+    const alloc = std.testing.allocator;
+    var response = Response.init(alloc);
+    defer response.deinit();
+    response.stop_reason = .max_tokens;
+    response.generation_stop = .max_tokens;
+    try response.content.append(alloc, .{ .tool_use = .{
+        .id = try alloc.dupe(u8, "call_partial"),
+        .name = try alloc.dupe(u8, "bash"),
+        .input_json = try alloc.dupe(u8, "{\"command\":tru"),
+    } });
+
+    const validity = classifyResponse(&response, false);
+    try std.testing.expectEqual(ResponseValidity.partial_text, validity);
+    try std.testing.expectEqual(
+        AgentDecision.request_continuation,
+        decideAgentAction(.max_tokens, validity, false),
+    );
+}
+
+test "RFC-023: interrupted tool payloads are non-executable partial responses" {
+    const alloc = std.testing.allocator;
+    for ([_]GenerationStop{ .max_tokens, .stop_sequence, .missing_terminal_event, .stream_aborted }) |stop| {
+        var response = Response.init(alloc);
+        defer response.deinit();
+        response.generation_stop = stop;
+        try response.content.append(alloc, .{ .tool_use = .{
+            .id = try alloc.dupe(u8, "call_partial"),
+            .name = try alloc.dupe(u8, "bash"),
+            .input_json = try alloc.dupe(u8, "{\"command\":tru"),
+        } });
+        try std.testing.expectEqual(ResponseValidity.partial_text, classifyResponse(&response, false));
+        try std.testing.expectEqual(AgentDecision.request_continuation, decideAgentAction(stop, .partial_text, false));
+    }
+}
+
+test "RFC-023: non-resumable stop-sequence response stalls" {
+    try std.testing.expectEqual(AgentDecision.fail_stalled, decideAgentAction(.stop_sequence, .thinking_only, false));
+    try std.testing.expectEqual(AgentDecision.fail_stalled, decideAgentAction(.stop_sequence, .empty, false));
 }
 
 test "RFC-023: CodeAct takes precedence over meaningful final text" {

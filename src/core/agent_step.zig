@@ -438,6 +438,53 @@ test "RFC-023: Act 52 provider failure recovers twice then stalls" {
     try std.testing.expectEqual(proto.StallReason.recovery_budget_exhausted, stalled.stall);
 }
 
+test "RFC-023: recovery exhaustion records transient retry while stalling" {
+    var loop: AgentLoop = .{};
+    markRecoveryExhausted(&loop);
+    try std.testing.expectEqual(proto.StepOutcome.transient_retry, loop.last_step_outcome);
+    try std.testing.expectEqual(proto.TurnOutcome.stalled, loop.last_turn_outcome);
+}
+
+test "RFC-023: valid action resets max-token continuation budget" {
+    var loop: AgentLoop = .{};
+    loop.max_tokens_continues = 5;
+    markValidActionProgress(&loop);
+    try std.testing.expectEqual(@as(usize, 0), loop.max_tokens_continues);
+}
+
+test "RFC-023: stop-sequence continuation is bounded and eventually stalls" {
+    var count: usize = 0;
+    for (0..5) |_| try std.testing.expect(stopSequenceContinuation(&count) == .next_act);
+    try std.testing.expectEqual(proto.StallReason.recovery_budget_exhausted, stopSequenceContinuation(&count).stall);
+    try std.testing.expectEqual(@as(usize, 6), count);
+}
+
+fn stopSequenceContinuation(count: *usize) proto.ActTransition {
+    // PSEUDOCODE:
+    // 1. Bound controlled stop-sequence continuations.
+    // 2. Stall after five resume boundaries.
+    count.* += 1;
+    if (count.* <= 5) return .{ .next_act = {} };
+    return .{ .stall = .recovery_budget_exhausted };
+}
+
+fn markRecoveryExhausted(loop: *AgentLoop) void {
+    // PSEUDOCODE:
+    // 1. Preserve the business outcome as stalled.
+    // 2. Report exhausted transient recovery as the immediate step outcome.
+    loop.last_step_outcome = .transient_retry;
+    loop.last_turn_outcome = .stalled;
+}
+
+fn markValidActionProgress(loop: *AgentLoop) void {
+    // PSEUDOCODE:
+    // 1. Treat a valid action as a recovery boundary.
+    // 2. Reset consecutive continuation pressure for later truncation.
+    loop.response_recovery_budget = .{};
+    loop.max_tokens_continues = 0;
+    loop.stop_sequence_continues = 0;
+}
+
 fn handleResponseRecovery(
     loop: *AgentLoop,
     act_id: usize,
@@ -479,8 +526,7 @@ fn handleResponseRecovery(
         return transition;
     } else {
         loop.last_agent_decision = .fail_stalled;
-        loop.last_step_outcome = .protocol_failure;
-        loop.last_turn_outcome = .stalled;
+        markRecoveryExhausted(loop);
         return transition;
     }
 }
@@ -562,7 +608,6 @@ fn handleMaxTokensStop(
         return proto.ActTransition{ .stall = .recovery_budget_exhausted };
     }
     main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response truncated (max_tokens), requesting continuation ({d}/5)...\x1b[0m\n", .{loop.max_tokens_continues});
-    try loop.closeOrphanedToolUses(response);
     var buf = utils.BufWriter.init(loop.alloc);
     defer buf.deinit();
     try buf.print(
@@ -938,17 +983,17 @@ pub fn executeStep(
         .execute_native_tools => {
             const was_added = try self.history.addAssistantResponse(&response);
             _ = scanResponseContent(self, &response, was_added);
-            self.response_recovery_budget = .{};
             self.last_recovery_class = null;
             self.last_step_outcome = .actions_executed;
+            markValidActionProgress(self);
             return executeNativeToolCalling(self, act_id, input_msgs_count, tool_defs, &response);
         },
         .execute_codeact => {
             const was_added = try self.history.addAssistantResponse(&response);
             _ = scanResponseContent(self, &response, was_added);
-            self.response_recovery_budget = .{};
             self.last_recovery_class = null;
             self.last_step_outcome = .actions_executed;
+            markValidActionProgress(self);
             return executeCodeActBlock(self, act_id, input_msgs_count, tool_defs, &response, js_code_opt.?);
         },
         .request_continuation => {
@@ -961,11 +1006,30 @@ pub fn executeStep(
 
             const was_added = try self.history.addAssistantResponse(&response);
             _ = scanResponseContent(self, &response, was_added);
+            // PSEUDOCODE:
+            // 1. Interrupted partial responses are committed for safe continuation.
+            // 2. Close every orphaned tool call without executing it.
+            if (validity == .partial_text and switch (gen_stop) {
+                .max_tokens, .stop_sequence, .missing_terminal_event, .stream_aborted => true,
+                else => false,
+            }) try self.closeOrphanedToolUses(&response);
             self.response_recovery_budget = .{};
             self.last_recovery_class = null;
             self.last_step_outcome = .continuation_requested;
             if (gen_stop == .max_tokens) {
                 return handleMaxTokensStop(self, act_id, input_msgs_count, tool_defs, &response);
+            }
+            if (gen_stop == .stop_sequence) {
+                // PSEUDOCODE:
+                // 1. Keep partial text in history for a safe resume boundary.
+                // 2. Bound controlled continuations and stall on repeated boundaries.
+                try self.history.addUser("[System] The response stopped at a controlled sequence boundary. Continue from that boundary without repeating prior output.");
+                const transition = stopSequenceContinuation(&self.stop_sequence_continues);
+                if (transition == .stall) {
+                    self.last_step_outcome = .continuation_requested;
+                    self.last_turn_outcome = .stalled;
+                }
+                return transition;
             }
             try self.history.addUser("[System] The response ended at an explicit stop boundary. Continue from that boundary without repeating prior output.");
             return proto.ActTransition{ .next_act = {} };

@@ -281,6 +281,9 @@ pub const Client = struct {
         if (idle_aborted) {
             ctx.response.stop_reason = .stream_aborted;
             ctx.response.generation_stop = .stream_aborted;
+            ctx.finalization_route = .idle_abort;
+        } else if (ctx.finalization_route == .pending) {
+            ctx.finalization_route = .eof;
         }
         if (ctx.line_buf.items.len > 0) {
             ctx.processLine(ctx.line_buf.items) catch {};
@@ -792,6 +795,20 @@ const ChatChunk = struct {
     usage: ?ChatUsageJson = null,
 };
 
+const TerminalEventKind = enum {
+    none,
+    finish_reason,
+    response_completion,
+};
+
+const FinalizationRoute = enum {
+    pending,
+    done_sentinel,
+    response_completion,
+    eof,
+    idle_abort,
+};
+
 const StreamCtx = struct {
     alloc: Allocator,
     response: proto.Response,
@@ -812,6 +829,8 @@ const StreamCtx = struct {
     event_type_len: usize = 0,
     finish_reason_received: bool = false,
     terminal_event_received: bool = false,
+    terminal_event_kind: TerminalEventKind = .none,
+    finalization_route: FinalizationRoute = .pending,
 
     pub fn emitNormalized(self: *StreamCtx, text: []const u8, thinking: bool) !void {
         if (text.len == 0) return;
@@ -900,7 +919,11 @@ const StreamCtx = struct {
             try self.response.content.append(self.alloc, .{ .text = text });
             self.text_accum.clearRetainingCapacity();
         }
-        if (explicit_completion) self.terminal_event_received = true;
+        self.finalization_route = if (explicit_completion) .response_completion else .done_sentinel;
+        if (explicit_completion) {
+            self.terminal_event_received = true;
+            self.terminal_event_kind = .response_completion;
+        }
         if (self.response.stop_reason == .unknown) {
             self.response.stop_reason = if (self.terminal_event_received) .end_turn else .missing_terminal_event;
         }
@@ -1024,6 +1047,7 @@ const StreamCtx = struct {
         // PSEUDOCODE: Map an explicit provider finish reason and mark terminal receipt.
         self.finish_reason_received = true;
         self.terminal_event_received = true;
+        self.terminal_event_kind = .finish_reason;
         if (std.mem.eql(u8, reason, "tool_calls") or std.mem.eql(u8, reason, "function")) {
             self.response.stop_reason = .tool_use;
             self.response.generation_stop = .tool_call;
@@ -1238,6 +1262,10 @@ const StreamCtx = struct {
 
     fn finalizeToolCalls(self: *StreamCtx) !void {
         try self.filter.finish(self);
+        // PSEUDOCODE:
+        // 1. Record EOF when no transport terminal event was observed.
+        // 2. Preserve [DONE], explicit response completion, and idle-abort routes.
+        if (self.finalization_route == .pending) self.finalization_route = .eof;
         // PSEUDOCODE:
         // 1. Preserve partial text/reasoning regardless of transport completion.
         // 2. Mark EOF without an explicit terminal event as missing_terminal_event.
@@ -1525,6 +1553,49 @@ test "openai stream: parse usage chunk (RFC-006 §3.1)" {
     try testing.expectEqual(@as(u64, 10), ctx.response.usage.reasoning_tokens);
 }
 
+test "RFC-023: terminal metadata distinguishes provider and transport completion" {
+    const alloc = testing.allocator;
+    var client = Client.init(alloc, "http://localhost/v1", "", "Authorization", "mock", 100);
+
+    var finish_ctx = StreamCtx{ .alloc = alloc, .response = proto.Response.init(alloc), .line_buf = .empty, .tool_calls = .empty };
+    defer finish_ctx.response.deinit();
+    defer finish_ctx.line_buf.deinit(alloc);
+    defer finish_ctx.tool_calls.deinit(alloc);
+    finish_ctx.applyFinishReason("stop");
+    try testing.expectEqual(TerminalEventKind.finish_reason, finish_ctx.terminal_event_kind);
+
+    var done_ctx = StreamCtx{ .alloc = alloc, .response = proto.Response.init(alloc), .line_buf = .empty, .tool_calls = .empty };
+    defer done_ctx.response.deinit();
+    defer done_ctx.line_buf.deinit(alloc);
+    defer done_ctx.tool_calls.deinit(alloc);
+    try done_ctx.processLine("data: [DONE]");
+    try testing.expectEqual(FinalizationRoute.done_sentinel, done_ctx.finalization_route);
+    try testing.expect(!done_ctx.terminal_event_received);
+
+    var response_ctx = StreamCtx{ .alloc = alloc, .response = proto.Response.init(alloc), .line_buf = .empty, .tool_calls = .empty };
+    defer response_ctx.response.deinit();
+    defer response_ctx.line_buf.deinit(alloc);
+    defer response_ctx.tool_calls.deinit(alloc);
+    try response_ctx.processLine("event: response.completed");
+    try response_ctx.processLine("data: {}");
+    try testing.expectEqual(TerminalEventKind.response_completion, response_ctx.terminal_event_kind);
+    try testing.expectEqual(FinalizationRoute.response_completion, response_ctx.finalization_route);
+
+    var eof_ctx = StreamCtx{ .alloc = alloc, .response = proto.Response.init(alloc), .line_buf = .empty, .tool_calls = .empty };
+    defer eof_ctx.response.deinit();
+    defer eof_ctx.line_buf.deinit(alloc);
+    defer eof_ctx.tool_calls.deinit(alloc);
+    try eof_ctx.finalizeToolCalls();
+    try testing.expectEqual(FinalizationRoute.eof, eof_ctx.finalization_route);
+
+    var idle_ctx = StreamCtx{ .alloc = alloc, .response = proto.Response.init(alloc), .line_buf = .empty, .tool_calls = .empty };
+    defer idle_ctx.response.deinit();
+    defer idle_ctx.line_buf.deinit(alloc);
+    defer idle_ctx.tool_calls.deinit(alloc);
+    var aborted = try client.finalizeOpenAiResponse(&idle_ctx, 200, true, .chat_completions);
+    defer aborted.deinit();
+    try testing.expectEqual(FinalizationRoute.idle_abort, idle_ctx.finalization_route);
+}
 test "RFC-023: EOF with partial thinking is not natural end_turn" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
