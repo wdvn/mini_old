@@ -45,6 +45,7 @@ const main = @import("../main.zig");
 const registry = @import("../tooling/registry.zig");
 const hooks = @import("../core/hooks.zig");
 const snapshot_mod = @import("../core/snapshot.zig");
+const agent_loop_monitor = @import("../core/agent_loop_monitor.zig");
 
 // ---------------------------------------------------------------------------
 // Security & auditing guard (ISSUE-CODEACT-001 M2/M3/M4)
@@ -75,11 +76,17 @@ fn guardAndDispatchPre(
         });
         return c.JS_ThrowTypeError(ctx, err_msg);
     }
+    // Same-response dedup guard: skip duplicate tool calls within a single script.
+    const args_hash = agent_loop_monitor.fuzzyArgsHash(input);
+    if (engine.isSeenCall(tool_name, args_hash)) {
+        return c.JS_ThrowTypeError(ctx, err_msg);
+    }
     hooks.dispatch(engine.alloc, engine.io, .{
         .event = "pre-tool-use",
         .tool_name = tool_name,
         .input_json = input,
     });
+    _ = engine.addSeenCall(engine.alloc, tool_name, args_hash) catch return JS_EXCEPTION;
     return null;
 }
 
@@ -158,11 +165,15 @@ fn jsMiniGlob(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
         });
         return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.glob (glob) is blocked");
     }
+    // Same-response dedup guard for read-only tools.
+    const glob_hash = agent_loop_monitor.fuzzyArgsHash(pattern);
+    if (engine.isSeenCall("glob", glob_hash)) return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.glob duplicate");
     hooks.dispatch(engine.alloc, engine.io, .{
         .event = "pre-tool-use",
         .tool_name = "glob",
         .input_json = pattern,
     });
+    _ = engine.addSeenCall(engine.alloc, "glob", glob_hash) catch return JS_EXCEPTION;
 
     const base_path = if (argc >= 2 and c.JS_IsUndefined(argv[1]) == 0 and c.JS_IsNull(argv[1]) == 0)
         jsStringSlice(ctx, argv[1], engine.alloc)
@@ -244,11 +255,14 @@ fn jsMiniGrep(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
         });
         return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.grep (grep) is blocked");
     }
+    const grep_hash = agent_loop_monitor.fuzzyArgsHash(pattern);
+    if (engine.isSeenCall("grep", grep_hash)) return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.grep duplicate");
     hooks.dispatch(engine.alloc, engine.io, .{
         .event = "pre-tool-use",
         .tool_name = "grep",
         .input_json = pattern,
     });
+    _ = engine.addSeenCall(engine.alloc, "grep", grep_hash) catch return JS_EXCEPTION;
 
     const path = if (argc >= 2 and c.JS_IsUndefined(argv[1]) == 0 and c.JS_IsNull(argv[1]) == 0)
         jsStringSlice(ctx, argv[1], engine.alloc)
@@ -290,11 +304,14 @@ fn jsMiniRead(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
         });
         return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.read (file_read) is blocked");
     }
+    const read_hash = agent_loop_monitor.fuzzyArgsHash(path);
+    if (engine.isSeenCall("file_read", read_hash)) return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.read duplicate");
     hooks.dispatch(engine.alloc, engine.io, .{
         .event = "pre-tool-use",
         .tool_name = "file_read",
         .input_json = path,
     });
+    _ = engine.addSeenCall(engine.alloc, "file_read", read_hash) catch return JS_EXCEPTION;
 
     var offset: usize = 1;
     var limit: usize = 2000;
@@ -509,11 +526,14 @@ fn jsMiniSh(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JS
         });
         return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.sh (bash) is blocked");
     }
+    const bash_hash = agent_loop_monitor.fuzzyArgsHash(command);
+    if (engine.isSeenCall("bash", bash_hash)) return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.sh (bash) duplicate");
     hooks.dispatch(engine.alloc, engine.io, .{
         .event = "pre-tool-use",
         .tool_name = "bash",
         .input_json = command,
     });
+    _ = engine.addSeenCall(engine.alloc, "bash", bash_hash) catch return JS_EXCEPTION;
 
     snapshotWritablePaths(engine.alloc, command);
 

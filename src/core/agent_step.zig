@@ -375,6 +375,7 @@ pub fn executeCodeActBlock(
         return handleCodeActEvalError(loop, act_id, input_msgs_count, tool_defs, response, js_code, start_codeact_ms, e);
     };
     defer res.deinit();
+    loop.engine.deinitSeenCalls(loop.engine.alloc);
 
     const end_codeact_ms: u64 = @as(u64, @intCast(utils.milliTimestamp()));
     const dur_ms = if (end_codeact_ms >= start_codeact_ms) @as(u64, @intCast(end_codeact_ms - start_codeact_ms)) else 0;
