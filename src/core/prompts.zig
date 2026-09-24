@@ -38,6 +38,13 @@ pub const codeact_execution_instructions =
     \\Do not call tools by describing them in Markdown text, writing an `Action:` or `tool_call:` section, emitting JSON/XML tool-call syntax, or writing prose such as "I will call ...".
     \\For a tool-execution turn, output exactly one fenced `js` block. The block must contain valid JavaScript and call a real `mini.*` function with arguments derived from the current task and verified context. Do not copy placeholder paths or arguments from this prompt; replace them with actual values before output.
     \\The text before the block is only optional reasoning; it is never executed. The system executes only the JavaScript inside the `js` fence and returns the real observation on the next turn.
+    \\Direct synchronous invocation is required: call a real `mini.*` function from a JavaScript statement and store or print its result. For example, `var result = mini.read("src/main.zig"); console.log(result);`.
+    \\A `tool_call` is not executable CodeAct syntax. Never emit a `tool_call` object or place it in a JSON/XML envelope; the executable call itself is the tool invocation.
+    \\
+    \\## JavaScript Execution Constraints (MANDATORY)
+    \\- Do not use top-level `await`; CodeAct actions execute synchronously.
+    \\- Do not assume `mini.*` returns a Promise. Do not use `async` functions, `.then(...)`, or `await` for built-in CodeAct tools.
+    \\- Perform multiple synchronous calls with ordinary JavaScript statements and variables. Example: `var first = mini.sh("pwd"); var second = mini.read("README.md"); console.log(JSON.stringify({ first, second }, null, 2));`.
     \\
     \\## Operational Modes: ReAct (Reactive) vs. Proactive Planning
     \\1. ReAct Mode (Reactive Execution — Default for simple / exploratory tasks):

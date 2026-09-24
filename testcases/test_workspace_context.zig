@@ -82,6 +82,10 @@ test "system prompt: codeact instructions require executable mini JavaScript" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "single executable JavaScript block") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "call a real `mini.*` function") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not copy placeholder paths or arguments") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Direct synchronous invocation is required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not use top-level `await`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not assume `mini.*` returns a Promise") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "`tool_call` is not executable CodeAct syntax") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "path/to/file") == null);
 }
 
