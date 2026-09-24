@@ -516,7 +516,11 @@ pub const McpClientManager = struct {
             server.shutdown();
             return;
         };
-        server.discoverTools() catch {};
+        server.discoverTools() catch |e| {
+            main.stderrPrint("[mcp] {s}: discoverTools failed ({s}), skipping.\n", .{ name, @errorName(e) });
+            server.shutdown();
+            return;
+        };
 
         try self.servers.append(self.alloc, server);
     }
