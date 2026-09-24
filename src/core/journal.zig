@@ -65,6 +65,8 @@ pub const StateDelta = struct {
     act_id: usize,
     /// File snapshot (for rollback).
     file_snapshots: []const FileSnapshot,
+    /// LLM stop reason for this act (debugging loop/termination).
+    stop_reason: ?[]const u8 = null,
 };
 
 pub const ActEvent = struct {

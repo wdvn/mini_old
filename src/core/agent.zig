@@ -218,6 +218,8 @@ pub const AgentLoop = struct {
     last_loop_reason: LoopReason = .none,
     /// Flag set when action loop circuit breaker trips to break out of agent loop.
     action_loop_tripped: bool = false,
+    /// Stop reason from the most recent LLM response (for journal debugging).
+    last_stop_reason: ?[]const u8 = null,
     /// Track whether the most recent LLM response had no meaningful content (empty/whitespace only).
     /// Used to prevent premature exit_loop when model returns nothing but also didn't fail.
     response_content_empty: bool = false,
@@ -636,6 +638,8 @@ pub const AgentLoop = struct {
         defer snapshots_list.deinit(self.alloc);
         collectSnapshots(self.alloc, self.snapshot_tracker, &snapshots_list);
 
+        if (self.last_stop_reason) |old| self.alloc.free(old);
+        self.last_stop_reason = self.alloc.dupe(u8, @tagName(response.stop_reason)) catch null;
         const pid: u32 = @intCast(std.c.getpid());
         logger.logAct(self.io, .{
             .session_pid = pid,

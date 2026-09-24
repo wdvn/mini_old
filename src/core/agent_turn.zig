@@ -147,6 +147,7 @@ fn flushSnapshotsAndJournal(self: *AgentLoop, act_id: usize) void {
             j.recordActComplete(self.io, act_id, .{
                 .act_id = act_id,
                 .file_snapshots = &.{},
+                .stop_reason = self.last_stop_reason,
             }) catch {};
         }
     }
