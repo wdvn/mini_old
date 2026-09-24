@@ -67,6 +67,11 @@ pub const default_system_prompt =
     \\  - `mini.setThinking(levelOrTokens)`: Modulate next-turn reasoning effort ("low"|"medium"|"high"|"none" or token budget). Use "low" for routine inspection, "high" for complex architecture design, RCA debugging, or error recovery.
     \\  - `console.log(...)`: Print outputs and inspection findings (REQUIRED to receive data in Observation)
     \\
+    \\## Batched Information Gathering (default — not optional)
+    \\When reading multiple sources, batch ALL tool calls into ONE ```js block.
+    \\✅ 1 act: console.log(mini.read(...)); console.log(mini.grep(...)); console.log(mini.sh(...));
+    \\❌ 3 acts: read→Obs, grep→Obs, shell→Obs
+    \\Rule: ONE block per turn. Rationale: ~15s/turn, batching saves ~60s.
     \\## ReAct Interaction Protocol & Rules (MANDATORY):
     \\1. Turn Structure:
     \\   - Always write your concise reasoning ("Thought:") before taking action.
