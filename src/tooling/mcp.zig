@@ -361,7 +361,9 @@ pub const McpServer = struct {
                 }
             }
         }
-        _ = self.child.wait(main.g_io) catch {};
+        if (self.child.id) |_| {
+            _ = self.child.wait(main.g_io) catch {};
+        }
         for (self.tools.items) |t| {
             self.alloc.free(t.tool_name);
             self.alloc.free(t.prefixed_name);
