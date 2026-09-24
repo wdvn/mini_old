@@ -26,59 +26,45 @@ pub const CsrGraph = struct {
     rev_indices: []u32,
     rev_edge_ids: []EdgeId,
 
-    pub fn build(alloc: Allocator, nodes: []const NodeRecord, edges: []const EdgeRecord) !CsrGraph {
-        const n: u32 = @intCast(nodes.len);
+    fn countActiveAndDegrees(
+        nodes: []const NodeRecord,
+        edges: []const EdgeRecord,
+        out_degree: []u32,
+        in_degree: []u32,
+    ) u32 {
+        // PSEUDOCODE:
+        // 1. Iterate over all edges
+        // 2. If edge and both endpoint nodes are active, increment active count and degrees
+        // 3. Return total active edge count
         var active_e: u32 = 0;
+        @memset(out_degree, 0);
+        @memset(in_degree, 0);
         for (edges) |e| {
             if (e.is_active and nodes[e.src].is_active and nodes[e.dst].is_active) {
                 active_e += 1;
-            }
-        }
-
-        // 1. Calculate degrees
-        const out_degree = try alloc.alloc(u32, n);
-        defer alloc.free(out_degree);
-        @memset(out_degree, 0);
-
-        const in_degree = try alloc.alloc(u32, n);
-        defer alloc.free(in_degree);
-        @memset(in_degree, 0);
-
-        for (edges) |e| {
-            if (e.is_active and nodes[e.src].is_active and nodes[e.dst].is_active) {
                 out_degree[e.src] += 1;
                 in_degree[e.dst] += 1;
             }
         }
+        return active_e;
+    }
 
-        // 2. Allocate CSR/CSC slices
-        const row_offsets = try alloc.alloc(u32, n + 1);
-        errdefer alloc.free(row_offsets);
-
-        const col_indices = try alloc.alloc(u32, active_e);
-        errdefer alloc.free(col_indices);
-
-        const edge_ids = try alloc.alloc(EdgeId, active_e);
-        errdefer alloc.free(edge_ids);
-
-        const rev_offsets = try alloc.alloc(u32, n + 1);
-        errdefer alloc.free(rev_offsets);
-
-        const rev_indices = try alloc.alloc(u32, active_e);
-        errdefer alloc.free(rev_indices);
-
-        const rev_edge_ids = try alloc.alloc(EdgeId, active_e);
-        errdefer alloc.free(rev_edge_ids);
-
-        // 3. Prefix sum for offsets
-        row_offsets[0] = 0;
-        rev_offsets[0] = 0;
-        for (0..n) |i| {
-            row_offsets[i + 1] = row_offsets[i] + out_degree[i];
-            rev_offsets[i + 1] = rev_offsets[i] + in_degree[i];
-        }
-
-        // 4. Fill edges
+    fn populateEdgeIndices(
+        alloc: Allocator,
+        n: u32,
+        nodes: []const NodeRecord,
+        edges: []const EdgeRecord,
+        row_offsets: []const u32,
+        rev_offsets: []const u32,
+        col_indices: []u32,
+        edge_ids: []EdgeId,
+        rev_indices: []u32,
+        rev_edge_ids: []EdgeId,
+    ) !void {
+        // PSEUDOCODE:
+        // 1. Copy starting offsets into mutable current position tracking slices
+        // 2. Iterate over active edges and populate forward/reverse indices & edge IDs
+        // 3. Increment current position counters
         const current_out = try alloc.alloc(u32, n);
         defer alloc.free(current_out);
         @memcpy(current_out, row_offsets[0..n]);
@@ -100,6 +86,43 @@ pub const CsrGraph = struct {
                 current_in[e.dst] += 1;
             }
         }
+    }
+
+    pub fn build(alloc: Allocator, nodes: []const NodeRecord, edges: []const EdgeRecord) !CsrGraph {
+        // PSEUDOCODE:
+        // 1. Allocate degree arrays and count active edges/degrees
+        // 2. Allocate forward and reverse CSR slices
+        // 3. Compute offset prefix sums and populate edge entries
+        // 4. Return initialized CsrGraph
+        const n: u32 = @intCast(nodes.len);
+        const out_degree = try alloc.alloc(u32, n);
+        defer alloc.free(out_degree);
+        const in_degree = try alloc.alloc(u32, n);
+        defer alloc.free(in_degree);
+
+        const active_e = countActiveAndDegrees(nodes, edges, out_degree, in_degree);
+
+        const row_offsets = try alloc.alloc(u32, n + 1);
+        errdefer alloc.free(row_offsets);
+        const col_indices = try alloc.alloc(u32, active_e);
+        errdefer alloc.free(col_indices);
+        const edge_ids = try alloc.alloc(EdgeId, active_e);
+        errdefer alloc.free(edge_ids);
+        const rev_offsets = try alloc.alloc(u32, n + 1);
+        errdefer alloc.free(rev_offsets);
+        const rev_indices = try alloc.alloc(u32, active_e);
+        errdefer alloc.free(rev_indices);
+        const rev_edge_ids = try alloc.alloc(EdgeId, active_e);
+        errdefer alloc.free(rev_edge_ids);
+
+        row_offsets[0] = 0;
+        rev_offsets[0] = 0;
+        for (0..n) |i| {
+            row_offsets[i + 1] = row_offsets[i] + out_degree[i];
+            rev_offsets[i + 1] = rev_offsets[i] + in_degree[i];
+        }
+
+        try populateEdgeIndices(alloc, n, nodes, edges, row_offsets, rev_offsets, col_indices, edge_ids, rev_indices, rev_edge_ids);
 
         return .{
             .alloc = alloc,

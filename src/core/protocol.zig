@@ -141,7 +141,6 @@ pub const StopReason = enum {
     unknown,
 };
 
-
 /// Complete response from an AI backend.
 /// Call `deinit` when finished to free memory.
 pub const Response = struct {

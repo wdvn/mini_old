@@ -41,6 +41,8 @@ const json = @import("../core/json.zig");
 const utils = @import("../core/utils.zig");
 const main = @import("../main.zig");
 const hooks = @import("../core/hooks.zig");
+const signals = @import("../core/signals.zig");
+const builtin = @import("builtin");
 
 // ---------------------------------------------------------------------------
 // I/O helper
@@ -93,6 +95,7 @@ pub const McpServer = struct {
     /// Server name (from config).
     name: []const u8,
     child: Child,
+    child_pid: std.process.Child.Id = 0,
     stdin_file: std.Io.File,
     stdout_file: std.Io.File,
     /// List of discovered tools.
@@ -106,7 +109,13 @@ pub const McpServer = struct {
     /// Read 1 line from stdout_file (regardless of length), buffering 8KB chunks.
     /// Returns slice owned by caller (must free via self.alloc) or error.McpEof on EOF.
     fn readLine(self: *McpServer) ![]u8 {
+        var loop_count: usize = 0;
         while (true) {
+            if (signals.isInterrupted()) return error.Interrupted;
+            loop_count += 1;
+            if (loop_count % 50 == 0) {
+                std.Io.sleep(main.g_io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+            }
             if (std.mem.indexOfScalar(u8, self.recv_buf.items, '\n')) |idx| {
                 const raw_line = self.recv_buf.items[0..idx];
                 var end = idx;
@@ -141,9 +150,35 @@ pub const McpServer = struct {
         }
     }
 
+    fn dispatchError(self: *McpServer, method: []const u8, err: anyerror) void {
+        // PSEUDOCODE: Dispatch OnError hook event for this MCP method.
+        hooks.dispatch(self.alloc, main.g_io, .{
+            .event = "OnError",
+            .mcp_server = self.name,
+            .mcp_method = method,
+            .error_message = @errorName(err),
+        });
+    }
+
+    fn writeRequest(self: *McpServer, req: []const u8, method: []const u8) !void {
+        // PSEUDOCODE: Write request JSON and newline delimiter to server stdin.
+        self.stdin_file.writeStreamingAll(main.g_io, req) catch |e| {
+            self.dispatchError(method, e);
+            return e;
+        };
+        self.stdin_file.writeStreamingAll(main.g_io, "\n") catch |e| {
+            self.dispatchError(method, e);
+            return e;
+        };
+    }
+
     /// Send JSON-RPC request and synchronously read response.
     /// Returns JSON response string (owned).
     fn call(self: *McpServer, method: []const u8, params_json: ?[]const u8) ![]u8 {
+        // PSEUDOCODE:
+        // 1. Dispatch OnRequest hook event.
+        // 2. Format JSON-RPC 2.0 request payload and write to stdin.
+        // 3. Read response line and return trimmed slice.
         hooks.dispatch(self.alloc, main.g_io, .{
             .event = "OnRequest",
             .mcp_server = self.name,
@@ -164,32 +199,10 @@ pub const McpServer = struct {
             , .{ id, method });
         defer self.alloc.free(req);
 
-        self.stdin_file.writeStreamingAll(main.g_io, req) catch |e| {
-            hooks.dispatch(self.alloc, main.g_io, .{
-                .event = "OnError",
-                .mcp_server = self.name,
-                .mcp_method = method,
-                .error_message = @errorName(e),
-            });
-            return e;
-        };
-        self.stdin_file.writeStreamingAll(main.g_io, "\n") catch |e| {
-            hooks.dispatch(self.alloc, main.g_io, .{
-                .event = "OnError",
-                .mcp_server = self.name,
-                .mcp_method = method,
-                .error_message = @errorName(e),
-            });
-            return e;
-        };
+        try self.writeRequest(req, method);
 
         const line = self.readLine() catch |e| {
-            hooks.dispatch(self.alloc, main.g_io, .{
-                .event = "OnError",
-                .mcp_server = self.name,
-                .mcp_method = method,
-                .error_message = @errorName(e),
-            });
+            self.dispatchError(method, e);
             return e;
         };
         defer self.alloc.free(line);
@@ -224,62 +237,71 @@ pub const McpServer = struct {
         try self.notify("notifications/initialized");
     }
 
+    fn findNextJsonObject(text: []const u8, start_idx: usize) ?struct { obj: []const u8, next_idx: usize } {
+        // PSEUDOCODE: Scan string starting at start_idx for balanced { ... } object boundaries.
+        var i = start_idx;
+        while (i < text.len and text[i] != '{') : (i += 1) {}
+        if (i >= text.len) return null;
+
+        const obj_start = i;
+        var depth: i32 = 0;
+        while (i < text.len) : (i += 1) {
+            switch (text[i]) {
+                '"' => {
+                    i += 1;
+                    while (i < text.len) : (i += 1) {
+                        if (text[i] == '\\') {
+                            i += 1;
+                            continue;
+                        }
+                        if (text[i] == '"') break;
+                    }
+                },
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if (depth == 0) {
+                        return .{ .obj = text[obj_start .. i + 1], .next_idx = i + 1 };
+                    }
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn registerDiscoveredTool(self: *McpServer, tool_json: []const u8) !void {
+        // PSEUDOCODE: Extract tool name, description, schema, and append to server tools list.
+        const name = json.findString(tool_json, "name") orelse return;
+        const desc = json.findString(tool_json, "description") orelse "";
+        const schema = json.findObject(tool_json, "inputSchema") orelse "{}";
+
+        const prefixed = try std.fmt.allocPrint(self.alloc, "{s}__{s}", .{ self.name, name });
+        try self.tools.append(self.alloc, .{
+            .server_name = self.name,
+            .tool_name = try self.alloc.dupe(u8, name),
+            .prefixed_name = prefixed,
+            .description = try self.alloc.dupe(u8, desc),
+            .input_schema_json = try self.alloc.dupe(u8, schema),
+        });
+    }
+
     /// Discover tools from server via tools/list.
     pub fn discoverTools(self: *McpServer) !void {
+        // PSEUDOCODE:
+        // 1. Call tools/list on MCP server.
+        // 2. Parse result.tools JSON array.
+        // 3. Extract and register each tool object.
         const resp = try self.call("tools/list", "{}");
         defer self.alloc.free(resp);
 
-        // Parse tools array from result.tools
         const result_obj = json.findObject(resp, "result") orelse return;
         const tools_arr = json.findArray(result_obj, "tools") orelse return;
 
-        var i: usize = 1; // skip [
-        while (i < tools_arr.len) {
-            if (tools_arr[i] != '{') {
-                i += 1;
-                continue;
-            }
-
-            // Find object end
-            var depth: i32 = 0;
-            const obj_start = i;
-            while (i < tools_arr.len) : (i += 1) {
-                switch (tools_arr[i]) {
-                    '"' => {
-                        i += 1;
-                        while (i < tools_arr.len) : (i += 1) {
-                            if (tools_arr[i] == '\\') {
-                                i += 1;
-                                continue;
-                            }
-                            if (tools_arr[i] == '"') break;
-                        }
-                    },
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if (depth == 0) {
-                            i += 1;
-                            break;
-                        }
-                    },
-                    else => {},
-                }
-            }
-            const tool_json = tools_arr[obj_start..i];
-
-            const name = json.findString(tool_json, "name") orelse continue;
-            const desc = json.findString(tool_json, "description") orelse "";
-            const schema = json.findObject(tool_json, "inputSchema") orelse "{}";
-
-            const prefixed = try std.fmt.allocPrint(self.alloc, "{s}__{s}", .{ self.name, name });
-            try self.tools.append(self.alloc, .{
-                .server_name = self.name,
-                .tool_name = try self.alloc.dupe(u8, name),
-                .prefixed_name = prefixed,
-                .description = try self.alloc.dupe(u8, desc),
-                .input_schema_json = try self.alloc.dupe(u8, schema),
-            });
+        var idx: usize = 1; // skip [
+        while (findNextJsonObject(tools_arr, idx)) |match| {
+            try self.registerDiscoveredTool(match.obj);
+            idx = match.next_idx;
         }
 
         main.stderrPrint("[mcp] {s}: {d} tools discovered\n", .{ self.name, self.tools.items.len });
@@ -322,6 +344,26 @@ pub const McpServer = struct {
 
     /// Shut down server and release resources.
     pub fn shutdown(self: *McpServer) void {
+        // Close pipes first so the kernel doesn't re-close them on child exit.
+        self.stdin_file.close(main.g_io);
+        self.stdout_file.close(main.g_io);
+        self.child.stdin = null;
+        self.child.stdout = null;
+
+        if (self.child_pid > 0) {
+            if (comptime builtin.os.tag != .windows) {
+                _ = std.posix.kill(-self.child_pid, std.posix.SIG.TERM) catch {
+                    _ = std.posix.kill(self.child_pid, std.posix.SIG.TERM) catch {};
+                };
+                const deadline = utils.milliTimestamp() + 500;
+                while (utils.milliTimestamp() < deadline) {
+                    if (self.child.wait(main.g_io) catch null) |_| break;
+                }
+            }
+        }
+        if (self.child.id) |_| {
+            _ = self.child.wait(main.g_io) catch {};
+        }
         for (self.tools.items) |t| {
             self.alloc.free(t.tool_name);
             self.alloc.free(t.prefixed_name);
@@ -329,13 +371,6 @@ pub const McpServer = struct {
             self.alloc.free(t.input_schema_json);
         }
         self.tools.deinit(self.alloc);
-
-        // Close pipes then null-out handle on child
-        self.stdin_file.close(main.g_io);
-        self.stdout_file.close(main.g_io);
-        self.child.stdin = null;
-        self.child.stdout = null;
-        _ = self.child.wait(main.g_io) catch {};
 
         // Free argv items, recv_buf, and server name.
         self.recv_buf.deinit(self.alloc);
@@ -394,6 +429,10 @@ pub const McpClientManager = struct {
     }
 
     fn parseConfig(self: *McpClientManager, config_json: []const u8) void {
+        // PSEUDOCODE:
+        // 1. Locate servers JSON object
+        // 2. Scan each key (server name) and value (server config object)
+        // 3. Extract command and spawn server
         const servers_obj = json.findObject(config_json, "servers") orelse return;
 
         var i: usize = 1; // skip {
@@ -403,43 +442,14 @@ pub const McpClientManager = struct {
                 continue;
             }
 
-            // Server name
             const name_start = i + 1;
             const name_end = std.mem.indexOfScalarPos(u8, servers_obj, name_start, '"') orelse break;
             const server_name = servers_obj[name_start..name_end];
             i = name_end + 1;
 
-            // Skip to {
-            while (i < servers_obj.len and servers_obj[i] != '{') : (i += 1) {}
-            if (i >= servers_obj.len) break;
-
-            // Find server config object
-            var depth: i32 = 0;
-            const cfg_start = i;
-            while (i < servers_obj.len) : (i += 1) {
-                switch (servers_obj[i]) {
-                    '"' => {
-                        i += 1;
-                        while (i < servers_obj.len) : (i += 1) {
-                            if (servers_obj[i] == '\\') {
-                                i += 1;
-                                continue;
-                            }
-                            if (servers_obj[i] == '"') break;
-                        }
-                    },
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if (depth == 0) {
-                            i += 1;
-                            break;
-                        }
-                    },
-                    else => {},
-                }
-            }
-            const server_cfg = servers_obj[cfg_start..i];
+            const match = McpServer.findNextJsonObject(servers_obj, i) orelse break;
+            const server_cfg = match.obj;
+            i = match.next_idx;
 
             const command = json.findString(server_cfg, "command") orelse continue;
             self.spawnServer(server_name, command, server_cfg) catch |e| {
@@ -448,11 +458,13 @@ pub const McpClientManager = struct {
         }
     }
 
-    fn spawnServer(self: *McpClientManager, name: []const u8, command: []const u8, config_json: []const u8) !void {
-        // Build argv
+    fn parseArgvList(alloc: Allocator, command: []const u8, config_json: []const u8) ![]const []const u8 {
         var argv = ArrayList([]const u8).empty;
-        defer argv.deinit(self.alloc);
-        try argv.append(self.alloc, try self.alloc.dupe(u8, command));
+        errdefer {
+            for (argv.items) |arg| alloc.free(arg);
+            argv.deinit(alloc);
+        }
+        try argv.append(alloc, try alloc.dupe(u8, command));
 
         if (json.findArray(config_json, "args")) |args_arr| {
             var j: usize = 1;
@@ -467,13 +479,20 @@ pub const McpClientManager = struct {
                         }
                         if (args_arr[j] == '"') break;
                     }
-                    try argv.append(self.alloc, try self.alloc.dupe(u8, args_arr[arg_start..j]));
+                    try argv.append(alloc, try alloc.dupe(u8, args_arr[arg_start..j]));
                     j += 1;
                 } else j += 1;
             }
         }
+        return try argv.toOwnedSlice(alloc);
+    }
 
-        const argv_slice = try argv.toOwnedSlice(self.alloc);
+    fn spawnServer(self: *McpClientManager, name: []const u8, command: []const u8, config_json: []const u8) !void {
+        // PSEUDOCODE:
+        // 1. Build argv from command and args array
+        // 2. Spawn child process with piped stdin/stdout
+        // 3. Complete handshake and discover tools
+        const argv_slice = try parseArgvList(self.alloc, command, config_json);
 
         const child = try std.process.spawn(main.g_io, .{
             .argv = argv_slice,
@@ -486,6 +505,7 @@ pub const McpClientManager = struct {
             .alloc = self.alloc,
             .name = name_copy,
             .child = child,
+            .child_pid = if (child.id) |pid| pid else 0,
             .stdin_file = child.stdin.?,
             .stdout_file = child.stdout.?,
             .tools = .empty,
@@ -497,7 +517,11 @@ pub const McpClientManager = struct {
             server.shutdown();
             return;
         };
-        server.discoverTools() catch {};
+        server.discoverTools() catch |e| {
+            main.stderrPrint("[mcp] {s}: discoverTools failed ({s}), skipping.\n", .{ name, @errorName(e) });
+            server.shutdown();
+            return;
+        };
 
         try self.servers.append(self.alloc, server);
     }

@@ -1,17 +1,16 @@
-const std = @import("std");
-const json = @import("src/json.zig");
+//! test_parse.zig — Unit tests for JSON tool call chunk parsing.
 
-pub fn main() !void {
+const std = @import("std");
+const testing = std.testing;
+const mini = @import("mini");
+const json = mini.json_mod;
+
+test "json parse: tool_calls chunk id extraction" {
     const chunk = "{\"tool_calls\":[{\"index\":0,\"id\":\"call_A\",\"type\":\"function\",\"function\":{\"name\":\"http_request\",\"arguments\":\"\"}}]}";
-    
-    if (json.findArray(chunk, "tool_calls")) |tc_arr| {
-        std.debug.print("tc_arr: {s}\n", .{tc_arr});
-        if (json.findString(tc_arr, "id")) |id| {
-            std.debug.print("id: {s}\n", .{id});
-        } else {
-            std.debug.print("id NOT FOUND\n", .{});
-        }
-    } else {
-        std.debug.print("tc_arr NOT FOUND\n", .{});
-    }
+
+    const tc_arr = json.findArray(chunk, "tool_calls");
+    try testing.expect(tc_arr != null);
+    const id = json.findString(tc_arr.?, "id");
+    try testing.expect(id != null);
+    try testing.expectEqualStrings("call_A", id.?);
 }

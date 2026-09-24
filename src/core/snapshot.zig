@@ -193,69 +193,84 @@ const WRITE_VERBS = [_][]const u8{
     "git stash",
 };
 
+fn extractRedirectPath(arena: Allocator, paths: *std.ArrayListUnmanaged([]const u8), seg: []const u8) !void {
+    // PSEUDOCODE:
+    // 1. Locate '>' character in segment.
+    // 2. Skip consecutive '>' chars (e.g. '>>').
+    // 3. Extract target token, strip quotes, and append if valid path.
+    const gt = std.mem.indexOf(u8, seg, ">") orelse return;
+    var i = gt;
+    while (i < seg.len and seg[i] == '>') i += 1;
+    const rest = std.mem.trim(u8, seg[i..], " \t");
+    var tok = std.mem.tokenizeAny(u8, rest, " \t");
+    if (tok.next()) |target| {
+        const cleaned = stripQuotes(target);
+        if (looksLikePath(cleaned) and !isDevNull(cleaned)) {
+            try appendUnique(arena, paths, cleaned);
+        }
+    }
+}
+
+fn extractTeePaths(arena: Allocator, paths: *std.ArrayListUnmanaged([]const u8), seg: []const u8) !void {
+    // PSEUDOCODE:
+    // 1. Check if segment contains "tee ".
+    // 2. Tokenize and extract target files, ignoring options like -a, -i.
+    if (std.mem.indexOf(u8, seg, "tee ") == null and std.mem.indexOf(u8, seg, "tee\t") == null) return;
+    var tok = std.mem.tokenizeAny(u8, seg, " \t");
+    while (tok.next()) |t| {
+        if (std.mem.eql(u8, t, "tee") or std.mem.eql(u8, t, "-a") or std.mem.eql(u8, t, "-i")) continue;
+        if (t.len > 0 and t[0] == '-') continue;
+        const cleaned = stripQuotes(t);
+        if (looksLikePath(cleaned) and !isDevNull(cleaned)) {
+            try appendUnique(arena, paths, cleaned);
+            break;
+        }
+    }
+}
+
+fn extractVerbPaths(arena: Allocator, paths: *std.ArrayListUnmanaged([]const u8), seg: []const u8) !void {
+    // PSEUDOCODE:
+    // 1. Check against WRITE_VERBS.
+    // 2. Tokenize tokens after verb; for mv/cp skip source file (count 0).
+    // 3. Append valid paths.
+    for (WRITE_VERBS) |verb| {
+        const idx = std.mem.indexOf(u8, seg, verb) orelse continue;
+        const after = seg[idx + verb.len ..];
+        var tok = std.mem.tokenizeAny(u8, after, " \t");
+        var count: usize = 0;
+        while (tok.next()) |t| {
+            defer count += 1;
+            if (t.len == 0 or t[0] == '-') continue;
+            const cleaned = stripQuotes(t);
+            if (isDevNull(cleaned)) continue;
+            if ((std.mem.startsWith(u8, verb, "mv ") or std.mem.startsWith(u8, verb, "cp ")) and count == 0) continue;
+            if (looksLikePath(cleaned) or std.mem.indexOfScalar(u8, cleaned, '/') != null) {
+                try appendUnique(arena, paths, cleaned);
+            }
+        }
+        break;
+    }
+}
+
 /// Extract paths at risk of being modified by bash command.
 /// Returns slice allocated from arena — caller does not need to free elements individually.
 pub fn extractWritablePaths(arena: std.mem.Allocator, command: []const u8) ![][]const u8 {
+    // PSEUDOCODE:
+    // 1. Split command into lines and segments by delimiters (&, ;, |).
+    // 2. Extract paths from redirections (>), tee, and write verbs.
+    // 3. Return unique paths as owned slice.
     var paths = std.ArrayListUnmanaged([]const u8).empty;
 
     var lines = std.mem.splitScalar(u8, command, '\n');
     while (lines.next()) |line| {
-        // Split by '&&', ';', '|'
         var segs = std.mem.tokenizeAny(u8, line, "&;|");
         while (segs.next()) |seg_raw| {
             const seg = std.mem.trim(u8, seg_raw, " \t");
             if (seg.len == 0) continue;
 
-            // 1. Redirect: > file, >> file, 2> file
-            if (std.mem.indexOf(u8, seg, ">")) |gt| {
-                // Skip 2> / &>
-                var i = gt;
-                while (i < seg.len and seg[i] == '>') i += 1;
-                const rest = std.mem.trim(u8, seg[i..], " \t");
-                var tok = std.mem.tokenizeAny(u8, rest, " \t");
-                if (tok.next()) |target| {
-                    const cleaned = stripQuotes(target);
-                    if (looksLikePath(cleaned) and !isDevNull(cleaned)) {
-                        try appendUnique(arena, &paths, cleaned);
-                    }
-                }
-            }
-
-            // 2. tee <file>
-            if (std.mem.indexOf(u8, seg, "tee ") != null or std.mem.indexOf(u8, seg, "tee\t") != null) {
-                var tok = std.mem.tokenizeAny(u8, seg, " \t");
-                while (tok.next()) |t| {
-                    if (std.mem.eql(u8, t, "tee") or std.mem.eql(u8, t, "-a") or std.mem.eql(u8, t, "-i")) continue;
-                    if (t.len > 0 and t[0] == '-') continue;
-                    const cleaned = stripQuotes(t);
-                    if (looksLikePath(cleaned) and !isDevNull(cleaned)) {
-                        try appendUnique(arena, &paths, cleaned);
-                        break;
-                    }
-                }
-            }
-
-            // 3. Verb + path arguments: mv/cp/rm/touch/sed -i...
-            for (WRITE_VERBS) |verb| {
-                if (std.mem.indexOf(u8, seg, verb)) |_| {
-                    // Get tokens after verb
-                    const after = seg[std.mem.indexOf(u8, seg, verb).? + verb.len ..];
-                    var tok = std.mem.tokenizeAny(u8, after, " \t");
-                    var count: usize = 0;
-                    while (tok.next()) |t| {
-                        defer count += 1;
-                        if (t.len == 0 or t[0] == '-') continue;
-                        const cleaned = stripQuotes(t);
-                        if (isDevNull(cleaned)) continue;
-                        // For mv/cp: skip first source (count 0 is src), target is count 1
-                        if ((std.mem.startsWith(u8, verb, "mv ") or std.mem.startsWith(u8, verb, "cp ")) and count == 0) continue;
-                        if (looksLikePath(cleaned) or std.mem.indexOfScalar(u8, cleaned, '/') != null) {
-                            try appendUnique(arena, &paths, cleaned);
-                        }
-                    }
-                    break; // 1 verb match is sufficient for this segment
-                }
-            }
+            try extractRedirectPath(arena, &paths, seg);
+            try extractTeePaths(arena, &paths, seg);
+            try extractVerbPaths(arena, &paths, seg);
         }
     }
     return paths.toOwnedSlice(arena);

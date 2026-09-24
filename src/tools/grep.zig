@@ -138,7 +138,10 @@ fn containsCI(haystack: []const u8, needle: []const u8) bool {
         for (0..needle.len) |j| {
             const h = std.ascii.toLower(haystack[i + j]);
             const n = std.ascii.toLower(needle[j]);
-            if (h != n) { match = false; break; }
+            if (h != n) {
+                match = false;
+                break;
+            }
         }
         if (match) return true;
     }
@@ -148,10 +151,10 @@ fn containsCI(haystack: []const u8, needle: []const u8) bool {
 /// Check if filename extension suggests binary content.
 fn isBinaryName(name: []const u8) bool {
     const binary_exts = [_][]const u8{
-        ".o", ".a", ".so", ".dylib", ".dll", ".exe",
-        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico",
-        ".zip", ".tar", ".gz", ".bz2", ".xz",
-        ".pdf", ".bin", ".wasm",
+        ".o",   ".a",    ".so",   ".dylib", ".dll", ".exe",
+        ".png", ".jpg",  ".jpeg", ".gif",   ".bmp", ".ico",
+        ".zip", ".tar",  ".gz",   ".bz2",   ".xz",  ".pdf",
+        ".bin", ".wasm",
     };
     for (binary_exts) |ext| {
         if (std.mem.endsWith(u8, name, ext)) return true;

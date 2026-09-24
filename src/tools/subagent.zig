@@ -37,41 +37,79 @@ pub fn getMaxDepth() usize {
     return DEFAULT_MAX_SUBAGENT_DEPTH;
 }
 
+fn resolveSubagentTask(alloc: Allocator, input_json: []const u8) !?[]u8 {
+    // PSEUDOCODE: Extract task description from task, prompt, instruction, or description field.
+    return (try json.findStringOwned(alloc, input_json, "task")) orelse
+        (try json.findStringOwned(alloc, input_json, "prompt")) orelse
+        (try json.findStringOwned(alloc, input_json, "instruction")) orelse
+        (try json.findStringOwned(alloc, input_json, "description"));
+}
+
+fn drainChildPipes(io: std.Io, alloc: Allocator, child: *std.process.Child, stdout_buf: *std.ArrayListUnmanaged(u8), stderr_buf: *std.ArrayListUnmanaged(u8)) void {
+    // PSEUDOCODE: Concurrently drain stderr in background thread while reading stdout in main thread.
+    const stderr_thread = if (child.stderr) |err_pipe|
+        std.Thread.spawn(.{}, drainAndStreamStderr, .{ io, err_pipe, stderr_buf, alloc }) catch null
+    else
+        null;
+
+    if (child.stdout) |out_pipe| {
+        _ = drainAndStream(io, out_pipe, stdout_buf, alloc, "subagent");
+    }
+
+    if (stderr_thread) |t| {
+        t.join();
+    } else if (child.stderr) |err_pipe| {
+        _ = drainAndStream(io, err_pipe, stderr_buf, alloc, "subagent:err");
+    }
+}
+
+fn formatSubagentResult(alloc: Allocator, term: std.process.Child.Term, stdout_buf: []const u8, stderr_buf: []const u8) ![]u8 {
+    // PSEUDOCODE: Format result message based on termination status and captured output.
+    switch (term) {
+        .exited => |code| {
+            if (code != 0) {
+                const err_detail = if (stderr_buf.len > 0) stderr_buf else stdout_buf;
+                return std.fmt.allocPrint(alloc, "Subagent terminated with error code: {d}. Details: {s}", .{ code, err_detail });
+            }
+        },
+        else => {
+            const err_detail = if (stderr_buf.len > 0) stderr_buf else stdout_buf;
+            return std.fmt.allocPrint(alloc, "Subagent crashed or was killed. Details: {s}", .{err_detail});
+        },
+    }
+
+    if (stdout_buf.len == 0) {
+        return std.fmt.allocPrint(alloc, "Subagent completed successfully but returned no content.", .{});
+    }
+    return alloc.dupe(u8, stdout_buf);
+}
+
 pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
+    // PSEUDOCODE:
+    // 1. Guard against exceeding maximum subagent depth.
+    // 2. Extract task string and propagate depth in environment.
+    // 3. Spawn child mini process and drain pipes concurrently.
+    // 4. Format and return outcome.
     const current_depth = getCurrentDepth();
     const max_depth = getMaxDepth();
-
     if (current_depth >= max_depth) {
         return std.fmt.allocPrint(alloc, "Error: Maximum subagent depth limit reached (depth={d}/{d}). Cannot spawn further subagents.", .{ current_depth, max_depth });
     }
 
-    const task = (try json.findStringOwned(alloc, input_json, "task")) orelse
-        (try json.findStringOwned(alloc, input_json, "prompt")) orelse
-        (try json.findStringOwned(alloc, input_json, "instruction")) orelse
-        (try json.findStringOwned(alloc, input_json, "description")) orelse {
+    const task = (try resolveSubagentTask(alloc, input_json)) orelse
         return std.fmt.allocPrint(alloc, "Error: missing 'task' parameter", .{});
-    };
     defer alloc.free(task);
 
-    // Set depth for child process inheritance via environ_map passed into spawn.
     var depth_buf: [16]u8 = undefined;
     const next_depth_str = std.fmt.bufPrintZ(&depth_buf, "{d}", .{current_depth + 1}) catch "1";
     const env_map = main.getEnvironMap();
     const prev_depth = if (env_map) |em| em.get("MINI_SUBAGENT_DEPTH") else null;
-    if (env_map) |em| {
-        em.put("MINI_SUBAGENT_DEPTH", next_depth_str) catch {};
-    }
+    if (env_map) |em| em.put("MINI_SUBAGENT_DEPTH", next_depth_str) catch {};
     defer {
-        if (env_map) |em| {
-            // Restore previous value; if absent, set "0" (not a subagent).
-            const restore = prev_depth orelse "0";
-            em.put("MINI_SUBAGENT_DEPTH", restore) catch {};
-        }
+        if (env_map) |em| em.put("MINI_SUBAGENT_DEPTH", prev_depth orelse "0") catch {};
     }
 
-    const exe_path = "/proc/self/exe";
-    const argv = [_][]const u8{ exe_path, "-e", task };
-
+    const argv = [_][]const u8{ "/proc/self/exe", "-e", task };
     var child = try std.process.spawn(io, .{
         .argv = &argv,
         .stdout = .pipe,
@@ -80,50 +118,14 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         .environ_map = env_map,
     });
 
-    // Buffer complete output for the agent (bounded by MAX_OUTPUT, excess drained).
     var stdout_buf = std.ArrayListUnmanaged(u8).empty;
     defer stdout_buf.deinit(alloc);
     var stderr_buf = std.ArrayListUnmanaged(u8).empty;
     defer stderr_buf.deinit(alloc);
 
-    // Concurrently read stderr alongside stdout to avoid pipe deadlock.
-    const stderr_thread = if (child.stderr) |err_pipe|
-        std.Thread.spawn(.{}, drainAndStreamStderr, .{ io, err_pipe, &stderr_buf, alloc }) catch null
-    else
-        null;
-
-    // Main thread reads + streams stdout.
-    if (child.stdout) |out_pipe| {
-        _ = drainAndStream(io, out_pipe, &stdout_buf, alloc, "subagent");
-    }
-
-    // Await stderr thread completion.
-    if (stderr_thread) |t| {
-        t.join();
-    } else if (child.stderr) |err_pipe| {
-        _ = drainAndStream(io, err_pipe, &stderr_buf, alloc, "subagent:err");
-    }
-
+    drainChildPipes(io, alloc, &child, &stdout_buf, &stderr_buf);
     const term = try child.wait(io);
-
-    switch (term) {
-        .exited => |code| {
-            if (code != 0) {
-                const err_detail = if (stderr_buf.items.len > 0) stderr_buf.items else stdout_buf.items;
-                return std.fmt.allocPrint(alloc, "Subagent terminated with error code: {d}. Details: {s}", .{ code, err_detail });
-            }
-        },
-        else => {
-            const err_detail = if (stderr_buf.items.len > 0) stderr_buf.items else stdout_buf.items;
-            return std.fmt.allocPrint(alloc, "Subagent crashed or was killed. Details: {s}", .{err_detail});
-        },
-    }
-
-    if (stdout_buf.items.len == 0) {
-        return std.fmt.allocPrint(alloc, "Subagent completed successfully but returned no content.", .{});
-    }
-
-    return alloc.dupe(u8, stdout_buf.items);
+    return formatSubagentResult(alloc, term, stdout_buf.items, stderr_buf.items);
 }
 
 // ---------------------------------------------------------------------------

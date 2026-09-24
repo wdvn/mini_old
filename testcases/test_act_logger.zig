@@ -1,3 +1,5 @@
+//! test_act_logger.zig — Unit tests for act logging and JSON persistence.
+
 const std = @import("std");
 const testing = std.testing;
 const mini = @import("mini");

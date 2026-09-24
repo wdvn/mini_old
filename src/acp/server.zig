@@ -289,7 +289,33 @@ pub const AcpServer = struct {
         try self.sendResult(id_opt, "{}");
     }
 
+    fn executeAgentPrompt(self: *AcpServer, expanded_prompt: []const u8) []const u8 {
+        var stop_reason: []const u8 = "end_turn";
+        self.agent.processInput(expanded_prompt, acpTextCallback, acpThinkCallback) catch |e| {
+            main.stderrPrint("[acp] Agent error during prompt: {s}\n", .{@errorName(e)});
+            stop_reason = switch (e) {
+                error.LLMRateLimitExceeded => "rate_limited",
+                error.LLMProviderUnavailable => "provider_unavailable",
+                else => "error",
+            };
+        };
+        if (self.is_cancelled) return "cancelled";
+        return stop_reason;
+    }
+
+    fn backupCurrentSession(self: *AcpServer) void {
+        const sid = self.current_session_id orelse return;
+        const session_file_path = self.resolveSessionFilePath(sid) catch return;
+        defer self.alloc.free(session_file_path);
+        self.agent.history.backupToFile(self.io, session_file_path) catch {};
+    }
+
     fn handleSessionPrompt(self: *AcpServer, id_opt: ?JsonId, params_json: ?[]const u8) !void {
+        // PSEUDOCODE:
+        // 1. Validate params and extract prompt text
+        // 2. Expand any @artifact references in prompt
+        // 3. Run agent prompt execution with callbacks
+        // 4. Back up session history and return stopReason result
         const params = params_json orelse {
             try self.sendError(id_opt, -32602, "Missing params");
             return;
@@ -303,38 +329,17 @@ pub const AcpServer = struct {
             return;
         }
 
-        // Expand @artifact references if present
         const expanded_prompt = try artifacts_mod.expandArtifactReferences(self.alloc, self.io, prompt_text);
         defer self.alloc.free(expanded_prompt);
 
-        // Activate active server for callbacks
         g_active_server = self;
         self.is_cancelled = false;
         defer {
             g_active_server = null;
         }
 
-        // Run agent loop
-        var stop_reason: []const u8 = "end_turn";
-        self.agent.processInput(expanded_prompt, acpTextCallback, acpThinkCallback) catch |e| {
-            main.stderrPrint("[acp] Agent error during prompt: {s}\n", .{@errorName(e)});
-            stop_reason = switch (e) {
-                error.LLMRateLimitExceeded => "rate_limited",
-                error.LLMProviderUnavailable => "provider_unavailable",
-                else => "error",
-            };
-        };
-
-        if (self.is_cancelled) {
-            stop_reason = "cancelled";
-        }
-
-        // Automatically back up session history
-        if (self.current_session_id) |sid| {
-            const session_file_path = try self.resolveSessionFilePath(sid);
-            defer self.alloc.free(session_file_path);
-            self.agent.history.backupToFile(self.io, session_file_path) catch {};
-        }
+        const stop_reason = self.executeAgentPrompt(expanded_prompt);
+        self.backupCurrentSession();
 
         const result_json = try std.fmt.allocPrint(self.alloc, "{{\"stopReason\":\"{s}\"}}", .{stop_reason});
         defer self.alloc.free(result_json);
@@ -617,68 +622,62 @@ pub fn findInteger(json_text: []const u8, key: []const u8) ?i64 {
     return std.fmt.parseInt(i64, json_text[start..i], 10) catch null;
 }
 
+fn extractTextFromArray(alloc: Allocator, arr: []const u8) !?[]u8 {
+    var result = utils.BufWriter.init(alloc);
+    defer result.deinit();
+
+    var i: usize = 0;
+    while (i < arr.len) : (i += 1) {
+        if (arr[i] != '{') continue;
+        const obj_start = i;
+        var depth: i32 = 0;
+        while (i < arr.len) : (i += 1) {
+            switch (arr[i]) {
+                '"' => {
+                    i += 1;
+                    while (i < arr.len) : (i += 1) {
+                        if (arr[i] == '\\') {
+                            i += 1;
+                            continue;
+                        }
+                        if (arr[i] == '"') break;
+                    }
+                },
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if (depth == 0) break;
+                },
+                else => {},
+            }
+        }
+        if (i < arr.len) {
+            const item_json = arr[obj_start .. i + 1];
+            if (json_mod.findString(item_json, "text")) |txt| {
+                if (result.list.items.len > 0) try result.writeAll("\n");
+                try result.writeAll(txt);
+            }
+        }
+    }
+
+    if (result.list.items.len > 0) {
+        return try alloc.dupe(u8, result.list.items);
+    }
+    return null;
+}
+
 /// Extract text from prompt in params (supports prompt array, content array, or plain string).
 pub fn extractPromptText(alloc: Allocator, params_json: []const u8) ![]u8 {
-    // 1. Check array params.prompt or params.content first
     const arr_json = json_mod.findArray(params_json, "prompt") orelse
         json_mod.findArray(params_json, "content") orelse null;
 
     if (arr_json) |arr| {
-        var result = utils.BufWriter.init(alloc);
-        defer result.deinit();
-
-        var i: usize = 0;
-        while (i < arr.len) : (i += 1) {
-            if (arr[i] != '{') continue;
-            const obj_start = i;
-            var depth: i32 = 0;
-            while (i < arr.len) : (i += 1) {
-                switch (arr[i]) {
-                    '"' => {
-                        i += 1;
-                        while (i < arr.len) : (i += 1) {
-                            if (arr[i] == '\\') { i += 1; continue; }
-                            if (arr[i] == '"') break;
-                        }
-                    },
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if (depth == 0) break;
-                    },
-                    else => {},
-                }
-            }
-            if (i < arr.len) {
-                const item_json = arr[obj_start .. i + 1];
-                if (json_mod.findString(item_json, "text")) |txt| {
-                    if (result.list.items.len > 0) {
-                        try result.writeAll("\n");
-                    }
-                    try result.writeAll(txt);
-                }
-            }
-        }
-
-        if (result.list.items.len > 0) {
-            return try alloc.dupe(u8, result.list.items);
-        }
+        if (try extractTextFromArray(alloc, arr)) |txt| return txt;
     }
 
-    // 2. Check direct params.prompt string
-    if (json_mod.findString(params_json, "prompt")) |pr| {
-        return try alloc.dupe(u8, pr);
-    }
-
-    // 3. Check direct params.message string
-    if (json_mod.findString(params_json, "message")) |msg| {
-        return try alloc.dupe(u8, msg);
-    }
-
-    // 4. Check direct params.text string
-    if (json_mod.findString(params_json, "text")) |txt| {
-        return try alloc.dupe(u8, txt);
-    }
+    if (json_mod.findString(params_json, "prompt")) |pr| return try alloc.dupe(u8, pr);
+    if (json_mod.findString(params_json, "message")) |msg| return try alloc.dupe(u8, msg);
+    if (json_mod.findString(params_json, "text")) |txt| return try alloc.dupe(u8, txt);
 
     return try alloc.dupe(u8, "");
 }

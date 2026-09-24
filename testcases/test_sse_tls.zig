@@ -2,8 +2,8 @@
 //! via lib/http_request.zig (postStream) when calling OPENAI_COMPAT_URL. Run: zig run test_sse_tls.zig
 
 const std = @import("std");
-const main_mod = @import("src/main.zig");
-const sse = @import("src/lib/http_request.zig");
+const main_mod = @import("mini");
+const sse = main_mod.http_request;
 
 var sink_buffer: [4096]u8 = undefined;
 var total: usize = 0;

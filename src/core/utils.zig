@@ -164,6 +164,21 @@ pub fn formatDuration(buf: []u8, duration_ms: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}h {d}m {d}s", .{ h, m, s }) catch "0h";
 }
 
+/// Check whether a word appears in text with word boundary checks (case-insensitive ASCII).
+/// Ensures that matching "plan" will not match "explanation" or "plant".
+pub fn hasWordIgnoreCase(text: []const u8, word: []const u8) bool {
+    if (text.len < word.len) return false;
+    var i: usize = 0;
+    while (i + word.len <= text.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(text[i .. i + word.len], word)) {
+            const prev_ok = (i == 0) or !std.ascii.isAlphanumeric(text[i - 1]);
+            const next_ok = (i + word.len == text.len) or !std.ascii.isAlphanumeric(text[i + word.len]);
+            if (prev_ok and next_ok) return true;
+        }
+    }
+    return false;
+}
+
 test "formatDuration formats ms, s, m, h" {
     var buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("12ms", formatDuration(&buf, 12));
@@ -176,5 +191,10 @@ test "formatDuration formats ms, s, m, h" {
     try std.testing.expectEqualStrings("1h 5m 12s", formatDuration(&buf, 3912000));
 }
 
-
-
+test "hasWordIgnoreCase word boundary detection" {
+    try std.testing.expect(hasWordIgnoreCase("## Implementation Plan", "plan"));
+    try std.testing.expect(hasWordIgnoreCase("Plan:", "plan"));
+    try std.testing.expect(hasWordIgnoreCase("action PLAN for next steps", "plan"));
+    try std.testing.expect(!hasWordIgnoreCase("Here is an explanation of the bug", "plan"));
+    try std.testing.expect(!hasWordIgnoreCase("water the plant", "plan"));
+}

@@ -39,7 +39,7 @@ fn isCombining(cp: u21) bool {
         0x0730...0x074A,
         0x07A6...0x07B0,
         0x0900...0x0903,
-        0x093A...0x094F, // включает े ् cho Devanagari
+        0x093A...0x094F, // Includes Devanagari signs and virama (0x093A...0x094F)
         0x0951...0x0957,
         0x0E31,
         0x0E34...0x0E3A, // Thai vowels
@@ -52,8 +52,9 @@ fn isCombining(cp: u21) bool {
         0x101FD,
         0x1D167...0x1D169,
         0x1D17B...0x1D182,
-        0x1F3FB...0x1F3FF, // Emoji skin tone modifiers — zero-width theo UAX #11
-        0xE0100...0xE01EF, => true, // Variation Selectors Supplement
+        0x1F3FB...0x1F3FF, // Emoji skin tone modifiers — zero-width per UAX #11
+        0xE0100...0xE01EF,
+        => true, // Variation Selectors Supplement
         else => false,
     };
 }
@@ -66,8 +67,7 @@ fn isJoinControl(cp: u21) bool {
     return cp == 0x200C or cp == 0x200D;
 }
 
-/// Check if codepoint belongs to emoji group (wide presentation, width 2).
-fn isEmojiWide(cp: u21) bool {
+fn isBmpEmojiWide(cp: u21) bool {
     return switch (cp) {
         0x231A...0x231B, // watch, hourglass
         0x23E9...0x23EC,
@@ -102,6 +102,13 @@ fn isEmojiWide(cp: u21) bool {
         0x2B1B...0x2B1C,
         0x2B50,
         0x2B55,
+        => true,
+        else => false,
+    };
+}
+
+fn isSmpEmojiPart1(cp: u21) bool {
+    return switch (cp) {
         0x1F004,
         0x1F0CF,
         0x1F18E,
@@ -129,7 +136,15 @@ fn isEmojiWide(cp: u21) bool {
         0x1F57A,
         0x1F595...0x1F596,
         0x1F5A4,
-        0x1F5FB...0x1F64F,
+        0x1F5FB...0x1F5FF,
+        => true,
+        else => false,
+    };
+}
+
+fn isSmpEmojiPart2(cp: u21) bool {
+    return switch (cp) {
+        0x1F600...0x1F64F,
         0x1F680...0x1F6C5,
         0x1F6CC,
         0x1F6D0...0x1F6D2,
@@ -146,9 +161,26 @@ fn isEmojiWide(cp: u21) bool {
         0x1FA70...0x1FA73,
         0x1FA78...0x1FA7A,
         0x1FA80...0x1FA82,
-        0x1FA90...0x1FA95, => true,
+        0x1FA90...0x1FA95,
+        => true,
         else => false,
     };
+}
+
+fn isSmpEmojiWide(cp: u21) bool {
+    // PSEUDOCODE:
+    // 1. Check if codepoint falls in first half of SMP emoji ranges
+    // 2. Otherwise check second half of SMP emoji ranges
+    return isSmpEmojiPart1(cp) or isSmpEmojiPart2(cp);
+}
+
+/// Check if codepoint belongs to emoji group (wide presentation, width 2).
+fn isEmojiWide(cp: u21) bool {
+    // PSEUDOCODE:
+    // 1. If cp is in Basic Multilingual Plane (< 0x10000), check BMP emoji ranges.
+    // 2. Otherwise check Supplementary Multilingual Plane emoji ranges.
+    if (cp < 0x10000) return isBmpEmojiWide(cp);
+    return isSmpEmojiWide(cp);
 }
 
 /// East Asian Wide / Fullwidth → width 2.
@@ -170,7 +202,8 @@ fn isEastAsianWide(cp: u21) bool {
         0x1F300...0x1F64F, // emoji overlap (width 2)
         0x1F900...0x1F9FF,
         0x20000...0x2FFFD, // CJK Ext B..
-        0x30000...0x3FFFD, => true,
+        0x30000...0x3FFFD,
+        => true,
         else => false,
     };
 }
@@ -329,7 +362,8 @@ fn isWordChar(cp: u21) bool {
         0x0400...0x04FF, // Cyrillic
         0x4E00...0x9FFF,
         0x3040...0x30FF,
-        0xAC00...0xD7A3, => true,
+        0xAC00...0xD7A3,
+        => true,
         else => !isCombining(cp) and !isEmojiWide(cp) and cp >= 0x80,
     };
 }
@@ -385,4 +419,3 @@ test "visibleWidth strips ANSI escapes" {
     try std.testing.expectEqual(@as(usize, 6), visibleWidth("\x1b[1;34mYou\x1b[0m > "));
     try std.testing.expectEqual(@as(usize, 5), visibleWidth("\x1b[31mhello\x1b[0m"));
 }
-

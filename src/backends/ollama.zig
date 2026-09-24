@@ -45,6 +45,34 @@ pub const Client = struct {
         return .{ .alloc = alloc, .base_url = base_url, .model = model, .max_tokens = max_tokens };
     }
 
+    fn getIdleTimeoutSecs() u32 {
+        const s = utils.getEnvSlice("MINI_WATCHDOG_ENABLED") orelse return 30;
+        const v = std.mem.trim(u8, s, " \t");
+        const disabled = std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "off");
+        return if (disabled) 0 else 30;
+    }
+
+    fn finalizeResponse(self: *Client, ctx: *StreamCtx, req_http_code: u32, idle_aborted: bool) !proto.Response {
+        _ = self;
+        ctx.response.http_code = req_http_code;
+        if (idle_aborted) ctx.response.stop_reason = .stream_aborted;
+
+        if (ctx.text_accum.items.len > 0) {
+            const text = try ctx.alloc.dupe(u8, ctx.text_accum.items);
+            try ctx.response.content.append(ctx.alloc, .{ .text = text });
+        }
+        if (req_http_code >= 400 or ctx.response.stop_reason == .unknown) {
+            if (ctx.raw_accum_init and ctx.response.raw_debug_info == null) {
+                ctx.response.raw_debug_info = ctx.alloc.dupe(u8, ctx.raw_accum.items) catch null;
+            }
+        }
+        if (ctx.raw_accum_init) ctx.raw_accum.deinit(ctx.alloc);
+        if (req_http_code < 400 and ctx.response.stop_reason == .unknown) {
+            ctx.response.stop_reason = .end_turn;
+        }
+        return ctx.response;
+    }
+
     /// Sends messages and receives streaming NDJSON response.
     pub fn sendMessage(
         self: *Client,
@@ -54,11 +82,15 @@ pub const Client = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !proto.Response {
+        // PSEUDOCODE:
+        // 1. Build request body and endpoint URL
+        // 2. Setup streaming context and watchdog
+        // 3. Post HTTP request and parse NDJSON stream
+        // 4. Finalize and return proto.Response
         _ = think_cb;
         const body = try buildRequestBody(self.alloc, self.model, system_prompt, msgs, tools);
         defer self.alloc.free(body);
 
-        // Build endpoint URL
         var url_buf: [512]u8 = undefined;
         const base_no_slash = std.mem.trimEnd(u8, self.base_url, "/");
         const url = std.fmt.bufPrint(&url_buf, "{s}/api/chat", .{base_no_slash}) catch return error.UrlBufOverflow;
@@ -76,58 +108,70 @@ pub const Client = struct {
         errdefer if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
 
         const headers = [_][]const u8{"Content-Type: application/json"};
-        // RFC-009 Phase 5: stream stall watchdog (fixed 30s idle; Ollama is
-        // local so a longer silence means the model/server is wedged).
-        // MINI_WATCHDOG_ENABLED=0 disables the idle stall watchdog.
-        const watchdog_enabled: bool = blk: {
-            if (utils.getEnvSlice("MINI_WATCHDOG_ENABLED")) |s| {
-                const v = std.mem.trim(u8, s, " \t");
-                break :blk !(std.mem.eql(u8, v, "0") or
-                    std.mem.eql(u8, v, "false") or
-                    std.mem.eql(u8, v, "off"));
-            }
-            break :blk true;
-        };
-        const idle_timeout_secs: u32 = if (watchdog_enabled) 30 else 0;
         var idle_aborted = false;
         const stream_result = http_lib.postStream(self.alloc, main.g_io, .{
             .url = url,
             .headers = &headers,
             .body = body,
-            .idle_timeout_secs = idle_timeout_secs,
+            .idle_timeout_secs = getIdleTimeoutSecs(),
             .out_idle_aborted = &idle_aborted,
         }, StreamCtx.onChunk, &ctx);
+
         const req_http_code = if (stream_result) |c| c else |e| switch (e) {
             error.StreamIdleTimeout => 598,
             else => return e,
         };
 
-        ctx.response.http_code = req_http_code;
-        if (idle_aborted) ctx.response.stop_reason = .stream_aborted;
-
-        // Save remaining text
-        if (ctx.text_accum.items.len > 0) {
-            const text = try self.alloc.dupe(u8, ctx.text_accum.items);
-            try ctx.response.content.append(ctx.alloc, .{ .text = text });
-        }
-        if (req_http_code >= 400 or ctx.response.stop_reason == .unknown) {
-            if (ctx.raw_accum_init and ctx.response.raw_debug_info == null) {
-                ctx.response.raw_debug_info = ctx.alloc.dupe(u8, ctx.raw_accum.items) catch null;
-            }
-        }
-        if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
-
-        if (req_http_code < 400 and ctx.response.stop_reason == .unknown) {
-            ctx.response.stop_reason = .end_turn;
-        }
-
-        return ctx.response;
+        return self.finalizeResponse(&ctx, req_http_code, idle_aborted);
     }
 };
 
 // ---------------------------------------------------------------------------
 // Request building
 // ---------------------------------------------------------------------------
+
+fn appendOllamaTools(w: *utils.BufWriter, tools: []const proto.ToolDefinition) !void {
+    if (tools.len == 0) return;
+    try w.writeAll(",\"tools\":[");
+    for (tools, 0..) |td, ti| {
+        if (ti > 0) try w.writeByte(',');
+        try w.print(
+            \\{{"type":"function","function":{{"name":"{s}","description":"{s}","parameters":{s}}}}}
+        , .{ td.name, td.description, td.input_schema_json });
+    }
+    try w.writeByte(']');
+}
+
+fn appendOllamaMessage(w: *utils.BufWriter, alloc: Allocator, msg: *const proto.Message) !void {
+    var content_buf = ArrayList(u8).empty;
+    defer content_buf.deinit(alloc);
+    var image_list = ArrayList([]const u8).empty;
+    defer image_list.deinit(alloc);
+    for (msg.content) |block| {
+        switch (block) {
+            .text => |t| try content_buf.appendSlice(alloc, t),
+            .tool_result => |tr| {
+                const s = try std.fmt.allocPrint(alloc, "[tool_result: {s}]", .{tr.content});
+                defer alloc.free(s);
+                try content_buf.appendSlice(alloc, s);
+            },
+            .image => |img| try image_list.append(alloc, img.data),
+            else => {},
+        }
+    }
+    const escaped = try json.escape(alloc, content_buf.items);
+    defer alloc.free(escaped);
+    try w.print("{{\"role\":\"{s}\",\"content\":\"{s}\"", .{ msg.role.toJson(), escaped });
+    if (image_list.items.len > 0) {
+        try w.writeAll(",\"images\":[");
+        for (image_list.items, 0..) |img_data, ii| {
+            if (ii > 0) try w.writeByte(',');
+            try w.print("\"{s}\"", .{img_data});
+        }
+        try w.writeByte(']');
+    }
+    try w.writeByte('}');
+}
 
 pub fn buildRequestBody(
     alloc: Allocator,
@@ -136,27 +180,18 @@ pub fn buildRequestBody(
     msgs: []const proto.Message,
     tools: []const proto.ToolDefinition,
 ) ![]u8 {
+    // PSEUDOCODE:
+    // 1. Write model and stream flag
+    // 2. Append tools if any
+    // 3. Append system prompt and message history
     var buf = utils.BufWriter.init(alloc);
     errdefer buf.deinit();
     const w = &buf;
 
     try w.print("{{\"model\":\"{s}\",\"stream\":true", .{model});
-
-    // Tools (Ollama 0.3.0+) placed before messages to ensure static JSON prefix
-    if (tools.len > 0) {
-        try w.writeAll(",\"tools\":[");
-        for (tools, 0..) |td, ti| {
-            if (ti > 0) try w.writeByte(',');
-            try w.print(
-                \\{{"type":"function","function":{{"name":"{s}","description":"{s}","parameters":{s}}}}}
-            , .{ td.name, td.description, td.input_schema_json });
-        }
-        try w.writeByte(']');
-    }
-
+    try appendOllamaTools(w, tools);
     try w.writeAll(",\"messages\":[");
 
-    // System
     if (system_prompt.len > 0) {
         const e = try json.escape(alloc, system_prompt);
         defer alloc.free(e);
@@ -164,36 +199,8 @@ pub fn buildRequestBody(
         if (msgs.len > 0) try w.writeByte(',');
     }
 
-    // Messages (Ollama uses content string, and optional top-level images array)
-    for (msgs, 0..) |msg, mi| {
-        var content_buf = ArrayList(u8).empty;
-        defer content_buf.deinit(alloc);
-        var image_list = ArrayList([]const u8).empty;
-        defer image_list.deinit(alloc);
-        for (msg.content) |block| {
-            switch (block) {
-                .text => |t| try content_buf.appendSlice(alloc, t),
-                .tool_result => |tr| {
-                    const s = try std.fmt.allocPrint(alloc, "[tool_result: {s}]", .{tr.content});
-                    defer alloc.free(s);
-                    try content_buf.appendSlice(alloc, s);
-                },
-                .image => |img| try image_list.append(alloc, img.data),
-                else => {},
-            }
-        }
-        const escaped = try json.escape(alloc, content_buf.items);
-        defer alloc.free(escaped);
-        try w.print("{{\"role\":\"{s}\",\"content\":\"{s}\"", .{ msg.role.toJson(), escaped });
-        if (image_list.items.len > 0) {
-            try w.writeAll(",\"images\":[");
-            for (image_list.items, 0..) |img_data, ii| {
-                if (ii > 0) try w.writeByte(',');
-                try w.print("\"{s}\"", .{img_data});
-            }
-            try w.writeByte(']');
-        }
-        try w.writeByte('}');
+    for (msgs, 0..) |*msg, mi| {
+        try appendOllamaMessage(w, alloc, msg);
         if (mi + 1 < msgs.len) try w.writeByte(',');
     }
     try w.writeByte(']');
@@ -266,7 +273,7 @@ const StreamCtx = struct {
                         .id = id,
                         .name = try self.alloc.dupe(u8, name),
                         .input_json = try self.alloc.dupe(u8, args),
-                    }});
+                    } });
                     self.response.stop_reason = .tool_use;
                 }
             }

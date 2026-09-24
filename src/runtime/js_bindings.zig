@@ -30,7 +30,6 @@ const JS_UNDEFINED = quickjs.JS_UNDEFINED;
 const JS_NULL = quickjs.JS_NULL;
 const JS_EXCEPTION = quickjs.JS_EXCEPTION;
 
-
 const bash_tool = @import("../tools/bash.zig");
 const file_tool = @import("../tools/file.zig");
 const glob_tool = @import("../tools/glob.zig");
@@ -46,6 +45,7 @@ const main = @import("../main.zig");
 const registry = @import("../tooling/registry.zig");
 const hooks = @import("../core/hooks.zig");
 const snapshot_mod = @import("../core/snapshot.zig");
+const agent_loop_monitor = @import("../core/agent_loop_monitor.zig");
 
 // ---------------------------------------------------------------------------
 // Security & auditing guard (ISSUE-CODEACT-001 M2/M3/M4)
@@ -57,6 +57,37 @@ const snapshot_mod = @import("../core/snapshot.zig");
 fn guardPolicy(engine: *Engine, tool_name: []const u8) bool {
     _ = engine;
     return !registry.isPermitted(tool_name);
+}
+
+fn guardAndDispatchPre(
+    engine: *Engine,
+    ctx: ?*c.JSContext,
+    tool_name: []const u8,
+    input: []const u8,
+    err_msg: [*c]const u8,
+) ?c.JSValue {
+    if (guardPolicy(engine, tool_name)) {
+        hooks.dispatch(engine.alloc, engine.io, .{
+            .event = "post-tool-use",
+            .tool_name = tool_name,
+            .input_json = input,
+            .tool_result = "blocked by policy",
+            .is_error = true,
+        });
+        return c.JS_ThrowTypeError(ctx, err_msg);
+    }
+    // Same-response dedup guard: skip duplicate tool calls within a single script.
+    const args_hash = agent_loop_monitor.fuzzyArgsHash(input);
+    if (engine.isSeenCall(tool_name, args_hash)) {
+        return c.JS_ThrowTypeError(ctx, err_msg);
+    }
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "pre-tool-use",
+        .tool_name = tool_name,
+        .input_json = input,
+    });
+    _ = engine.addSeenCall(engine.alloc, tool_name, args_hash) catch return JS_EXCEPTION;
+    return null;
 }
 
 fn getEngine(ctx: ?*c.JSContext) ?*Engine {
@@ -71,55 +102,29 @@ fn jsStringSlice(ctx: ?*c.JSContext, val: c.JSValue, alloc: Allocator) ?[]u8 {
     return alloc.dupe(u8, if (c_str) |p| std.mem.sliceTo(p, 0) else "") catch null;
 }
 
-// ---------------------------------------------------------------------------
-// mini.glob(pattern, basePath?)
-// ---------------------------------------------------------------------------
-fn jsMiniGlob(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
-    _ = this_val;
-    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
-    engine.renewActivity();
-    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.glob requires at least 1 argument (pattern)");
-
-    const pattern = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid pattern");
-    defer engine.alloc.free(pattern);
-
-    // M2: policy check — mini.glob maps to 'glob' tool
-    if (guardPolicy(engine, "glob")) {
-        hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = "glob",
-            .input_json = pattern, .tool_result = "blocked by policy", .is_error = true,
-        });
-        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.glob (glob) is blocked");
-    }
-    hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = "glob", .input_json = pattern,
-    });
-
-    const base_path = if (argc >= 2 and c.JS_IsUndefined(argv[1]) == 0 and c.JS_IsNull(argv[1]) == 0)
-        jsStringSlice(ctx, argv[1], engine.alloc)
-    else
-        null;
-    defer if (base_path) |p| engine.alloc.free(p);
-
-    // Build input JSON for glob tool
-    var json_w = utils.BufWriter.init(engine.alloc);
+fn buildPatternPathJson(alloc: Allocator, pattern: []const u8, path: ?[]const u8) ![]u8 {
+    // PSEUDOCODE:
+    // 1. Escape pattern and path
+    // 2. Format JSON string {"pattern":"...","path":"..."}
+    var json_w = utils.BufWriter.init(alloc);
     defer json_w.deinit();
-    const pattern_escaped = json_mod.escape(engine.alloc, pattern) catch return JS_EXCEPTION;
-    defer engine.alloc.free(pattern_escaped);
-    json_w.print("{{\"pattern\":\"{s}\"", .{pattern_escaped}) catch return JS_EXCEPTION;
-    if (base_path) |p| {
-        const p_escaped = json_mod.escape(engine.alloc, p) catch return JS_EXCEPTION;
-        defer engine.alloc.free(p_escaped);
-        json_w.print(",\"path\":\"{s}\"", .{p_escaped}) catch return JS_EXCEPTION;
+    const pattern_escaped = try json_mod.escape(alloc, pattern);
+    defer alloc.free(pattern_escaped);
+    try json_w.print("{{\"pattern\":\"{s}\"", .{pattern_escaped});
+    if (path) |p| {
+        const p_escaped = try json_mod.escape(alloc, p);
+        defer alloc.free(p_escaped);
+        try json_w.print(",\"path\":\"{s}\"", .{p_escaped});
     }
-    json_w.writeAll("}") catch return JS_EXCEPTION;
+    try json_w.writeAll("}");
+    return json_w.toOwnedSlice();
+}
 
-    const res = glob_tool.executeTool(engine.alloc, engine.io, json_w.list.items) catch |e| {
-        return c.JS_ThrowInternalError(ctx, "glob error: %s", @errorName(e).ptr);
-    };
-    defer engine.alloc.free(res);
-
-    // Parse lines in res into JS Array of strings
+fn parseGlobLinesToArray(ctx: ?*c.JSContext, res: []const u8) c.JSValue {
+    // PSEUDOCODE:
+    // 1. Split tool output by newlines
+    // 2. Filter out informational lines
+    // 3. Populate and return JS Array of strings
     const arr = c.JS_NewArray(ctx);
     var it = std.mem.splitScalar(u8, res, '\n');
     var idx: u32 = 0;
@@ -131,7 +136,96 @@ fn jsMiniGlob(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
             idx += 1;
         }
     }
+    return arr;
+}
 
+// ---------------------------------------------------------------------------
+// mini.glob(pattern, basePath?)
+// ---------------------------------------------------------------------------
+fn jsMiniGlob(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    // PSEUDOCODE:
+    // 1. Validate argument count and parse pattern/base_path
+    // 2. Check security policy and dispatch pre/post hooks
+    // 3. Build JSON payload, execute glob tool, and parse results into JS array
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.glob requires at least 1 argument (pattern)");
+
+    const pattern = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid pattern");
+    defer engine.alloc.free(pattern);
+
+    if (guardPolicy(engine, "glob")) {
+        hooks.dispatch(engine.alloc, engine.io, .{
+            .event = "post-tool-use",
+            .tool_name = "glob",
+            .input_json = pattern,
+            .tool_result = "blocked by policy",
+            .is_error = true,
+        });
+        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.glob (glob) is blocked");
+    }
+    // Same-response dedup guard for read-only tools.
+    const glob_hash = agent_loop_monitor.fuzzyArgsHash(pattern);
+    if (engine.isSeenCall("glob", glob_hash)) return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.glob duplicate");
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "pre-tool-use",
+        .tool_name = "glob",
+        .input_json = pattern,
+    });
+    _ = engine.addSeenCall(engine.alloc, "glob", glob_hash) catch return JS_EXCEPTION;
+
+    const base_path = if (argc >= 2 and c.JS_IsUndefined(argv[1]) == 0 and c.JS_IsNull(argv[1]) == 0)
+        jsStringSlice(ctx, argv[1], engine.alloc)
+    else
+        null;
+    defer if (base_path) |p| engine.alloc.free(p);
+
+    const input_json = buildPatternPathJson(engine.alloc, pattern, base_path) catch return JS_EXCEPTION;
+    defer engine.alloc.free(input_json);
+
+    const res = glob_tool.executeTool(engine.alloc, engine.io, input_json) catch |e| {
+        return c.JS_ThrowInternalError(ctx, "glob error: %s", @errorName(e).ptr);
+    };
+    defer engine.alloc.free(res);
+
+    return parseGlobLinesToArray(ctx, res);
+}
+
+fn parseGrepLine(ctx: ?*c.JSContext, line: []const u8) c.JSValue {
+    // PSEUDOCODE:
+    // 1. Split line by ':' into path, line_num, rest
+    // 2. Build JS object with path, line, text
+    var parts = std.mem.splitScalar(u8, line, ':');
+    const f = parts.next();
+    const l_str = parts.next();
+    const rest = if (f != null and l_str != null) line[f.?.len + l_str.?.len + 2 ..] else line;
+
+    const obj = c.JS_NewObject(ctx);
+    if (f) |file_path| {
+        _ = c.JS_SetPropertyStr(ctx, obj, "path", c.JS_NewStringLen(ctx, file_path.ptr, file_path.len));
+    }
+    if (l_str) |ls| {
+        const line_num = std.fmt.parseInt(i32, ls, 10) catch 0;
+        _ = c.JS_SetPropertyStr(ctx, obj, "line", c.JS_NewInt32(ctx, line_num));
+    }
+    _ = c.JS_SetPropertyStr(ctx, obj, "text", c.JS_NewStringLen(ctx, rest.ptr, rest.len));
+    return obj;
+}
+
+fn parseGrepLinesToArray(ctx: ?*c.JSContext, res: []const u8) c.JSValue {
+    // PSEUDOCODE:
+    // 1. Split tool output by newlines
+    // 2. Parse each line into object and add to array
+    const arr = c.JS_NewArray(ctx);
+    var it = std.mem.splitScalar(u8, res, '\n');
+    var idx: u32 = 0;
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const obj = parseGrepLine(ctx, line);
+        _ = c.JS_SetPropertyUint32(ctx, arr, idx, obj);
+        idx += 1;
+    }
     return arr;
 }
 
@@ -139,6 +233,10 @@ fn jsMiniGlob(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
 // mini.grep(pattern, path?, options?)
 // ---------------------------------------------------------------------------
 fn jsMiniGrep(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    // PSEUDOCODE:
+    // 1. Validate argument count and parse pattern/path
+    // 2. Check security policy and dispatch pre/post hooks
+    // 3. Build JSON payload, execute grep tool, and parse results into JS array
     _ = this_val;
     const engine = getEngine(ctx) orelse return JS_UNDEFINED;
     engine.renewActivity();
@@ -147,17 +245,24 @@ fn jsMiniGrep(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
     const pattern = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid pattern");
     defer engine.alloc.free(pattern);
 
-    // M2: policy check — mini.grep maps to 'grep' tool
     if (guardPolicy(engine, "grep")) {
         hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = "grep",
-            .input_json = pattern, .tool_result = "blocked by policy", .is_error = true,
+            .event = "post-tool-use",
+            .tool_name = "grep",
+            .input_json = pattern,
+            .tool_result = "blocked by policy",
+            .is_error = true,
         });
         return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.grep (grep) is blocked");
     }
+    const grep_hash = agent_loop_monitor.fuzzyArgsHash(pattern);
+    if (engine.isSeenCall("grep", grep_hash)) return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.grep duplicate");
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = "grep", .input_json = pattern,
+        .event = "pre-tool-use",
+        .tool_name = "grep",
+        .input_json = pattern,
     });
+    _ = engine.addSeenCall(engine.alloc, "grep", grep_hash) catch return JS_EXCEPTION;
 
     const path = if (argc >= 2 and c.JS_IsUndefined(argv[1]) == 0 and c.JS_IsNull(argv[1]) == 0)
         jsStringSlice(ctx, argv[1], engine.alloc)
@@ -165,49 +270,15 @@ fn jsMiniGrep(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
         null;
     defer if (path) |p| engine.alloc.free(p);
 
-    var json_w = utils.BufWriter.init(engine.alloc);
-    defer json_w.deinit();
-    const pattern_escaped = json_mod.escape(engine.alloc, pattern) catch return JS_EXCEPTION;
-    defer engine.alloc.free(pattern_escaped);
-    json_w.print("{{\"pattern\":\"{s}\"", .{pattern_escaped}) catch return JS_EXCEPTION;
-    if (path) |p| {
-        const p_escaped = json_mod.escape(engine.alloc, p) catch return JS_EXCEPTION;
-        defer engine.alloc.free(p_escaped);
-        json_w.print(",\"path\":\"{s}\"", .{p_escaped}) catch return JS_EXCEPTION;
-    }
-    json_w.writeAll("}") catch return JS_EXCEPTION;
+    const input_json = buildPatternPathJson(engine.alloc, pattern, path) catch return JS_EXCEPTION;
+    defer engine.alloc.free(input_json);
 
-    const res = grep_tool.executeTool(engine.alloc, engine.io, json_w.list.items) catch |e| {
+    const res = grep_tool.executeTool(engine.alloc, engine.io, input_json) catch |e| {
         return c.JS_ThrowInternalError(ctx, "grep error: %s", @errorName(e).ptr);
     };
     defer engine.alloc.free(res);
 
-    const arr = c.JS_NewArray(ctx);
-    var it = std.mem.splitScalar(u8, res, '\n');
-    var idx: u32 = 0;
-    while (it.next()) |line| {
-        if (line.len == 0) continue;
-        // Parse "file:line:content"
-        var parts = std.mem.splitScalar(u8, line, ':');
-        const f = parts.next();
-        const l_str = parts.next();
-        const rest = if (f != null and l_str != null) line[f.?.len + l_str.?.len + 2 ..] else line;
-
-        const obj = c.JS_NewObject(ctx);
-        if (f) |file_path| {
-            _ = c.JS_SetPropertyStr(ctx, obj, "path", c.JS_NewStringLen(ctx, file_path.ptr, file_path.len));
-        }
-        if (l_str) |ls| {
-            const line_num = std.fmt.parseInt(i32, ls, 10) catch 0;
-            _ = c.JS_SetPropertyStr(ctx, obj, "line", c.JS_NewInt32(ctx, line_num));
-        }
-        _ = c.JS_SetPropertyStr(ctx, obj, "text", c.JS_NewStringLen(ctx, rest.ptr, rest.len));
-
-        _ = c.JS_SetPropertyUint32(ctx, arr, idx, obj);
-        idx += 1;
-    }
-
-    return arr;
+    return parseGrepLinesToArray(ctx, res);
 }
 
 // ---------------------------------------------------------------------------
@@ -225,14 +296,22 @@ fn jsMiniRead(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
     // M2: policy check — mini.read maps to 'file_read' tool
     if (guardPolicy(engine, "file_read")) {
         hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = "file_read",
-            .input_json = path, .tool_result = "blocked by policy", .is_error = true,
+            .event = "post-tool-use",
+            .tool_name = "file_read",
+            .input_json = path,
+            .tool_result = "blocked by policy",
+            .is_error = true,
         });
         return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.read (file_read) is blocked");
     }
+    const read_hash = agent_loop_monitor.fuzzyArgsHash(path);
+    if (engine.isSeenCall("file_read", read_hash)) return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.read duplicate");
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = "file_read", .input_json = path,
+        .event = "pre-tool-use",
+        .tool_name = "file_read",
+        .input_json = path,
     });
+    _ = engine.addSeenCall(engine.alloc, "file_read", read_hash) catch return JS_EXCEPTION;
 
     var offset: usize = 1;
     var limit: usize = 2000;
@@ -271,42 +350,29 @@ fn jsMiniWrite(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
     const content = jsStringSlice(ctx, argv[1], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid content");
     defer engine.alloc.free(content);
 
-    // M2: policy check — mini.write maps to 'file_write' tool
-    if (guardPolicy(engine, "file_write")) {
-        hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = "file_write",
-            .input_json = path, .tool_result = "blocked by policy", .is_error = true,
-        });
-        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.write (file_write) is blocked");
-    }
-    hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = "file_write", .input_json = path,
-    });
-
-    // M4: snapshot old content to CAS/journal BEFORE writing
+    if (guardAndDispatchPre(engine, ctx, "file_write", path, "Security Policy Error: mini.write (file_write) is blocked")) |v| return v;
     if (snapshot_mod.getTracker()) |t| t.beforeFileWrite(path);
 
     const res = file_tool.writeFile(engine.alloc, engine.io, path, content) catch |e| {
-        const obj = c.JS_NewObject(ctx);
-        _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, 0));
-        const err_name = @errorName(e);
-        _ = c.JS_SetPropertyStr(ctx, obj, "message", c.JS_NewStringLen(ctx, err_name.ptr, err_name.len));
-        return obj;
+        return makeOkResult(ctx, false, @errorName(e));
     };
     defer engine.alloc.free(res);
 
-    // M4: flush snapshot after writing
     if (snapshot_mod.getTracker()) |t| t.afterFileWrite(0, path);
-
-    // M3: post-hook
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "post-tool-use", .tool_name = "file_write",
-        .input_json = path, .tool_result = res,
+        .event = "post-tool-use",
+        .tool_name = "file_write",
+        .input_json = path,
+        .tool_result = res,
     });
 
+    return makeOkResult(ctx, true, res);
+}
+
+fn makeOkResult(ctx: ?*c.JSContext, ok: bool, msg: []const u8) c.JSValue {
     const obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, 1));
-    _ = c.JS_SetPropertyStr(ctx, obj, "message", c.JS_NewStringLen(ctx, res.ptr, res.len));
+    _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, if (ok) 1 else 0));
+    _ = c.JS_SetPropertyStr(ctx, obj, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
     return obj;
 }
 
@@ -314,6 +380,10 @@ fn jsMiniWrite(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
 // mini.patch(path, oldStr, newStr, opts?)
 // ---------------------------------------------------------------------------
 fn jsMiniPatch(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    // PSEUDOCODE:
+    // 1. Validate argument count and parse path, oldStr, newStr
+    // 2. Check security policy and create CAS snapshot
+    // 3. Edit file and return status object
     _ = this_val;
     const engine = getEngine(ctx) orelse return JS_UNDEFINED;
     engine.renewActivity();
@@ -328,41 +398,24 @@ fn jsMiniPatch(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
     const new_str = jsStringSlice(ctx, argv[2], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid newStr");
     defer engine.alloc.free(new_str);
 
-    // M2: policy check — mini.patch maps to 'file_edit' tool
-    if (guardPolicy(engine, "file_edit")) {
-        hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = "file_edit",
-            .input_json = path, .tool_result = "blocked by policy", .is_error = true,
-        });
-        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.patch (file_edit) is blocked");
-    }
-    hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = "file_edit", .input_json = path,
-    });
-
-    // M4: snapshot before editing
+    if (guardAndDispatchPre(engine, ctx, "file_edit", path, "Security Policy Error: mini.patch (file_edit) is blocked")) |v| return v;
     if (snapshot_mod.getTracker()) |t| t.beforeFileWrite(path);
 
     const res = file_tool.editFile(engine.alloc, engine.io, path, old_str, new_str) catch |e| {
-        const obj = c.JS_NewObject(ctx);
-        _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, 0));
-        const err_name = @errorName(e);
-        _ = c.JS_SetPropertyStr(ctx, obj, "message", c.JS_NewStringLen(ctx, err_name.ptr, err_name.len));
-        return obj;
+        return makeOkResult(ctx, false, @errorName(e));
     };
     defer engine.alloc.free(res);
 
     if (snapshot_mod.getTracker()) |t| t.afterFileWrite(0, path);
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "post-tool-use", .tool_name = "file_edit",
-        .input_json = path, .tool_result = res,
+        .event = "post-tool-use",
+        .tool_name = "file_edit",
+        .input_json = path,
+        .tool_result = res,
     });
 
     const is_ok = std.mem.indexOf(u8, res, "Modified") != null;
-    const obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, if (is_ok) 1 else 0));
-    _ = c.JS_SetPropertyStr(ctx, obj, "message", c.JS_NewStringLen(ctx, res.ptr, res.len));
-    return obj;
+    return makeOkResult(ctx, is_ok, res);
 }
 
 // ---------------------------------------------------------------------------
@@ -407,10 +460,51 @@ fn jsMiniStat(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
     return obj;
 }
 
+fn snapshotWritablePaths(alloc: Allocator, command: []const u8) void {
+    // PSEUDOCODE:
+    // 1. Extract writable file paths from shell command
+    // 2. Snapshot each path before executing command
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    if (snapshot_mod.extractWritablePaths(arena.allocator(), command)) |writable| {
+        for (writable) |p| {
+            if (snapshot_mod.getTracker()) |t| t.beforeFileWrite(p);
+        }
+    } else |_| {}
+}
+
+fn makeShResult(ctx: ?*c.JSContext, ok: bool, exit_code: i32, stdout: []const u8, stderr: []const u8) c.JSValue {
+    // PSEUDOCODE:
+    // 1. Allocate JS object
+    // 2. Populate exitCode, ok, stdout, stderr
+    const obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, obj, "exitCode", c.JS_NewInt32(ctx, exit_code));
+    _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, if (ok) 1 else 0));
+    _ = c.JS_SetPropertyStr(ctx, obj, "stdout", c.JS_NewStringLen(ctx, stdout.ptr, stdout.len));
+    _ = c.JS_SetPropertyStr(ctx, obj, "stderr", c.JS_NewStringLen(ctx, stderr.ptr, stderr.len));
+    return obj;
+}
+
+fn buildShCommandJson(alloc: Allocator, command: []const u8) ![]u8 {
+    // PSEUDOCODE:
+    // 1. Escape shell command string
+    // 2. Format JSON payload {"command":"..."}
+    var json_w = utils.BufWriter.init(alloc);
+    defer json_w.deinit();
+    const cmd_escaped = try json_mod.escape(alloc, command);
+    defer alloc.free(cmd_escaped);
+    try json_w.print("{{\"command\":\"{s}\"}}", .{cmd_escaped});
+    return json_w.toOwnedSlice();
+}
+
 // ---------------------------------------------------------------------------
 // mini.sh(command, opts?)
 // ---------------------------------------------------------------------------
 fn jsMiniSh(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    // PSEUDOCODE:
+    // 1. Validate argument count and parse command
+    // 2. Check security policy and snapshot target files
+    // 3. Execute command via bash tool and return result
     _ = this_val;
     const engine = getEngine(ctx) orelse return JS_UNDEFINED;
     engine.renewActivity();
@@ -419,61 +513,45 @@ fn jsMiniSh(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JS
     const command = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid command");
     defer engine.alloc.free(command);
 
-    // Build JSON for bash tool — escape command string (may contain
-    // quotes/newlines) so round-trip JSON parses correctly on tool side.
-    var json_w = utils.BufWriter.init(engine.alloc);
-    defer json_w.deinit();
-    const cmd_escaped = json_mod.escape(engine.alloc, command) catch return JS_EXCEPTION;
-    defer engine.alloc.free(cmd_escaped);
-    json_w.print("{{\"command\":\"{s}\"}}", .{cmd_escaped}) catch return JS_EXCEPTION;
+    const input_json = buildShCommandJson(engine.alloc, command) catch return JS_EXCEPTION;
+    defer engine.alloc.free(input_json);
 
-    // M2: policy check — mini.sh maps to 'bash' tool
     if (guardPolicy(engine, "bash")) {
         hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = "bash",
-            .input_json = command, .tool_result = "blocked by policy", .is_error = true,
+            .event = "post-tool-use",
+            .tool_name = "bash",
+            .input_json = command,
+            .tool_result = "blocked by policy",
+            .is_error = true,
         });
         return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.sh (bash) is blocked");
     }
+    const bash_hash = agent_loop_monitor.fuzzyArgsHash(command);
+    if (engine.isSeenCall("bash", bash_hash)) return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.sh (bash) duplicate");
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = "bash", .input_json = command,
+        .event = "pre-tool-use",
+        .tool_name = "bash",
+        .input_json = command,
     });
+    _ = engine.addSeenCall(engine.alloc, "bash", bash_hash) catch return JS_EXCEPTION;
 
-    // M4: snapshot paths at risk of write commands (sed -i, >, tee, mv, cp, rm...)
-    {
-        var arena = std.heap.ArenaAllocator.init(engine.alloc);
-        defer arena.deinit();
-        if (snapshot_mod.extractWritablePaths(arena.allocator(), command)) |writable| {
-            for (writable) |p| {
-                if (snapshot_mod.getTracker()) |t| t.beforeFileWrite(p);
-            }
-        } else |_| {}
-    }
+    snapshotWritablePaths(engine.alloc, command);
 
-    const out = bash_tool.executeTool(engine.alloc, engine.io, json_w.list.items) catch |e| {
-        const obj = c.JS_NewObject(ctx);
-        _ = c.JS_SetPropertyStr(ctx, obj, "exitCode", c.JS_NewInt32(ctx, 1));
-        _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, 0));
-        const err_name = @errorName(e);
-        _ = c.JS_SetPropertyStr(ctx, obj, "stderr", c.JS_NewStringLen(ctx, err_name.ptr, err_name.len));
-        _ = c.JS_SetPropertyStr(ctx, obj, "stdout", c.JS_NewStringLen(ctx, "", 0));
-        return obj;
+    const out = bash_tool.executeTool(engine.alloc, engine.io, input_json) catch |e| {
+        return makeShResult(ctx, false, 1, "", @errorName(e));
     };
     defer engine.alloc.free(out);
 
     engine.renewActivity();
 
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "post-tool-use", .tool_name = "bash",
-        .input_json = command, .tool_result = out,
+        .event = "post-tool-use",
+        .tool_name = "bash",
+        .input_json = command,
+        .tool_result = out,
     });
 
-    const obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, obj, "exitCode", c.JS_NewInt32(ctx, 0));
-    _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, 1));
-    _ = c.JS_SetPropertyStr(ctx, obj, "stdout", c.JS_NewStringLen(ctx, out.ptr, out.len));
-    _ = c.JS_SetPropertyStr(ctx, obj, "stderr", c.JS_NewStringLen(ctx, "", 0));
-    return obj;
+    return makeShResult(ctx, true, 0, out, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -644,7 +722,75 @@ fn jsObjectToJsonString(ctx: ?*c.JSContext, obj: c.JSValue, alloc: Allocator) ?[
     return jsStringSlice(ctx, s, alloc);
 }
 
+const HttpJsOptions = struct {
+    body_opt: ?[]u8 = null,
+    headers_json_opt: ?[]u8 = null,
+    max_body_size_opt: ?usize = null,
+    timeout_s_opt: ?u32 = null,
+
+    fn deinit(self: *HttpJsOptions, alloc: Allocator) void {
+        if (self.body_opt) |b| alloc.free(b);
+        if (self.headers_json_opt) |h| alloc.free(h);
+    }
+};
+
+fn parseHttpJsOptions(ctx: ?*c.JSContext, opts_val: c.JSValue, alloc: Allocator) HttpJsOptions {
+    var opts = HttpJsOptions{};
+    if (c.JS_IsObject(opts_val) == 0) return opts;
+    opts.body_opt = jsOptString(ctx, opts_val, "body", alloc);
+    const hv = c.JS_GetPropertyStr(ctx, opts_val, "headers");
+    defer c.JS_FreeValue(ctx, hv);
+    if (c.JS_IsObject(hv) != 0) {
+        opts.headers_json_opt = jsObjectToJsonString(ctx, hv, alloc);
+    }
+    if (jsOptInt(ctx, opts_val, "max_body_size")) |v| {
+        if (v > 0) opts.max_body_size_opt = @intCast(v);
+    }
+    if (jsOptInt(ctx, opts_val, "timeout_s")) |v| {
+        if (v > 0) opts.timeout_s_opt = @intCast(v);
+    }
+    return opts;
+}
+
+fn buildHttpHeadersObject(ctx: ?*c.JSContext, headers: []const http_lib.Response.Header) c.JSValue {
+    const headers_obj = c.JS_NewObject(ctx);
+    for (headers) |h| {
+        const name = c.JS_NewStringLen(ctx, h.name.ptr, h.name.len);
+        const atom = c.JS_ValueToAtom(ctx, name);
+        c.JS_FreeValue(ctx, name);
+        const val = c.JS_NewStringLen(ctx, h.value.ptr, h.value.len);
+        _ = c.JS_SetProperty(ctx, headers_obj, atom, val);
+        c.JS_FreeAtom(ctx, atom);
+    }
+    return headers_obj;
+}
+
+fn makeHttpResult(ctx: ?*c.JSContext, res: *const http_lib.Response) c.JSValue {
+    const obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, obj, "status", c.JS_NewInt32(ctx, @intCast(res.status)));
+    _ = c.JS_SetPropertyStr(ctx, obj, "body", c.JS_NewStringLen(ctx, res.body.ptr, res.body.len));
+    _ = c.JS_SetPropertyStr(ctx, obj, "truncated", c.JS_NewBool(ctx, if (res.truncated) 1 else 0));
+    _ = c.JS_SetPropertyStr(ctx, obj, "headers", buildHttpHeadersObject(ctx, res.headers));
+    return obj;
+}
+
+fn executeHttpFetch(alloc: Allocator, io: std.Io, method: []const u8, url: []const u8, opts: *const HttpJsOptions) !http_lib.Response {
+    return http_lib.fetch(alloc, io, .{
+        .url = url,
+        .method = method,
+        .body = opts.body_opt,
+        .headers_json = opts.headers_json_opt,
+        .max_body_size = opts.max_body_size_opt orelse http_lib.DEFAULT_MAX_BODY_SIZE,
+        .timeout_s = opts.timeout_s_opt orelse http_lib.DEFAULT_TIMEOUT_S,
+    });
+}
+
 fn jsMiniHttp(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    // PSEUDOCODE:
+    // 1. Validate argument count and parse method and url
+    // 2. Parse optional request options (body, headers, timeout, max size)
+    // 3. Check security policy and execute fetch
+    // 4. Format and return response object
     _ = this_val;
     const engine = getEngine(ctx) orelse return JS_UNDEFINED;
     engine.renewActivity();
@@ -656,50 +802,12 @@ fn jsMiniHttp(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
     const url = jsStringSlice(ctx, argv[1], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid url");
     defer engine.alloc.free(url);
 
-    // opts: { body?, headers?, max_body_size?, timeout_s? }
-    var body_opt: ?[]u8 = null;
-    defer if (body_opt) |b| engine.alloc.free(b);
-    var headers_json_opt: ?[]u8 = null;
-    defer if (headers_json_opt) |h| engine.alloc.free(h);
-    var max_body_size_opt: ?usize = null;
-    var timeout_s_opt: ?u32 = null;
+    var opts = if (argc >= 3) parseHttpJsOptions(ctx, argv[2], engine.alloc) else HttpJsOptions{};
+    defer opts.deinit(engine.alloc);
 
-    if (argc >= 3 and c.JS_IsObject(argv[2]) != 0) {
-        const opts = argv[2];
-        body_opt = jsOptString(ctx, opts, "body", engine.alloc);
-        const hv = c.JS_GetPropertyStr(ctx, opts, "headers");
-        defer c.JS_FreeValue(ctx, hv);
-        if (c.JS_IsObject(hv) != 0) {
-            headers_json_opt = jsObjectToJsonString(ctx, hv, engine.alloc);
-        }
-        if (jsOptInt(ctx, opts, "max_body_size")) |v| {
-            if (v > 0) max_body_size_opt = @intCast(v);
-        }
-        if (jsOptInt(ctx, opts, "timeout_s")) |v| {
-            if (v > 0) timeout_s_opt = @intCast(v);
-        }
-    }
+    if (guardAndDispatchPre(engine, ctx, "http_request", url, "Security Policy Error: mini.http (http_request) is blocked")) |v| return v;
 
-    // M2: policy check — mini.http maps to 'http_request' tool
-    if (guardPolicy(engine, "http_request")) {
-        hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = "http_request",
-            .input_json = url, .tool_result = "blocked by policy", .is_error = true,
-        });
-        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.http (http_request) is blocked");
-    }
-    hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = "http_request", .input_json = url,
-    });
-
-    var res = http_lib.fetch(engine.alloc, engine.io, .{
-        .url = url,
-        .method = method,
-        .body = body_opt,
-        .headers_json = headers_json_opt,
-        .max_body_size = max_body_size_opt orelse http_lib.DEFAULT_MAX_BODY_SIZE,
-        .timeout_s = timeout_s_opt orelse http_lib.DEFAULT_TIMEOUT_S,
-    }) catch |e| {
+    var res = executeHttpFetch(engine.alloc, engine.io, method, url, &opts) catch |e| {
         return c.JS_ThrowInternalError(ctx, "http error: %s", @errorName(e).ptr);
     };
     defer res.deinit(engine.alloc);
@@ -707,28 +815,13 @@ fn jsMiniHttp(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.
     engine.renewActivity();
 
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "post-tool-use", .tool_name = "http_request",
-        .input_json = url, .tool_result = res.body,
+        .event = "post-tool-use",
+        .tool_name = "http_request",
+        .input_json = url,
+        .tool_result = res.body,
     });
 
-    const obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, obj, "status", c.JS_NewInt32(ctx, @intCast(res.status)));
-    _ = c.JS_SetPropertyStr(ctx, obj, "body", c.JS_NewStringLen(ctx, res.body.ptr, res.body.len));
-    _ = c.JS_SetPropertyStr(ctx, obj, "truncated", c.JS_NewBool(ctx, if (res.truncated) 1 else 0));
-
-    const headers_obj = c.JS_NewObject(ctx);
-    for (res.headers) |h| {
-        // JS_SetProperty steals val and does not steal atom — per QuickJS convention:
-        // create string -> convert to atom (atom keeps string alive) -> set -> free atom ref.
-        const name = c.JS_NewStringLen(ctx, h.name.ptr, h.name.len);
-        const atom = c.JS_ValueToAtom(ctx, name);
-        c.JS_FreeValue(ctx, name);
-        const val = c.JS_NewStringLen(ctx, h.value.ptr, h.value.len);
-        _ = c.JS_SetProperty(ctx, headers_obj, atom, val); // steal val
-        c.JS_FreeAtom(ctx, atom);
-    }
-    _ = c.JS_SetPropertyStr(ctx, obj, "headers", headers_obj);
-    return obj;
+    return makeHttpResult(ctx, &res);
 }
 
 // ---------------------------------------------------------------------------
@@ -882,66 +975,116 @@ pub fn setPendingThinkingOverride(override: ?ThinkingOverride) void {
     g_thinking_mutex.unlock();
 }
 
+fn setThinkingBudget(budget: i32) void {
+    if (budget <= 0) {
+        setPendingThinkingOverride(.{ .effort = "none", .budget_tokens = 0 });
+        return;
+    }
+    const b: u32 = @intCast(budget);
+    const eff: []const u8 = if (b <= 1024) "low" else if (b <= 4096) "medium" else "high";
+    setPendingThinkingOverride(.{ .effort = eff, .budget_tokens = b });
+}
+
+fn parseEffortString(str: []const u8) ?ThinkingOverride {
+    if (std.mem.eql(u8, str, "low")) return .{ .effort = "low", .budget_tokens = 1024 };
+    if (std.mem.eql(u8, str, "medium")) return .{ .effort = "medium", .budget_tokens = 4096 };
+    if (std.mem.eql(u8, str, "high")) return .{ .effort = "high", .budget_tokens = 8192 };
+    if (std.mem.eql(u8, str, "none") or std.mem.eql(u8, str, "off")) return .{ .effort = "none", .budget_tokens = 0 };
+    if (std.mem.eql(u8, str, "minimal")) return .{ .effort = "minimal", .budget_tokens = 512 };
+    return null;
+}
+
 // ---------------------------------------------------------------------------
 // mini.setThinking(levelOrTokens)
 // ---------------------------------------------------------------------------
 fn jsMiniSetThinking(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    // PSEUDOCODE:
+    // 1. Validate argument count and check if number or string
+    // 2. If number, convert to token budget and effort level
+    // 3. If string, map effort name to budget and set pending thinking
     _ = this_val;
     const engine = getEngine(ctx) orelse return JS_UNDEFINED;
     engine.renewActivity();
     if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.setThinking requires 1 argument (string level or number budget)");
 
-    // Case 1: number budget
     if (c.JS_IsNumber(argv[0]) != 0) {
         var budget: i32 = 0;
         if (c.JS_ToInt32(ctx, &budget, argv[0]) == 0) {
-            if (budget <= 0) {
-                while (!g_thinking_mutex.tryLock()) {}
-g_pending_thinking = .{ .effort = "none", .budget_tokens = 0 };
-    g_thinking_mutex.unlock();
-            } else {
-                const b: u32 = @intCast(budget);
-                const eff: []const u8 = if (b <= 1024) "low" else if (b <= 4096) "medium" else "high";
-                while (!g_thinking_mutex.tryLock()) {}
-g_pending_thinking = .{ .effort = eff, .budget_tokens = b };
-    g_thinking_mutex.unlock();
-            }
+            setThinkingBudget(budget);
             return c.JS_NewBool(ctx, 1);
         }
     }
 
-    // Case 2: string effort ("low" | "medium" | "high" | "none" | "minimal")
     if (c.JS_IsString(argv[0]) != 0) {
         const str = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid string argument");
         defer engine.alloc.free(str);
 
-        if (std.mem.eql(u8, str, "low")) {
-            while (!g_thinking_mutex.tryLock()) {}
-g_pending_thinking = .{ .effort = "low", .budget_tokens = 1024 };
-    g_thinking_mutex.unlock();
-        } else if (std.mem.eql(u8, str, "medium")) {
-            while (!g_thinking_mutex.tryLock()) {}
-g_pending_thinking = .{ .effort = "medium", .budget_tokens = 4096 };
-    g_thinking_mutex.unlock();
-        } else if (std.mem.eql(u8, str, "high")) {
-            while (!g_thinking_mutex.tryLock()) {}
-g_pending_thinking = .{ .effort = "high", .budget_tokens = 8192 };
-    g_thinking_mutex.unlock();
-        } else if (std.mem.eql(u8, str, "none") or std.mem.eql(u8, str, "off")) {
-            while (!g_thinking_mutex.tryLock()) {}
-g_pending_thinking = .{ .effort = "none", .budget_tokens = 0 };
-    g_thinking_mutex.unlock();
-        } else if (std.mem.eql(u8, str, "minimal")) {
-            while (!g_thinking_mutex.tryLock()) {}
-g_pending_thinking = .{ .effort = "minimal", .budget_tokens = 512 };
-    g_thinking_mutex.unlock();
-        } else {
-            return c.JS_ThrowTypeError(ctx, "level must be 'low', 'medium', 'high', 'none', or a token budget number");
+        if (parseEffortString(str)) |override| {
+            setPendingThinkingOverride(override);
+            return c.JS_NewBool(ctx, 1);
         }
-        return c.JS_NewBool(ctx, 1);
+        return c.JS_ThrowTypeError(ctx, "level must be 'low', 'medium', 'high', 'none', or a token budget number");
     }
 
     return c.JS_ThrowTypeError(ctx, "argument must be string or number");
+}
+
+const MediaJsOptions = struct {
+    size_opt: ?[]u8 = null,
+    filename_opt: ?[]u8 = null,
+    model_opt: ?[]u8 = null,
+    seconds: u32 = 4,
+
+    fn deinit(self: *MediaJsOptions, alloc: Allocator) void {
+        if (self.size_opt) |s| alloc.free(s);
+        if (self.filename_opt) |f| alloc.free(f);
+        if (self.model_opt) |m| alloc.free(m);
+    }
+};
+
+fn parseMediaJsOptions(ctx: ?*c.JSContext, opts_val: c.JSValue, alloc: Allocator) MediaJsOptions {
+    var opts = MediaJsOptions{};
+    if (c.JS_IsObject(opts_val) == 0) return opts;
+    opts.size_opt = jsOptString(ctx, opts_val, "size", alloc);
+    opts.filename_opt = jsOptString(ctx, opts_val, "filename", alloc);
+    opts.model_opt = jsOptString(ctx, opts_val, "model", alloc);
+    if (jsOptInt(ctx, opts_val, "seconds")) |sec| {
+        if (sec > 0) opts.seconds = @intCast(sec);
+    }
+    return opts;
+}
+
+fn executeMediaGeneration(
+    engine: *Engine,
+    kind: []const u8,
+    prompt_or_path: []const u8,
+    opts: *const MediaJsOptions,
+) !media_gen_tool.MediaResult {
+    if (std.mem.eql(u8, kind, "video")) {
+        return media_gen_tool.generateVideoDirect(engine.alloc, engine.io, prompt_or_path, opts.seconds, opts.filename_opt, opts.model_opt);
+    } else if (std.mem.eql(u8, kind, "attach")) {
+        return media_gen_tool.attachImageDirect(engine.alloc, engine.io, prompt_or_path);
+    } else {
+        return media_gen_tool.generateImageDirect(engine.alloc, engine.io, prompt_or_path, opts.size_opt, opts.filename_opt, opts.model_opt);
+    }
+}
+
+fn makeMediaResult(ctx: ?*c.JSContext, res: media_gen_tool.MediaResult) c.JSValue {
+    const obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, if (res.ok) 1 else 0));
+    _ = c.JS_SetPropertyStr(ctx, obj, "path", c.JS_NewStringLen(ctx, res.path.ptr, res.path.len));
+    _ = c.JS_SetPropertyStr(ctx, obj, "media_type", c.JS_NewStringLen(ctx, res.media_type.ptr, res.media_type.len));
+    _ = c.JS_SetPropertyStr(ctx, obj, "bytes", c.JS_NewInt64(ctx, @intCast(res.bytes)));
+    if (res.message.len > 0) {
+        _ = c.JS_SetPropertyStr(ctx, obj, "message", c.JS_NewStringLen(ctx, res.message.ptr, res.message.len));
+    }
+    return obj;
+}
+
+fn mediaKindToToolName(kind: []const u8) []const u8 {
+    if (std.mem.eql(u8, kind, "video")) return "generate_video";
+    if (std.mem.eql(u8, kind, "attach")) return "image_attach";
+    return "generate_image";
 }
 
 // ---------------------------------------------------------------------------
@@ -951,6 +1094,11 @@ g_pending_thinking = .{ .effort = "minimal", .budget_tokens = 512 };
 //   Returns: { ok: bool, path: string, media_type: string, bytes: int, message?: string }
 // ---------------------------------------------------------------------------
 fn jsMiniMedia(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    // PSEUDOCODE:
+    // 1. Validate argument count and parse kind and prompt/path
+    // 2. Map kind to tool name and enforce security policy
+    // 3. Parse options and execute media generation
+    // 4. Return result object to JS
     _ = this_val;
     const engine = getEngine(ctx) orelse return JS_UNDEFINED;
     engine.renewActivity();
@@ -962,78 +1110,30 @@ fn jsMiniMedia(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
     const prompt_or_path = jsStringSlice(ctx, argv[1], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid prompt or path");
     defer engine.alloc.free(prompt_or_path);
 
-    const tool_name: []const u8 = if (std.mem.eql(u8, kind, "video"))
-        "generate_video"
-    else if (std.mem.eql(u8, kind, "attach"))
-        "image_attach"
-    else
-        "generate_image";
+    const tool_name = mediaKindToToolName(kind);
+    if (guardAndDispatchPre(engine, ctx, tool_name, prompt_or_path, "Security Policy Error: mini.media is blocked by policy")) |v| return v;
 
-    if (guardPolicy(engine, tool_name)) {
-        hooks.dispatch(engine.alloc, engine.io, .{
-            .event = "post-tool-use", .tool_name = tool_name,
-            .input_json = prompt_or_path, .tool_result = "blocked by policy", .is_error = true,
-        });
-        return c.JS_ThrowTypeError(ctx, "Security Policy Error: mini.media is blocked by policy");
-    }
+    var opts = if (argc >= 3) parseMediaJsOptions(ctx, argv[2], engine.alloc) else MediaJsOptions{};
+    defer opts.deinit(engine.alloc);
 
-    hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "pre-tool-use", .tool_name = tool_name, .input_json = prompt_or_path,
-    });
-
-    // Parse optional opts
-    var size_opt: ?[]u8 = null;
-    defer if (size_opt) |s| engine.alloc.free(s);
-    var filename_opt: ?[]u8 = null;
-    defer if (filename_opt) |f| engine.alloc.free(f);
-    var model_opt: ?[]u8 = null;
-    defer if (model_opt) |m| engine.alloc.free(m);
-    var seconds: u32 = 4;
-
-    if (argc >= 3 and c.JS_IsObject(argv[2]) != 0) {
-        const opts = argv[2];
-        size_opt = jsOptString(ctx, opts, "size", engine.alloc);
-        filename_opt = jsOptString(ctx, opts, "filename", engine.alloc);
-        model_opt = jsOptString(ctx, opts, "model", engine.alloc);
-        if (jsOptInt(ctx, opts, "seconds")) |sec| {
-            if (sec > 0) seconds = @intCast(sec);
-        }
-    }
-
-    const res = if (std.mem.eql(u8, kind, "video"))
-        media_gen_tool.generateVideoDirect(engine.alloc, engine.io, prompt_or_path, seconds, filename_opt, model_opt) catch |e| {
-            return c.JS_ThrowTypeError(ctx, @errorName(e));
-        }
-    else if (std.mem.eql(u8, kind, "attach"))
-        media_gen_tool.attachImageDirect(engine.alloc, engine.io, prompt_or_path) catch |e| {
-            return c.JS_ThrowTypeError(ctx, @errorName(e));
-        }
-    else
-        media_gen_tool.generateImageDirect(engine.alloc, engine.io, prompt_or_path, size_opt, filename_opt, model_opt) catch |e| {
-            return c.JS_ThrowTypeError(ctx, @errorName(e));
-        };
+    const res = executeMediaGeneration(engine, kind, prompt_or_path, &opts) catch |e| {
+        return c.JS_ThrowTypeError(ctx, @errorName(e));
+    };
     defer {
         engine.alloc.free(res.path);
         engine.alloc.free(res.media_type);
         if (res.message.len > 0) engine.alloc.free(res.message);
     }
 
-    // Post-hook
     hooks.dispatch(engine.alloc, engine.io, .{
-        .event = "post-tool-use", .tool_name = tool_name,
-        .input_json = prompt_or_path, .tool_result = res.path,
+        .event = "post-tool-use",
+        .tool_name = tool_name,
+        .input_json = prompt_or_path,
+        .tool_result = res.path,
         .is_error = !res.ok,
     });
 
-    const obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, obj, "ok", c.JS_NewBool(ctx, if (res.ok) 1 else 0));
-    _ = c.JS_SetPropertyStr(ctx, obj, "path", c.JS_NewStringLen(ctx, res.path.ptr, res.path.len));
-    _ = c.JS_SetPropertyStr(ctx, obj, "media_type", c.JS_NewStringLen(ctx, res.media_type.ptr, res.media_type.len));
-    _ = c.JS_SetPropertyStr(ctx, obj, "bytes", c.JS_NewInt64(ctx, @intCast(res.bytes)));
-    if (res.message.len > 0) {
-        _ = c.JS_SetPropertyStr(ctx, obj, "message", c.JS_NewStringLen(ctx, res.message.ptr, res.message.len));
-    }
-    return obj;
+    return makeMediaResult(ctx, res);
 }
 
 /// Register global `mini` object into JSContext

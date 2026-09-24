@@ -219,7 +219,8 @@ test "config: auto-detects $MINI_HOME/providers/<provider>.json" {
     try env.put("MINI_HOME", tmp_home);
     try env.put("OPENAI_COMPAT_PROVIDER", "testmodel");
 
-    mini.config_mod.loadDotEnv(alloc, &env, io);
+    // Call provider config loader directly to avoid .env file interference
+    mini.config_mod.loadActiveProviderConfig(alloc, &env, io);
 
     try testing.expectEqualStrings("https://api.testmodel.ai/v1", env.get("OPENAI_COMPAT_URL").?);
     try testing.expectEqualStrings("testmodel-v1", env.get("OPENAI_COMPAT_MODEL").?);

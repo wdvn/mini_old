@@ -266,8 +266,39 @@ pub const MemoryStore = struct {
     }
 };
 
+fn parseKeywords(alloc: Allocator, v_opt: ?std.json.Value) ![][]u8 {
+    // PSEUDOCODE: Parse keywords JSON array into owned string slice.
+    const v = v_opt orelse return &.{};
+    const arr = switch (v) {
+        .array => |a| a.items,
+        else => return error.InvalidFormat,
+    };
+    var keywords = std.ArrayList([]u8).empty;
+    errdefer {
+        for (keywords.items) |kw| alloc.free(kw);
+        keywords.deinit(alloc);
+    }
+    for (arr) |item| {
+        try keywords.append(alloc, try alloc.dupe(u8, jsonStr(item)));
+    }
+    return try keywords.toOwnedSlice(alloc);
+}
+
+fn parseOptionalString(alloc: Allocator, v_opt: ?std.json.Value) !?[]u8 {
+    // PSEUDOCODE: Return duped string if value is string, else null.
+    const v = v_opt orelse return null;
+    return switch (v) {
+        .string => |s| try alloc.dupe(u8, s),
+        else => null,
+    };
+}
+
 /// Parse 1 JSONL line into MemoryEntry (deep-copy, owned by caller).
 fn parseLine(alloc: Allocator, line: []const u8) !MemoryEntry {
+    // PSEUDOCODE:
+    // 1. Parse JSON from slice and validate root is object.
+    // 2. Extract required fields: id, type, content, ts.
+    // 3. Extract keywords, optional strings (source_session, supersedes), confidence, and access metrics.
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
     defer parsed.deinit();
 
@@ -285,26 +316,11 @@ fn parseLine(alloc: Allocator, line: []const u8) !MemoryEntry {
     const content = try alloc.dupe(u8, jsonStr(obj.get("content") orelse return error.MissingField));
     errdefer alloc.free(content);
 
-    const ts = jsonInt(obj.get("ts") orelse return error.MissingField, 0);
-
-    var keywords = std.ArrayList([]u8).empty;
+    const keywords = try parseKeywords(alloc, obj.get("keywords"));
     errdefer {
-        for (keywords.items) |kw| alloc.free(kw);
-        keywords.deinit(alloc);
+        for (keywords) |kw| alloc.free(kw);
+        alloc.free(keywords);
     }
-    if (obj.get("keywords")) |v| {
-        switch (v) {
-            .array => |arr| for (arr.items) |item| {
-                try keywords.append(alloc, try alloc.dupe(u8, jsonStr(item)));
-            },
-            else => return error.InvalidFormat,
-        }
-    }
-
-    const source_session: ?[]u8 = switch (obj.get("source_session") orelse .null) {
-        .string => |s| try alloc.dupe(u8, s),
-        else => null,
-    };
 
     const confidence: f32 = switch (obj.get("confidence") orelse .null) {
         .float => |f| @floatCast(f),
@@ -312,25 +328,17 @@ fn parseLine(alloc: Allocator, line: []const u8) !MemoryEntry {
         else => 0.0,
     };
 
-    const supersedes: ?[]u8 = switch (obj.get("supersedes") orelse .null) {
-        .string => |s| try alloc.dupe(u8, s),
-        else => null,
-    };
-
-    const access_count: u32 = @intCast(@max(0, jsonInt(obj.get("access_count") orelse .null, 0)));
-    const last_access = jsonInt(obj.get("last_access") orelse .null, 0);
-
     return .{
         .id = id,
-        .ts = ts,
+        .ts = jsonInt(obj.get("ts") orelse return error.MissingField, 0),
         .type = type_str,
         .content = content,
-        .keywords = try keywords.toOwnedSlice(alloc),
-        .source_session = source_session,
+        .keywords = keywords,
+        .source_session = try parseOptionalString(alloc, obj.get("source_session")),
         .confidence = confidence,
-        .supersedes = supersedes,
-        .access_count = access_count,
-        .last_access = last_access,
+        .supersedes = try parseOptionalString(alloc, obj.get("supersedes")),
+        .access_count = @intCast(@max(0, jsonInt(obj.get("access_count") orelse .null, 0))),
+        .last_access = jsonInt(obj.get("last_access") orelse .null, 0),
     };
 }
 

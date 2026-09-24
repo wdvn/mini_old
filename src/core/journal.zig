@@ -65,6 +65,8 @@ pub const StateDelta = struct {
     act_id: usize,
     /// File snapshot (for rollback).
     file_snapshots: []const FileSnapshot,
+    /// LLM stop reason for this act (debugging loop/termination).
+    stop_reason: ?[]const u8 = null,
 };
 
 pub const ActEvent = struct {
@@ -88,7 +90,7 @@ pub const ActJournal = struct {
 
     pub fn init(alloc: Allocator, io: std.Io, file_path: []const u8) !ActJournal {
         const path_dup = try alloc.dupe(u8, file_path);
-        
+
         // Ensure parent directory exists
         if (std.fs.path.dirname(path_dup)) |dir| {
             const cwd = std.Io.Dir.cwd();
@@ -132,61 +134,68 @@ pub const ActJournal = struct {
     /// Maximum journal files to retain (default 30, overridden by MINI_JOURNAL_KEEP).
     pub const default_max_journal_files: usize = 30;
 
-    /// Prune `journal_*.jsonl` files in SAME directory as `self_path`,
-    /// keeping the `max_journal_files` newest files by mtime.
-    /// Current process's file is always kept (just created/written).
-    /// Best-effort: silently ignore errors — pruning must never fail the agent.
-    pub fn pruneOldJournals(alloc: Allocator, io: std.Io, self_path: []const u8) void {
-        const dir_path = std.fs.path.dirname(self_path) orelse ".";
+    const JournalItem = struct { name: []u8, mtime_ns: i96 };
 
-        const cwd = std.Io.Dir.cwd();
-        var dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch return;
-        defer dir.close(io);
+    fn resolveMaxJournalKeep() usize {
+        const s = utils.getEnvSlice("MINI_JOURNAL_KEEP") orelse return default_max_journal_files;
+        const v = std.fmt.parseInt(usize, s, 10) catch return default_max_journal_files;
+        return if (v == 0) default_max_journal_files else v;
+    }
 
-        const max_keep = blk: {
-            const s = utils.getEnvSlice("MINI_JOURNAL_KEEP") orelse break :blk default_max_journal_files;
-            const v = std.fmt.parseInt(usize, s, 10) catch break :blk default_max_journal_files;
-            break :blk if (v == 0) default_max_journal_files else v;
-        };
-
-        // Collect {name, mtime} for all journal_*.jsonl in directory.
-        const Item = struct { name: []u8, mtime_ns: i96 };
-        var items: std.ArrayList(Item) = .empty;
-        defer {
-            for (items.items) |it_| alloc.free(it_.name);
-            items.deinit(alloc);
-        }
-
+    fn collectJournalItems(alloc: Allocator, io: std.Io, dir: *std.Io.Dir, items: *std.ArrayList(JournalItem)) void {
+        // PSEUDOCODE:
+        // 1. Iterate entries in directory.
+        // 2. Filter for journal_*.jsonl files.
+        // 3. Stat mtime and append to items list.
         var it = dir.iterate();
         while (it.next(io) catch null) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.startsWith(u8, entry.name, "journal_") or !std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
             const name_dup = alloc.dupe(u8, entry.name) catch continue;
-            const mtime_ns: i96 = blk2: {
-                const st = dir.statFile(io, entry.name, .{}) catch {
-                    alloc.free(name_dup);
-                    continue;
-                };
-                break :blk2 st.mtime.nanoseconds;
+            const st = dir.statFile(io, entry.name, .{}) catch {
+                alloc.free(name_dup);
+                continue;
             };
-            items.append(alloc, .{ .name = name_dup, .mtime_ns = mtime_ns }) catch {
+            items.append(alloc, .{ .name = name_dup, .mtime_ns = st.mtime.nanoseconds }) catch {
                 alloc.free(name_dup);
                 continue;
             };
         }
+    }
 
+    /// Prune `journal_*.jsonl` files in SAME directory as `self_path`,
+    /// keeping the `max_journal_files` newest files by mtime.
+    /// Current process's file is always kept (just created/written).
+    /// Best-effort: silently ignore errors — pruning must never fail the agent.
+    pub fn pruneOldJournals(alloc: Allocator, io: std.Io, self_path: []const u8) void {
+        // PSEUDOCODE:
+        // 1. Open journals directory and collect all journal items.
+        // 2. Sort descending by mtime (newest first).
+        // 3. Delete files exceeding max_keep (except self_path).
+        const dir_path = std.fs.path.dirname(self_path) orelse ".";
+        const cwd = std.Io.Dir.cwd();
+        var dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch return;
+        defer dir.close(io);
+
+        var items: std.ArrayList(JournalItem) = .empty;
+        defer {
+            for (items.items) |it_| alloc.free(it_.name);
+            items.deinit(alloc);
+        }
+        collectJournalItems(alloc, io, &dir, &items);
+
+        const max_keep = resolveMaxJournalKeep();
         if (items.items.len <= max_keep) return;
 
-        // Sort descending by mtime (newest first) — keep first `max_keep`.
-        std.mem.sort(Item, items.items, {}, struct {
-            fn lt(_: void, a: Item, b: Item) bool {
+        std.mem.sort(JournalItem, items.items, {}, struct {
+            fn lt(_: void, a: JournalItem, b: JournalItem) bool {
                 return a.mtime_ns > b.mtime_ns;
             }
         }.lt);
 
+        const current_base = std.fs.path.basename(self_path);
         for (items.items[max_keep..]) |old| {
-            // Never delete current process journal
-            if (std.mem.eql(u8, old.name, std.fs.path.basename(self_path))) continue;
+            if (std.mem.eql(u8, old.name, current_base)) continue;
             dir.deleteFile(io, old.name) catch {};
         }
     }
@@ -291,10 +300,10 @@ pub const ActJournal = struct {
         var out_buf = std.ArrayList(u8).empty;
         defer out_buf.deinit(self.alloc);
         var aw = std.Io.Writer.Allocating.fromArrayList(self.alloc, &out_buf);
-        
+
         try std.json.Stringify.value(event, .{}, &aw.writer);
         try aw.writer.writeByte('\n');
-        
+
         out_buf = aw.toArrayList();
 
         // Write to main journal

@@ -195,6 +195,32 @@ pub fn expandArtifactReferences(alloc: Allocator, io: std.Io, prompt: []const u8
     return result.list.toOwnedSlice(alloc);
 }
 
+fn readExistingMetadata(alloc: Allocator, io: std.Io, meta_path: []const u8) ?[]u8 {
+    const cwd = std.Io.Dir.cwd();
+    var mf = cwd.openFile(io, meta_path, .{}) catch return null;
+    defer mf.close(io);
+    const st = mf.stat(io) catch return null;
+    if (st.size >= 1024 * 1024) return null;
+    const mb = alloc.alloc(u8, @intCast(st.size)) catch return null;
+    errdefer alloc.free(mb);
+    const mn = utils.readAll(io, mf, mb) catch 0;
+    return mb[0..mn];
+}
+
+fn appendExistingJsonArray(w: *utils.BufWriter, existing_content: ?[]const u8) !void {
+    try w.writeAll("[\n");
+    if (existing_content) |ec| {
+        const trimmed = std.mem.trim(u8, ec, " \t\r\n");
+        if (trimmed.len >= 2 and trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']') {
+            const inner = trimmed[1 .. trimmed.len - 1];
+            if (inner.len > 0) {
+                try w.writeAll(inner);
+                try w.writeAll(",\n");
+            }
+        }
+    }
+}
+
 fn updateMetadata(
     alloc: Allocator,
     io: std.Io,
@@ -213,65 +239,29 @@ fn updateMetadata(
     _ = std.c.clock_gettime(.REALTIME, &ts);
     const now = ts.sec;
 
-    // Read existing metadata if present
-    const cwd = std.Io.Dir.cwd();
-    var existing_content: ?[]u8 = null;
-    if (cwd.openFile(io, meta_path, .{})) |mf| {
-        defer mf.close(io);
-        if (mf.stat(io)) |st| {
-            if (st.size < 1024 * 1024) {
-                const mbuf = alloc.alloc(u8, @intCast(st.size)) catch null;
-                if (mbuf) |mb| {
-                    const mn = utils.readAll(io, mf, mb) catch 0;
-                    existing_content = mb[0..mn];
-                }
-            }
-        } else |_| {}
-    } else |_| {}
+    const existing_content = readExistingMetadata(alloc, io, meta_path);
     defer if (existing_content) |ec| alloc.free(ec);
 
     var w = utils.BufWriter.init(alloc);
     defer w.deinit();
 
-    const effective_title = title orelse name;
-    const effective_type = artifact_type orelse "text";
-    const effective_summary = summary orelse "";
-
     const esc_name = try json.escape(alloc, name);
     defer alloc.free(esc_name);
-    const esc_title = try json.escape(alloc, effective_title);
+    const esc_title = try json.escape(alloc, title orelse name);
     defer alloc.free(esc_title);
-    const esc_type = try json.escape(alloc, effective_type);
+    const esc_type = try json.escape(alloc, artifact_type orelse "text");
     defer alloc.free(esc_type);
-    const esc_sum = try json.escape(alloc, effective_summary);
+    const esc_sum = try json.escape(alloc, summary orelse "");
     defer alloc.free(esc_sum);
     const esc_path = try json.escape(alloc, path);
     defer alloc.free(esc_path);
 
-    // Write JSON array structure
-    if (existing_content) |ec| {
-        const trimmed = std.mem.trim(u8, ec, " \t\r\n");
-        if (trimmed.len >= 2 and trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']') {
-            const inner = trimmed[1 .. trimmed.len - 1];
-            try w.writeAll("[\n");
-            if (inner.len > 0) {
-                try w.writeAll(inner);
-                try w.writeAll(",\n");
-            }
-            try w.print("  {{\"name\":\"{s}\",\"title\":\"{s}\",\"type\":\"{s}\",\"summary\":\"{s}\",\"user_facing\":{},\"path\":\"{s}\",\"timestamp\":{d}}}\n]", .{
-                esc_name, esc_title, esc_type, esc_sum, user_facing, esc_path, now,
-            });
-        } else {
-            try w.print("[\n  {{\"name\":\"{s}\",\"title\":\"{s}\",\"type\":\"{s}\",\"summary\":\"{s}\",\"user_facing\":{},\"path\":\"{s}\",\"timestamp\":{d}}}\n]", .{
-                esc_name, esc_title, esc_type, esc_sum, user_facing, esc_path, now,
-            });
-        }
-    } else {
-        try w.print("[\n  {{\"name\":\"{s}\",\"title\":\"{s}\",\"type\":\"{s}\",\"summary\":\"{s}\",\"user_facing\":{},\"path\":\"{s}\",\"timestamp\":{d}}}\n]", .{
-            esc_name, esc_title, esc_type, esc_sum, user_facing, esc_path, now,
-        });
-    }
+    try appendExistingJsonArray(&w, existing_content);
+    try w.print("  {{\"name\":\"{s}\",\"title\":\"{s}\",\"type\":\"{s}\",\"summary\":\"{s}\",\"user_facing\":{},\"path\":\"{s}\",\"timestamp\":{d}}}\n]", .{
+        esc_name, esc_title, esc_type, esc_sum, user_facing, esc_path, now,
+    });
 
+    const cwd = std.Io.Dir.cwd();
     const file = try cwd.createFile(io, meta_path, .{ .truncate = true });
     defer file.close(io);
     try file.writeStreamingAll(io, w.list.items);
@@ -306,5 +296,3 @@ test "artifacts write, read and reference expansion" {
     try std.testing.expect(std.mem.indexOf(u8, expanded, "--- [Artifact: test_plan.md] ---") != null);
     try std.testing.expect(std.mem.indexOf(u8, expanded, "Test artifact content") != null);
 }
-
-

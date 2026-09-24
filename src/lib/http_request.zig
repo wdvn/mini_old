@@ -292,26 +292,10 @@ fn preferIpv4() bool {
 /// Returns `null` when disabled, when the host has no IPv4 address, when the
 /// host is already an IP literal, or on any error — callers then fall back to
 /// std's default connection logic (IPv6-only hosts keep working).
-fn preconnectIpv4(client: *std.http.Client, uri: std.Uri) ?*std.http.Client.Connection {
-    if (!preferIpv4()) return null;
-
-    const protocol = std.http.Client.Protocol.fromUri(uri) orelse return null;
-    if (protocol == .tls and std.http.Client.disable_tls) return null;
-
-    const io = client.io;
-
-    var host_buf: [net.HostName.max_len]u8 = undefined;
-    const host_name = uri.getHost(&host_buf) catch return null;
-
-    // Already an IP literal — std connects directly, no DNS/race involved.
-    if (net.IpAddress.parseIp4(host_name.bytes, uri.port orelse 0)) |_| return null else |_| {}
-    if (net.IpAddress.parseIp6(host_name.bytes, uri.port orelse 0)) |_| return null else |_| {}
-
-    const port: u16 = uri.port orelse switch (protocol) {
-        .plain => 80,
-        .tls => 443,
-    };
-
+fn resolveFirstIpv4(io: std.Io, host_name: net.HostName, port: u16) ?net.Ip4Address {
+    // PSEUDOCODE:
+    // 1. Lookup IPv4 addresses for host_name and port
+    // 2. Iterate queue results and return first IP4 address found
     var results_buf: [16]net.HostName.LookupResult = undefined;
     var results: std.Io.Queue(net.HostName.LookupResult) = .init(&results_buf);
     host_name.lookup(io, &results, .{ .port = port, .family = .ip4 }) catch return null;
@@ -328,8 +312,34 @@ fn preconnectIpv4(client: *std.http.Client, uri: std.Uri) ?*std.http.Client.Conn
             .canonical_name => {},
         }
     } else |_| {}
+    return ip4;
+}
 
-    const addr = ip4 orelse return null;
+fn preconnectIpv4(client: *std.http.Client, uri: std.Uri) ?*std.http.Client.Connection {
+    // PSEUDOCODE:
+    // 1. Check if IPv4 preference enabled and protocol supported
+    // 2. Extract host name; return null if already IP literal
+    // 3. Resolve first IPv4 address
+    // 4. Initialize TLS state if needed and connect with proxied host
+    if (!preferIpv4()) return null;
+
+    const protocol = std.http.Client.Protocol.fromUri(uri) orelse return null;
+    if (protocol == .tls and std.http.Client.disable_tls) return null;
+
+    const io = client.io;
+    var host_buf: [net.HostName.max_len]u8 = undefined;
+    const host_name = uri.getHost(&host_buf) catch return null;
+
+    // Already an IP literal — std connects directly, no DNS/race involved.
+    if (net.IpAddress.parseIp4(host_name.bytes, uri.port orelse 0)) |_| return null else |_| {}
+    if (net.IpAddress.parseIp6(host_name.bytes, uri.port orelse 0)) |_| return null else |_| {}
+
+    const port: u16 = uri.port orelse switch (protocol) {
+        .plain => 80,
+        .tls => 443,
+    };
+
+    const addr = resolveFirstIpv4(io, host_name, port) orelse return null;
 
     var ip_buf: [net.HostName.max_len]u8 = undefined;
     const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{
@@ -343,134 +353,90 @@ fn preconnectIpv4(client: *std.http.Client, uri: std.Uri) ?*std.http.Client.Conn
         .host = .{ .bytes = ip_str },
         .port = port,
         .protocol = protocol,
-        // Preserve the real host name for SNI + certificate verification and so
-        // the pooled connection matches the request's URI host.
         .proxied_host = host_name,
         .proxied_port = port,
     }) catch null;
 }
 
-/// Like `fetch` but uses existing client (reuses connection pool, caller manages deinit).
-pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options) !Response {
-    const http_method = try parseMethod(opts.method);
-
-    var extra_headers: []std.http.Header = &.{};
-    var extra_headers_owned = false;
-    defer if (extra_headers_owned) {
-        for (extra_headers) |h| {
-            alloc.free(h.name);
-            alloc.free(h.value);
-        }
-        alloc.free(extra_headers);
-    };
-    if (opts.headers_json) |hj| {
-        extra_headers = try parseHeadersJson(alloc, hj);
-        extra_headers_owned = true;
-    }
-
-    const uri = try std.Uri.parse(opts.url);
-    var req = try client.request(http_method, uri, .{
-        .extra_headers = extra_headers,
-        .headers = .{
-            .accept_encoding = .omit,
-        },
-        .keep_alive = false,
-        // Prefer IPv4 when available (works around blackholed IPv6 routes,
-        // which otherwise fail as TlsInitializationFailed during handshake).
-        .connection = preconnectIpv4(client, uri),
-    });
-    defer req.deinit();
-
-    // --- Send request body ---
-    if (opts.body) |b| {
+fn sendRequestBody(req: *std.http.Client.Request, body: ?[]const u8) !void {
+    // PSEUDOCODE:
+    // 1. If body is non-empty, set content-length, write body unflushed, end, and flush
+    // 2. Otherwise dispatch bodiless request
+    if (body) |b| {
         if (b.len > 0) {
             req.transfer_encoding = .{ .content_length = b.len };
             var req_body = try req.sendBodyUnflushed(&.{});
             try req_body.writer.writeAll(b);
             try req_body.end();
             try req.connection.?.flush();
-        } else {
-            try req.sendBodiless();
-        }
-    } else {
-        try req.sendBodiless();
-    }
-
-    // --- Receive response head ---
-    var redirect_buffer: [4096]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buffer);
-
-    const status: u16 = @intFromEnum(response.head.status);
-    const reason: []const u8 = response.head.reason;
-
-    // --- Collect headers using std HeaderIterator ---
-    var header_list = std.ArrayList(Response.Header).empty;
-    defer {
-        for (header_list.items) |h| {
-            alloc.free(h.name);
-            alloc.free(h.value);
-        }
-        header_list.deinit(alloc);
-    }
-    if (response.head.bytes.len > 0) {
-        var it = response.head.iterateHeaders();
-        while (it.next()) |h| {
-            try header_list.append(alloc, .{
-                .name = try alloc.dupe(u8, h.name),
-                .value = try alloc.dupe(u8, h.value),
-            });
+            return;
         }
     }
+    try req.sendBodiless();
+}
 
-    // --- Read body with limit ---
-    var resp_body = std.ArrayList(u8).empty;
-    defer resp_body.deinit(alloc);
+fn collectResponseHeaders(alloc: Allocator, response: anytype, header_list: *std.ArrayList(Response.Header)) !void {
+    if (response.head.bytes.len == 0) return;
+    var it = response.head.iterateHeaders();
+    while (it.next()) |h| {
+        try header_list.append(alloc, .{
+            .name = try alloc.dupe(u8, h.name),
+            .value = try alloc.dupe(u8, h.value),
+        });
+    }
+}
 
-    var transfer_buf: [4096]u8 = undefined;
-    const r = response.reader(&transfer_buf);
-
+fn readLimitedResponseBody(alloc: Allocator, r: anytype, max_body_size: usize, resp_body: *std.ArrayList(u8)) !usize {
+    // PSEUDOCODE:
+    // 1. Read chunks from reader until EOF or signal interruption
+    // 2. Append up to max_body_size to resp_body
+    // 3. Return total bytes received
     var chunk_buf: [4096]u8 = undefined;
     var total_bytes: usize = 0;
     while (true) {
         if (signals.isInterrupted()) return error.Interrupted;
         const n = r.readSliceShort(&chunk_buf) catch |e| {
-            // Already read a portion → consider sufficient, don't fail whole request
             if (resp_body.items.len > 0) break;
             return e;
         };
         if (signals.isInterrupted()) return error.Interrupted;
         if (n == 0) break;
         total_bytes += n;
-        if (resp_body.items.len < opts.max_body_size) {
-            const to_copy = @min(n, opts.max_body_size - resp_body.items.len);
+        if (resp_body.items.len < max_body_size) {
+            const to_copy = @min(n, max_body_size - resp_body.items.len);
             try resp_body.appendSlice(alloc, chunk_buf[0..to_copy]);
         }
     }
+    return total_bytes;
+}
 
-    // --- Pack into a single allocation for simple deinit ---
-    // Layout: reason | header names+values | body  (no padding, cumulative offsets)
-    const reason_len = reason.len;
+fn packResponse(
+    alloc: Allocator,
+    status: u16,
+    reason: []const u8,
+    headers: []const Response.Header,
+    body: []const u8,
+    total_bytes: usize,
+) !Response {
+    // PSEUDOCODE:
+    // 1. Calculate combined length for reason, headers, and body
+    // 2. Allocate base slice and copy data sequentially
+    // 3. Return constructed Response
     var headers_flat_len: usize = 0;
-    for (header_list.items) |h| {
-        headers_flat_len += h.name.len + h.value.len;
-    }
-    const total_len = reason_len + headers_flat_len + resp_body.items.len;
+    for (headers) |h| headers_flat_len += h.name.len + h.value.len;
+    const total_len = reason.len + headers_flat_len + body.len;
 
     const base = try alloc.alloc(u8, total_len);
     errdefer alloc.free(base);
 
-
-
     var off: usize = 0;
-    // reason
     @memcpy(base[off .. off + reason.len], reason);
     const reason_out = base[off .. off + reason.len];
     off += reason.len;
 
-    // headers: Header array pointing into base
-    const headers_out = try alloc.alloc(Response.Header, header_list.items.len);
+    const headers_out = try alloc.alloc(Response.Header, headers.len);
     errdefer alloc.free(headers_out);
-    for (header_list.items, 0..) |h, idx| {
+    for (headers, 0..) |h, idx| {
         @memcpy(base[off .. off + h.name.len], h.name);
         const name_out = base[off .. off + h.name.len];
         off += h.name.len;
@@ -480,9 +446,8 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
         headers_out[idx] = .{ .name = name_out, .value = value_out };
     }
 
-    // body
-    @memcpy(base[off .. off + resp_body.items.len], resp_body.items);
-    const body_out = base[off .. off + resp_body.items.len];
+    @memcpy(base[off .. off + body.len], body);
+    const body_out = base[off .. off + body.len];
 
     return .{
         .status = status,
@@ -490,10 +455,77 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
         .headers = headers_out,
         .body = body_out,
         .total_body_bytes = total_bytes,
-        .truncated = total_bytes > resp_body.items.len,
+        .truncated = total_bytes > body.len,
         .intern_base = base,
         .intern_headers = headers_out,
     };
+}
+
+const ExtraHeaders = struct {
+    headers: []std.http.Header,
+    owned: bool,
+
+    pub fn deinit(self: ExtraHeaders, alloc: Allocator) void {
+        if (!self.owned) return;
+        for (self.headers) |h| {
+            alloc.free(h.name);
+            alloc.free(h.value);
+        }
+        alloc.free(self.headers);
+    }
+};
+
+fn resolveExtraHeaders(alloc: Allocator, headers_json: ?[]const u8) !ExtraHeaders {
+    if (headers_json) |hj| {
+        return .{ .headers = try parseHeadersJson(alloc, hj), .owned = true };
+    }
+    return .{ .headers = &.{}, .owned = false };
+}
+
+/// Like `fetch` but uses existing client (reuses connection pool, caller manages deinit).
+pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options) !Response {
+    // PSEUDOCODE:
+    // 1. Parse method, headers, and construct request
+    // 2. Send request body and receive response head
+    // 3. Read body with limit and pack into contiguous response
+    const http_method = try parseMethod(opts.method);
+    const extra = try resolveExtraHeaders(alloc, opts.headers_json);
+    defer extra.deinit(alloc);
+
+    const uri = try std.Uri.parse(opts.url);
+    var req = try client.request(http_method, uri, .{
+        .extra_headers = extra.headers,
+        .headers = .{ .accept_encoding = .omit },
+        .keep_alive = false,
+        .connection = preconnectIpv4(client, uri),
+    });
+    defer req.deinit();
+
+    try sendRequestBody(&req, opts.body);
+
+    var redirect_buffer: [4096]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buffer);
+    const status: u16 = @intFromEnum(response.head.status);
+    const reason: []const u8 = response.head.reason;
+
+    var header_list = std.ArrayList(Response.Header).empty;
+    defer {
+        for (header_list.items) |h| {
+            alloc.free(h.name);
+            alloc.free(h.value);
+        }
+        header_list.deinit(alloc);
+    }
+    try collectResponseHeaders(alloc, response, &header_list);
+
+    var resp_body = std.ArrayList(u8).empty;
+    defer resp_body.deinit(alloc);
+
+    var transfer_buf: [4096]u8 = undefined;
+    const r = response.reader(&transfer_buf);
+    const total_bytes = try readLimitedResponseBody(alloc, r, opts.max_body_size, &resp_body);
+
+    return try packResponse(alloc, status, reason, header_list.items, resp_body.items, total_bytes);
 }
 
 pub const DownloadResult = struct {
@@ -502,84 +534,11 @@ pub const DownloadResult = struct {
     error_message: ?[]const u8 = null,
 };
 
-/// Download an HTTP resource directly into a file on disk in chunks (RFC-011 §3.3).
-/// Avoids loading large bodies (e.g. 200MB video) into memory buffers.
-pub fn downloadToFile(
-    alloc: Allocator,
-    io: std.Io,
-    opts: Options,
-    target_path: []const u8,
-) !DownloadResult {
-    var client = std.http.Client{
-        .allocator = alloc,
-        .io = io,
-    };
-    defer client.deinit();
-    initTlsState(&client, io);
-
-    const http_method = try parseMethod(opts.method);
-
-    var extra_headers: []std.http.Header = &.{};
-    var extra_headers_owned = false;
-    defer if (extra_headers_owned) {
-        for (extra_headers) |h| {
-            alloc.free(h.name);
-            alloc.free(h.value);
-        }
-        alloc.free(extra_headers);
-    };
-    if (opts.headers_json) |hj| {
-        extra_headers = try parseHeadersJson(alloc, hj);
-        extra_headers_owned = true;
-    }
-
-    const uri = try std.Uri.parse(opts.url);
-    var req = try client.request(http_method, uri, .{
-        .extra_headers = extra_headers,
-        .headers = .{
-            .accept_encoding = .omit,
-        },
-        .keep_alive = false,
-        .connection = preconnectIpv4(&client, uri),
-    });
-    defer req.deinit();
-
-    if (opts.body) |b| {
-        if (b.len > 0) {
-            req.transfer_encoding = .{ .content_length = b.len };
-            var req_body = try req.sendBodyUnflushed(&.{});
-            try req_body.writer.writeAll(b);
-            try req_body.end();
-            try req.connection.?.flush();
-        } else {
-            try req.sendBodiless();
-        }
-    } else {
-        try req.sendBodiless();
-    }
-
-    var redirect_buffer: [4096]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buffer);
-    const status: u16 = @intFromEnum(response.head.status);
-
-    var transfer_buf: [4096]u8 = undefined;
-    const r = response.reader(&transfer_buf);
-
-    if (status < 200 or status >= 300) {
-        var err_buf: [2048]u8 = undefined;
-        const n = r.readSliceShort(&err_buf) catch 0;
-        const msg = if (n > 0) try alloc.dupe(u8, err_buf[0..n]) else null;
-        return DownloadResult{
-            .status = status,
-            .total_bytes = 0,
-            .error_message = msg,
-        };
-    }
-
-    const cwd = std.Io.Dir.cwd();
-    const file = try cwd.createFile(io, target_path, .{});
-    defer file.close(io);
-
+fn streamResponseBodyToFile(io: std.Io, r: anytype, file: std.Io.File, max_size: usize) !usize {
+    // PSEUDOCODE:
+    // 1. Loop reading chunks into 16KB buffer
+    // 2. Check signal interruption and max_size
+    // 3. Write streaming all to file
     var chunk_buf: [16 * 1024]u8 = undefined;
     var total_bytes: usize = 0;
     while (true) {
@@ -591,20 +550,74 @@ pub fn downloadToFile(
         if (signals.isInterrupted()) return error.Interrupted;
         if (n == 0) break;
         total_bytes += n;
-        if (total_bytes > opts.max_body_size) {
+        if (total_bytes > max_size) {
             return error.FileTooLarge;
         }
         try file.writeStreamingAll(io, chunk_buf[0..n]);
     }
+    return total_bytes;
+}
 
-    return DownloadResult{
-        .status = status,
-        .total_bytes = total_bytes,
-    };
+fn readErrorMessage(alloc: Allocator, r: anytype) !?[]const u8 {
+    var err_buf: [2048]u8 = undefined;
+    const n = r.readSliceShort(&err_buf) catch 0;
+    return if (n > 0) try alloc.dupe(u8, err_buf[0..n]) else null;
+}
+
+/// Download an HTTP resource directly into a file on disk in chunks (RFC-011 §3.3).
+/// Avoids loading large bodies (e.g. 200MB video) into memory buffers.
+pub fn downloadToFile(
+    alloc: Allocator,
+    io: std.Io,
+    opts: Options,
+    target_path: []const u8,
+) !DownloadResult {
+    // PSEUDOCODE:
+    // 1. Set up client, TLS state, headers and request
+    // 2. Send request body and receive head
+    // 3. If non-2xx status, return error message
+    // 4. Create target file and stream body chunks to disk
+    var client = std.http.Client{ .allocator = alloc, .io = io };
+    defer client.deinit();
+    initTlsState(&client, io);
+
+    const http_method = try parseMethod(opts.method);
+    const extra = try resolveExtraHeaders(alloc, opts.headers_json);
+    defer extra.deinit(alloc);
+
+    const uri = try std.Uri.parse(opts.url);
+    var req = try client.request(http_method, uri, .{
+        .extra_headers = extra.headers,
+        .headers = .{ .accept_encoding = .omit },
+        .keep_alive = false,
+        .connection = preconnectIpv4(&client, uri),
+    });
+    defer req.deinit();
+
+    try sendRequestBody(&req, opts.body);
+
+    var redirect_buffer: [4096]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buffer);
+    const status: u16 = @intFromEnum(response.head.status);
+
+    var transfer_buf: [4096]u8 = undefined;
+    const r = response.reader(&transfer_buf);
+
+    if (status < 200 or status >= 300) {
+        const msg = try readErrorMessage(alloc, r);
+        return DownloadResult{ .status = status, .total_bytes = 0, .error_message = msg };
+    }
+
+    const cwd = std.Io.Dir.cwd();
+    const file = try cwd.createFile(io, target_path, .{});
+    defer file.close(io);
+
+    const total_bytes = try streamResponseBodyToFile(io, r, file, opts.max_body_size);
+    return DownloadResult{ .status = status, .total_bytes = total_bytes };
 }
 
 // ---------------------------------------------------------------------------
-// postStream — streaming cho SSE / NDJSON (backends AI)
+// postStream — streaming for SSE / NDJSON (AI backends)
 // ---------------------------------------------------------------------------
 
 /// Callback receiving each data chunk from HTTP response (streaming).
@@ -656,6 +669,75 @@ fn freeHeadersKv(alloc: Allocator, headers: []std.http.Header) void {
     alloc.free(headers);
 }
 
+fn calculateStreamDeadline(opts: StreamOptions) i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    const start_ms = @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1000000);
+    const abs_max: u32 = @min(opts.timeout_secs, @max(opts.idle_timeout_secs, 1) * 6);
+    return start_ms + @as(i64, @intCast(abs_max)) * 1000;
+}
+
+fn checkStreamWatchdog(watch_fd: ?posix.socket_t, idle_timeout_secs: u32, buffered_len: usize) !bool {
+    const fd = watch_fd orelse return true;
+    if (buffered_len > 0) return true;
+    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    const timeout_ms: i32 = @intCast(@as(u64, idle_timeout_secs) * 1000);
+    const prc = try posix.poll(&fds, timeout_ms);
+    return prc > 0;
+}
+
+fn streamResponseLoop(
+    r: anytype,
+    watch_fd: ?posix.socket_t,
+    opts: StreamOptions,
+    deadline_ms: i64,
+    on_chunk: StreamChunkFn,
+    userdata: *anyopaque,
+) !void {
+    // PSEUDOCODE:
+    // 1. Loop checking signals and wall-clock deadline
+    // 2. Poll socket with idle timeout if buffer is empty
+    // 3. Peek greedy chunk; break on EOF, invoke on_chunk callback, toss bytes
+    var got_any = false;
+    while (true) {
+        if (signals.isInterrupted()) return error.Interrupted;
+
+        var ts_now: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.REALTIME, &ts_now);
+        const now_ms = @as(i64, @intCast(ts_now.sec)) * 1000 + @divTrunc(ts_now.nsec, 1000000);
+        if (now_ms >= deadline_ms) {
+            if (opts.out_idle_aborted) |flag| flag.* = true;
+            return error.StreamIdleTimeout;
+        }
+
+        const socket_ready = try checkStreamWatchdog(watch_fd, opts.idle_timeout_secs, r.bufferedLen());
+        if (!socket_ready) {
+            if (opts.out_idle_aborted) |flag| flag.* = true;
+            return error.StreamIdleTimeout;
+        }
+
+        const chunk = r.peekGreedy(1) catch |e| switch (e) {
+            error.EndOfStream => break,
+            else => return e,
+        };
+        if (signals.isInterrupted()) return error.Interrupted;
+        if (chunk.len == 0) break;
+        got_any = true;
+        on_chunk(chunk, userdata);
+        r.toss(chunk.len);
+    }
+}
+
+fn sendPostStreamBody(req: *std.http.Client.Request, body: []const u8) !void {
+    req.transfer_encoding = .{ .content_length = body.len };
+    var req_body = try req.sendBodyUnflushed(&.{});
+    if (body.len > 0) {
+        try req_body.writer.writeAll(body);
+    }
+    try req_body.end();
+    try req.connection.?.flush();
+}
+
 /// Send HTTP POST and stream response chunk-by-chunk via `on_chunk` callback.
 /// Returns HTTP status code. Used for SSE/NDJSON across AI backends.
 pub fn postStream(
@@ -665,13 +747,16 @@ pub fn postStream(
     on_chunk: StreamChunkFn,
     userdata: *anyopaque,
 ) !u32 {
+    // PSEUDOCODE:
+    // 1. Setup client, TLS state, headers and POST request
+    // 2. Send body and receive response head
+    // 3. Resolve socket fd for watchdog and compute deadline
+    // 4. Stream response chunks via callback and return status code
     var client = std.http.Client{
         .allocator = alloc,
         .io = io,
     };
     defer client.deinit();
-
-    // See fetch(): redirect http → https requires pre-warmed TLS state.
     initTlsState(&client, io);
 
     const extra_headers = try parseHeadersKv(alloc, opts.headers);
@@ -680,103 +765,27 @@ pub fn postStream(
     const uri = try std.Uri.parse(opts.url);
     var req = try client.request(.POST, uri, .{
         .extra_headers = extra_headers,
-        .headers = .{
-            .accept_encoding = .omit,
-        },
+        .headers = .{ .accept_encoding = .omit },
         .keep_alive = false,
-        // Prefer IPv4 when available (works around blackholed IPv6 routes,
-        // which otherwise fail as TlsInitializationFailed during handshake).
         .connection = preconnectIpv4(&client, uri),
     });
     defer req.deinit();
 
-    // Send body
-    // POST must always have a body (sendBodiless asserts !method.requestHasBody()
-    // → panics with POST/PUT). Send content_length = 0 when body is empty.
-    req.transfer_encoding = .{ .content_length = opts.body.len };
-    var req_body = try req.sendBodyUnflushed(&.{});
-    if (opts.body.len > 0) {
-        try req_body.writer.writeAll(opts.body);
-    }
-    try req_body.end();
-    try req.connection.?.flush();
+    try sendPostStreamBody(&req, opts.body);
 
     var redirect_buffer: [4096]u8 = undefined;
     var response = try req.receiveHead(&redirect_buffer);
 
-    // Read streaming chunks
     var transfer_buf: [4096]u8 = undefined;
     const r = response.reader(&transfer_buf);
 
-    // Idle fd for the Stream Stall Watchdog (RFC-009 Phase 5).
     const watch_fd: ?posix.socket_t = if (opts.idle_timeout_secs > 0)
         (if (req.connection) |conn| conn.stream_reader.stream.socket.handle else null)
     else
         null;
 
-    // Wall-clock deadline: absolute max stream duration from response headers receipt.
-    // Prevents extended-thinking models (e.g. reasoning_effort=high) from hanging
-    // indefinitely when TCP keepalive/TLS heartbeat fools the poll-based idle watchdog.
-    const deadline_ms: i64 = blk: {
-        var ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(.REALTIME, &ts);
-        const start_ms = @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1000000);
-        // Use the smaller of total timeout or 6x idle timeout as absolute ceiling.
-        // This handles: idle=60s → deadline=120s (matches timeout_secs default),
-        // idle=15s → deadline=90s, etc. Prevents 3h+ hangs from extended thinking.
-        const abs_max: u32 = @min(opts.timeout_secs, @max(opts.idle_timeout_secs, 1) * 6);
-        break :blk start_ms + @as(i64, @intCast(abs_max)) * 1000;
-    };
-
-    var got_any = false;
-    const read_result: anyerror!void = blk: {
-        while (true) {
-            if (signals.isInterrupted()) break :blk error.Interrupted;
-            // Wall-clock check: abort if total stream duration exceeded.
-            {
-                var ts_now: std.c.timespec = undefined;
-                _ = std.c.clock_gettime(.REALTIME, &ts_now);
-                const now_ms = @as(i64, @intCast(ts_now.sec)) * 1000 + @divTrunc(ts_now.nsec, 1000000);
-                if (now_ms >= deadline_ms) {
-                    if (opts.out_idle_aborted) |flag| flag.* = true;
-                    if (!got_any) return error.StreamIdleTimeout;
-                    break :blk error.StreamIdleTimeout;
-                }
-            }
-            // Stream Stall Watchdog: poll with idle timeout before each blocked
-            // read. If the server goes silent for > idle_timeout_secs, abort
-            // instead of blocking until the total timeout (120s) elapses.
-            if (watch_fd) |fd| {
-                if (r.bufferedLen() == 0) {
-                    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-                    const timeout_ms: i32 = @intCast(@as(u64, opts.idle_timeout_secs) * 1000);
-                    const prc = posix.poll(&fds, timeout_ms) catch |e| break :blk e;
-                    if (prc == 0) {
-                        // No bytes within the idle window → stream stalled.
-                        if (opts.out_idle_aborted) |flag| flag.* = true;
-                        if (!got_any) return error.StreamIdleTimeout;
-                        break :blk error.StreamIdleTimeout;
-                    }
-                }
-            }
-            const chunk = r.peekGreedy(1) catch |e| switch (e) {
-                error.EndOfStream => break :blk {},
-                else => break :blk e,
-            };
-            if (signals.isInterrupted()) break :blk error.Interrupted;
-            if (chunk.len == 0) break :blk {};
-            got_any = true;
-            on_chunk(chunk, userdata);
-            r.toss(chunk.len);
-        }
-        break :blk {};
-    };
-    if (read_result) |_| {} else |e| {
-        if (e == error.Interrupted) return error.Interrupted;
-        if (e == error.StreamIdleTimeout) return error.StreamIdleTimeout;
-        
-        return e;
-    }
+    const deadline_ms = calculateStreamDeadline(opts);
+    try streamResponseLoop(r, watch_fd, opts, deadline_ms, on_chunk, userdata);
 
     return @intFromEnum(response.head.status);
 }

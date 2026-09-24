@@ -71,61 +71,83 @@ pub fn detectMimeType(data: []const u8, filename: []const u8) []const u8 {
     return "application/octet-stream";
 }
 
-/// Extract image dimensions (width, height) from header if possible.
-pub fn extractDimensions(data: []const u8, mime: []const u8) struct { width: u32, height: u32 } {
+pub const ImageDimensions = struct { width: u32, height: u32 };
+
+fn extractWebpDimensions(data: []const u8) ImageDimensions {
+    // PSEUDOCODE:
+    // 1. Check VP8 lossy header (data[12..16] == "VP8 ")
+    // 2. Check VP8L lossless header (data[12..16] == "VP8L")
+    // 3. Read width and height bits according to WebP specification
     var width: u32 = 0;
     var height: u32 = 0;
+    if (std.mem.eql(u8, data[12..16], "VP8 ") and data.len >= 30) {
+        const raw_w = std.mem.readInt(u16, data[26..28][0..2], .little);
+        const raw_h = std.mem.readInt(u16, data[28..30][0..2], .little);
+        width = raw_w & 0x3FFF;
+        height = raw_h & 0x3FFF;
+    } else if (std.mem.eql(u8, data[12..16], "VP8L") and data.len >= 25) {
+        const b0 = data[21];
+        const b1 = data[22];
+        const b2 = data[23];
+        const b3 = data[24];
+        width = 1 + (@as(u32, b0) | ((@as(u32, b1) & 0x3F) << 8));
+        height = 1 + (((@as(u32, b1) >> 6) | (@as(u32, b2) << 2) | ((@as(u32, b3) & 0x0F) << 10)));
+    }
+    return .{ .width = width, .height = height };
+}
 
-    if (std.mem.eql(u8, mime, "image/png") and data.len >= 24) {
-        // PNG: IHDR chunk width at 16..20, height at 20..24 (big-endian)
-        width = std.mem.readInt(u32, data[16..20][0..4], .big);
-        height = std.mem.readInt(u32, data[20..24][0..4], .big);
-    } else if (std.mem.eql(u8, mime, "image/gif") and data.len >= 10) {
-        // GIF: width at 6..8, height at 8..10 (little-endian)
-        width = std.mem.readInt(u16, data[6..8][0..2], .little);
-        height = std.mem.readInt(u16, data[8..10][0..2], .little);
-    } else if (std.mem.eql(u8, mime, "image/webp") and data.len >= 30) {
-        if (std.mem.eql(u8, data[12..16], "VP8 ") and data.len >= 30) {
-            // VP8 simple lossy: 26..30
-            const raw_w = std.mem.readInt(u16, data[26..28][0..2], .little);
-            const raw_h = std.mem.readInt(u16, data[28..30][0..2], .little);
-            width = raw_w & 0x3FFF;
-            height = raw_h & 0x3FFF;
-        } else if (std.mem.eql(u8, data[12..16], "VP8L") and data.len >= 25) {
-            // VP8L lossless: 21..25
-            const b0 = data[21];
-            const b1 = data[22];
-            const b2 = data[23];
-            const b3 = data[24];
-            width = 1 + (@as(u32, b0) | ((@as(u32, b1) & 0x3F) << 8));
-            height = 1 + (((@as(u32, b1) >> 6) | (@as(u32, b2) << 2) | ((@as(u32, b3) & 0x0F) << 10)));
+fn extractJpegDimensions(data: []const u8) ImageDimensions {
+    // PSEUDOCODE:
+    // 1. Scan JPEG segments starting after initial SOI marker
+    // 2. Identify SOF0/SOF1/SOF2 markers (0xFFC0, 0xFFC1, 0xFFC2)
+    // 3. Parse height and width in big-endian, or stop on EOI/SOS
+    var width: u32 = 0;
+    var height: u32 = 0;
+    var i: usize = 2;
+    while (i + 8 < data.len) {
+        if (data[i] != 0xFF) {
+            i += 1;
+            continue;
         }
-    } else if (std.mem.eql(u8, mime, "image/jpeg")) {
-        // JPEG: scan segments for SOF0 (0xFFC0) or SOF2 (0xFFC2)
-        var i: usize = 2;
-        while (i + 8 < data.len) {
-            if (data[i] != 0xFF) {
-                i += 1;
-                continue;
-            }
-            const marker = data[i + 1];
-            if (marker == 0xC0 or marker == 0xC1 or marker == 0xC2) {
-                // Found SOF marker: length(2), precision(1), height(2), width(2)
-                height = std.mem.readInt(u16, data[i + 5 .. i + 7][0..2], .big);
-                width = std.mem.readInt(u16, data[i + 7 .. i + 9][0..2], .big);
-                break;
-            }
-            if (marker == 0xD9 or marker == 0xDA) break; // EOI or SOS
-            if (i + 4 <= data.len) {
-                const seg_len = std.mem.readInt(u16, data[i + 2 .. i + 4][0..2], .big);
-                i += 2 + seg_len;
-            } else {
-                break;
-            }
+        const marker = data[i + 1];
+        if (marker == 0xC0 or marker == 0xC1 or marker == 0xC2) {
+            height = std.mem.readInt(u16, data[i + 5 .. i + 7][0..2], .big);
+            width = std.mem.readInt(u16, data[i + 7 .. i + 9][0..2], .big);
+            break;
+        }
+        if (marker == 0xD9 or marker == 0xDA) break;
+        if (i + 4 <= data.len) {
+            const seg_len = std.mem.readInt(u16, data[i + 2 .. i + 4][0..2], .big);
+            i += 2 + seg_len;
+        } else {
+            break;
         }
     }
-
     return .{ .width = width, .height = height };
+}
+
+/// Extract image dimensions (width, height) from header if possible.
+pub fn extractDimensions(data: []const u8, mime: []const u8) ImageDimensions {
+    // PSEUDOCODE:
+    // 1. Identify image format by mime type
+    // 2. Parse PNG / GIF directly from standard header offsets
+    // 3. Delegate WebP and JPEG parsing to dedicated helper functions
+    if (std.mem.eql(u8, mime, "image/png") and data.len >= 24) {
+        return .{
+            .width = std.mem.readInt(u32, data[16..20][0..4], .big),
+            .height = std.mem.readInt(u32, data[20..24][0..4], .big),
+        };
+    } else if (std.mem.eql(u8, mime, "image/gif") and data.len >= 10) {
+        return .{
+            .width = std.mem.readInt(u16, data[6..8][0..2], .little),
+            .height = std.mem.readInt(u16, data[8..10][0..2], .little),
+        };
+    } else if (std.mem.eql(u8, mime, "image/webp") and data.len >= 30) {
+        return extractWebpDimensions(data);
+    } else if (std.mem.eql(u8, mime, "image/jpeg")) {
+        return extractJpegDimensions(data);
+    }
+    return .{ .width = 0, .height = 0 };
 }
 
 /// Read image from disk, validate size/magic bytes, and return base64-encoded result.
@@ -175,6 +197,52 @@ pub const PromptParseResult = struct {
     }
 };
 
+fn parseImageToken(
+    alloc: Allocator,
+    io: std.Io,
+    input: []const u8,
+    i: usize,
+    limits: ImageLimits,
+    images_list: *std.ArrayListUnmanaged(proto.ImageBlock),
+) !usize {
+    // PSEUDOCODE:
+    // 1. Verify images count does not exceed max_per_turn
+    // 2. Parse escaped path after "@image:" marker
+    // 3. Read image file and append to images_list
+    // 4. Return new character index after image token
+    if (images_list.items.len >= limits.max_per_turn) {
+        return error.TooManyImagesPerTurn;
+    }
+
+    const path_start = i + "@image:".len;
+    var path_end = path_start;
+    var path_buf = std.ArrayList(u8).empty;
+    defer path_buf.deinit(alloc);
+
+    while (path_end < input.len) {
+        if (input[path_end] == '\\' and path_end + 1 < input.len and input[path_end + 1] == ' ') {
+            try path_buf.append(alloc, ' ');
+            path_end += 2;
+        } else if (input[path_end] == ' ' or input[path_end] == '\t' or input[path_end] == '\n' or input[path_end] == '\r') {
+            break;
+        } else {
+            try path_buf.append(alloc, input[path_end]);
+            path_end += 1;
+        }
+    }
+
+    if (path_buf.items.len > 0) {
+        var img_res = try readImageFile(alloc, io, path_buf.items, limits);
+        errdefer img_res.deinit(alloc);
+        try images_list.append(alloc, .{
+            .data = img_res.data,
+            .media_type = try alloc.dupe(u8, img_res.media_type),
+        });
+    }
+
+    return path_end;
+}
+
 /// Scans prompt for `@image:<path>` tokens with space escaping (`\ `).
 /// Extracts image blocks via `readImageFile` and returns cleaned prompt text.
 pub fn parsePromptImages(
@@ -183,6 +251,10 @@ pub fn parsePromptImages(
     input: []const u8,
     limits: ImageLimits,
 ) !PromptParseResult {
+    // PSEUDOCODE:
+    // 1. Scan input string, delegating "@image:" tokens to parseImageToken
+    // 2. Collapse consecutive whitespace in clean_buf
+    // 3. Return trimmed clean text and populated images slice
     var images_list = std.ArrayListUnmanaged(proto.ImageBlock).empty;
     errdefer {
         for (images_list.items) |img| {
@@ -198,44 +270,10 @@ pub fn parsePromptImages(
     var i: usize = 0;
     while (i < input.len) {
         if (std.mem.startsWith(u8, input[i..], "@image:")) {
-            if (images_list.items.len >= limits.max_per_turn) {
-                return error.TooManyImagesPerTurn;
-            }
-
-            const path_start = i + "@image:".len;
-            var path_end = path_start;
-            var path_buf = std.ArrayList(u8).empty;
-            defer path_buf.deinit(alloc);
-
-            while (path_end < input.len) {
-                if (input[path_end] == '\\' and path_end + 1 < input.len and input[path_end + 1] == ' ') {
-                    try path_buf.append(alloc, ' ');
-                    path_end += 2;
-                } else if (input[path_end] == ' ' or input[path_end] == '\t' or input[path_end] == '\n' or input[path_end] == '\r') {
-                    break;
-                } else {
-                    try path_buf.append(alloc, input[path_end]);
-                    path_end += 1;
-                }
-            }
-
-            const raw_path = path_buf.items;
-            if (raw_path.len > 0) {
-                var img_res = try readImageFile(alloc, io, raw_path, limits);
-                errdefer img_res.deinit(alloc);
-
-                try images_list.append(alloc, .{
-                    .data = img_res.data,
-                    .media_type = try alloc.dupe(u8, img_res.media_type),
-                });
-            }
-
-            i = path_end;
+            i = try parseImageToken(alloc, io, input, i, limits, &images_list);
         } else {
             const ch = input[i];
-            if (ch == ' ' and clean_buf.items.len > 0 and clean_buf.items[clean_buf.items.len - 1] == ' ') {
-                // Skip consecutive space created by token removal
-            } else {
+            if (!(ch == ' ' and clean_buf.items.len > 0 and clean_buf.items[clean_buf.items.len - 1] == ' ')) {
                 try clean_buf.append(alloc, ch);
             }
             i += 1;
@@ -243,10 +281,8 @@ pub fn parsePromptImages(
     }
 
     const trimmed = std.mem.trim(u8, clean_buf.items, " \t\r\n");
-    const clean_text = try alloc.dupe(u8, trimmed);
-
     return .{
-        .clean_text = clean_text,
+        .clean_text = try alloc.dupe(u8, trimmed),
         .images = try images_list.toOwnedSlice(alloc),
     };
 }

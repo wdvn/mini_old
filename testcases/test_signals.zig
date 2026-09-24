@@ -1,3 +1,5 @@
+//! test_signals.zig — Unit tests for atomic signal handling and interruption state.
+
 const std = @import("std");
 const testing = std.testing;
 const mini = @import("mini");

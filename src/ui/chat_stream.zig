@@ -236,10 +236,181 @@ pub const StreamEventParser = struct {
         self.closing_backticks = 0;
     }
 
+    fn ensureInText(
+        self: *StreamEventParser,
+        context: anytype,
+        comptime emitFn: fn (@TypeOf(context), StreamEvent) void,
+    ) void {
+        if (self.state != .in_text) {
+            self.state = .in_text;
+            emitFn(context, .text_start);
+        }
+    }
+
+    fn isCodeActLanguage(lang: []const u8) bool {
+        return std.mem.eql(u8, lang, "js") or
+            std.mem.eql(u8, lang, "javascript") or
+            std.mem.eql(u8, lang, "ts") or
+            std.mem.eql(u8, lang, "typescript") or
+            std.mem.eql(u8, lang, "codeact") or
+            std.mem.eql(u8, lang, "node");
+    }
+
+    fn feedInThink(
+        self: *StreamEventParser,
+        chunk: []const u8,
+        i: *usize,
+        close_tags: []const []const u8,
+        context: anytype,
+        comptime emitFn: fn (@TypeOf(context), StreamEvent) void,
+    ) void {
+        const c = chunk[i.*];
+        if (c == '<' or self.tag_len > 0) {
+            if (self.tag_len < self.tag_buf.len) {
+                self.tag_buf[self.tag_len] = c;
+                self.tag_len += 1;
+                i.* += 1;
+
+                const cur = self.tag_buf[0..self.tag_len];
+                if (isExactMatch(cur, close_tags)) {
+                    self.state = .idle;
+                    self.tag_len = 0;
+                    emitFn(context, .think_end);
+                } else if (isPrefixOfAny(cur, close_tags)) {
+                    // Valid prefix of a close tag, continue buffering
+                } else {
+                    emitFn(context, .{ .think_chunk = cur });
+                    self.tag_len = 0;
+                }
+            } else {
+                emitFn(context, .{ .think_chunk = self.tag_buf[0..self.tag_len] });
+                self.tag_len = 0;
+            }
+        } else {
+            emitFn(context, .{ .think_chunk = chunk[i.* .. i.* + 1] });
+            i.* += 1;
+        }
+    }
+
+    fn feedInCodeAct(
+        self: *StreamEventParser,
+        chunk: []const u8,
+        i: *usize,
+        context: anytype,
+        comptime emitFn: fn (@TypeOf(context), StreamEvent) void,
+    ) void {
+        const c = chunk[i.*];
+        if (c == '`') {
+            self.closing_backticks += 1;
+            if (self.closing_backticks == 3) {
+                self.state = .idle;
+                self.closing_backticks = 0;
+                emitFn(context, .codeact_end);
+            }
+            i.* += 1;
+            return;
+        }
+        if (self.closing_backticks > 0) {
+            var k: usize = 0;
+            while (k < self.closing_backticks) : (k += 1) {
+                emitFn(context, .{ .codeact_chunk = "`" });
+            }
+            self.closing_backticks = 0;
+        }
+        emitFn(context, .{ .codeact_chunk = chunk[i.* .. i.* + 1] });
+        i.* += 1;
+    }
+
+    fn feedInFenceCheck(
+        self: *StreamEventParser,
+        chunk: []const u8,
+        i: *usize,
+        context: anytype,
+        comptime emitFn: fn (@TypeOf(context), StreamEvent) void,
+    ) void {
+        const c = chunk[i.*];
+        if (self.fence_len < 3 and c != '`') {
+            self.in_fence_check = false;
+            self.ensureInText(context, emitFn);
+            emitFn(context, .{ .text_chunk = self.fence_buf[0..self.fence_len] });
+            self.fence_len = 0;
+            return;
+        }
+
+        if (c == '\n') {
+            self.in_fence_check = false;
+            const raw_lang = if (self.fence_len > 3) self.fence_buf[3..self.fence_len] else "";
+            const lang = std.mem.trim(u8, raw_lang, " \r\t");
+            if (isCodeActLanguage(lang)) {
+                if (self.state == .in_text) {
+                    self.state = .idle;
+                    emitFn(context, .text_end);
+                }
+                self.state = .in_codeact;
+                self.closing_backticks = 0;
+                emitFn(context, .codeact_start);
+            } else {
+                self.ensureInText(context, emitFn);
+                emitFn(context, .{ .text_chunk = self.fence_buf[0..self.fence_len] });
+                emitFn(context, .{ .text_chunk = "\n" });
+            }
+            self.fence_len = 0;
+            i.* += 1;
+        } else {
+            if (self.fence_len < self.fence_buf.len) {
+                self.fence_buf[self.fence_len] = c;
+                self.fence_len += 1;
+                i.* += 1;
+            } else {
+                self.in_fence_check = false;
+                self.ensureInText(context, emitFn);
+                emitFn(context, .{ .text_chunk = self.fence_buf[0..self.fence_len] });
+                self.fence_len = 0;
+            }
+        }
+    }
+
+    fn feedOpenThinkingTag(
+        self: *StreamEventParser,
+        chunk: []const u8,
+        i: *usize,
+        open_tags: []const []const u8,
+        context: anytype,
+        comptime emitFn: fn (@TypeOf(context), StreamEvent) void,
+    ) void {
+        const c = chunk[i.*];
+        if (self.tag_len < self.tag_buf.len) {
+            self.tag_buf[self.tag_len] = c;
+            self.tag_len += 1;
+            i.* += 1;
+
+            const cur = self.tag_buf[0..self.tag_len];
+            if (isExactMatch(cur, open_tags)) {
+                if (self.state == .in_text) {
+                    self.state = .idle;
+                    emitFn(context, .text_end);
+                }
+                self.state = .in_think;
+                self.tag_len = 0;
+                emitFn(context, .think_start);
+            } else if (isPrefixOfAny(cur, open_tags)) {
+                // Valid prefix of an open tag, continue buffering
+            } else {
+                self.ensureInText(context, emitFn);
+                emitFn(context, .{ .text_chunk = cur });
+                self.tag_len = 0;
+            }
+        } else {
+            self.ensureInText(context, emitFn);
+            emitFn(context, .{ .text_chunk = self.tag_buf[0..self.tag_len] });
+            self.tag_len = 0;
+        }
+    }
+
     pub fn feed(self: *StreamEventParser, chunk: []const u8, context: anytype, comptime emitFn: fn (@TypeOf(context), StreamEvent) void) void {
-        // RFC-012 §3.5.2: resolve active tag arrays once per feed() based on the
-        // provider profile's ThinkingTagSet. With `.none` no tag matching occurs
-        // and every byte (including '<') flows straight through as text.
+        // PSEUDOCODE:
+        // 1. Resolve active thinking open/close tags for current provider profile.
+        // 2. Iterate characters and delegate to in-think, in-codeact, fence check, or text handlers.
         const active = activeThinkTags(self.thinking_tags);
         const open_tags: []const []const u8 = if (active) |a| a.open else &.{};
         const close_tags: []const []const u8 = if (active) |a| a.close else &.{};
@@ -247,178 +418,24 @@ pub const StreamEventParser = struct {
         var i: usize = 0;
         while (i < chunk.len) {
             const c = chunk[i];
-
-            // 1. Parse <think>...</think> and Chinese variants (<思考>...</思考>, <推理>, <反思>, <推敲>)
             if (self.state == .in_think) {
-                if (c == '<' or self.tag_len > 0) {
-                    if (self.tag_len < self.tag_buf.len) {
-                        self.tag_buf[self.tag_len] = c;
-                        self.tag_len += 1;
-                        i += 1;
-
-                        const cur = self.tag_buf[0..self.tag_len];
-                        if (isExactMatch(cur, close_tags)) {
-                            self.state = .idle;
-                            self.tag_len = 0;
-                            emitFn(context, .think_end);
-                        } else if (isPrefixOfAny(cur, close_tags)) {
-                            // Valid prefix of a close tag, continue buffering
-                        } else {
-                            emitFn(context, .{ .think_chunk = cur });
-                            self.tag_len = 0;
-                        }
-                    } else {
-                        emitFn(context, .{ .think_chunk = self.tag_buf[0..self.tag_len] });
-                        self.tag_len = 0;
-                    }
-                } else {
-                    emitFn(context, .{ .think_chunk = chunk[i .. i + 1] });
-                    i += 1;
-                }
-                continue;
-            }
-
-            // 2. Parse inside CodeAct block (```js ... ```)
-            if (self.state == .in_codeact) {
-                if (c == '`') {
-                    self.closing_backticks += 1;
-                    if (self.closing_backticks == 3) {
-                        self.state = .idle;
-                        self.closing_backticks = 0;
-                        emitFn(context, .codeact_end);
-                        i += 1;
-                        continue;
-                    }
-                    i += 1;
-                    continue;
-                } else {
-                    if (self.closing_backticks > 0) {
-                        var k: usize = 0;
-                        while (k < self.closing_backticks) : (k += 1) {
-                            emitFn(context, .{ .codeact_chunk = "`" });
-                        }
-                        self.closing_backticks = 0;
-                    }
-                    emitFn(context, .{ .codeact_chunk = chunk[i .. i + 1] });
-                    i += 1;
-                    continue;
-                }
-            }
-
-            // 3. Parse opening Code Fence ```
-            if (self.in_fence_check) {
-                if (self.fence_len < 3 and c != '`') {
-                    self.in_fence_check = false;
-                    if (self.state != .in_text) {
-                        self.state = .in_text;
-                        emitFn(context, .text_start);
-                    }
-                    emitFn(context, .{ .text_chunk = self.fence_buf[0..self.fence_len] });
-                    self.fence_len = 0;
-                    continue;
-                }
-
-                if (c == '\n') {
-                    self.in_fence_check = false;
-                    const raw_lang = if (self.fence_len > 3) self.fence_buf[3..self.fence_len] else "";
-                    const lang = std.mem.trim(u8, raw_lang, " \r\t");
-
-                    if (std.mem.eql(u8, lang, "js") or
-                        std.mem.eql(u8, lang, "javascript") or
-                        std.mem.eql(u8, lang, "ts") or
-                        std.mem.eql(u8, lang, "typescript") or
-                        std.mem.eql(u8, lang, "codeact") or
-                        std.mem.eql(u8, lang, "node"))
-                    {
-                        if (self.state == .in_text) {
-                            self.state = .idle;
-                            emitFn(context, .text_end);
-                        }
-                        self.state = .in_codeact;
-                        self.closing_backticks = 0;
-                        emitFn(context, .codeact_start);
-                    } else {
-                        if (self.state != .in_text) {
-                            self.state = .in_text;
-                            emitFn(context, .text_start);
-                        }
-                        emitFn(context, .{ .text_chunk = self.fence_buf[0..self.fence_len] });
-                        emitFn(context, .{ .text_chunk = "\n" });
-                    }
-                    self.fence_len = 0;
-                    i += 1;
-                    continue;
-                } else {
-                    if (self.fence_len < self.fence_buf.len) {
-                        self.fence_buf[self.fence_len] = c;
-                        self.fence_len += 1;
-                        i += 1;
-                    } else {
-                        self.in_fence_check = false;
-                        if (self.state != .in_text) {
-                            self.state = .in_text;
-                            emitFn(context, .text_start);
-                        }
-                        emitFn(context, .{ .text_chunk = self.fence_buf[0..self.fence_len] });
-                        self.fence_len = 0;
-                    }
-                    continue;
-                }
-            }
-
-            // 4. Check opening thinking tags (<think>, <思考>, <推理>, <反思>, <推敲>)
-            if (c == '<' or self.tag_len > 0) {
-                if (self.tag_len < self.tag_buf.len) {
-                    self.tag_buf[self.tag_len] = c;
-                    self.tag_len += 1;
-                    i += 1;
-
-                    const cur = self.tag_buf[0..self.tag_len];
-                    if (isExactMatch(cur, open_tags)) {
-                        if (self.state == .in_text) {
-                            self.state = .idle;
-                            emitFn(context, .text_end);
-                        }
-                        self.state = .in_think;
-                        self.tag_len = 0;
-                        emitFn(context, .think_start);
-                    } else if (isPrefixOfAny(cur, open_tags)) {
-                        // Valid prefix of an open tag, continue buffering
-                    } else {
-                        if (self.state != .in_text) {
-                            self.state = .in_text;
-                            emitFn(context, .text_start);
-                        }
-                        emitFn(context, .{ .text_chunk = cur });
-                        self.tag_len = 0;
-                    }
-                } else {
-                    if (self.state != .in_text) {
-                        self.state = .in_text;
-                        emitFn(context, .text_start);
-                    }
-                    emitFn(context, .{ .text_chunk = self.tag_buf[0..self.tag_len] });
-                    self.tag_len = 0;
-                }
-                continue;
-            }
-
-            // 5. Check start of code fence ```
-            if (c == '`') {
+                self.feedInThink(chunk, &i, close_tags, context, emitFn);
+            } else if (self.state == .in_codeact) {
+                self.feedInCodeAct(chunk, &i, context, emitFn);
+            } else if (self.in_fence_check) {
+                self.feedInFenceCheck(chunk, &i, context, emitFn);
+            } else if (c == '<' or self.tag_len > 0) {
+                self.feedOpenThinkingTag(chunk, &i, open_tags, context, emitFn);
+            } else if (c == '`') {
                 self.in_fence_check = true;
                 self.fence_buf[0] = '`';
                 self.fence_len = 1;
                 i += 1;
-                continue;
+            } else {
+                self.ensureInText(context, emitFn);
+                emitFn(context, .{ .text_chunk = chunk[i .. i + 1] });
+                i += 1;
             }
-
-            // 6. Regular text chunk
-            if (self.state != .in_text) {
-                self.state = .in_text;
-                emitFn(context, .text_start);
-            }
-            emitFn(context, .{ .text_chunk = chunk[i .. i + 1] });
-            i += 1;
         }
     }
 };
@@ -796,12 +813,7 @@ pub const TurnRenderer = struct {
         }
     }
 
-    pub fn streamThinking(self: *TurnRenderer, text: []const u8) void {
-        self.stopWaiting();
-        if (self.ui_state != .thinking) {
-            self.startThinking();
-        }
-
+    fn appendThinkingSnippet(self: *TurnRenderer, text: []const u8) void {
         for (text) |c| {
             if (c == '\n' or c == '\r' or c == '\t') {
                 if (self.think_snippet_len > 0 and self.think_snippet_buf[self.think_snippet_len - 1] != ' ') {
@@ -823,35 +835,50 @@ pub const TurnRenderer = struct {
                 }
             }
         }
+    }
+
+    fn renderLiveThinking(self: *TurnRenderer, now: i64) void {
+        self.think_last_update_ms = now;
+        const diff = if (now >= self.think_start_ms) now - self.think_start_ms else 0;
+        var dur_buf: [32]u8 = undefined;
+        const dur_str = utils.formatDuration(&dur_buf, @intCast(diff));
+        const frame = self.spinner.nextFrame();
+
+        const snippet = std.mem.trim(u8, self.think_snippet_buf[0..self.think_snippet_len], " ");
+        var out_buf: [256]u8 = undefined;
+        var eff_buf: [48]u8 = undefined;
+        const eff_part = if (active_effort) |eff|
+            std.fmt.bufPrint(&eff_buf, " \x1b[36m[{s}]\x1b[0m", .{eff}) catch ""
+        else
+            "";
+        const line = if (snippet.len > 0)
+            std.fmt.bufPrint(&out_buf, " \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})\x1b[0m{s} \x1b[2;90m{s}\x1b[0m", .{
+                frame, dur_str, eff_part, snippet,
+            }) catch ""
+        else
+            std.fmt.bufPrint(&out_buf, " \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})\x1b[0m{s}...\x1b[0m", .{
+                frame, dur_str, eff_part,
+            }) catch "";
+
+        if (line.len > 0) self.renderInplaceLine(line);
+    }
+
+    pub fn streamThinking(self: *TurnRenderer, text: []const u8) void {
+        // PSEUDOCODE:
+        // 1. Transition from waiting to thinking if needed.
+        // 2. Buffer snippet text for live preview.
+        // 3. Throttle live UI update to terminal at 40ms intervals.
+        self.stopWaiting();
+        if (self.ui_state != .thinking) self.startThinking();
+
+        self.appendThinkingSnippet(text);
 
         if (comptime builtin.is_test) return;
         if (!term.isStdoutTty()) return;
 
         const now = utils.milliTimestamp();
         if (now - self.think_last_update_ms >= 40) {
-            self.think_last_update_ms = now;
-            const diff = if (now >= self.think_start_ms) now - self.think_start_ms else 0;
-            var dur_buf: [32]u8 = undefined;
-            const dur_str = utils.formatDuration(&dur_buf, @intCast(diff));
-            const frame = self.spinner.nextFrame();
-
-            const snippet = std.mem.trim(u8, self.think_snippet_buf[0..self.think_snippet_len], " ");
-            var out_buf: [256]u8 = undefined;
-            var eff_buf: [48]u8 = undefined;
-            const eff_part = if (active_effort) |eff|
-                std.fmt.bufPrint(&eff_buf, " \x1b[36m[{s}]\x1b[0m", .{eff}) catch ""
-            else
-                "";
-            const line = if (snippet.len > 0)
-                std.fmt.bufPrint(&out_buf, " \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})\x1b[0m{s} \x1b[2;90m{s}\x1b[0m", .{
-                    frame, dur_str, eff_part, snippet,
-                }) catch ""
-            else
-                std.fmt.bufPrint(&out_buf, " \x1b[36m{s}\x1b[0m \x1b[90mThinking ({s})\x1b[0m{s}...\x1b[0m", .{
-                    frame, dur_str, eff_part,
-                }) catch "";
-
-            if (line.len > 0) self.renderInplaceLine(line);
+            self.renderLiveThinking(now);
         }
     }
 
@@ -938,7 +965,69 @@ pub const TurnRenderer = struct {
         }
     }
 
+    const CodeActPreview = struct {
+        line2: ?[]const u8 = null,
+        line3: ?[]const u8 = null,
+        num_lines: usize = 1,
+    };
+
+    fn resolveCodeActPreview(self: *TurnRenderer) CodeActPreview {
+        if (self.codeact_curr_len > 0) {
+            if (self.codeact_line2_len > 0) {
+                return .{
+                    .line2 = self.codeact_line2_buf[0..self.codeact_line2_len],
+                    .line3 = self.codeact_curr_buf[0..self.codeact_curr_len],
+                    .num_lines = 3,
+                };
+            }
+            return .{
+                .line2 = self.codeact_curr_buf[0..self.codeact_curr_len],
+                .num_lines = 2,
+            };
+        }
+        if (self.codeact_line2_len > 0) {
+            if (self.codeact_line1_len > 0) {
+                return .{
+                    .line2 = self.codeact_line1_buf[0..self.codeact_line1_len],
+                    .line3 = self.codeact_line2_buf[0..self.codeact_line2_len],
+                    .num_lines = 3,
+                };
+            }
+            return .{
+                .line2 = self.codeact_line2_buf[0..self.codeact_line2_len],
+                .num_lines = 2,
+            };
+        }
+        return .{};
+    }
+
+    fn renderCodeActPreviewLine(line: []const u8, max_cols: usize, is_last: bool) void {
+        var trunc_buf: [160]u8 = undefined;
+        const safe = truncateAnsi(&trunc_buf, line, max_cols);
+        var line_buf: [256]u8 = undefined;
+        const style = if (is_last) "\x1b[37m" else "\x1b[2;37m";
+        const str = std.fmt.bufPrint(&line_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m {s}{s}\x1b[0m", .{ style, safe }) catch "";
+        term.writeStdout(str);
+    }
+
+    fn clearCodeActExcessLines(rendered: usize, target: usize) void {
+        if (rendered > target) {
+            const excess = rendered - target;
+            for (0..excess) |_| {
+                term.writeStdout("\n\r\x1b[2K");
+            }
+            for (0..excess) |_| {
+                term.writeStdout("\x1b[1A");
+            }
+        }
+    }
+
     fn renderCodeActInPlace(self: *TurnRenderer, now: i64) void {
+        // PSEUDOCODE:
+        // 1. Check TTY environment.
+        // 2. Format dynamic spinner header line.
+        // 3. Move cursor up and render 1-3 preview lines.
+        // 4. Clear any excess rows.
         if (comptime builtin.is_test) return;
         if (!term.isStdoutTty()) return;
 
@@ -952,78 +1041,23 @@ pub const TurnRenderer = struct {
             frame, dur_str,
         }) catch " ⚡ CodeAct...";
 
-        var line2_opt: ?[]const u8 = null;
-        var line3_opt: ?[]const u8 = null;
-        var num_lines: usize = 1;
+        const preview = self.resolveCodeActPreview();
 
-        if (self.codeact_curr_len > 0) {
-            if (self.codeact_line2_len > 0) {
-                line2_opt = self.codeact_line2_buf[0..self.codeact_line2_len];
-                line3_opt = self.codeact_curr_buf[0..self.codeact_curr_len];
-                num_lines = 3;
-            } else {
-                line2_opt = self.codeact_curr_buf[0..self.codeact_curr_len];
-                num_lines = 2;
-            }
-        } else if (self.codeact_line2_len > 0) {
-            if (self.codeact_line1_len > 0) {
-                line2_opt = self.codeact_line1_buf[0..self.codeact_line1_len];
-                line3_opt = self.codeact_line2_buf[0..self.codeact_line2_len];
-                num_lines = 3;
-            } else {
-                line2_opt = self.codeact_line2_buf[0..self.codeact_line2_len];
-                num_lines = 2;
-            }
-        }
-
-        // Move cursor up to first previously rendered line
         if (self.codeact_rendered_lines > 1) {
-            for (0..self.codeact_rendered_lines - 1) |_| {
-                term.writeStdout("\x1b[1A");
-            }
+            for (0..self.codeact_rendered_lines - 1) |_| term.writeStdout("\x1b[1A");
         }
 
-        // Render Line 1 (Header)
         term.writeStdout("\r\x1b[2K");
         term.writeStdout(header_line);
 
-        // Anti-wrap: each in-place line MUST occupy exactly 1 terminal row,
-        // otherwise cursor-up (\x1b[1A) math in subsequent re-renders and in
-        // endCodeAct() lands on the wrong row and garbles the block.
         const win = term.getTerminalSize();
-        // prefix "  │ " ≈ 6 cols + margins; keep 4 cols spare
         const max_content_cols: usize = if (win.cols > 14) win.cols - 10 else 60;
 
-        // Render Line 2
-        if (line2_opt) |l2| {
-            var l2_trunc: [160]u8 = undefined;
-            const l2_safe = truncateAnsi(&l2_trunc, l2, max_content_cols);
-            var l2_buf: [256]u8 = undefined;
-            const l2_str = std.fmt.bufPrint(&l2_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m \x1b[2;37m{s}\x1b[0m", .{l2_safe}) catch "";
-            term.writeStdout(l2_str);
-        }
+        if (preview.line2) |l2| renderCodeActPreviewLine(l2, max_content_cols, preview.line3 == null);
+        if (preview.line3) |l3| renderCodeActPreviewLine(l3, max_content_cols, true);
 
-        // Render Line 3
-        if (line3_opt) |l3| {
-            var l3_trunc: [160]u8 = undefined;
-            const l3_safe = truncateAnsi(&l3_trunc, l3, max_content_cols);
-            var l3_buf: [256]u8 = undefined;
-            const l3_str = std.fmt.bufPrint(&l3_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m \x1b[37m{s}\x1b[0m", .{l3_safe}) catch "";
-            term.writeStdout(l3_str);
-        }
-
-        // Clear excess lines if this render has fewer lines than before
-        if (self.codeact_rendered_lines > num_lines) {
-            const excess = self.codeact_rendered_lines - num_lines;
-            for (0..excess) |_| {
-                term.writeStdout("\n\r\x1b[2K");
-            }
-            for (0..excess) |_| {
-                term.writeStdout("\x1b[1A");
-            }
-        }
-
-        self.codeact_rendered_lines = num_lines;
+        clearCodeActExcessLines(self.codeact_rendered_lines, preview.num_lines);
+        self.codeact_rendered_lines = preview.num_lines;
     }
 
     pub fn markCodeActReady(self: *TurnRenderer) void {
@@ -1121,56 +1155,42 @@ pub const TurnRenderer = struct {
     // Tool Execution Lifecycle Handlers
     // -----------------------------------------------------------------------
 
-    /// Start executing a Tool Action.
-    pub fn startTool(self: *TurnRenderer, name: []const u8, input_json: []const u8) void {
-        self.stopWaiting();
-        if (self.ui_state == .thinking or self.is_thinking) {
-            self.endThinking();
-        }
-        if (self.ui_state == .codeact_ready or self.ui_state == .codeact_live or self.is_codeact) {
-            self.endCodeAct();
-        }
-        self.highlighter.flush(self.io);
-
-        var detail_buf: [256]u8 = undefined;
-        var detail: []const u8 = "";
-
+    fn formatToolDetail(buf: []u8, name: []const u8, input_json: []const u8) []const u8 {
         if (std.mem.eql(u8, name, "bash") or std.mem.eql(u8, name, "sh") or std.mem.eql(u8, name, "exec")) {
             if (json_mod.findString(input_json, "command") orelse json_mod.findString(input_json, "cmd")) |cmd| {
                 const trimmed = if (cmd.len > 80) cmd[0..80] else cmd;
-                detail = std.fmt.bufPrint(&detail_buf, "\x1b[35m{s}\x1b[0m", .{trimmed}) catch "";
+                return std.fmt.bufPrint(buf, "\x1b[35m{s}\x1b[0m", .{trimmed}) catch "";
             }
         } else if (std.mem.eql(u8, name, "invoke_subagent") or std.mem.eql(u8, name, "batch_invoke_subagents") or std.mem.eql(u8, name, "subagent")) {
             if (json_mod.findString(input_json, "task") orelse json_mod.findString(input_json, "prompt") orelse json_mod.findString(input_json, "description")) |t| {
                 const trimmed = if (t.len > 80) t[0..80] else t;
-                detail = std.fmt.bufPrint(&detail_buf, "\x1b[36m\"{s}\"\x1b[0m", .{trimmed}) catch "";
+                return std.fmt.bufPrint(buf, "\x1b[36m\"{s}\"\x1b[0m", .{trimmed}) catch "";
             }
         } else if (std.mem.eql(u8, name, "file_read") or std.mem.eql(u8, name, "file_write") or std.mem.eql(u8, name, "file_edit") or std.mem.eql(u8, name, "read_file") or std.mem.eql(u8, name, "write_file") or std.mem.eql(u8, name, "edit_file")) {
             if (json_mod.findString(input_json, "path") orelse json_mod.findString(input_json, "TargetFile") orelse json_mod.findString(input_json, "file")) |path| {
-                detail = std.fmt.bufPrint(&detail_buf, "\x1b[34m{s}\x1b[0m", .{path}) catch "";
+                return std.fmt.bufPrint(buf, "\x1b[34m{s}\x1b[0m", .{path}) catch "";
             }
         } else if (std.mem.eql(u8, name, "grep")) {
             if (json_mod.findString(input_json, "pattern") orelse json_mod.findString(input_json, "query")) |pat| {
-                detail = std.fmt.bufPrint(&detail_buf, "\x1b[33m/{s}/\x1b[0m", .{pat}) catch "";
+                return std.fmt.bufPrint(buf, "\x1b[33m/{s}/\x1b[0m", .{pat}) catch "";
             }
         } else if (std.mem.eql(u8, name, "glob")) {
             if (json_mod.findString(input_json, "pattern")) |pat| {
-                detail = std.fmt.bufPrint(&detail_buf, "\x1b[33m{s}\x1b[0m", .{pat}) catch "";
+                return std.fmt.bufPrint(buf, "\x1b[33m{s}\x1b[0m", .{pat}) catch "";
             }
         } else if (std.mem.eql(u8, name, "http_request") or std.mem.eql(u8, name, "http") or std.mem.eql(u8, name, "fetch")) {
             if (json_mod.findString(input_json, "url")) |u| {
                 const trimmed = if (u.len > 80) u[0..80] else u;
-                detail = std.fmt.bufPrint(&detail_buf, "\x1b[34m{s}\x1b[0m", .{trimmed}) catch "";
+                return std.fmt.bufPrint(buf, "\x1b[34m{s}\x1b[0m", .{trimmed}) catch "";
             }
         } else if (std.mem.eql(u8, name, "session_diagnostics")) {
             const op = json_mod.findString(input_json, "operation") orelse "list";
             if (json_mod.findInt(input_json, "pid", i32)) |pid| {
-                detail = std.fmt.bufPrint(&detail_buf, "\x1b[36m{s} pid={d}\x1b[0m", .{ op, pid }) catch "";
-            } else {
-                detail = std.fmt.bufPrint(&detail_buf, "\x1b[36m{s}\x1b[0m", .{op}) catch "";
+                return std.fmt.bufPrint(buf, "\x1b[36m{s} pid={d}\x1b[0m", .{ op, pid }) catch "";
             }
+            return std.fmt.bufPrint(buf, "\x1b[36m{s}\x1b[0m", .{op}) catch "";
         } else if (std.mem.eql(u8, name, "codeact")) {
-            detail = "\x1b[35mCodeAct script\x1b[0m";
+            return "\x1b[35mCodeAct script\x1b[0m";
         } else {
             if (json_mod.findString(input_json, "task") orelse
                 json_mod.findString(input_json, "query") orelse
@@ -1180,13 +1200,27 @@ pub const TurnRenderer = struct {
                 json_mod.findString(input_json, "prompt")) |val|
             {
                 const trimmed = if (val.len > 80) val[0..80] else val;
-                detail = std.fmt.bufPrint(&detail_buf, "\x1b[90m{s}\x1b[0m", .{trimmed}) catch "";
+                return std.fmt.bufPrint(buf, "\x1b[90m{s}\x1b[0m", .{trimmed}) catch "";
             }
         }
+        return "";
+    }
 
-        if (self.consecutive_newlines == 0) {
-            self.ensureNewline();
-        }
+    /// Start executing a Tool Action.
+    pub fn startTool(self: *TurnRenderer, name: []const u8, input_json: []const u8) void {
+        // PSEUDOCODE:
+        // 1. Stop waiting/thinking/codeact states and flush highlighter.
+        // 2. Format tool argument details.
+        // 3. Print action line and switch state to tool_executing.
+        self.stopWaiting();
+        if (self.ui_state == .thinking or self.is_thinking) self.endThinking();
+        if (self.ui_state == .codeact_ready or self.ui_state == .codeact_live or self.is_codeact) self.endCodeAct();
+        self.highlighter.flush(self.io);
+
+        var detail_buf: [256]u8 = undefined;
+        const detail = formatToolDetail(&detail_buf, name, input_json);
+
+        if (self.consecutive_newlines == 0) self.ensureNewline();
         var header_buf: [512]u8 = undefined;
         const line = std.fmt.bufPrint(&header_buf, " \x1b[1;33m{s}\x1b[0m \x1b[1;37m{s}\x1b[0m {s}\n", .{
             term.GLYPH_ACTION, name, detail,
@@ -1196,13 +1230,37 @@ pub const TurnRenderer = struct {
         self.ui_state = .tool_executing;
     }
 
+    fn renderToolOutputSnippet(self: *TurnRenderer, result: []const u8) void {
+        const trimmed_res = std.mem.trim(u8, result, " \r\n\t");
+        if (trimmed_res.len == 0) return;
+
+        var line_it = std.mem.splitScalar(u8, trimmed_res, '\n');
+        var line_count: usize = 0;
+        while (line_it.next()) |raw_line| {
+            const clean_line = std.mem.trim(u8, raw_line, " \r\t");
+            if (clean_line.len == 0) continue;
+            if (line_count >= 3) {
+                self.write("    \x1b[2;90m...\x1b[0m\n");
+                break;
+            }
+            line_count += 1;
+            const truncated_line = if (clean_line.len > 120) clean_line[0..120] else clean_line;
+            var out_line_buf: [256]u8 = undefined;
+            const out_line = std.fmt.bufPrint(&out_line_buf, "    \x1b[2;90m│\x1b[0m \x1b[90m{s}\x1b[0m\n", .{truncated_line}) catch continue;
+            self.write(out_line);
+        }
+    }
+
     /// Finish a Tool Action and display output snippet (up to 3 lines).
     pub fn finishTool(self: *TurnRenderer, name: []const u8, result: []const u8, is_error: bool, duration_ms: u64, patch_path: ?[]const u8, patch_diff: ?[]const u8) void {
+        // PSEUDOCODE:
+        // 1. Render diff preview if patch details are provided.
+        // 2. Format and print tool completion / error status line.
+        // 3. Render brief stdout/stderr snippet if not a diff.
+        // 4. Reset turn renderer state to idle.
         if (patch_path) |path| {
             if (patch_diff) |diff| {
-                if (diff.len > 0) {
-                    diff_mod.renderDiff(self.io, path, diff, .{});
-                }
+                if (diff.len > 0) diff_mod.renderDiff(self.io, path, diff, .{});
             }
         }
 
@@ -1223,26 +1281,8 @@ pub const TurnRenderer = struct {
             self.write(status_line);
         }
 
-        // Render up to 3 lines of output snippet (stream inplace detail)
         if (patch_diff == null or patch_diff.?.len == 0) {
-            const trimmed_res = std.mem.trim(u8, result, " \r\n\t");
-            if (trimmed_res.len > 0) {
-                var line_it = std.mem.splitScalar(u8, trimmed_res, '\n');
-                var line_count: usize = 0;
-                while (line_it.next()) |raw_line| {
-                    const clean_line = std.mem.trim(u8, raw_line, " \r\t");
-                    if (clean_line.len == 0) continue;
-                    if (line_count >= 3) {
-                        self.write("    \x1b[2;90m...\x1b[0m\n");
-                        break;
-                    }
-                    line_count += 1;
-                    const truncated_line = if (clean_line.len > 120) clean_line[0..120] else clean_line;
-                    var out_line_buf: [256]u8 = undefined;
-                    const out_line = std.fmt.bufPrint(&out_line_buf, "    \x1b[2;90m│\x1b[0m \x1b[90m{s}\x1b[0m\n", .{truncated_line}) catch continue;
-                    self.write(out_line);
-                }
-            }
+            self.renderToolOutputSnippet(result);
         }
 
         self.ui_state = .idle;
@@ -1253,25 +1293,20 @@ pub const TurnRenderer = struct {
     // Turn Finalization
     // -----------------------------------------------------------------------
 
-    /// Finish entire Turn and print Telemetry Status Footer.
-    pub fn finishTurn(self: *TurnRenderer, stats: TurnStats) void {
+    fn closeActiveStreamingStates(self: *TurnRenderer) void {
         self.stopWaiting();
-        if (self.ui_state == .thinking or self.is_thinking) {
-            self.endThinking();
-        }
-        if (self.ui_state == .codeact_live or self.ui_state == .codeact_ready or self.is_codeact) {
-            self.endCodeAct();
-        }
+        if (self.ui_state == .thinking or self.is_thinking) self.endThinking();
+        if (self.ui_state == .codeact_live or self.ui_state == .codeact_ready or self.is_codeact) self.endCodeAct();
         self.parser.flush(self, dispatchParserEvent);
-        if (self.ui_state == .text_streaming) {
-            self.endTextResponse();
-        }
+        if (self.ui_state == .text_streaming) self.endTextResponse();
         self.highlighter.flush(self.io);
         self.ensureNewline();
         self.parser.resetAct();
         self.ui_state = .idle;
         self.resetErrorSignature();
+    }
 
+    fn renderTelemetryFooter(self: *TurnRenderer, stats: TurnStats) void {
         term.writeStdout("\n");
 
         const total_tokens = stats.prompt_tokens + stats.completion_tokens;
@@ -1312,6 +1347,15 @@ pub const TurnRenderer = struct {
         ) catch return;
 
         term.writeStdout(footer);
+    }
+
+    /// Finish entire Turn and print Telemetry Status Footer.
+    pub fn finishTurn(self: *TurnRenderer, stats: TurnStats) void {
+        // PSEUDOCODE:
+        // 1. Flush and close all active sub-renderers and stream states.
+        // 2. Render summary telemetry metrics footer.
+        self.closeActiveStreamingStates();
+        self.renderTelemetryFooter(stats);
     }
 };
 

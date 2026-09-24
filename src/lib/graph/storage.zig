@@ -107,6 +107,25 @@ pub const Graph = struct {
         return n;
     }
 
+    fn dupeAttributes(arena_alloc: Allocator, attr: EdgeAttributes) !EdgeAttributes {
+        return .{
+            .condition = if (attr.condition) |c| try arena_alloc.dupe(u8, c) else null,
+            .guidance = if (attr.guidance) |g| try arena_alloc.dupe(u8, g) else null,
+            .pitfalls = if (attr.pitfalls) |p| try arena_alloc.dupe(u8, p) else null,
+            .supersedes = if (attr.supersedes) |s| try arena_alloc.dupe(u8, s) else null,
+            .weight = attr.weight,
+        };
+    }
+
+    fn deactivateSuperseded(self: *Graph, old_sid: ?[]const u8) void {
+        const sid = old_sid orelse return;
+        const old_eid = self.str_id_to_edge.get(sid) orelse return;
+        if (self.edges.items[old_eid].is_active) {
+            self.edges.items[old_eid].is_active = false;
+            if (self.active_edge_count > 0) self.active_edge_count -= 1;
+        }
+    }
+
     /// Add an edge between src and dst.
     pub fn addEdge(
         self: *Graph,
@@ -116,28 +135,21 @@ pub const Graph = struct {
         attr: EdgeAttributes,
         str_id: ?[]const u8,
     ) !EdgeId {
+        // PSEUDOCODE:
+        // 1. Verify src and dst exist within nodes list
+        // 2. Clone string ID and attributes into arena
+        // 3. Deactivate superseded edge if specified
+        // 4. Append new edge to storage and update adjacencies/map
         if (src >= self.nodes.items.len or dst >= self.nodes.items.len) {
             return error.NodeNotFound;
         }
 
         const arena_alloc = self.arena.allocator();
         const edge_id: EdgeId = @intCast(self.edges.items.len);
-
         const dup_str_id = if (str_id) |sid| try arena_alloc.dupe(u8, sid) else null;
-        const dup_cond = if (attr.condition) |c| try arena_alloc.dupe(u8, c) else null;
-        const dup_guidance = if (attr.guidance) |g| try arena_alloc.dupe(u8, g) else null;
-        const dup_pitfalls = if (attr.pitfalls) |p| try arena_alloc.dupe(u8, p) else null;
-        const dup_supersedes = if (attr.supersedes) |s| try arena_alloc.dupe(u8, s) else null;
+        const dup_attr = try dupeAttributes(arena_alloc, attr);
 
-        // If this edge supersedes a prior edge, mark old edge inactive
-        if (dup_supersedes) |old_sid| {
-            if (self.str_id_to_edge.get(old_sid)) |old_eid| {
-                if (self.edges.items[old_eid].is_active) {
-                    self.edges.items[old_eid].is_active = false;
-                    if (self.active_edge_count > 0) self.active_edge_count -= 1;
-                }
-            }
-        }
+        self.deactivateSuperseded(dup_attr.supersedes);
 
         try self.edges.append(self.alloc, .{
             .id = edge_id,
@@ -145,13 +157,7 @@ pub const Graph = struct {
             .src = src,
             .dst = dst,
             .rel = rel,
-            .attr = .{
-                .condition = dup_cond,
-                .guidance = dup_guidance,
-                .pitfalls = dup_pitfalls,
-                .weight = attr.weight,
-                .supersedes = dup_supersedes,
-            },
+            .attr = dup_attr,
             .is_active = true,
         });
 

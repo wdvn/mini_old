@@ -167,6 +167,164 @@ pub const Client = struct {
 
     /// Send messages to API and receive streaming response.
     /// Supports 3-Tier Dual-Protocol Auto-Negotiation & Adaptive Fallback.
+    fn resolveActiveProtocol(self: *const Client, profile: provider.ProviderProfile) ProtocolMode {
+        // PSEUDOCODE: RFC-012 §7 priority: explicit OPENAI_PROTOCOL > ProviderProfile.protocol > cached auto-negotiate.
+        if (self.protocol_mode == .chat_completions) return .chat_completions;
+        if (self.protocol_mode == .responses) return .responses;
+        return switch (profile.protocol) {
+            .chat_completions => .chat_completions,
+            .responses => .responses,
+            .auto => self.cached_protocol orelse .responses,
+        };
+    }
+
+    fn formatEndpointUrl(base_url: []const u8, protocol: ProtocolMode, buf: *[512]u8) []const u8 {
+        // PSEUDOCODE: Append 'responses' or 'chat/completions' to root API URL.
+        const root_url = getRootApiUrl(base_url);
+        const endpoint_suffix = if (protocol == .responses) "responses" else "chat/completions";
+        const sep = if (std.mem.endsWith(u8, root_url, "/")) "" else "/";
+        return std.fmt.bufPrint(buf, "{s}{s}{s}", .{ root_url, sep, endpoint_suffix }) catch base_url;
+    }
+
+    fn formatAuthHeader(api_header: []const u8, api_key: []const u8, buf: *[512]u8) []const u8 {
+        // PSEUDOCODE: Format 'Authorization: Bearer <key>' or custom header '<header>: <key>'.
+        const api_key_str = if (api_key.len > 0) api_key else "nokey";
+        if (std.mem.eql(u8, api_header, "Authorization")) {
+            return std.fmt.bufPrint(buf, "Authorization: Bearer {s}", .{api_key_str}) catch "Authorization: Bearer nokey";
+        }
+        return std.fmt.bufPrint(buf, "{s}: {s}", .{ api_header, api_key_str }) catch "Authorization: Bearer nokey";
+    }
+
+    fn buildActiveRequestBody(
+        self: *Client,
+        active_protocol: ProtocolMode,
+        profile: provider.ProviderProfile,
+        adapter: ?*JsProviderAdapter,
+        system_prompt: []const u8,
+        msgs: []const proto.Message,
+        tools: []const proto.ToolDefinition,
+    ) ![]const u8 {
+        // PSEUDOCODE: Build protocol-appropriate JSON request body and run adapter transform.
+        const native_body = if (active_protocol == .responses)
+            try buildResponsesRequestBody(self.alloc, self.model, self.max_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, system_prompt, msgs, tools, profile)
+        else
+            try buildRequestBodyWithProfile(self.alloc, profile, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, self.disable_stream_options, system_prompt, msgs, tools);
+        defer self.alloc.free(native_body);
+        return try self.transformBody(adapter, native_body);
+    }
+
+    fn executeStream(self: *Client, url: []const u8, auth_header: []const u8, body: []const u8, ctx: *StreamCtx, idle_aborted: *bool) !u32 {
+        // PSEUDOCODE: Post HTTP stream request with headers and timeout watchdog.
+        const headers = [_][]const u8{ auth_header, "Content-Type: application/json" };
+        const stream_result = http_lib.postStream(self.alloc, main.g_io, .{
+            .url = url,
+            .headers = &headers,
+            .body = body,
+            .timeout_secs = 120,
+            .idle_timeout_secs = self.effectiveIdleTimeout(),
+            .out_idle_aborted = idle_aborted,
+        }, StreamCtx.onChunk, ctx);
+
+        return if (stream_result) |c| c else |e| switch (e) {
+            error.StreamIdleTimeout => 0,
+            else => return e,
+        };
+    }
+
+    fn checkProtocolFallback(self: *Client, active_protocol: *ProtocolMode, profile: provider.ProviderProfile, req_http_code: u32, raw_resp: []const u8, has_tools: bool) bool {
+        // PSEUDOCODE: Auto-negotiation cross-protocol fallback for .auto profiles.
+        if (self.protocol_mode != .auto or profile.protocol != .auto) return false;
+        if (active_protocol.* == .chat_completions and req_http_code == 400) {
+            if (std.mem.indexOf(u8, raw_resp, "responses") != null or
+                std.mem.indexOf(u8, raw_resp, "unsupported_model") != null or
+                (std.mem.indexOf(u8, raw_resp, "reasoning") != null and has_tools))
+            {
+                active_protocol.* = .responses;
+                self.cached_protocol = .responses;
+                return true;
+            }
+        }
+        const responses_rejected = req_http_code == 400 and (std.mem.indexOf(u8, raw_resp, "not found") != null or
+            std.mem.indexOf(u8, raw_resp, "json_parse_error") != null or
+            std.mem.indexOf(u8, raw_resp, "ResponseInput") != null);
+        if (active_protocol.* == .responses and (req_http_code == 404 or responses_rejected)) {
+            active_protocol.* = .chat_completions;
+            self.cached_protocol = .chat_completions;
+            return true;
+        }
+        return false;
+    }
+
+    fn checkParameterRetry(self: *Client, req_http_code: u32, raw_resp: []const u8) bool {
+        // PSEUDOCODE: Adapt unsupported parameters (tokens, reasoning, stream_options) on 400 error.
+        if (req_http_code != 400) return false;
+        var should_retry = false;
+        if (std.mem.indexOf(u8, raw_resp, "unsupported_parameter") != null and
+            (std.mem.indexOf(u8, raw_resp, "max_tokens") != null or std.mem.indexOf(u8, raw_resp, "max_completion_tokens") != null))
+        {
+            self.use_completion_tokens = !self.use_completion_tokens;
+            should_retry = true;
+        }
+        if (std.mem.indexOf(u8, raw_resp, "reasoning_effort") != null) {
+            self.disable_reasoning_effort = true;
+            should_retry = true;
+        }
+        if (std.mem.indexOf(u8, raw_resp, "stream_options") != null or std.mem.indexOf(u8, raw_resp, "include_usage") != null) {
+            self.disable_stream_options = true;
+            should_retry = true;
+        }
+        return should_retry;
+    }
+
+    fn finalizeOpenAiResponse(self: *Client, ctx: *StreamCtx, req_http_code: u32, idle_aborted: bool, active_protocol: ProtocolMode) !proto.Response {
+        // PSEUDOCODE: Mark abort, flush line buffer, finalize tool calls, and record usage/protocol.
+        if (idle_aborted) ctx.response.stop_reason = .stream_aborted;
+        if (ctx.line_buf.items.len > 0) {
+            ctx.processLine(ctx.line_buf.items) catch {};
+            ctx.line_buf.clearRetainingCapacity();
+        }
+        try ctx.finalizeToolCalls();
+        ctx.response.http_code = if (req_http_code == 0) 598 else req_http_code;
+
+        if (req_http_code == 200 and self.protocol_mode == .auto) {
+            self.cached_protocol = active_protocol;
+        }
+        if ((ctx.response.stop_reason == .unknown or req_http_code >= 400) and ctx.raw_accum_init) {
+            if (ctx.response.raw_debug_info == null) {
+                ctx.response.raw_debug_info = ctx.alloc.dupe(u8, ctx.raw_accum.items) catch null;
+            }
+        }
+        if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
+        return ctx.response;
+    }
+
+    fn shouldRetryRequest(
+        self: *Client,
+        active_protocol: *ProtocolMode,
+        profile: provider.ProviderProfile,
+        req_http_code: u32,
+        raw_resp: []const u8,
+        has_tools: bool,
+    ) bool {
+        // PSEUDOCODE: Check cross-protocol fallback or parameter retry on error.
+        return self.checkProtocolFallback(active_protocol, profile, req_http_code, raw_resp, has_tools) or
+            self.checkParameterRetry(req_http_code, raw_resp);
+    }
+
+    fn executeAttempt(
+        self: *Client,
+        active_protocol: ProtocolMode,
+        body: []const u8,
+        ctx: *StreamCtx,
+        idle_aborted: *bool,
+    ) !u32 {
+        var url_buf: [512]u8 = undefined;
+        const url = formatEndpointUrl(self.base_url, active_protocol, &url_buf);
+        var auth_buf: [512]u8 = undefined;
+        const auth_header = formatAuthHeader(self.api_header, self.api_key, &auth_buf);
+        return self.executeStream(url, auth_header, body, ctx, idle_aborted);
+    }
+
     pub fn sendMessage(
         self: *Client,
         system_prompt: []const u8,
@@ -175,47 +333,15 @@ pub const Client = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !proto.Response {
-        const root_url = getRootApiUrl(self.base_url);
         const adapter = try self.loadAdapter();
         defer if (adapter) |a| a.deinit();
         const profile = if (adapter) |a| a.profile else provider.resolveProfile(self.provider_key, self.base_url);
-        var active_protocol: ProtocolMode = blk: {
-            // RFC-012 §7 priority: explicit OPENAI_PROTOCOL > ProviderProfile.protocol > cached auto-negotiate.
-            if (self.protocol_mode == .chat_completions) break :blk .chat_completions;
-            if (self.protocol_mode == .responses) break :blk .responses;
-            switch (profile.protocol) {
-                .chat_completions => break :blk .chat_completions,
-                .responses => break :blk .responses,
-                .auto => {
-                    if (self.cached_protocol) |p| break :blk p;
-                    break :blk .responses; // existing auto-negotiate default
-                },
-            }
-        };
+        var active_protocol = self.resolveActiveProtocol(profile);
 
         var retry_count: u32 = 0;
         while (retry_count < 4) : (retry_count += 1) {
-            const native_body = if (active_protocol == .responses)
-                try buildResponsesRequestBody(self.alloc, self.model, self.max_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, system_prompt, msgs, tools, profile)
-            else
-                try buildRequestBodyWithProfile(self.alloc, profile, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, self.disable_stream_options, system_prompt, msgs, tools);
-            defer self.alloc.free(native_body);
-            const body = try self.transformBody(adapter, native_body);
+            const body = try self.buildActiveRequestBody(active_protocol, profile, adapter, system_prompt, msgs, tools);
             defer self.alloc.free(body);
-
-            // Build URL according to active protocol
-            var url_buf: [512]u8 = undefined;
-            const endpoint_suffix = if (active_protocol == .responses) "responses" else "chat/completions";
-            const sep = if (std.mem.endsWith(u8, root_url, "/")) "" else "/";
-            const url = std.fmt.bufPrint(&url_buf, "{s}{s}{s}", .{ root_url, sep, endpoint_suffix }) catch self.base_url;
-
-            // Build auth header
-            var auth_buf: [512]u8 = undefined;
-            const api_key_str = if (self.api_key.len > 0) self.api_key else "nokey";
-            const auth_header = if (std.mem.eql(u8, self.api_header, "Authorization"))
-                std.fmt.bufPrint(&auth_buf, "Authorization: Bearer {s}", .{api_key_str}) catch "Authorization: Bearer nokey"
-            else
-                std.fmt.bufPrint(&auth_buf, "{s}: {s}", .{ self.api_header, api_key_str }) catch "Authorization: Bearer nokey";
 
             var ctx = StreamCtx{
                 .alloc = self.alloc,
@@ -232,115 +358,17 @@ pub const Client = struct {
             errdefer ctx.response.deinit();
             errdefer if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
 
-            const headers = [_][]const u8{ auth_header, "Content-Type: application/json" };
             var idle_aborted = false;
-            const stream_result = http_lib.postStream(self.alloc, main.g_io, .{
-                .url = url,
-                .headers = &headers,
-                .body = body,
-                .timeout_secs = 120,
-                .idle_timeout_secs = self.effectiveIdleTimeout(),
-                .out_idle_aborted = &idle_aborted,
-            }, StreamCtx.onChunk, &ctx);
-            const req_http_code = if (stream_result) |c| c else |e| switch (e) {
-                error.StreamIdleTimeout => 0, // watchdog fired; finalize below
-                else => return e,
-            };
+            const req_http_code = try self.executeAttempt(active_protocol, body, &ctx, &idle_aborted);
+            const raw_resp = if (ctx.raw_accum_init) ctx.raw_accum.items else "";
 
-            if (idle_aborted) {
-                ctx.response.stop_reason = .stream_aborted;
+            if (self.shouldRetryRequest(&active_protocol, profile, req_http_code, raw_resp, tools.len > 0)) {
+                if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
+                ctx.response.deinit();
+                continue;
             }
 
-            if (ctx.line_buf.items.len > 0) {
-                ctx.processLine(ctx.line_buf.items) catch {};
-                ctx.line_buf.clearRetainingCapacity();
-            }
-
-            try ctx.finalizeToolCalls();
-            ctx.response.http_code = if (req_http_code == 0) 598 else req_http_code; // 598 = watchdog-aborted marker
-
-            // Auto-Negotiation & Adaptive Cross-Protocol Fallback (Tier 2)
-            if (self.protocol_mode == .auto and ctx.raw_accum_init) {
-                const raw_resp = ctx.raw_accum.items;
-
-                // Fallback 1: Chat Completions -> Responses API on 400 error due to lack of support or tools/reasoning conflict
-                // RFC-012 §3.6: profile-pinned protocol (e.g. deepseek/qwen/minimax/glm/kimi/vllm) must NOT cross-fallback;
-                // only profiles with .auto wire protocol are allowed to negotiate up.
-                if (active_protocol == .chat_completions and profile.protocol == .auto and req_http_code == 400) {
-                    if (std.mem.indexOf(u8, raw_resp, "responses") != null or
-                        std.mem.indexOf(u8, raw_resp, "unsupported_model") != null or
-                        (std.mem.indexOf(u8, raw_resp, "reasoning") != null and tools.len > 0))
-                    {
-                        active_protocol = .responses;
-                        self.cached_protocol = .responses;
-                        if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
-                        ctx.response.deinit();
-                        continue;
-                    }
-                }
-
-                // Fallback 2: Responses API -> Chat Completions when:
-                //   - Server returns 404 (endpoint /responses does not exist), OR
-                //   - Server returns 400 + "not found" (endpoint exists but model not found), OR
-                //   - Server returns 400 + json_parse_error / ResponseInput (endpoint exists but does not
-                //     understand Responses API JSON format — e.g. OpenAI-compat proxies like agnes).
-                const responses_format_rejected = req_http_code == 400 and (std.mem.indexOf(u8, raw_resp, "not found") != null or
-                    std.mem.indexOf(u8, raw_resp, "json_parse_error") != null or
-                    std.mem.indexOf(u8, raw_resp, "ResponseInput") != null);
-                if (active_protocol == .responses and profile.protocol == .auto and (req_http_code == 404 or responses_format_rejected)) {
-                    active_protocol = .chat_completions;
-                    self.cached_protocol = .chat_completions;
-                    if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
-                    ctx.response.deinit();
-                    continue;
-                }
-            }
-
-            // Retry adaptive parameters in Chat Completions
-            if (req_http_code == 400 and ctx.raw_accum_init) {
-                const raw_resp = ctx.raw_accum.items;
-                var should_retry = false;
-
-                if (std.mem.indexOf(u8, raw_resp, "unsupported_parameter") != null and
-                    (std.mem.indexOf(u8, raw_resp, "max_tokens") != null or std.mem.indexOf(u8, raw_resp, "max_completion_tokens") != null))
-                {
-                    self.use_completion_tokens = !self.use_completion_tokens;
-                    should_retry = true;
-                }
-
-                if (std.mem.indexOf(u8, raw_resp, "reasoning_effort") != null) {
-                    self.disable_reasoning_effort = true;
-                    should_retry = true;
-                }
-
-                // RFC-006 §3.6: stream_options not supported by older compat APIs
-                if (std.mem.indexOf(u8, raw_resp, "stream_options") != null or
-                    std.mem.indexOf(u8, raw_resp, "include_usage") != null)
-                {
-                    self.disable_stream_options = true;
-                    should_retry = true;
-                }
-
-                if (should_retry) {
-                    if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
-                    ctx.response.deinit();
-                    continue; // Retry
-                }
-            }
-
-            // Remember successful protocol (Tier 3: Protocol Memory Caching)
-            if (req_http_code == 200 and self.protocol_mode == .auto) {
-                self.cached_protocol = active_protocol;
-            }
-
-            if ((ctx.response.stop_reason == .unknown or req_http_code >= 400) and ctx.raw_accum_init) {
-                if (ctx.response.raw_debug_info == null) {
-                    ctx.response.raw_debug_info = ctx.alloc.dupe(u8, ctx.raw_accum.items) catch null;
-                }
-            }
-            if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
-
-            return ctx.response;
+            return self.finalizeOpenAiResponse(&ctx, req_http_code, idle_aborted, active_protocol);
         }
         return error.MaxRetriesExceeded;
     }
@@ -349,6 +377,96 @@ pub const Client = struct {
 // ---------------------------------------------------------------------------
 // Request building
 // ---------------------------------------------------------------------------
+
+fn appendResponsesReasoning(
+    w: *utils.BufWriter,
+    disable_reasoning_effort: bool,
+    reasoning_effort: ?[]const u8,
+    profile: provider.ProviderProfile,
+) !void {
+    // PSEUDOCODE: Write Responses API reasoning object if provider supports it.
+    if (disable_reasoning_effort or profile.reasoning_param == .unsupported) return;
+    if (reasoning_effort) |effort| {
+        if (!std.mem.eql(u8, effort, "none")) {
+            try w.print(",\"reasoning\":{{\"effort\":\"{s}\"}}", .{effort});
+        }
+    } else {
+        try w.writeAll(",\"reasoning\":{\"effort\":\"medium\"}");
+    }
+}
+
+fn appendResponsesTools(w: *utils.BufWriter, alloc: Allocator, tools: []const proto.ToolDefinition) !void {
+    // PSEUDOCODE: Serialize tools array with escaped descriptions and parameter schemas.
+    if (tools.len == 0) return;
+    try w.writeAll(",\"tools\":[");
+    for (tools, 0..) |td, ti| {
+        if (ti > 0) try w.writeByte(',');
+        const escaped_desc = try json.escape(alloc, td.description);
+        defer alloc.free(escaped_desc);
+        try w.print(
+            \\{{"type":"function","name":"{s}","description":"{s}","parameters":{s}}}
+        , .{ td.name, escaped_desc, td.input_schema_json });
+    }
+    try w.writeAll("]");
+}
+
+fn appendResponsesContentBlock(
+    w: *utils.BufWriter,
+    alloc: Allocator,
+    role: proto.Role,
+    block: proto.ContentBlock,
+    first_item: *bool,
+) !void {
+    // PSEUDOCODE: Serialize single content block (text, tool_use, tool_result, image) into Responses API item.
+    switch (block) {
+        .text => |t| {
+            if (t.len == 0) return;
+            if (!first_item.*) try w.writeByte(',');
+            first_item.* = false;
+            const escaped = try json.escape(alloc, t);
+            defer alloc.free(escaped);
+            try w.print("{{\"role\":\"{s}\",\"content\":\"{s}\"}}", .{ role.toJson(), escaped });
+        },
+        .tool_use => |tu| {
+            if (!first_item.*) try w.writeByte(',');
+            first_item.* = false;
+            const escaped_args = try json.escape(alloc, tu.input_json);
+            defer alloc.free(escaped_args);
+            try w.print(
+                \\{{"type":"function_call","call_id":"{s}","name":"{s}","arguments":"{s}"}}
+            , .{ tu.id, tu.name, escaped_args });
+        },
+        .tool_result => |tr| {
+            if (!first_item.*) try w.writeByte(',');
+            first_item.* = false;
+            const escaped = try json.escape(alloc, tr.content);
+            defer alloc.free(escaped);
+            try w.print(
+                \\{{"type":"function_call_output","call_id":"{s}","output":"{s}"}}
+            , .{ tr.tool_use_id, escaped });
+        },
+        .image => |img| {
+            if (!first_item.*) try w.writeByte(',');
+            first_item.* = false;
+            try w.print(
+                \\{{"type":"input_image","image_url":"data:{s};base64,{s}"}}
+            , .{ img.media_type, img.data });
+        },
+        .thinking => {},
+    }
+}
+
+fn appendResponsesInput(w: *utils.BufWriter, alloc: Allocator, msgs: []const proto.Message) !void {
+    // PSEUDOCODE: Serialize all messages content blocks into Responses API input array.
+    try w.writeAll(",\"input\":[");
+    var first_item = true;
+    for (msgs) |msg| {
+        for (msg.content) |block| {
+            try appendResponsesContentBlock(w, alloc, msg.role, block, &first_item);
+        }
+    }
+    try w.writeAll("]}");
+}
 
 /// Build request body for OpenAI Responses API (POST /v1/responses).
 pub fn buildResponsesRequestBody(
@@ -365,24 +483,10 @@ pub fn buildResponsesRequestBody(
     var buf = utils.BufWriter.init(alloc);
     errdefer buf.deinit();
     const w = &buf;
-
     _ = max_tokens;
 
     try w.print("{{\"model\":\"{s}\",\"stream\":true", .{model});
-
-    if (!disable_reasoning_effort) {
-        // RFC-012: providers with unsupported reasoning_param (deepseek/minimax/glm)
-        // must never emit any reasoning field, even when forced onto the Responses API.
-        if (profile.reasoning_param != .unsupported) {
-            if (reasoning_effort) |effort| {
-                if (!std.mem.eql(u8, effort, "none")) {
-                    try w.print(",\"reasoning\":{{\"effort\":\"{s}\"}}", .{effort});
-                }
-            } else {
-                try w.writeAll(",\"reasoning\":{\"effort\":\"medium\"}");
-            }
-        }
-    }
+    try appendResponsesReasoning(w, disable_reasoning_effort, reasoning_effort, profile);
 
     if (system_prompt.len > 0) {
         const escaped_sys = try json.escape(alloc, system_prompt);
@@ -390,69 +494,174 @@ pub fn buildResponsesRequestBody(
         try w.print(",\"instructions\":\"{s}\"", .{escaped_sys});
     }
 
-    if (tools.len > 0) {
-        try w.writeAll(",\"tools\":[");
-        for (tools, 0..) |td, ti| {
-            if (ti > 0) try w.writeByte(',');
-            const escaped_desc = try json.escape(alloc, td.description);
-            defer alloc.free(escaped_desc);
-            try w.print(
-                \\{{"type":"function","name":"{s}","description":"{s}","parameters":{s}}}
-            , .{ td.name, escaped_desc, td.input_schema_json });
-        }
-        try w.writeAll("]");
-    }
-
-    try w.writeAll(",\"input\":[");
-    var first_item = true;
-    for (msgs) |msg| {
-        for (msg.content) |block| {
-            switch (block) {
-                .text => |t| {
-                    if (t.len == 0) continue;
-                    if (!first_item) try w.writeByte(',');
-                    first_item = false;
-                    const escaped = try json.escape(alloc, t);
-                    defer alloc.free(escaped);
-                    try w.print("{{\"role\":\"{s}\",\"content\":\"{s}\"}}", .{ msg.role.toJson(), escaped });
-                },
-                .tool_use => |tu| {
-                    if (!first_item) try w.writeByte(',');
-                    first_item = false;
-                    const escaped_args = try json.escape(alloc, tu.input_json);
-                    defer alloc.free(escaped_args);
-                    try w.print(
-                        \\{{"type":"function_call","call_id":"{s}","name":"{s}","arguments":"{s}"}}
-                    , .{ tu.id, tu.name, escaped_args });
-                },
-                .tool_result => |tr| {
-                    if (!first_item) try w.writeByte(',');
-                    first_item = false;
-                    const escaped = try json.escape(alloc, tr.content);
-                    defer alloc.free(escaped);
-                    try w.print(
-                        \\{{"type":"function_call_output","call_id":"{s}","output":"{s}"}}
-                    , .{ tr.tool_use_id, escaped });
-                },
-                .image => |img| {
-                    if (!first_item) try w.writeByte(',');
-                    first_item = false;
-                    try w.print(
-                        \\{{"type":"input_image","image_url":"data:{s};base64,{s}"}}
-                    , .{ img.media_type, img.data });
-                },
-                .thinking => {},
-            }
-        }
-    }
-    try w.writeAll("]}");
-
+    try appendResponsesTools(w, alloc, tools);
+    try appendResponsesInput(w, alloc, msgs);
     return buf.toOwnedSlice();
 }
 
 // ---------------------------------------------------------------------------
 // Chat Completions Request building
 // ---------------------------------------------------------------------------
+
+fn resolveReasoningEffortStr(
+    profile: provider.ProviderProfile,
+    disable_reasoning_effort: bool,
+    reasoning_effort: ?[]const u8,
+    buf: *[64]u8,
+) []const u8 {
+    // PSEUDOCODE: Format reasoning_effort or reasoning object string based on profile.
+    if (disable_reasoning_effort or profile.reasoning_param == .unsupported) return "";
+    const effort = reasoning_effort orelse return "";
+    if (std.mem.eql(u8, effort, "none")) return "";
+    return switch (profile.reasoning_param) {
+        .top_level_effort => std.fmt.bufPrint(buf, "\"reasoning_effort\":\"{s}\",", .{effort}) catch "",
+        .nested_reasoning_object => std.fmt.bufPrint(buf, "\"reasoning\":{{\"effort\":\"{s}\"}},", .{effort}) catch "",
+        .unsupported => "",
+    };
+}
+
+fn appendChatTools(w: *utils.BufWriter, alloc: Allocator, tools: []const proto.ToolDefinition) !void {
+    // PSEUDOCODE: Write tools array definition for Chat Completions API.
+    if (tools.len == 0) return;
+    try w.writeAll(",\"tools\":[");
+    for (tools, 0..) |td, ti| {
+        if (ti > 0) try w.writeByte(',');
+        const escaped_desc = try json.escape(alloc, td.description);
+        defer alloc.free(escaped_desc);
+        try w.print(
+            \\{{"type":"function","function":{{"name":"{s}","description":"{s}","parameters":{s}}}}}
+        , .{ td.name, escaped_desc, td.input_schema_json });
+    }
+    try w.writeAll("],\"tool_choice\":\"auto\"");
+}
+
+fn appendChatToolResultMessages(w: *utils.BufWriter, alloc: Allocator, msg: proto.Message, first_msg: *bool) !bool {
+    // PSEUDOCODE: Encode tool_result blocks as individual "tool" role messages. Returns true if other blocks exist.
+    var has_tool_results = false;
+    var has_other_blocks = false;
+    for (msg.content) |block| {
+        if (block == .tool_result) has_tool_results = true else has_other_blocks = true;
+    }
+    if (!has_tool_results) return true;
+
+    for (msg.content) |block| {
+        if (block == .tool_result) {
+            if (!first_msg.*) try w.writeByte(',');
+            first_msg.* = false;
+            const tr = block.tool_result;
+            const escaped = try json.escape(alloc, tr.content);
+            defer alloc.free(escaped);
+            try w.print(
+                \\{{"role":"tool","tool_call_id":"{s}","content":"{s}"}}
+            , .{ tr.tool_use_id, escaped });
+        }
+    }
+    return has_other_blocks;
+}
+
+fn appendChatContentBlocks(w: *utils.BufWriter, alloc: Allocator, content: []const proto.ContentBlock) !void {
+    // PSEUDOCODE: Write multi-part content array with text and images.
+    try w.writeAll("\"content\":[");
+    var first_cb = true;
+    for (content) |block| {
+        switch (block) {
+            .text => |t| {
+                if (t.len == 0) continue;
+                if (!first_cb) try w.writeByte(',');
+                first_cb = false;
+                const escaped = try json.escape(alloc, t);
+                defer alloc.free(escaped);
+                try w.print("{{\"type\":\"text\",\"text\":\"{s}\"}}", .{escaped});
+            },
+            .image => |img| {
+                if (!first_cb) try w.writeByte(',');
+                first_cb = false;
+                try w.print(
+                    \\{{"type":"image_url","image_url":{{"url":"data:{s};base64,{s}"}}}}
+                , .{ img.media_type, img.data });
+            },
+            else => {},
+        }
+    }
+    try w.writeByte(']');
+}
+
+fn appendChatTextContent(w: *utils.BufWriter, alloc: Allocator, content: []const proto.ContentBlock) !void {
+    // PSEUDOCODE: Write single string content or null.
+    for (content) |block| {
+        if (block == .text) {
+            const escaped = try json.escape(alloc, block.text);
+            defer alloc.free(escaped);
+            return try w.print("\"content\":\"{s}\"", .{escaped});
+        }
+    }
+    return try w.print("\"content\":null", .{});
+}
+
+fn appendChatToolCalls(w: *utils.BufWriter, alloc: Allocator, content: []const proto.ContentBlock) !void {
+    // PSEUDOCODE: Write assistant tool_calls array if any tool_use blocks exist.
+    var has_tool_calls = false;
+    for (content) |b| if (b == .tool_use) {
+        has_tool_calls = true;
+        break;
+    };
+    if (!has_tool_calls) return;
+
+    try w.print(",\"tool_calls\":[", .{});
+    var first_tc = true;
+    for (content) |block| {
+        if (block == .tool_use) {
+            const tu = block.tool_use;
+            if (!first_tc) try w.writeByte(',');
+            first_tc = false;
+            const escaped_args = try json.escape(alloc, tu.input_json);
+            defer alloc.free(escaped_args);
+            try w.print(
+                \\{{"type":"function","id":"{s}","function":{{"name":"{s}","arguments":"{s}"}}}}
+            , .{ tu.id, tu.name, escaped_args });
+        }
+    }
+    try w.writeByte(']');
+}
+
+fn appendChatMessage(
+    w: *utils.BufWriter,
+    alloc: Allocator,
+    profile: provider.ProviderProfile,
+    msg: proto.Message,
+    first_msg: *bool,
+) !void {
+    // PSEUDOCODE: Encode single chat message including content, reasoning echo, and tool calls.
+    const has_remaining = try appendChatToolResultMessages(w, alloc, msg, first_msg);
+    if (!has_remaining) return;
+
+    if (!first_msg.*) try w.writeByte(',');
+    first_msg.* = false;
+    try w.print("{{\"role\":\"{s}\",", .{msg.role.toJson()});
+
+    var has_images = false;
+    var reasoning_text: ?[]const u8 = null;
+    for (msg.content) |b| {
+        if (b == .image) has_images = true else if (b == .thinking) reasoning_text = b.thinking.thinking;
+    }
+
+    if (has_images) {
+        try appendChatContentBlocks(w, alloc, msg.content);
+    } else {
+        try appendChatTextContent(w, alloc, msg.content);
+    }
+
+    if (msg.role == .assistant and reasoning_text != null) {
+        if (profile.echo_policy == .echo_required or profile.echo_policy == .echo_optional) {
+            const escaped_rt = try json.escape(alloc, reasoning_text.?);
+            defer alloc.free(escaped_rt);
+            try w.print(",\"reasoning_content\":\"{s}\"", .{escaped_rt});
+        }
+    }
+
+    try appendChatToolCalls(w, alloc, msg.content);
+    try w.writeByte('}');
+}
 
 /// Build request body for OpenAI Chat Completions API with a specific ProviderProfile (RFC-012).
 pub fn buildRequestBodyWithProfile(
@@ -473,51 +682,18 @@ pub fn buildRequestBodyWithProfile(
     const w = &buf;
 
     var reasoning_buf: [64]u8 = undefined;
-    const reasoning_effort_str: []const u8 = blk: {
-        if (disable_reasoning_effort) break :blk "";
-        if (profile.reasoning_param == .unsupported) break :blk "";
-        if (reasoning_effort) |effort| {
-            if (std.mem.eql(u8, effort, "none")) break :blk "";
-            if (profile.reasoning_param == .top_level_effort) {
-                break :blk std.fmt.bufPrint(&reasoning_buf, "\"reasoning_effort\":\"{s}\",", .{effort}) catch "";
-            } else if (profile.reasoning_param == .nested_reasoning_object) {
-                break :blk std.fmt.bufPrint(&reasoning_buf, "\"reasoning\":{{\"effort\":\"{s}\"}},", .{effort}) catch "";
-            }
-        }
-        break :blk "";
-    };
-    // RFC-006 §3.6: adaptive stream_options — omit if compat API or provider does not support it
+    const reasoning_effort_str = resolveReasoningEffortStr(profile, disable_reasoning_effort, reasoning_effort, &reasoning_buf);
     const effective_stream_opts = !disable_stream_options and profile.supports_stream_options;
-    const stream_options_str = if (effective_stream_opts) ",\"stream_options\":{\"include_usage\":true}" else "";
+    const stream_opts_str = if (effective_stream_opts) ",\"stream_options\":{\"include_usage\":true}" else "";
 
-    const effective_use_completion_tokens = use_completion_tokens or profile.use_completion_tokens;
-    if (effective_use_completion_tokens) {
-        try w.print(
-            \\{{"model":"{s}","max_completion_tokens":{d},{s}"stream":true{s}
-        , .{ model, max_tokens, reasoning_effort_str, stream_options_str });
-    } else {
-        try w.print(
-            \\{{"model":"{s}","max_tokens":{d},{s}"stream":true{s}
-        , .{ model, max_tokens, reasoning_effort_str, stream_options_str });
-    }
+    const tok_field = if (use_completion_tokens or profile.use_completion_tokens) "max_completion_tokens" else "max_tokens";
+    try w.print("{{\"model\":\"{s}\",\"{s}\":{d},{s}\"stream\":true{s}", .{
+        model, tok_field, max_tokens, reasoning_effort_str, stream_opts_str,
+    });
 
-    // Tool definitions (placed before messages to ensure static 100% JSON prefix between turns)
-    if (tools.len > 0) {
-        try w.writeAll(",\"tools\":[");
-        for (tools, 0..) |td, ti| {
-            if (ti > 0) try w.writeByte(',');
-            const escaped_desc = try json.escape(alloc, td.description);
-            defer alloc.free(escaped_desc);
-            try w.print(
-                \\{{"type":"function","function":{{"name":"{s}","description":"{s}","parameters":{s}}}}}
-            , .{ td.name, escaped_desc, td.input_schema_json });
-        }
-        try w.writeAll("],\"tool_choice\":\"auto\"");
-    }
-
+    try appendChatTools(w, alloc, tools);
     try w.writeAll(",\"messages\":[");
 
-    // System message
     if (system_prompt.len > 0) {
         const escaped_sys = try json.escape(alloc, system_prompt);
         defer alloc.free(escaped_sys);
@@ -525,134 +701,9 @@ pub fn buildRequestBodyWithProfile(
         if (msgs.len > 0) try w.writeByte(',');
     }
 
-    // Messages
     var first_msg = true;
     for (msgs) |msg| {
-        // Check if message has tool_results
-        var has_tool_results = false;
-        var has_other_blocks = false;
-        for (msg.content) |block| {
-            if (block == .tool_result) {
-                has_tool_results = true;
-            } else {
-                has_other_blocks = true;
-            }
-        }
-
-        if (has_tool_results) {
-            // Encode all tool_results as "tool" role messages
-            for (msg.content) |block| {
-                if (block == .tool_result) {
-                    if (!first_msg) try w.writeByte(',');
-                    first_msg = false;
-                    const tr = block.tool_result;
-                    const escaped = try json.escape(alloc, tr.content);
-                    defer alloc.free(escaped);
-                    try w.print(
-                        \\{{"role":"tool","tool_call_id":"{s}","content":"{s}"}}
-                    , .{ tr.tool_use_id, escaped });
-                }
-            }
-            if (!has_other_blocks) continue;
-            // Otherwise, continue to encode non-tool blocks (e.g. attached images) as standard message
-        }
-
-        // Standard user or assistant message
-        if (!first_msg) try w.writeByte(',');
-        first_msg = false;
-        try w.print("{{\"role\":\"{s}\",", .{msg.role.toJson()});
-
-        var has_images = false;
-        var reasoning_text: ?[]const u8 = null;
-        for (msg.content) |block| {
-            if (block == .image) {
-                has_images = true;
-            } else if (block == .thinking) {
-                reasoning_text = block.thinking.thinking;
-            }
-        }
-
-        if (has_images) {
-            try w.writeAll("\"content\":[");
-            var first_cb = true;
-            for (msg.content) |block| {
-                switch (block) {
-                    .text => |t| {
-                        if (t.len == 0) continue;
-                        if (!first_cb) try w.writeByte(',');
-                        first_cb = false;
-                        const escaped = try json.escape(alloc, t);
-                        defer alloc.free(escaped);
-                        try w.print("{{\"type\":\"text\",\"text\":\"{s}\"}}", .{escaped});
-                    },
-                    .image => |img| {
-                        if (!first_cb) try w.writeByte(',');
-                        first_cb = false;
-                        try w.print(
-                            \\{{"type":"image_url","image_url":{{"url":"data:{s};base64,{s}"}}}}
-                        , .{ img.media_type, img.data });
-                    },
-                    else => {},
-                }
-            }
-            try w.writeByte(']');
-        } else {
-            var has_text = false;
-            var text_content: ?[]const u8 = null;
-            for (msg.content) |block| {
-                if (block == .text) {
-                    has_text = true;
-                    text_content = block.text;
-                    break;
-                }
-            }
-
-            if (has_text and text_content != null) {
-                const escaped = try json.escape(alloc, text_content.?);
-                defer alloc.free(escaped);
-                try w.print("\"content\":\"{s}\"", .{escaped});
-            } else {
-                try w.print("\"content\":null", .{});
-            }
-        }
-
-        // Echo reasoning_content for providers requiring it in assistant history (DeepSeek)
-        if (msg.role == .assistant and reasoning_text != null) {
-            if (profile.echo_policy == .echo_required or profile.echo_policy == .echo_optional) {
-                const escaped_rt = try json.escape(alloc, reasoning_text.?);
-                defer alloc.free(escaped_rt);
-                try w.print(",\"reasoning_content\":\"{s}\"", .{escaped_rt});
-            }
-        }
-
-        // Handle tool_calls
-        var has_tool_calls = false;
-        for (msg.content) |block| {
-            if (block == .tool_use) {
-                has_tool_calls = true;
-                break;
-            }
-        }
-
-        if (has_tool_calls) {
-            try w.print(",\"tool_calls\":[", .{});
-            var first_tc = true;
-            for (msg.content) |block| {
-                if (block == .tool_use) {
-                    const tu = block.tool_use;
-                    if (!first_tc) try w.writeByte(',');
-                    first_tc = false;
-                    const escaped_args = try json.escape(alloc, tu.input_json);
-                    defer alloc.free(escaped_args);
-                    try w.print(
-                        \\{{"type":"function","id":"{s}","function":{{"name":"{s}","arguments":"{s}"}}}}
-                    , .{ tu.id, tu.name, escaped_args });
-                }
-            }
-            try w.writeByte(']');
-        }
-
-        try w.writeByte('}');
+        try appendChatMessage(w, alloc, profile, msg, &first_msg);
     }
 
     try w.writeByte(']');
@@ -709,6 +760,33 @@ const PartialToolCall = struct {
         self.name.deinit(alloc);
         self.args.deinit(alloc);
     }
+};
+
+const ChatUsagePromptDetails = struct { cached_tokens: ?u64 = null };
+const ChatUsageCompletionDetails = struct { reasoning_tokens: ?u64 = null };
+const ChatUsageJson = struct {
+    prompt_tokens: ?u64 = null,
+    completion_tokens: ?u64 = null,
+    total_tokens: ?u64 = null,
+    prompt_tokens_details: ?ChatUsagePromptDetails = null,
+    completion_tokens_details: ?ChatUsageCompletionDetails = null,
+    prompt_cache_hit_tokens: ?u64 = null,
+};
+const ChatChoiceDeltaToolCallFunction = struct { name: ?[]const u8 = null, arguments: ?[]const u8 = null };
+const ChatChoiceDeltaToolCall = struct { index: ?u32 = null, id: ?[]const u8 = null, type: ?[]const u8 = null, function: ?ChatChoiceDeltaToolCallFunction = null };
+const ChatChoiceDeltaDetail = struct { reasoning_content: ?[]const u8 = null, reasoning: ?[]const u8 = null };
+const ChatChoiceDelta = struct {
+    content: ?[]const u8 = null,
+    reasoning_content: ?[]const u8 = null,
+    reasoning: ?[]const u8 = null,
+    detail: ?ChatChoiceDeltaDetail = null,
+    details: ?ChatChoiceDeltaDetail = null,
+    tool_calls: ?[]ChatChoiceDeltaToolCall = null,
+};
+const ChatChoice = struct { index: ?u32 = null, delta: ?ChatChoiceDelta = null, finish_reason: ?[]const u8 = null };
+const ChatChunk = struct {
+    choices: ?[]ChatChoice = null,
+    usage: ?ChatUsageJson = null,
 };
 
 const StreamCtx = struct {
@@ -778,9 +856,246 @@ const StreamCtx = struct {
         }
     }
 
-    fn processLine(self: *StreamCtx, line: []const u8) !void {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
+    fn parseResponsesUsage(self: *StreamCtx, data: []const u8) void {
+        // PSEUDOCODE: Parse token usage metrics from Responses API payload.
+        if (!std.mem.startsWith(u8, data, "{")) return;
+        const usage_obj = blk: {
+            if (json.findObject(data, "response")) |resp_obj| {
+                if (json.findObject(resp_obj, "usage")) |u| break :blk u;
+            }
+            break :blk json.findObject(data, "usage");
+        };
+        const u_obj = usage_obj orelse return;
+        const pt = if (json.findInt(u_obj, "input_tokens", u64)) |v| v else (json.findInt(u_obj, "prompt_tokens", u64) orelse 0);
+        const ct = if (json.findInt(u_obj, "output_tokens", u64)) |v| v else (json.findInt(u_obj, "completion_tokens", u64) orelse 0);
+        const tt = if (json.findInt(u_obj, "total_tokens", u64)) |v| v else (pt + ct);
+        self.response.usage.prompt_tokens = pt;
+        self.response.usage.completion_tokens = ct;
+        self.response.usage.total_tokens = tt;
+        if (json.findObject(u_obj, "input_tokens_details")) |itd| {
+            if (json.findInt(itd, "cached_tokens", u64)) |cv| self.response.usage.cached_tokens = cv;
+        }
+        if (json.findObject(u_obj, "output_tokens_details")) |otd| {
+            if (json.findInt(otd, "reasoning_tokens", u64)) |rv| self.response.usage.reasoning_tokens = rv;
+        }
+    }
 
+    fn handleDoneEvent(self: *StreamCtx, data: []const u8) !void {
+        // PSEUDOCODE: Finalize stream on [DONE] or response.done: usage, filters, thinking, text, stop_reason.
+        self.parseResponsesUsage(data);
+        try self.filter.finish(self);
+        if (self.think_accum_init and self.think_accum.items.len > 0) {
+            const think_text = try self.alloc.dupe(u8, self.think_accum.items);
+            try self.response.content.append(self.alloc, .{ .thinking = .{ .thinking = think_text, .signature = "" } });
+            self.think_accum.clearRetainingCapacity();
+        }
+        if (self.text_accum_init and self.text_accum.items.len > 0) {
+            const text = try self.alloc.dupe(u8, self.text_accum.items);
+            try self.response.content.append(self.alloc, .{ .text = text });
+            self.text_accum.clearRetainingCapacity();
+        }
+        if (self.response.stop_reason == .unknown and !self.finish_reason_received) {
+            self.response.stop_reason = .end_turn;
+        }
+    }
+
+    fn handleResponsesItemDone(self: *StreamCtx, data: []const u8) !void {
+        // PSEUDOCODE: Finalize tool call from response.output_item.done or response.tool_call.done.
+        if (json.findObject(data, "item")) |item_obj| {
+            const item_type = json.findString(item_obj, "type") orelse "";
+            if (std.mem.eql(u8, item_type, "function_call") or std.mem.eql(u8, item_type, "tool_call")) {
+                const call_id = (try json.findStringOwned(self.alloc, item_obj, "call_id")) orelse (try json.findStringOwned(self.alloc, item_obj, "id"));
+                defer if (call_id) |cid| self.alloc.free(cid);
+                const name = try json.findStringOwned(self.alloc, item_obj, "name");
+                defer if (name) |n| self.alloc.free(n);
+                const args = try json.findStringOwned(self.alloc, item_obj, "arguments");
+                defer if (args) |a| self.alloc.free(a);
+                const index = json.findInt(data, "output_index", u32);
+                try self.setToolCallFinal(index, call_id, name, args);
+            }
+        } else {
+            const call_id = (try json.findStringOwned(self.alloc, data, "call_id")) orelse (try json.findStringOwned(self.alloc, data, "id"));
+            defer if (call_id) |cid| self.alloc.free(cid);
+            const name = try json.findStringOwned(self.alloc, data, "name");
+            defer if (name) |n| self.alloc.free(n);
+            const args = try json.findStringOwned(self.alloc, data, "arguments");
+            defer if (args) |a| self.alloc.free(a);
+            const index = json.findInt(data, "output_index", u32);
+            if (args != null or call_id != null or name != null) {
+                try self.setToolCallFinal(index, call_id, name, args);
+            }
+        }
+    }
+
+    fn handleResponsesDeltaEvent(
+        self: *StreamCtx,
+        ev: []const u8,
+        data: []const u8,
+        custom_text: ?[]const u8,
+        custom_reasoning: ?[]const u8,
+    ) !bool {
+        // PSEUDOCODE: Handle text and reasoning deltas for Responses API.
+        if (std.mem.eql(u8, ev, "response.output_text.delta") or std.mem.eql(u8, ev, "response.text.delta")) {
+            if (json.findString(data, "delta")) |delta_text| {
+                if (delta_text.len > 0) {
+                    const unescaped = json.unescape(self.alloc, delta_text) catch delta_text;
+                    defer if (unescaped.ptr != delta_text.ptr) self.alloc.free(unescaped);
+                    if (!self.text_accum_init) {
+                        self.text_accum = .empty;
+                        self.text_accum_init = true;
+                    }
+                    if (custom_text == null) try self.filter.feed(unescaped, self);
+                }
+            }
+            return true;
+        }
+        if (std.mem.eql(u8, ev, "response.reasoning_text.delta") or std.mem.eql(u8, ev, "response.reasoning.delta")) {
+            if (json.findString(data, "delta")) |delta_text| {
+                if (delta_text.len > 0) {
+                    const unescaped = json.unescape(self.alloc, delta_text) catch delta_text;
+                    defer if (unescaped.ptr != delta_text.ptr) self.alloc.free(unescaped);
+                    if (!self.think_accum_init) {
+                        self.think_accum = .empty;
+                        self.think_accum_init = true;
+                    }
+                    if (custom_reasoning == null) try self.emitNormalized(unescaped, true);
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn handleResponsesToolEvent(self: *StreamCtx, ev: []const u8, data: []const u8) !bool {
+        // PSEUDOCODE: Handle tool call events (added, delta, done) for Responses API.
+        if (std.mem.eql(u8, ev, "response.output_item.added")) {
+            if (json.findObject(data, "item")) |item_obj| {
+                const item_type = json.findString(item_obj, "type") orelse "";
+                if (std.mem.eql(u8, item_type, "function_call") or std.mem.eql(u8, item_type, "tool_call")) {
+                    const call_id = (try json.findStringOwned(self.alloc, item_obj, "call_id")) orelse (try json.findStringOwned(self.alloc, item_obj, "id"));
+                    defer if (call_id) |cid| self.alloc.free(cid);
+                    const name = try json.findStringOwned(self.alloc, item_obj, "name");
+                    defer if (name) |n| self.alloc.free(n);
+                    const index = json.findInt(data, "output_index", u32);
+                    try self.mergeToolCallDelta(index, call_id, name, null);
+                }
+            }
+            return true;
+        }
+        if (std.mem.eql(u8, ev, "response.tool_call.delta") or std.mem.eql(u8, ev, "response.function_call_arguments.delta")) {
+            const index = json.findInt(data, "output_index", u32) orelse json.findInt(data, "index", u32);
+            const call_id = (try json.findStringOwned(self.alloc, data, "call_id")) orelse (try json.findStringOwned(self.alloc, data, "id"));
+            defer if (call_id) |cid| self.alloc.free(cid);
+            const name = try json.findStringOwned(self.alloc, data, "name");
+            defer if (name) |n| self.alloc.free(n);
+            const args = (try json.findStringOwned(self.alloc, data, "delta")) orelse (try json.findStringOwned(self.alloc, data, "arguments"));
+            defer if (args) |a| self.alloc.free(a);
+            try self.mergeToolCallDelta(index, call_id, name, args);
+            return true;
+        }
+        if (std.mem.eql(u8, ev, "response.output_item.done") or std.mem.eql(u8, ev, "response.tool_call.done") or std.mem.eql(u8, ev, "response.function_call_arguments.done")) {
+            try self.handleResponsesItemDone(data);
+            return true;
+        }
+        return false;
+    }
+
+    fn handleResponsesApiEvent(
+        self: *StreamCtx,
+        ev: []const u8,
+        data: []const u8,
+        custom_text: ?[]const u8,
+        custom_reasoning: ?[]const u8,
+    ) !bool {
+        // PSEUDOCODE: Route event to delta or tool handlers, absorbing all response.* events.
+        if (try self.handleResponsesDeltaEvent(ev, data, custom_text, custom_reasoning)) return true;
+        if (try self.handleResponsesToolEvent(ev, data)) return true;
+        return std.mem.startsWith(u8, ev, "response.");
+    }
+
+    fn applyFinishReason(self: *StreamCtx, reason: []const u8) void {
+        // PSEUDOCODE: Map OpenAI finish_reason to proto.StopReason.
+        self.finish_reason_received = true;
+        if (std.mem.eql(u8, reason, "tool_calls") or std.mem.eql(u8, reason, "function")) {
+            self.response.stop_reason = .tool_use;
+        } else if (std.mem.eql(u8, reason, "stop")) {
+            self.response.stop_reason = .end_turn;
+        } else if (std.mem.eql(u8, reason, "length")) {
+            self.response.stop_reason = .max_tokens;
+        } else if (std.mem.eql(u8, reason, "content_filter")) {
+            self.response.stop_reason = .unknown;
+        }
+    }
+
+    fn handleChatChoiceDelta(
+        self: *StreamCtx,
+        delta: anytype,
+        custom_text: ?[]const u8,
+        custom_reasoning: ?[]const u8,
+    ) !void {
+        // PSEUDOCODE: Extract reasoning, text, and tool calls from choice delta.
+        const detail_reasoning = if (delta.detail) |d| (d.reasoning_content orelse d.reasoning) else if (delta.details) |d| (d.reasoning_content orelse d.reasoning) else null;
+        const reasoning = delta.reasoning_content orelse delta.reasoning orelse detail_reasoning;
+        if (if (custom_reasoning == null) reasoning else null) |r| {
+            if (r.len > 0) {
+                if (!self.think_accum_init) {
+                    self.think_accum = .empty;
+                    self.think_accum_init = true;
+                }
+                try self.think_accum.appendSlice(self.alloc, r);
+                if (self.think_cb) |cb| cb(r);
+            }
+        }
+        if (if (custom_text == null) delta.content else null) |text| {
+            if (text.len > 0) {
+                if (!self.text_accum_init) {
+                    self.text_accum = .empty;
+                    self.text_accum_init = true;
+                }
+                try self.filter.feed(text, self);
+            }
+        }
+        if (delta.tool_calls) |tool_calls| {
+            for (tool_calls) |tc_obj| {
+                const fname = if (tc_obj.function) |f| f.name else null;
+                const fargs = if (tc_obj.function) |f| f.arguments else null;
+                try self.mergeToolCallDelta(tc_obj.index, tc_obj.id, fname, fargs);
+            }
+        }
+    }
+
+    fn handleChatChunk(
+        self: *StreamCtx,
+        data: []const u8,
+        custom_text: ?[]const u8,
+        custom_reasoning: ?[]const u8,
+    ) !void {
+        // PSEUDOCODE: Parse OpenAI Chat Completions chunk JSON, update choices, finish_reason, and usage.
+        const parsed = std.json.parseFromSlice(ChatChunk, self.alloc, data, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+
+        if (parsed.value.choices) |choices| {
+            for (choices) |choice| {
+                if (choice.delta) |delta| try self.handleChatChoiceDelta(delta, custom_text, custom_reasoning);
+                if (choice.finish_reason) |reason| self.applyFinishReason(reason);
+            }
+        }
+        if (parsed.value.usage) |u| {
+            const cached = if (u.prompt_tokens_details) |ptd| (ptd.cached_tokens orelse 0) else (u.prompt_cache_hit_tokens orelse 0);
+            const reasoning_tok = if (u.completion_tokens_details) |ctd| (ctd.reasoning_tokens orelse 0) else 0;
+            self.response.usage = .{
+                .prompt_tokens = u.prompt_tokens orelse 0,
+                .completion_tokens = u.completion_tokens orelse 0,
+                .total_tokens = u.total_tokens orelse 0,
+                .cached_tokens = cached,
+                .reasoning_tokens = reasoning_tok,
+            };
+        }
+    }
+
+    fn processLine(self: *StreamCtx, line: []const u8) !void {
+        // PSEUDOCODE: Parse single SSE line, dispatch done, Responses API, or Chat Completions events.
+        const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) {
             self.event_type_len = 0;
             return;
@@ -795,67 +1110,16 @@ const StreamCtx = struct {
         }
 
         if (!std.mem.startsWith(u8, trimmed, "data: ")) return;
-
         const data = trimmed["data: ".len..];
         var ev: []const u8 = self.event_type[0..self.event_type_len];
         if (json.findString(data, "type")) |t| {
-            if (std.mem.startsWith(u8, t, "response.")) {
-                ev = t;
-            }
+            if (std.mem.startsWith(u8, t, "response.")) ev = t;
         }
 
-        // Handle [DONE] or Responses API completion event
         if (std.mem.eql(u8, data, "[DONE]") or std.mem.eql(u8, ev, "response.done") or std.mem.eql(u8, ev, "response.completed")) {
-            // Check usage in Responses API payload if present
-            if (std.mem.startsWith(u8, data, "{")) {
-                const usage_obj = blk: {
-                    if (json.findObject(data, "response")) |resp_obj| {
-                        if (json.findObject(resp_obj, "usage")) |u| break :blk u;
-                    }
-                    break :blk json.findObject(data, "usage");
-                };
-                if (usage_obj) |u_obj| {
-                    const pt = if (json.findInt(u_obj, "input_tokens", u64)) |v| v else (json.findInt(u_obj, "prompt_tokens", u64) orelse 0);
-                    const ct = if (json.findInt(u_obj, "output_tokens", u64)) |v| v else (json.findInt(u_obj, "completion_tokens", u64) orelse 0);
-                    const tt = if (json.findInt(u_obj, "total_tokens", u64)) |v| v else (pt + ct);
-                    self.response.usage.prompt_tokens = pt;
-                    self.response.usage.completion_tokens = ct;
-                    self.response.usage.total_tokens = tt;
-                    if (json.findObject(u_obj, "input_tokens_details")) |itd| {
-                        if (json.findInt(itd, "cached_tokens", u64)) |cv| {
-                            self.response.usage.cached_tokens = cv;
-                        }
-                    }
-                    if (json.findObject(u_obj, "output_tokens_details")) |otd| {
-                        if (json.findInt(otd, "reasoning_tokens", u64)) |rv| {
-                            self.response.usage.reasoning_tokens = rv;
-                        }
-                    }
-                }
-            }
-
-            try self.filter.finish(self);
-            // Save accumulated thinking
-            if (self.think_accum_init and self.think_accum.items.len > 0) {
-                const think_text = try self.alloc.dupe(u8, self.think_accum.items);
-                try self.response.content.append(self.alloc, .{ .thinking = .{ .thinking = think_text, .signature = "" } });
-                self.think_accum.clearRetainingCapacity();
-            }
-            // Save accumulated text into response
-            if (self.text_accum_init and self.text_accum.items.len > 0) {
-                const text = try self.alloc.dupe(u8, self.text_accum.items);
-                try self.response.content.append(self.alloc, .{ .text = text });
-                self.text_accum.clearRetainingCapacity();
-            }
-            // Only set to end_turn if tool_use or max_tokens not already set
-            if (self.response.stop_reason == .unknown and !self.finish_reason_received) {
-                self.response.stop_reason = .end_turn;
-            }
-            return;
+            return self.handleDoneEvent(data);
         }
 
-        // Adapter overrides are evaluated once per JSON event. Null/failed extraction
-        // falls back to native fields; tool calls and usage always use native parsing.
         const custom_text = if (self.adapter) |a| a.extractContent(self.alloc, data) else null;
         defer if (custom_text) |s| self.alloc.free(s);
         const custom_reasoning = if (self.adapter) |a| a.extractReasoning(self.alloc, data) else null;
@@ -863,231 +1127,8 @@ const StreamCtx = struct {
         if (custom_text) |s| try self.filter.feed(s, self);
         if (custom_reasoning) |s| try self.emitNormalized(s, true);
 
-        // Responses API event handlers
-        if (std.mem.eql(u8, ev, "response.output_text.delta") or std.mem.eql(u8, ev, "response.text.delta")) {
-            if (json.findString(data, "delta")) |delta_text| {
-                if (delta_text.len > 0) {
-                    const unescaped = json.unescape(self.alloc, delta_text) catch delta_text;
-                    defer if (unescaped.ptr != delta_text.ptr) self.alloc.free(unescaped);
-                    if (!self.text_accum_init) {
-                        self.text_accum = .empty;
-                        self.text_accum_init = true;
-                    }
-                    if (custom_text == null) try self.filter.feed(unescaped, self);
-                }
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, ev, "response.reasoning_text.delta") or std.mem.eql(u8, ev, "response.reasoning.delta")) {
-            if (json.findString(data, "delta")) |delta_text| {
-                if (delta_text.len > 0) {
-                    const unescaped = json.unescape(self.alloc, delta_text) catch delta_text;
-                    defer if (unescaped.ptr != delta_text.ptr) self.alloc.free(unescaped);
-                    if (!self.think_accum_init) {
-                        self.think_accum = .empty;
-                        self.think_accum_init = true;
-                    }
-                    if (custom_reasoning == null) try self.emitNormalized(unescaped, true);
-                }
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, ev, "response.output_item.added")) {
-            if (json.findObject(data, "item")) |item_obj| {
-                const item_type = json.findString(item_obj, "type") orelse "";
-                if (std.mem.eql(u8, item_type, "function_call") or std.mem.eql(u8, item_type, "tool_call")) {
-                    const call_id = (try json.findStringOwned(self.alloc, item_obj, "call_id")) orelse (try json.findStringOwned(self.alloc, item_obj, "id"));
-                    defer if (call_id) |cid| self.alloc.free(cid);
-                    const name = try json.findStringOwned(self.alloc, item_obj, "name");
-                    defer if (name) |n| self.alloc.free(n);
-                    const index = json.findInt(data, "output_index", u32);
-                    try self.mergeToolCallDelta(index, call_id, name, null);
-                }
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, ev, "response.tool_call.delta") or std.mem.eql(u8, ev, "response.function_call_arguments.delta")) {
-            const index = json.findInt(data, "output_index", u32) orelse json.findInt(data, "index", u32);
-            const call_id = (try json.findStringOwned(self.alloc, data, "call_id")) orelse (try json.findStringOwned(self.alloc, data, "id"));
-            defer if (call_id) |cid| self.alloc.free(cid);
-            const name = try json.findStringOwned(self.alloc, data, "name");
-            defer if (name) |n| self.alloc.free(n);
-            const args = (try json.findStringOwned(self.alloc, data, "delta")) orelse (try json.findStringOwned(self.alloc, data, "arguments"));
-            defer if (args) |a| self.alloc.free(a);
-            try self.mergeToolCallDelta(index, call_id, name, args);
-            return;
-        }
-
-        if (std.mem.eql(u8, ev, "response.output_item.done") or std.mem.eql(u8, ev, "response.tool_call.done") or std.mem.eql(u8, ev, "response.function_call_arguments.done")) {
-            if (json.findObject(data, "item")) |item_obj| {
-                const item_type = json.findString(item_obj, "type") orelse "";
-                if (std.mem.eql(u8, item_type, "function_call") or std.mem.eql(u8, item_type, "tool_call")) {
-                    const call_id = (try json.findStringOwned(self.alloc, item_obj, "call_id")) orelse (try json.findStringOwned(self.alloc, item_obj, "id"));
-                    defer if (call_id) |cid| self.alloc.free(cid);
-                    const name = try json.findStringOwned(self.alloc, item_obj, "name");
-                    defer if (name) |n| self.alloc.free(n);
-                    const args = try json.findStringOwned(self.alloc, item_obj, "arguments");
-                    defer if (args) |a| self.alloc.free(a);
-                    const index = json.findInt(data, "output_index", u32);
-                    try self.setToolCallFinal(index, call_id, name, args);
-                }
-            } else {
-                const call_id = (try json.findStringOwned(self.alloc, data, "call_id")) orelse (try json.findStringOwned(self.alloc, data, "id"));
-                defer if (call_id) |cid| self.alloc.free(cid);
-                const name = try json.findStringOwned(self.alloc, data, "name");
-                defer if (name) |n| self.alloc.free(n);
-                const args = try json.findStringOwned(self.alloc, data, "arguments");
-                defer if (args) |a| self.alloc.free(a);
-                const index = json.findInt(data, "output_index", u32);
-                if (args != null or call_id != null or name != null) {
-                    try self.setToolCallFinal(index, call_id, name, args);
-                }
-            }
-            return;
-        }
-
-        // All other Responses API events (e.g. response.created, response.in_progress, response.content_part.added, etc.)
-        if (std.mem.startsWith(u8, ev, "response.")) return;
-
-        // RFC-006 §3.1: Usage JSON parse struct (nested optional)
-        const UsagePromptDetails = struct {
-            cached_tokens: ?u64 = null,
-        };
-        const UsageCompletionDetails = struct {
-            reasoning_tokens: ?u64 = null,
-        };
-        const UsageJson = struct {
-            prompt_tokens: ?u64 = null,
-            completion_tokens: ?u64 = null,
-            total_tokens: ?u64 = null,
-            prompt_tokens_details: ?UsagePromptDetails = null,
-            completion_tokens_details: ?UsageCompletionDetails = null,
-            // DeepSeek alias (RFC-006 §3.1)
-            prompt_cache_hit_tokens: ?u64 = null,
-        };
-
-        const Chunk = struct {
-            const ChoiceDeltaToolCallFunction = struct {
-                name: ?[]const u8 = null,
-                arguments: ?[]const u8 = null,
-            };
-            const ChoiceDeltaToolCall = struct {
-                index: ?u32 = null,
-                id: ?[]const u8 = null,
-                type: ?[]const u8 = null,
-                function: ?ChoiceDeltaToolCallFunction = null,
-            };
-            const ChoiceDeltaDetail = struct {
-                reasoning_content: ?[]const u8 = null,
-                reasoning: ?[]const u8 = null,
-            };
-            const ChoiceDelta = struct {
-                content: ?[]const u8 = null,
-                reasoning_content: ?[]const u8 = null,
-                // RFC-006 §3.3: OpenAI o-series/GPT-5.x uses field "reasoning"
-                reasoning: ?[]const u8 = null,
-                // Nested proxy/aggregator wrappers: delta.detail.reasoning_content or delta.details
-                detail: ?ChoiceDeltaDetail = null,
-                details: ?ChoiceDeltaDetail = null,
-                tool_calls: ?[]ChoiceDeltaToolCall = null,
-            };
-            const Choice = struct {
-                index: ?u32 = null,
-                delta: ?ChoiceDelta = null,
-                finish_reason: ?[]const u8 = null,
-            };
-            id: ?[]const u8 = null,
-            object: ?[]const u8 = null,
-            created: ?u64 = null,
-            model: ?[]const u8 = null,
-            choices: ?[]Choice = null,
-            // RFC-006 §3.1: usage chunk (sent in last chunk when include_usage=true)
-            usage: ?UsageJson = null,
-        };
-
-        const parsed = std.json.parseFromSlice(Chunk, self.alloc, data, .{ .ignore_unknown_fields = true }) catch return;
-        defer parsed.deinit();
-
-        const chunk = parsed.value;
-        if (chunk.choices) |choices| {
-            for (choices) |choice| {
-                if (choice.delta) |delta| {
-                    // Receive reasoning from variants:
-                    // 1. DeepSeek-style: delta.reasoning_content
-                    // 2. OpenAI o-series/GPT-5.x: delta.reasoning
-                    // 3. Nested proxy/aggregator wrappers: delta.detail.reasoning_content / delta.details
-                    const detail_reasoning = if (delta.detail) |d|
-                        (d.reasoning_content orelse d.reasoning)
-                    else if (delta.details) |d|
-                        (d.reasoning_content orelse d.reasoning)
-                    else
-                        null;
-                    const reasoning = delta.reasoning_content orelse delta.reasoning orelse detail_reasoning;
-                    if (if (custom_reasoning == null) reasoning else null) |r| {
-                        if (r.len > 0) {
-                            if (!self.think_accum_init) {
-                                self.think_accum = .empty;
-                                self.think_accum_init = true;
-                            }
-                            try self.think_accum.appendSlice(self.alloc, r);
-                            if (self.think_cb) |cb| cb(r);
-                        }
-                    }
-                    if (if (custom_text == null) delta.content else null) |text| {
-                        if (text.len > 0) {
-                            if (!self.text_accum_init) {
-                                self.text_accum = .empty;
-                                self.text_accum_init = true;
-                            }
-                            try self.filter.feed(text, self);
-                        }
-                    }
-                    if (delta.tool_calls) |tool_calls| {
-                        // Merge by index (OpenAI streaming standard): DeepSeek and most
-                        // compat providers only send id in the first chunk; subsequent chunks
-                        // have only index + arguments — cannot blindly append to last item.
-                        for (tool_calls) |tc_obj| {
-                            const fname = if (tc_obj.function) |f| f.name else null;
-                            const fargs = if (tc_obj.function) |f| f.arguments else null;
-                            try self.mergeToolCallDelta(tc_obj.index, tc_obj.id, fname, fargs);
-                        }
-                    }
-                }
-                if (choice.finish_reason) |reason| {
-                    self.finish_reason_received = true;
-                    // RFC-006 §3.4: fully map OpenAI finish_reason
-                    if (std.mem.eql(u8, reason, "tool_calls")) {
-                        self.response.stop_reason = .tool_use;
-                    } else if (std.mem.eql(u8, reason, "stop")) {
-                        self.response.stop_reason = .end_turn;
-                    } else if (std.mem.eql(u8, reason, "length")) {
-                        self.response.stop_reason = .max_tokens;
-                    } else if (std.mem.eql(u8, reason, "function")) {
-                        // Legacy function calling → map as tool_calls
-                        self.response.stop_reason = .tool_use;
-                    } else if (std.mem.eql(u8, reason, "content_filter")) {
-                        // Content filter → .unknown + debug info (not end_turn)
-                        self.response.stop_reason = .unknown;
-                    }
-                }
-            }
-        }
-
-        // RFC-006 §3.1: parse usage from last chunk
-        if (chunk.usage) |u| {
-            const cached = if (u.prompt_tokens_details) |ptd| (ptd.cached_tokens orelse 0) else (u.prompt_cache_hit_tokens orelse 0);
-            const reasoning_tok = if (u.completion_tokens_details) |ctd| (ctd.reasoning_tokens orelse 0) else 0;
-            self.response.usage = .{
-                .prompt_tokens = u.prompt_tokens orelse 0,
-                .completion_tokens = u.completion_tokens orelse 0,
-                .total_tokens = u.total_tokens orelse 0,
-                .cached_tokens = cached,
-                .reasoning_tokens = reasoning_tok,
-            };
-        }
+        if (try self.handleResponsesApiEvent(ev, data, custom_text, custom_reasoning)) return;
+        try self.handleChatChunk(data, custom_text, custom_reasoning);
     }
 
     /// Merge 1 tool_call delta into the list, locating slot by index (standard
@@ -1266,13 +1307,13 @@ test "js_provider: client loads configured adapter and transforms outgoing body"
     try testing.expectEqualStrings("{\"model\":\"adapted\"}", body);
 }
 
-// --- Tests: streaming tool_calls gop theo index (DeepSeek style) ---
+// --- Tests: streaming tool_calls merged by index (DeepSeek style) ---
 
 fn feedLines(ctx: anytype, lines: []const []const u8) !void {
     for (lines) |ln| try ctx.processLine(ln);
 }
 
-test "openai stream: parallel tool calls gop theo index (DeepSeek style)" {
+test "openai stream: parallel tool calls merged by index (DeepSeek style)" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
         .alloc = alloc,
@@ -1818,4 +1859,3 @@ test "openai sanitizeToolName: strips DSML tags and rejects invalid tool names" 
     try testing.expect(sanitizeToolName("   ") == null);
     try testing.expect(sanitizeToolName("invalid tool with spaces") == null);
 }
-

@@ -1,3 +1,5 @@
+//! test_session_diagnostics.zig — Unit tests for session listing and diagnostics telemetry.
+
 const std = @import("std");
 const testing = std.testing;
 const mini = @import("mini");

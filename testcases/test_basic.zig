@@ -1,3 +1,5 @@
+//! test_basic.zig — Standalone test for model name prefix detection.
+
 const std = @import("std");
 pub fn main() !void {
     const model = "gpt-5.6-luna";

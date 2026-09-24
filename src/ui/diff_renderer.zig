@@ -11,17 +11,51 @@ pub const DiffOptions = struct {
     show_box: bool = true,
 };
 
+fn renderDiffHeader(file_path: []const u8) void {
+    var header_buf: [256]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buf, "  \x1b[90m{s}── \x1b[1;37m{s}\x1b[0m\x1b[90m ───────────────────────────────────────────────\x1b[0m\n", .{
+        term.BOX_TOP_LEFT, file_path,
+    }) catch "  ╭── Diff ───────────────────────────────────────────────\n";
+    term.writeStdout(header);
+}
+
+fn renderDiffFooter() void {
+    var footer_buf: [128]u8 = undefined;
+    const footer = std.fmt.bufPrint(&footer_buf, "  \x1b[90m{s}─────────────────────────────────────────────────────────────\x1b[0m\n", .{
+        term.BOX_BOT_LEFT,
+    }) catch "  ╰─────────────────────────────────────────────────────────────\n";
+    term.writeStdout(footer);
+}
+
+fn renderDiffLine(line: []const u8) void {
+    var line_buf: [2048]u8 = undefined;
+    if (std.mem.startsWith(u8, line, "+++") or std.mem.startsWith(u8, line, "---")) {
+        const out = std.fmt.bufPrint(&line_buf, "  \x1b[90m{s} \x1b[1;90m{s}\x1b[0m\n", .{ term.BOX_VERT, line }) catch return;
+        term.writeStdout(out);
+    } else if (std.mem.startsWith(u8, line, "+")) {
+        const out = std.fmt.bufPrint(&line_buf, "  \x1b[90m{s}\x1b[0m \x1b[32m{s}\x1b[0m\n", .{ term.BOX_VERT, line }) catch return;
+        term.writeStdout(out);
+    } else if (std.mem.startsWith(u8, line, "-")) {
+        const out = std.fmt.bufPrint(&line_buf, "  \x1b[90m{s}\x1b[0m \x1b[31m{s}\x1b[0m\n", .{ term.BOX_VERT, line }) catch return;
+        term.writeStdout(out);
+    } else if (std.mem.startsWith(u8, line, "@@")) {
+        const out = std.fmt.bufPrint(&line_buf, "  \x1b[90m{s}\x1b[0m \x1b[36m{s}\x1b[0m\n", .{ term.BOX_VERT, line }) catch return;
+        term.writeStdout(out);
+    } else {
+        const out = std.fmt.bufPrint(&line_buf, "  \x1b[90m{s} \x1b[90m{s}\x1b[0m\n", .{ term.BOX_VERT, line }) catch return;
+        term.writeStdout(out);
+    }
+}
+
 /// Render a patch string / unified diff to stdout with color formatting.
 pub fn renderDiff(io: std.Io, file_path: []const u8, patch_content: []const u8, options: DiffOptions) void {
+    // PSEUDOCODE:
+    // 1. Draw diff box header if enabled.
+    // 2. Split patch lines and calculate head/tail truncation bounds.
+    // 3. Render lines with syntax highlighting, omitting middle section if truncated.
+    // 4. Draw diff box footer if enabled.
     _ = io;
-    if (options.show_box) {
-        // Header
-        var header_buf: [256]u8 = undefined;
-        const header = std.fmt.bufPrint(&header_buf, "  \x1b[90m{s}── \x1b[1;37m{s}\x1b[0m\x1b[90m ───────────────────────────────────────────────\x1b[0m\n", .{
-            term.BOX_TOP_LEFT, file_path,
-        }) catch "  ╭── Diff ───────────────────────────────────────────────\n";
-        term.writeStdout(header);
-    }
+    if (options.show_box) renderDiffHeader(file_path);
 
     var lines_list = std.ArrayListUnmanaged([]const u8).empty;
     var it = std.mem.splitScalar(u8, patch_content, '\n');
@@ -34,7 +68,6 @@ pub fn renderDiff(io: std.Io, file_path: []const u8, patch_content: []const u8, 
     const should_truncate = total_lines > options.max_display_lines;
     const head_count = if (should_truncate) 20 else total_lines;
     const tail_start = if (should_truncate) total_lines - 8 else total_lines;
-
     var printed: usize = 0;
 
     for (lines_list.items, 0..) |line, idx| {
@@ -49,35 +82,11 @@ pub fn renderDiff(io: std.Io, file_path: []const u8, patch_content: []const u8, 
             }
             continue;
         }
-
-        var line_buf: [2048]u8 = undefined;
-
-        if (std.mem.startsWith(u8, line, "+++") or std.mem.startsWith(u8, line, "---")) {
-            const out = std.fmt.bufPrint(&line_buf, "  \x1b[90m{s} \x1b[1;90m{s}\x1b[0m\n", .{ term.BOX_VERT, line }) catch continue;
-            term.writeStdout(out);
-        } else if (std.mem.startsWith(u8, line, "+")) {
-            const out = std.fmt.bufPrint(&line_buf, "  \x1b[90m{s}\x1b[0m \x1b[32m{s}\x1b[0m\n", .{ term.BOX_VERT, line }) catch continue;
-            term.writeStdout(out);
-        } else if (std.mem.startsWith(u8, line, "-")) {
-            const out = std.fmt.bufPrint(&line_buf, "  \x1b[90m{s}\x1b[0m \x1b[31m{s}\x1b[0m\n", .{ term.BOX_VERT, line }) catch continue;
-            term.writeStdout(out);
-        } else if (std.mem.startsWith(u8, line, "@@")) {
-            const out = std.fmt.bufPrint(&line_buf, "  \x1b[90m{s}\x1b[0m \x1b[36m{s}\x1b[0m\n", .{ term.BOX_VERT, line }) catch continue;
-            term.writeStdout(out);
-        } else {
-            const out = std.fmt.bufPrint(&line_buf, "  \x1b[90m{s} \x1b[90m{s}\x1b[0m\n", .{ term.BOX_VERT, line }) catch continue;
-            term.writeStdout(out);
-        }
+        renderDiffLine(line);
         printed += 1;
     }
 
-    if (options.show_box) {
-        var footer_buf: [128]u8 = undefined;
-        const footer = std.fmt.bufPrint(&footer_buf, "  \x1b[90m{s}─────────────────────────────────────────────────────────────\x1b[0m\n", .{
-            term.BOX_BOT_LEFT,
-        }) catch "  ╰─────────────────────────────────────────────────────────────\n";
-        term.writeStdout(footer);
-    }
+    if (options.show_box) renderDiffFooter();
 }
 
 test "renderDiff does not crash" {

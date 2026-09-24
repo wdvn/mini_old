@@ -13,11 +13,14 @@ const EdgeId = graph_mod.EdgeId;
 const RelationType = graph_mod.RelationType;
 const NodeType = graph_mod.NodeType;
 const EdgeAttributes = graph_mod.EdgeAttributes;
+const EdgeRecord = graph_mod.EdgeRecord;
+const NeighborhoodResult = graph_mod.NeighborhoodResult;
 const traverseNeighborhood = graph_mod.traverseNeighborhood;
 const repairCycles = graph_mod.repairCycles;
 const checkTerminalReachability = graph_mod.checkTerminalReachability;
 const applyEventJson = graph_mod.applyEventJson;
 const utils = @import("../utils.zig");
+const prompts_mod = @import("../prompts.zig");
 
 pub const PGraphStore = struct {
     alloc: Allocator,
@@ -133,9 +136,8 @@ pub const PGraphStore = struct {
         try file.writePositionalAll(io, write_buf, end_offset);
     }
 
-    /// Pre-seed foundational tool nodes and common developer workflow transitions.
-    pub fn seedDefaults(self: *PGraphStore, io: std.Io) !void {
-        // Core tools in mini-agent registry
+    fn seedDefaultNodes(self: *PGraphStore, io: std.Io) !void {
+        // PSEUDOCODE: Append default core tool nodes to graph.
         const default_nodes = [_]struct { name: []const u8, desc: []const u8 }{
             .{ .name = "bash", .desc = "Run shell commands, execute compiler, run tests" },
             .{ .name = "file_read", .desc = "Read and view file content" },
@@ -158,74 +160,78 @@ pub const PGraphStore = struct {
             defer self.alloc.free(line);
             try self.appendEvent(io, line);
         }
+    }
 
-        // Standard procedural transitions
-        const default_edges = [_]struct {
-            src: []const u8,
-            rel: []const u8,
-            dst: []const u8,
-            cond: []const u8,
-            guid: []const u8,
-            pitfalls: []const u8,
-        }{
-            .{
-                .src = "grep",
-                .rel = "LEADS_TO",
-                .dst = "file_read",
-                .cond = "match located in file",
-                .guid = "Inspect the exact file and line range discovered by grep to understand context.",
-                .pitfalls = "Do not modify code without viewing its surrounding context first.",
-            },
-            .{
-                .src = "glob",
-                .rel = "LEADS_TO",
-                .dst = "file_read",
-                .cond = "target files identified",
-                .guid = "Read the target file before making any edits.",
-                .pitfalls = "Do not make blind assumptions on file structure.",
-            },
-            .{
-                .src = "file_edit",
-                .rel = "LEADS_TO",
-                .dst = "bash",
-                .cond = "code edit applied",
-                .guid = "Run tests or compiler checks immediately after editing code.",
-                .pitfalls = "Do not leave scratch test files outside testcases/ or unvalidated edits.",
-            },
-            .{
-                .src = "multi_file_edit",
-                .rel = "LEADS_TO",
-                .dst = "bash",
-                .cond = "multi-chunk edits applied",
-                .guid = "Run test suite to verify code compiles and passes validation.",
-                .pitfalls = "Ensure all chunks match uniquely without leaving syntax errors.",
-            },
-            .{
-                .src = "file_write",
-                .rel = "LEADS_TO",
-                .dst = "bash",
-                .cond = "new file written",
-                .guid = "Run build or tests to verify newly created module.",
-                .pitfalls = "Ensure parent directories exist and build targets compile.",
-            },
-            .{
-                .src = "bash",
-                .rel = "TRIGGERS",
-                .dst = "grep",
-                .cond = "compiler error or test failure",
-                .guid = "Search codebase for failing symbol or error message to diagnose root cause.",
-                .pitfalls = "Do not mutate code before understanding exact error cause.",
-            },
-            .{
-                .src = "bash",
-                .rel = "TRIGGERS",
-                .dst = "session_diagnostics",
-                .cond = "crash, timeout, or unexpected failure",
-                .guid = "Inspect session logs and audit journal in ~/.mini/sessions to review telemetry.",
-                .pitfalls = "Do not guess backend errors without checking raw_snippet.",
-            },
-        };
+    const DefaultEdgeDef = struct {
+        src: []const u8,
+        rel: []const u8,
+        dst: []const u8,
+        cond: []const u8,
+        guid: []const u8,
+        pitfalls: []const u8,
+    };
 
+    const default_edges = [_]DefaultEdgeDef{
+        .{
+            .src = "grep",
+            .rel = "LEADS_TO",
+            .dst = "file_read",
+            .cond = "match located in file",
+            .guid = "Inspect the exact file and line range discovered by grep to understand context.",
+            .pitfalls = "Do not modify code without viewing its surrounding context first.",
+        },
+        .{
+            .src = "glob",
+            .rel = "LEADS_TO",
+            .dst = "file_read",
+            .cond = "target files identified",
+            .guid = "Read the target file before making any edits.",
+            .pitfalls = "Do not make blind assumptions on file structure.",
+        },
+        .{
+            .src = "file_edit",
+            .rel = "LEADS_TO",
+            .dst = "bash",
+            .cond = "code edit applied",
+            .guid = "Run tests or compiler checks immediately after editing code.",
+            .pitfalls = "Do not leave scratch test files outside testcases/ or unvalidated edits.",
+        },
+        .{
+            .src = "multi_file_edit",
+            .rel = "LEADS_TO",
+            .dst = "bash",
+            .cond = "multi-chunk edits applied",
+            .guid = "Run test suite to verify code compiles and passes validation.",
+            .pitfalls = "Ensure all chunks match uniquely without leaving syntax errors.",
+        },
+        .{
+            .src = "file_write",
+            .rel = "LEADS_TO",
+            .dst = "bash",
+            .cond = "new file written",
+            .guid = "Run build or tests to verify newly created module.",
+            .pitfalls = "Ensure parent directories exist and build targets compile.",
+        },
+        .{
+            .src = "bash",
+            .rel = "TRIGGERS",
+            .dst = "grep",
+            .cond = "compiler error or test failure",
+            .guid = "Search codebase for failing symbol or error message to diagnose root cause.",
+            .pitfalls = "Do not mutate code before understanding exact error cause.",
+        },
+        .{
+            .src = "bash",
+            .rel = "TRIGGERS",
+            .dst = "session_diagnostics",
+            .cond = "crash, timeout, or unexpected failure",
+            .guid = "Inspect session logs and audit journal in ~/.mini/sessions to review telemetry.",
+            .pitfalls = "Do not guess backend errors without checking raw_snippet.",
+        },
+    };
+
+    fn seedDefaultEdges(self: *PGraphStore, io: std.Io) !void {
+        // PSEUDOCODE: Append default procedural transitions to graph.
         for (default_edges) |de| {
             const eid = try self.nextId("pge");
             defer self.alloc.free(eid);
@@ -235,6 +241,15 @@ pub const PGraphStore = struct {
             defer self.alloc.free(line);
             try self.appendEvent(io, line);
         }
+    }
+
+    /// Pre-seed foundational tool nodes and common developer workflow transitions.
+    pub fn seedDefaults(self: *PGraphStore, io: std.Io) !void {
+        // PSEUDOCODE:
+        // 1. Pre-seed default core tool nodes.
+        // 2. Pre-seed standard procedural transitions between tools.
+        try self.seedDefaultNodes(io);
+        try self.seedDefaultEdges(io);
     }
 
     /// Match tool action string to known node ID (with common alias normalization).
@@ -342,116 +357,97 @@ pub const PGraphStore = struct {
         orbit_nodes: []const []const u8,
     };
 
-    /// Detects whether the trajectory exhibits signs of orbiting ("quay vòng") in 3D procedural space.
-    /// An orbit is a repeating closed cycle of length P in [2, 5] with zero code mutation (ΔZ = 0).
-    pub fn detectTrajectoryOrbit(trajectory: []const []const u8, current_tool: ?[]const u8) ?OrbitInfo {
-        if (trajectory.len < 2) return null;
+    fn isCycleNodesDistinct(cycle: []const []const u8) bool {
+        for (cycle, 0..) |n1, a| {
+            for (cycle[a + 1 ..]) |n2| {
+                if (std.mem.eql(u8, n1, n2)) return false;
+            }
+        }
+        return true;
+    }
 
-        const active_tool = current_tool orelse trajectory[trajectory.len - 1];
+    fn hasMutationNode(cycle: []const []const u8) bool {
+        for (cycle) |node_name| {
+            if (ToolDomain3D.fromToolName(node_name) == .mutate) return true;
+        }
+        return false;
+    }
 
-        // 1. Check for multi-revolution periodic repeating patterns (revolutions >= 2)
+    fn countMultiRevolutions(trajectory: []const []const u8, p: usize) usize {
+        var revs: usize = 2;
+        var offset: usize = 3 * p;
+        while (trajectory.len >= offset) : (offset += p) {
+            var rev_match = true;
+            var j: usize = 0;
+            while (j < p) : (j += 1) {
+                if (!std.mem.eql(u8, trajectory[trajectory.len - p + j], trajectory[trajectory.len - offset + j])) {
+                    rev_match = false;
+                    break;
+                }
+            }
+            if (rev_match) revs += 1 else break;
+        }
+        return revs;
+    }
+
+    fn checkMultiRevolutionOrbit(trajectory: []const []const u8) ?OrbitInfo {
         var p: usize = 2;
         while (p <= 5) : (p += 1) {
-            if (trajectory.len >= 2 * p) {
-                var matches = true;
-                var i: usize = 0;
-                while (i < p) : (i += 1) {
-                    const idx1 = trajectory.len - p + i;
-                    const idx2 = trajectory.len - 2 * p + i;
-                    if (!std.mem.eql(u8, trajectory[idx1], trajectory[idx2])) {
-                        matches = false;
-                        break;
-                    }
-                }
-                if (matches) {
-                    const cycle = trajectory[trajectory.len - p .. trajectory.len];
-                    // Verify that all vertices in the candidate cycle are mutually distinct (simple cycle)
-                    var distinct = true;
-                    for (cycle, 0..) |n1, a| {
-                        for (cycle[a + 1 ..]) |n2| {
-                            if (std.mem.eql(u8, n1, n2)) {
-                                distinct = false;
-                                break;
-                            }
-                        }
-                        if (!distinct) break;
-                    }
-                    if (!distinct) continue;
-
-                    // Verify ΔZ = 0 (no mutation tool in the orbit)
-                    var has_mutation = false;
-                    for (cycle) |node_name| {
-                        if (ToolDomain3D.fromToolName(node_name) == .mutate) {
-                            has_mutation = true;
-                            break;
-                        }
-                    }
-                    if (!has_mutation) {
-                        var revs: usize = 2;
-                        var offset: usize = 3 * p;
-                        while (trajectory.len >= offset) : (offset += p) {
-                            var rev_match = true;
-                            var j: usize = 0;
-                            while (j < p) : (j += 1) {
-                                if (!std.mem.eql(u8, trajectory[trajectory.len - p + j], trajectory[trajectory.len - offset + j])) {
-                                    rev_match = false;
-                                    break;
-                                }
-                            }
-                            if (rev_match) revs += 1 else break;
-                        }
-                        return OrbitInfo{
-                            .period = p,
-                            .revolutions = revs,
-                            .orbit_nodes = cycle,
-                        };
-                    }
+            if (trajectory.len < 2 * p) continue;
+            var matches = true;
+            var i: usize = 0;
+            while (i < p) : (i += 1) {
+                const idx1 = trajectory.len - p + i;
+                const idx2 = trajectory.len - 2 * p + i;
+                if (!std.mem.eql(u8, trajectory[idx1], trajectory[idx2])) {
+                    matches = false;
+                    break;
                 }
             }
+            if (!matches) continue;
+            const cycle = trajectory[trajectory.len - p .. trajectory.len];
+            if (!isCycleNodesDistinct(cycle) or hasMutationNode(cycle)) continue;
+
+            return OrbitInfo{
+                .period = p,
+                .revolutions = countMultiRevolutions(trajectory, p),
+                .orbit_nodes = cycle,
+            };
         }
-
-        // 2. Check for first closure of an orbit (revolutions = 1)
-        // Occurs when active_tool matches a previously visited node at distance P in [2, 5]
-        p = 2;
-        while (p <= 5) : (p += 1) {
-            if (trajectory.len >= p + 1) {
-                const head = trajectory[trajectory.len - 1];
-                const tail = trajectory[trajectory.len - 1 - p];
-                if (std.mem.eql(u8, head, tail) and std.mem.eql(u8, head, active_tool)) {
-                    const cycle = trajectory[trajectory.len - 1 - p .. trajectory.len - 1];
-                    // Verify all vertices in the cycle are mutually distinct
-                    var distinct = true;
-                    for (cycle, 0..) |n1, a| {
-                        for (cycle[a + 1 ..]) |n2| {
-                            if (std.mem.eql(u8, n1, n2)) {
-                                distinct = false;
-                                break;
-                            }
-                        }
-                        if (!distinct) break;
-                    }
-                    if (!distinct) continue;
-
-                    // Check ΔZ = 0 across the cycle
-                    var has_mutation = false;
-                    for (cycle) |node_name| {
-                        if (ToolDomain3D.fromToolName(node_name) == .mutate) {
-                            has_mutation = true;
-                            break;
-                        }
-                    }
-                    if (!has_mutation) {
-                        return OrbitInfo{
-                            .period = p,
-                            .revolutions = 1,
-                            .orbit_nodes = cycle,
-                        };
-                    }
-                }
-            }
-        }
-
         return null;
+    }
+
+    fn checkFirstClosureOrbit(trajectory: []const []const u8, active_tool: []const u8) ?OrbitInfo {
+        var p: usize = 2;
+        while (p <= 5) : (p += 1) {
+            if (trajectory.len < p + 1) continue;
+            const head = trajectory[trajectory.len - 1];
+            const tail = trajectory[trajectory.len - 1 - p];
+            if (std.mem.eql(u8, head, tail) and std.mem.eql(u8, head, active_tool)) {
+                const cycle = trajectory[trajectory.len - 1 - p .. trajectory.len - 1];
+                if (!isCycleNodesDistinct(cycle) or hasMutationNode(cycle)) continue;
+
+                return OrbitInfo{
+                    .period = p,
+                    .revolutions = 1,
+                    .orbit_nodes = cycle,
+                };
+            }
+        }
+        return null;
+    }
+
+    /// Detects whether the trajectory exhibits signs of orbiting in 3D procedural space.
+    /// An orbit is a repeating closed cycle of length P in [2, 5] with zero code mutation (ΔZ = 0).
+    pub fn detectTrajectoryOrbit(trajectory: []const []const u8, current_tool: ?[]const u8) ?OrbitInfo {
+        // PSEUDOCODE:
+        // 1. Guard against short trajectory (< 2).
+        // 2. Check for multi-revolution periodic repeating patterns.
+        // 3. Check for first closure of orbit with zero mutation.
+        if (trajectory.len < 2) return null;
+        if (checkMultiRevolutionOrbit(trajectory)) |info| return info;
+        const active_tool = current_tool orelse trajectory[trajectory.len - 1];
+        return checkFirstClosureOrbit(trajectory, active_tool);
     }
 
     fn isObservationalOrGeneric(name: []const u8) bool {
@@ -461,7 +457,123 @@ pub const PGraphStore = struct {
     }
 
     /// Extract h-hop neighborhood subgraph guidance formatted as markdown (RFC-010 PG-3).
-    /// If an orbit is detected in 3D procedural space ("dấu hiệu quay vòng"), produces a
+    /// If an orbit is detected in 3D procedural space, produces a
+    /// Checkpoint & Recap block instead of cyclic forward step suggestions.
+    /// `user_request` is the original task prompt — injected to keep the model anchored
+    /// to its goal rather than drifting into generic exploration.
+    fn formatOrbitCheckpoint(
+        self: *PGraphStore,
+        alloc: Allocator,
+        act_str: []const u8,
+        orbit: OrbitInfo,
+        user_request: ?[]const u8,
+    ) ![]u8 {
+        var bw = utils.BufWriter.init(alloc);
+        errdefer bw.deinit();
+
+        try bw.writeAll("[Procedural 3D Map Checkpoint & Trajectory Recap]\n");
+        try bw.print("📍 Waypoint: 3D Trajectory Orbit Detected (circling pattern: ", .{});
+        for (orbit.orbit_nodes) |on| {
+            try bw.print("`{s}` → ", .{on});
+        }
+        try bw.print("`{s}`, period={d}, revolutions={d})\n\n", .{ act_str, orbit.period, orbit.revolutions });
+
+        try bw.writeAll("🗺️ Explored Territory Recap:\n");
+        for (orbit.orbit_nodes) |on| {
+            const dom = ToolDomain3D.fromToolName(on);
+            const desc = if (self.matchNode(on)) |nid| self.graph.nodes.items[nid].desc else "";
+            try bw.print("- `{s}` [{s}]: {s}\n", .{ on, dom.label(), desc });
+        }
+
+        try bw.writeAll("\n⚠️ Navigation Checkpoint (ΔZ = 0, zero code mutation in orbit):\n");
+        try bw.print("You have scouted this region of the procedural map. All immediate forward paths from `{s}` have already been explored in this trajectory.\n\n", .{act_str});
+
+        try bw.writeAll("\n⚡ Orbit Break Directive:\n");
+        try bw.writeAll(prompts_mod.pg_orbit_break_directive);
+
+        if (user_request) |req| {
+            const trunc = if (req.len > 180) req[0..180] ++ "..." else req;
+            try bw.print("🎯 Your task: \"{s}\"\n\n", .{trunc});
+        }
+
+        try bw.writeAll(prompts_mod.pg_orbit_must_list);
+
+        return try bw.toOwnedSlice();
+    }
+
+    fn isEdgeSuppressed(self: *PGraphStore, edge: EdgeRecord, start_node_id: usize, recent_actions: []const []const u8) bool {
+        if (!edge.is_active or edge.src == edge.dst) return true;
+        for (recent_actions) |ra| {
+            if (self.matchNode(ra)) |ra_id| {
+                if (ra_id == edge.dst or (edge.src != start_node_id and ra_id == edge.src)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn formatSuggestedEdge(self: *PGraphStore, bw: *utils.BufWriter, edge: EdgeRecord) !void {
+        const src_name = self.graph.nodes.items[edge.src].name;
+        const dst_name = self.graph.nodes.items[edge.dst].name;
+        try bw.print("- `{s}` → `{s}` ({s})\n", .{ src_name, dst_name, edge.rel.toString() });
+        if (edge.attr.condition) |cond| {
+            if (cond.len > 0) try bw.print("  - Condition: {s}\n", .{cond});
+        }
+        if (edge.attr.guidance) |guid| {
+            if (guid.len > 0) try bw.print("  - Suggestion: {s}\n", .{guid});
+        }
+        if (edge.attr.pitfalls) |pit| {
+            if (pit.len > 0) try bw.print("  - Pitfalls: {s}\n", .{pit});
+        }
+    }
+
+    fn formatNeighborhoodAdvisory(
+        self: *PGraphStore,
+        alloc: Allocator,
+        start_node_id: usize,
+        neighborhood: NeighborhoodResult,
+        recent_actions: []const []const u8,
+        last_failed: bool,
+        user_request: ?[]const u8,
+        max_hops: u32,
+    ) !?[]u8 {
+        var bw = utils.BufWriter.init(alloc);
+        errdefer bw.deinit();
+
+        try bw.writeAll("[Procedural Advisory (Optional Suggestions)]\n");
+        if (last_failed) {
+            try bw.writeAll("Notice: Previous action reported a non-zero exit code or failure. Consider these heuristic suggestions if helpful (you are NOT required to follow them):\n");
+        }
+        const current_node_name = self.graph.nodes.items[start_node_id].name;
+        try bw.print("Current Action: `{s}`\nObserved Pattern Suggestions (h={d}-hop neighborhood):\n", .{ current_node_name, max_hops });
+
+        var printed_edges: usize = 0;
+        for (neighborhood.edges) |eid| {
+            if (eid >= self.graph.edges.items.len) continue;
+            const edge = self.graph.edges.items[eid];
+            if (self.isEdgeSuppressed(edge, start_node_id, recent_actions)) continue;
+            try self.formatSuggestedEdge(&bw, edge);
+            printed_edges += 1;
+        }
+
+        if (printed_edges == 0) {
+            if (!last_failed) {
+                bw.deinit();
+                return null;
+            }
+            try bw.writeAll(prompts_mod.pg_no_recovery_note);
+            return try bw.toOwnedSlice();
+        }
+
+        try bw.writeAll(prompts_mod.advisory_note_strong ++ "\n");
+        if (user_request) |req| {
+            const trunc = if (req.len > 200) req[0..200] ++ "..." else req;
+            try bw.print(prompts_mod.pg_task_reminder_fmt, .{trunc});
+        }
+        return try bw.toOwnedSlice();
+    }
+
+    /// Extract h-hop neighborhood subgraph guidance formatted as markdown (RFC-010 PG-3).
+    /// If an orbit is detected in 3D procedural space, produces a
     /// Checkpoint & Recap block instead of cyclic forward step suggestions.
     /// `user_request` is the original task prompt — injected to keep the model anchored
     /// to its goal rather than drifting into generic exploration.
@@ -477,48 +589,10 @@ pub const PGraphStore = struct {
         const act_str = last_action orelse return null;
         const start_node_id = self.matchNode(act_str) orelse return null;
 
-        // Check for 3D trajectory orbit (signs of "quay vòng" in procedural space)
         if (detectTrajectoryOrbit(recent_actions, act_str)) |orbit| {
-            var bw = utils.BufWriter.init(alloc);
-            errdefer bw.deinit();
-
-            try bw.writeAll("[Procedural 3D Map Checkpoint & Trajectory Recap]\n");
-            try bw.print("📍 Waypoint: 3D Trajectory Orbit Detected (circling pattern: ", .{});
-            for (orbit.orbit_nodes) |on| {
-                try bw.print("`{s}` → ", .{on});
-            }
-            try bw.print("`{s}`, period={d}, revolutions={d})\n\n", .{ act_str, orbit.period, orbit.revolutions });
-
-            try bw.writeAll("🗺️ Explored Territory Recap:\n");
-            for (orbit.orbit_nodes) |on| {
-                const dom = ToolDomain3D.fromToolName(on);
-                const desc = if (self.matchNode(on)) |nid| self.graph.nodes.items[nid].desc else "";
-                try bw.print("- `{s}` [{s}]: {s}\n", .{ on, dom.label(), desc });
-            }
-
-            try bw.writeAll("\n⚠️ Navigation Checkpoint (ΔZ = 0, zero code mutation in orbit):\n");
-            try bw.print("You have scouted this region of the procedural map. All immediate forward paths from `{s}` have already been explored in this trajectory.\n\n", .{act_str});
-
-            try bw.writeAll("⚡ Orbit Break Directive:\n");
-            try bw.writeAll("Do NOT repeat this exploratory cycle. You have already gathered sufficient context in your context window.\n");
-
-            // Anchor to the user's original task so the model knows WHAT to advance toward
-            if (user_request) |req| {
-                const trunc = if (req.len > 180) req[0..180] ++ "..." else req;
-                try bw.print("🎯 Your task: \"{s}\"\n\n", .{trunc});
-            }
-
-            try bw.writeAll("You MUST:\n");
-            try bw.writeAll("1. Summarize the key findings from your exploration in 1-2 sentences.\n");
-            try bw.writeAll("2. Use those findings to make DIRECT PROGRESS on the task — e.g. edit code with `file_edit`/`file_write`, run a targeted test, or conclude with a direct answer.\n");
-            try bw.writeAll("3. Execute the first concrete step NOW — do NOT output another exploratory tool call.\n");
-            try bw.writeAll("4. If you already have enough information, skip further exploration and answer the user's question directly.\n");
-
-            const slice = try bw.toOwnedSlice();
-            return slice;
+            return try self.formatOrbitCheckpoint(alloc, act_str, orbit, user_request);
         }
 
-        // Selective guidance policy: check if node has active outgoing edges or previous act failed
         const out_edges = if (start_node_id < self.graph.out_adj.items.len) self.graph.out_adj.items[start_node_id].items else &.{};
         var active_out_count: usize = 0;
         for (out_edges) |eid| {
@@ -526,126 +600,57 @@ pub const PGraphStore = struct {
                 active_out_count += 1;
             }
         }
-
-        if (active_out_count == 0 and !last_failed) {
-            return null;
-        }
+        if (active_out_count == 0 and !last_failed) return null;
 
         var neighborhood = try traverseNeighborhood(&self.graph, start_node_id, max_hops, alloc);
         defer neighborhood.deinit(alloc);
 
-        const current_node_name = self.graph.nodes.items[start_node_id].name;
+        return try self.formatNeighborhoodAdvisory(alloc, start_node_id, neighborhood, recent_actions, last_failed, user_request, max_hops);
+    }
 
-        var bw = utils.BufWriter.init(alloc);
-        errdefer bw.deinit();
-
-        try bw.writeAll("[Procedural Advisory (Optional Suggestions)]\n");
-        if (last_failed) {
-            try bw.writeAll("Notice: Previous action reported a non-zero exit code or failure. Consider these heuristic suggestions if helpful (you are NOT required to follow them):\n");
+    fn hasActiveEdge(graph: *const Graph, src_id: usize, dst_id: usize) bool {
+        // PSEUDOCODE: Check if active directed edge exists between src_id and dst_id.
+        const edges = if (src_id < graph.out_adj.items.len) graph.out_adj.items[src_id].items else &.{};
+        for (edges) |eid| {
+            if (eid < graph.edges.items.len) {
+                const edge = graph.edges.items[eid];
+                if (edge.is_active and edge.dst == dst_id) return true;
+            }
         }
-        try bw.print("Current Action: `{s}`\nObserved Pattern Suggestions (h={d}-hop neighborhood):\n", .{ current_node_name, max_hops });
+        return false;
+    }
 
-        var printed_edges: usize = 0;
-        for (neighborhood.edges) |eid| {
-            if (eid >= self.graph.edges.items.len) continue;
-            const edge = self.graph.edges.items[eid];
-            if (!edge.is_active) continue;
+    fn promoteCandidateEdge(self: *PGraphStore, io: std.Io, src_name: []const u8, dst_name: []const u8) !void {
+        // PSEUDOCODE: Generate edge ID and append add_edge event to JSONL, then repair cycles.
+        const eid = try self.nextId("pge");
+        defer self.alloc.free(eid);
 
-            // Suppress self-loops
-            if (edge.src == edge.dst) continue;
+        const line = try std.fmt.allocPrint(self.alloc,
+            \\{{"ev":"add_edge","id":"{s}","edge":{{"src":"{s}","rel":"LEADS_TO","dst":"{s}","guidance":"Observed frequent transition (frequency >= 3)","condition":"frequent workflow pattern"}}}}
+        , .{ eid, src_name, dst_name });
+        defer self.alloc.free(line);
 
-            const dst_name = self.graph.nodes.items[edge.dst].name;
-
-            // Cycle suppression: if destination tool (or intermediate path node) was executed recently in trajectory,
-            // suppress it from suggested next steps to avoid ping-pong loops (regardless of last_failed).
-            var in_recent = false;
-            for (recent_actions) |ra| {
-                if (self.matchNode(ra)) |ra_id| {
-                    if (ra_id == edge.dst or (edge.src != start_node_id and ra_id == edge.src)) {
-                        in_recent = true;
-                        break;
-                    }
-                }
-            }
-            if (in_recent) continue;
-
-            const src_name = self.graph.nodes.items[edge.src].name;
-            const rel_str = edge.rel.toString();
-
-            try bw.print("- `{s}` → `{s}` ({s})\n", .{ src_name, dst_name, rel_str });
-            if (edge.attr.condition) |cond| {
-                if (cond.len > 0) try bw.print("  - Condition: {s}\n", .{cond});
-            }
-            if (edge.attr.guidance) |guid| {
-                if (guid.len > 0) try bw.print("  - Suggestion: {s}\n", .{guid});
-            }
-            if (edge.attr.pitfalls) |pit| {
-                if (pit.len > 0) try bw.print("  - Pitfalls: {s}\n", .{pit});
-            }
-            printed_edges += 1;
-        }
-
-        if (printed_edges == 0) {
-            if (last_failed) {
-                // All known recovery actions have already been attempted recently.
-                // Explicitly advise the model not to repeat exploratory queries.
-                try bw.writeAll("- No new untried recovery steps found in procedural neighborhood.\n");
-                try bw.writeAll("⚠️ Note: You have already attempted the standard exploratory tools for this failure. Do NOT repeat previous searches; formulate a direct fix and proceed to modify code.\n");
-                const slice = try bw.toOwnedSlice();
-                return slice;
-            }
-            bw.deinit();
-            return null;
-        }
-
-        try bw.writeAll("⚠️ Advisory Note: These are heuristic suggestions from past workflows. You are NOT required to follow them. If you have gathered sufficient context, proceed directly to modifying code or concluding.\n");
-
-        // Anchor to the user's original request so suggestions stay task-focused
-        if (user_request) |req| {
-            try bw.writeAll("\n🎯 Current task reminder: \"");
-            // Truncate to first ~200 chars to keep advisory compact
-            const trunc = if (req.len > 200) req[0..200] ++ "..." else req;
-            try bw.writeAll(trunc);
-            try bw.writeAll("\" — tailor your next step to make direct progress on this task.\n");
-        }
-
-        const slice = try bw.toOwnedSlice();
-        return slice;
+        try self.appendEvent(io, line);
+        _ = repairCycles(&self.graph, self.alloc) catch 0;
     }
 
     /// Record a transition between two tool actions (RFC-010 PG-2 population frequency gate).
     /// If transition frequency reaches threshold N=3, automatically persists candidate edge.
     pub fn recordTransition(self: *PGraphStore, io: std.Io, src_action: []const u8, dst_action: []const u8) !void {
+        // PSEUDOCODE:
+        // 1. Guard against self-transitions or generic tool pairs.
+        // 2. Validate nodes exist and no active or reverse edges exist.
+        // 3. Increment transition counter and promote if threshold N=3 reached.
         if (!self.auto_populate or std.mem.eql(u8, src_action, dst_action)) return;
 
         const src_id = self.matchNode(src_action) orelse return;
         const dst_id = self.matchNode(dst_action) orelse return;
-
         const src_name = self.graph.nodes.items[src_id].name;
         const dst_name = self.graph.nodes.items[dst_id].name;
 
-        // Guard 1: Do not auto-populate transitions between two generic observation/execution tools
         if (isObservationalOrGeneric(src_name) and isObservationalOrGeneric(dst_name)) return;
-
-        // Guard 2: If edge already exists and is active, no need to learn
-        const out_edges = if (src_id < self.graph.out_adj.items.len) self.graph.out_adj.items[src_id].items else &.{};
-        for (out_edges) |eid| {
-            if (eid < self.graph.edges.items.len) {
-                const edge = self.graph.edges.items[eid];
-                if (edge.is_active and edge.dst == dst_id) return;
-            }
-        }
-
-        // Guard 3: Direct reverse edge check (prevent immediate 2-cycles A <-> B)
-        const rev_edges = if (dst_id < self.graph.out_adj.items.len) self.graph.out_adj.items[dst_id].items else &.{};
-        for (rev_edges) |eid| {
-            if (eid < self.graph.edges.items.len) {
-                const edge = self.graph.edges.items[eid];
-                if (edge.is_active and edge.dst == src_id) return;
-            }
-        }
-
-        // Guard 4: Reachability check (prevent multi-hop cycles A -> B -> ... -> A)
+        if (hasActiveEdge(&self.graph, src_id, dst_id)) return;
+        if (hasActiveEdge(&self.graph, dst_id, src_id)) return;
         if (isReachable(&self.graph, dst_id, src_id, self.alloc)) return;
 
         const key = try std.fmt.allocPrint(self.alloc, "{s}->{s}", .{ src_name, dst_name });
@@ -654,19 +659,7 @@ pub const PGraphStore = struct {
         if (self.transitions.getPtr(key)) |count_ptr| {
             count_ptr.* += 1;
             if (count_ptr.* >= 3) {
-                // Threshold reached: promote candidate edge to JSONL
-                const eid = try self.nextId("pge");
-                defer self.alloc.free(eid);
-
-                const line = try std.fmt.allocPrint(self.alloc,
-                    \\{{"ev":"add_edge","id":"{s}","edge":{{"src":"{s}","rel":"LEADS_TO","dst":"{s}","guidance":"Observed frequent transition (frequency >= 3)","condition":"frequent workflow pattern"}}}}
-                , .{ eid, src_name, dst_name });
-                defer self.alloc.free(line);
-
-                try self.appendEvent(io, line);
-
-                // Run cycle repair as secondary safety guarantee
-                _ = repairCycles(&self.graph, self.alloc) catch 0;
+                try self.promoteCandidateEdge(io, src_name, dst_name);
             }
         } else {
             const owned_key = try self.alloc.dupe(u8, key);

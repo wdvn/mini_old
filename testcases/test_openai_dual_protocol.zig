@@ -1,3 +1,5 @@
+//! test_openai_dual_protocol.zig — Unit tests for OpenAI dual-protocol auto-negotiation and URL normalization.
+
 const std = @import("std");
 const testing = std.testing;
 const mini = @import("mini");

@@ -16,6 +16,18 @@ SUMMARY_FILE="$REPORT_DIR/swebench_summary_$TIMESTAMP.json"
 
 mkdir -p "$CACHE_DIR" "$RUNS_DIR" "$REPORT_DIR"
 
+# Ensure Zig is in PATH if installed in user directory
+if ! command -v zig &> /dev/null && [ -d "$HOME/.zvm/0.16.0" ]; then
+    export PATH="$HOME/.zvm/0.16.0:$PATH"
+fi
+
+# Load backend settings from ~/.bashrc if not already in environment
+if [ -z "$OPENAI_COMPAT_URL" ] && [ -z "$ANTHROPIC_API_KEY" ] && [ -f "$HOME/.bashrc" ]; then
+    eval "$(grep -E "^export (OPENAI_COMPAT_|ANTHROPIC_|CLAUDE_)" "$HOME/.bashrc" 2>/dev/null || true)"
+fi
+
+export MINI_ENABLE_STRUCTURED_PLANNING="${MINI_ENABLE_STRUCTURED_PLANNING:-1}"
+
 if [ ! -f "$MINI_BIN" ]; then
     echo "Building mini binary..."
     zig build
@@ -124,18 +136,20 @@ Issue Description:
 $problem_statement
 
 Instructions:
-1. Use bash commands (e.g. grep -n, cat, sed, python3) to locate, inspect, and understand where the issue occurs in the codebase.
-2. Use bash or file_edit to make the minimal, precise fix required to solve the issue.
-3. Verify your fix using python3 in bash if appropriate.
-4. Ensure code style and conventions are maintained.
-5. Conclude your turn with a brief summary of the fix once completed."
+1. Formulate a concise structured plan (JSON or markdown checklist) outlining your steps before making changes.
+2. Locate, inspect, and understand where the issue occurs in the codebase.
+3. Make the minimal, precise fix required to solve the issue.
+4. Verify your fix using python3 in bash if appropriate.
+5. Ensure code style and conventions are maintained.
+6. Conclude your turn with a brief summary of the fix once completed."
 
     echo "  Executing mini on task (no timeout, runs until completion)..." | tee -a "$REPORT_FILE"
     start_time=$(date +%s%3N)
     
-    # Run mini inside the target workspace directory — no timeout, mini is a heavy-task agent.
-    # grep, file_read, file_write are temporarily blocked to force model to use bash
-    (cd "$task_dir" && MINI_TOOL_BLOCKLIST="grep,file_read,file_write,read_file,write_file,read,write" "$MINI_BIN" -e "$prompt" >> "$REPORT_FILE" 2>&1 || true)
+    # Run mini inside the target workspace directory with Plan Mode enabled.
+    # Default MINI_TOOL_BLOCKLIST is empty so all planned tools (file_edit, bash, grep, etc.) can operate.
+    TOOL_BLOCKLIST="${MINI_TOOL_BLOCKLIST:-}"
+    (cd "$task_dir" && MINI_ENABLE_STRUCTURED_PLANNING="$MINI_ENABLE_STRUCTURED_PLANNING" MINI_TOOL_BLOCKLIST="$TOOL_BLOCKLIST" "$MINI_BIN" -e "$prompt" 2>&1 | tee -a "$REPORT_FILE" || true)
     
     end_time=$(date +%s%3N)
     duration=$((end_time - start_time))
