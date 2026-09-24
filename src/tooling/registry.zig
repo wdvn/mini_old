@@ -708,8 +708,10 @@ pub fn interruptActiveMcp() void {
                 // doesn't try to re-close already-closed fds (BADF panic).
                 srv.child.stdin = null;
                 srv.child.stdout = null;
-                srv.stdin_file.close(main.g_io);
-                srv.stdout_file.close(main.g_io);
+                // Use raw fd close (ignore BADF) to avoid panic if kernel
+                // already closed the pipe ends when the child process died.
+                _ = std.c.close(srv.stdin_file.handle);
+                _ = std.c.close(srv.stdout_file.handle);
             }
         }
     }
@@ -733,8 +735,10 @@ pub fn forceKillActiveMcp() void {
                 // doesn't try to re-close already-closed fds (BADF panic).
                 srv.child.stdin = null;
                 srv.child.stdout = null;
-                srv.stdin_file.close(main.g_io);
-                srv.stdout_file.close(main.g_io);
+                // Use raw fd close (ignore BADF) to avoid panic if kernel
+                // already closed the pipe ends when the child process died.
+                _ = std.c.close(srv.stdin_file.handle);
+                _ = std.c.close(srv.stdout_file.handle);
             }
         }
     }
