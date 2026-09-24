@@ -74,7 +74,13 @@ pub const Client = struct {
 
     fn finalizeClaudeResponse(self: *Client, ctx: *StreamCtx, req_http_code: u32, idle_aborted: bool) !proto.Response {
         ctx.response.http_code = req_http_code;
-        if (idle_aborted) ctx.response.stop_reason = .stream_aborted;
+        if (idle_aborted) {
+            ctx.response.stop_reason = .stream_aborted;
+            ctx.response.generation_stop = .stream_aborted;
+        } else if (ctx.response.generation_stop == null and req_http_code < 400) {
+            ctx.response.stop_reason = if (ctx.seen_message_stop) .end_turn else .unknown;
+            ctx.response.generation_stop = proto.toGenerationStop(ctx.response.stop_reason, req_http_code);
+        }
 
         if (ctx.text_accum.items.len > 0) {
             const text = try self.alloc.dupe(u8, ctx.text_accum.items);
@@ -316,6 +322,7 @@ const StreamCtx = struct {
     in_think_block: bool = false,
     event_type: [64]u8 = undefined,
     event_type_len: usize = 0,
+    seen_message_stop: bool = false,
     raw_accum: ArrayList(u8) = undefined,
     raw_accum_init: bool = false,
 
@@ -325,8 +332,9 @@ const StreamCtx = struct {
             self.raw_accum = .empty;
             self.raw_accum_init = true;
         }
-        if (self.raw_accum.items.len < 64 * 1024) {
-            self.raw_accum.appendSlice(self.alloc, chunk) catch {};
+        const remaining = proto.MAX_RESPONSE_SNIPPET_LEN - @min(self.raw_accum.items.len, proto.MAX_RESPONSE_SNIPPET_LEN);
+        if (remaining > 0) {
+            self.raw_accum.appendSlice(self.alloc, chunk[0..@min(chunk.len, remaining)]) catch {};
         }
 
         for (chunk) |c| {
@@ -443,6 +451,7 @@ const StreamCtx = struct {
     fn handleMessageDelta(self: *StreamCtx, data: []const u8) void {
         if (json.findString(data, "stop_reason")) |reason| {
             self.response.stop_reason = parseStopReason(reason);
+            self.response.generation_stop = proto.toGenerationStop(self.response.stop_reason, 200);
             hooks.dispatch(self.alloc, main.g_io, .{
                 .event = "message_delta",
                 .stop_reason = reason,
@@ -477,7 +486,9 @@ const StreamCtx = struct {
         } else if (std.mem.eql(u8, ev, "message_delta")) {
             self.handleMessageDelta(data);
         } else if (std.mem.eql(u8, ev, "message_stop")) {
+            self.seen_message_stop = true;
             if (self.response.stop_reason == .unknown) self.response.stop_reason = .end_turn;
+            self.response.generation_stop = proto.toGenerationStop(self.response.stop_reason, 200);
         }
     }
 
@@ -513,6 +524,84 @@ test "claude buildRequestBody contains cache_control" {
     try testing.expect(std.mem.indexOf(u8, body, "\"system\":[{\"type\":\"text\",\"text\":\"System prompt test\",\"cache_control\":{\"type\":\"ephemeral\"}}]") != null);
     // Verify tool2 (last tool) has cache_control
     try testing.expect(std.mem.indexOf(u8, body, "\"name\":\"tool2\",\"description\":\"desc2\",\"input_schema\":{},\"cache_control\":{\"type\":\"ephemeral\"}") != null);
+}
+
+test "RFC-023: Claude message stop populates generation stop" {
+    const alloc = testing.allocator;
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = proto.Response.init(alloc),
+        .text_cb = null,
+        .think_cb = null,
+        .line_buf = .empty,
+        .text_accum = .empty,
+        .think_accum = .empty,
+        .args_accum = .empty,
+    };
+    defer ctx.response.deinit();
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.text_accum.deinit(alloc);
+    defer ctx.think_accum.deinit(alloc);
+    defer ctx.args_accum.deinit(alloc);
+
+    try ctx.processLine("event: message_stop");
+    try ctx.processLine("data: {}");
+
+    try testing.expectEqual(proto.StopReason.end_turn, ctx.response.stop_reason);
+    try testing.expectEqual(proto.GenerationStop.natural_end, ctx.response.generation_stop);
+}
+
+test "RFC-023: Claude message delta terminal reason survives EOF" {
+    const alloc = testing.allocator;
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = proto.Response.init(alloc),
+        .text_cb = null,
+        .think_cb = null,
+        .line_buf = .empty,
+        .text_accum = .empty,
+        .think_accum = .empty,
+        .args_accum = .empty,
+    };
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.text_accum.deinit(alloc);
+    defer ctx.think_accum.deinit(alloc);
+    defer ctx.args_accum.deinit(alloc);
+
+    try ctx.processLine("event: message_delta");
+    try ctx.processLine("data: {\"stop_reason\":\"end_turn\"}");
+
+    var client = Client.init(alloc, "test-key", "claude-test", 1024);
+    var response = try client.finalizeClaudeResponse(&ctx, 200, false);
+    defer response.deinit();
+
+    try testing.expectEqual(proto.GenerationStop.natural_end, response.getGenerationStop());
+}
+
+test "RFC-023: Claude idle abort overrides earlier terminal state" {
+    const alloc = testing.allocator;
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = proto.Response.init(alloc),
+        .text_cb = null,
+        .think_cb = null,
+        .line_buf = .empty,
+        .text_accum = .empty,
+        .think_accum = .empty,
+        .args_accum = .empty,
+    };
+    ctx.response.stop_reason = .end_turn;
+    ctx.response.generation_stop = .natural_end;
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.text_accum.deinit(alloc);
+    defer ctx.think_accum.deinit(alloc);
+    defer ctx.args_accum.deinit(alloc);
+
+    var client = Client.init(alloc, "test-key", "claude-test", 1024);
+    var response = try client.finalizeClaudeResponse(&ctx, 200, true);
+    defer response.deinit();
+
+    try testing.expectEqual(proto.GenerationStop.stream_aborted, response.getGenerationStop());
 }
 
 test "claude buildRequestBody dynamic thinking budget" {

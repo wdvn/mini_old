@@ -221,12 +221,11 @@ pub const AgentLoop = struct {
     /// Stop reason from the most recent LLM response (for journal debugging).
     last_stop_reason: ?[]const u8 = null,
     /// Track whether the most recent LLM response had no meaningful content (empty/whitespace only).
-    /// Used to prevent premature exit_loop when model returns nothing but also didn't fail.
-    response_content_empty: bool = false,
     /// RFC-023 response state for the current turn.
-    last_generation_stop: proto.StopReason = .unknown,
+    last_generation_stop: proto.GenerationStop = .missing_terminal_event,
     last_response_validity: proto.ResponseValidity = .empty,
     last_agent_decision: proto.AgentDecision = .request_continuation,
+    last_step_outcome: proto.StepOutcome = .final_answer,
     response_recovery_budget: proto.ResponseRecoveryBudget = .{},
     turn_recovery_attempts: usize = 0,
     last_agent_message: ?[]const u8 = null,
@@ -471,10 +470,10 @@ pub const AgentLoop = struct {
             .recent_tools = .empty,
             .coordinator = coordinator,
             .watchdog = watchdog,
-            .response_content_empty = false,
-            .last_generation_stop = .unknown,
+            .last_generation_stop = .missing_terminal_event,
             .last_response_validity = .empty,
             .last_agent_decision = .request_continuation,
+            .last_step_outcome = .final_answer,
             .response_recovery_budget = .{},
             .turn_recovery_attempts = 0,
             .last_agent_message = null,
@@ -522,6 +521,14 @@ pub const AgentLoop = struct {
         }
         self.recent_tools.deinit(self.alloc);
         self.deinitTurnToolRecords();
+        if (self.last_agent_message) |msg| {
+            self.alloc.free(msg);
+            self.last_agent_message = null;
+        }
+        if (self.last_stop_reason) |sr| {
+            self.alloc.free(sr);
+            self.last_stop_reason = null;
+        }
         self.plan.deinit();
     }
 
@@ -555,7 +562,10 @@ pub const AgentLoop = struct {
         if (self.last_backend_raw_error) |old| self.alloc.free(old);
         self.last_backend_raw_error = null;
         if (raw) |r| {
-            self.last_backend_raw_error = self.alloc.dupe(u8, r) catch null;
+            self.last_backend_raw_error = self.alloc.dupe(
+                u8,
+                proto.boundedResponseSnippet(r),
+            ) catch null;
         }
     }
 
@@ -765,7 +775,7 @@ pub const AgentLoop = struct {
         user_text: []const u8,
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
-    ) !void {
+    ) !proto.TurnResult {
         return self.processInputWithImages(user_text, &.{}, text_cb, think_cb);
     }
 
@@ -775,7 +785,7 @@ pub const AgentLoop = struct {
         images: []const proto.ImageBlock,
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
-        result: anyerror!void = {},
+        result: anyerror!proto.TurnResult = error.Unexpected,
     };
 
     fn turnWorkerThreadEntry(ctx: *TurnWorkerContext) void {
@@ -794,7 +804,7 @@ pub const AgentLoop = struct {
         images: []const proto.ImageBlock,
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
-    ) !void {
+    ) !proto.TurnResult {
         self.coordinator.resetTurn();
         defer self.coordinator.notifyTurnComplete();
 
@@ -949,7 +959,7 @@ pub const AgentLoop = struct {
                 .model = self.backend.model(),
                 .error_name = @errorName(e),
                 .http_code = self.last_backend_http_code,
-                .attempt = 1,
+                .attempt = self.current_act_attempt,
                 .raw_snippet = self.last_backend_raw_error,
             }) catch {};
         }

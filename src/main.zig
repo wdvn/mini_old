@@ -280,8 +280,10 @@ fn executeSinglePrompt(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop
     renderer.startTurn(media_res.clean_text);
     const start_ms = utils.milliTimestamp();
 
-    try agent.processInputWithImages(media_res.clean_text, media_res.images, ui_repl.printText, ui_repl.printThinkText);
-    if (signals_mod.isInterrupted()) std.process.exit(130);
+    var turn_result = try agent.processInputWithImages(media_res.clean_text, media_res.images, ui_repl.printText, ui_repl.printThinkText);
+    defer turn_result.deinit(alloc);
+    if (signals_mod.isInterrupted() or turn_result.outcome == .cancelled) std.process.exit(130);
+    if (turn_result.outcome != .completed) std.process.exit(1);
 
     const end_ms = utils.milliTimestamp();
     const duration = if (end_ms >= start_ms) @as(u64, @intCast(end_ms - start_ms)) else 0;

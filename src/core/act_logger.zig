@@ -79,10 +79,10 @@ pub const ActLogger = struct {
         self.alloc.free(self.acts_dir);
     }
 
-    /// Write detailed Act log to file ~/.mini/acts/act_<pid>_<act_id>.json
+    /// Write detailed Act log to file ~/.mini/acts/act_<pid>_<act_id>_<attempt>.json
     pub fn logAct(self: *ActLogger, io: std.Io, data: ActDebugData) !void {
         var file_name_buf: [128]u8 = undefined;
-        const file_name = std.fmt.bufPrint(&file_name_buf, "act_{d}_{d}.json", .{ data.session_pid, data.act_id }) catch return;
+        const file_name = std.fmt.bufPrint(&file_name_buf, "act_{d}_{d}_{d}.json", .{ data.session_pid, data.act_id, data.llm_response.attempt }) catch return;
 
         const full_path = try std.fs.path.join(self.alloc, &.{ self.acts_dir, file_name });
         defer self.alloc.free(full_path);

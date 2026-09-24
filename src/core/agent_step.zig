@@ -23,12 +23,7 @@ const AgentLoop = agent_mod.AgentLoop;
 const prompts_mod = @import("prompts.zig");
 const agent_loop_monitor = @import("agent_loop_monitor.zig");
 
-pub const StepResult = enum {
-    continue_loop,
-    retry_act,
-    exit_loop,
-    exit_stalled,
-};
+pub const StepResult = proto.ActTransition;
 
 /// Manages ephemeral allocations and content blocks for Procedural Graph and Plan progress guidance.
 pub const GuidanceProgressContext = struct {
@@ -156,7 +151,6 @@ pub fn scanResponseContent(loop: *AgentLoop, response: *const proto.Response, wa
             }
         }
     }
-    loop.response_content_empty = !has_meaningful_text and !has_tool_use_blocks;
 
     for (response.content.items) |block| {
         switch (block) {
@@ -199,7 +193,8 @@ fn handleCodeActLoopTrip(loop: *AgentLoop, act_id: usize) !StepResult {
         try loop.history.addUser(trip_msg);
         loop.action_loop_tripped = false;
         loop.consecutive_dup_tool_count = 0;
-        return .continue_loop;
+        loop.last_step_outcome = .actions_executed;
+        return proto.ActTransition{ .next_act = {} };
     } else {
         main.stderrPrint(
             "\n\x1b[33m[agent] ⚠️ Action loop persisted after replanning attempts: identical CodeAct script repeated. Halting loop.\x1b[0m\n",
@@ -208,8 +203,9 @@ fn handleCodeActLoopTrip(loop: *AgentLoop, act_id: usize) !StepResult {
         const trip_msg = "[CodeAct System Intervention]: Action loop persisted after multiple replanning attempts. Halting execution. Synthesize your findings and answer the user now.";
         try loop.history.addUser(trip_msg);
         loop.action_loop_tripped = true;
+        loop.last_step_outcome = .protocol_failure;
         loop.last_turn_outcome = .stalled;
-        return .exit_stalled;
+        return proto.ActTransition{ .stall = .action_loop };
     }
 }
 
@@ -242,7 +238,8 @@ fn handleCodeActEvalError(
     const err_msg = try std.fmt.allocPrint(loop.alloc, prompts_mod.codeact_system_error_fmt, .{@errorName(e)});
     defer loop.alloc.free(err_msg);
     try loop.history.addUser(err_msg);
-    return .continue_loop;
+    loop.last_step_outcome = .actions_executed;
+    return proto.ActTransition{ .next_act = {} };
 }
 
 fn handleCodeActSuccess(loop: *AgentLoop, res: ExecutionResult, dur_ms: u64) !StepResult {
@@ -276,7 +273,8 @@ fn handleCodeActSuccess(loop: *AgentLoop, res: ExecutionResult, dur_ms: u64) !St
     } else {
         try loop.history.addUser(out_buf.list.items);
     }
-    return .continue_loop;
+    loop.last_step_outcome = .actions_executed;
+    return proto.ActTransition{ .next_act = {} };
 }
 
 fn handleCodeActScriptError(loop: *AgentLoop, res: ExecutionResult, dur_ms: u64) !StepResult {
@@ -309,7 +307,8 @@ fn handleCodeActScriptError(loop: *AgentLoop, res: ExecutionResult, dur_ms: u64)
     }
 
     try loop.history.addUser(err_buf.list.items);
-    return .continue_loop;
+    loop.last_step_outcome = .actions_executed;
+    return proto.ActTransition{ .next_act = {} };
 }
 
 // PSEUDOCODE:
@@ -363,7 +362,8 @@ pub fn executeCodeActBlock(
             );
             defer loop.alloc.free(note);
             try loop.history.addUser(note);
-            return .continue_loop;
+            loop.last_step_outcome = .actions_executed;
+            return proto.ActTransition{ .next_act = {} };
         }
     }
 
@@ -404,16 +404,38 @@ pub fn executeCodeActBlock(
     }
 }
 
-fn responseRecoveryClass(validity: proto.ResponseValidity, stop_reason: proto.StopReason) ?proto.RecoveryClass {
+fn nextResponseRecoveryTransition(
+    validity: proto.ResponseValidity,
+    gen_stop: proto.GenerationStop,
+    budget: *proto.ResponseRecoveryBudget,
+) !?proto.ActTransition {
     // PSEUDOCODE:
-    // 1. Map no-action response shapes to the RFC-023 recovery class.
-    // 2. Preserve stop-reason information when it changes the recovery class.
-    return switch (validity) {
-        .thinking_only => .thinking_only,
-        .whitespace_only, .empty => .empty_response,
-        .partial_text => if (stop_reason == .missing_terminal_event) .missing_terminal else .stream_aborted,
-        else => null,
-    };
+    // 1. Resolve the independent failure-class recovery budget.
+    // 2. Preserve Act identity for retries that still have capacity.
+    // 3. Return a typed stall after the matching budget is exhausted.
+    const class = proto.responseRecoveryClass(validity, gen_stop) orelse return null;
+    if (budget.consume(class) == .retry) {
+        return proto.ActTransition{ .retry_same_act = {} };
+    }
+    return proto.ActTransition{ .stall = .recovery_budget_exhausted };
+}
+
+test "RFC-023: Act 52 provider failure recovers twice then stalls" {
+    var budget = proto.ResponseRecoveryBudget{};
+
+    // Act 52, attempt 1: HTTP 500 is a provider failure.
+    const provider_failure = proto.ActTransition{ .fail = .provider_error };
+    try std.testing.expectEqual(proto.FailureReason.provider_error, provider_failure.fail);
+
+    // Act 52, attempts 2-3: successful HTTP 200 thinking-only responses retry the same Act.
+    const recovery_1 = (try nextResponseRecoveryTransition(.thinking_only, .natural_end, &budget)).?;
+    try std.testing.expect(recovery_1 == .retry_same_act);
+    const recovery_2 = (try nextResponseRecoveryTransition(.thinking_only, .natural_end, &budget)).?;
+    try std.testing.expect(recovery_2 == .retry_same_act);
+
+    // Act 52, attempt 4: class budget exhausted; no new Act and no completion.
+    const stalled = (try nextResponseRecoveryTransition(.thinking_only, .natural_end, &budget)).?;
+    try std.testing.expectEqual(proto.StallReason.recovery_budget_exhausted, stalled.stall);
 }
 
 fn handleResponseRecovery(
@@ -423,31 +445,65 @@ fn handleResponseRecovery(
     tool_defs: []const proto.ToolDefinition,
     response: *const proto.Response,
     validity: proto.ResponseValidity,
+    gen_stop: proto.GenerationStop,
+    history_checkpoint: usize,
 ) !StepResult {
-    const class = responseRecoveryClass(validity, response.stop_reason) orelse return .continue_loop;
-    // PSEUDOCODE:
-    // 1. Log the unusable response before removing it from model-visible history.
-    // 2. Rollback only the current Act's assistant message.
-    // 3. Retry the same Act while the failure-class budget remains.
-    // 4. End the turn as stalled when the bounded recovery class is exhausted.
+    const recovery_class: proto.RecoveryClass = proto.responseRecoveryClass(validity, gen_stop) orelse {
+        loop.last_step_outcome = .protocol_failure;
+        loop.last_turn_outcome = .failed;
+        return proto.ActTransition{ .fail = .protocol_error };
+    };
+    loop.last_recovery_class = recovery_class;
+
     loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{
         .exec_type = "response_recovery",
         .is_error = true,
         .error_message = @tagName(validity),
     });
-    loop.history.truncate(input_msgs_count);
-    loop.last_turn_outcome = .stalled;
 
-    const decision = loop.response_recovery_budget.consume(class);
-    if (decision == .stalled) {
+    loop.history.truncate(history_checkpoint);
+
+    const transition = (try nextResponseRecoveryTransition(validity, gen_stop, &loop.response_recovery_budget)).?;
+    if (transition == .retry_same_act) {
+        loop.turn_recovery_attempts += 1;
+        loop.last_agent_decision = .retry_transient;
+        loop.last_step_outcome = .transient_retry;
+
+        const advisory = switch (recovery_class) {
+            .thinking_only => "The model response contained internal reasoning/thinking only, without any actionable output or tool invocation. Please provide the necessary tool calls or final response to proceed.",
+            .empty_response => "The model response was empty or contained only whitespace. Please provide the necessary tool calls or final response to proceed.",
+            .missing_terminal => "The model response stream terminated unexpectedly without a terminal event. Please resume and provide the complete tool call or response.",
+            .stream_aborted => "The model response stream was interrupted or aborted due to idle timeout. Please resume from where execution stopped.",
+        };
+        try loop.history.addUser(advisory);
+        return transition;
+    } else {
         loop.last_agent_decision = .fail_stalled;
-        return .exit_stalled;
+        loop.last_step_outcome = .protocol_failure;
+        loop.last_turn_outcome = .stalled;
+        return transition;
     }
+}
 
-    loop.turn_recovery_attempts += 1;
-    loop.last_agent_decision = .retry_transient;
-    try loop.history.addUser(prompts_mod.empty_response_advisory);
-    return .retry_act;
+fn finalAnswerWatchdogTransition(watchdog_action: anytype) proto.ActTransition {
+    // PSEUDOCODE:
+    // 1. Only a valid final-text candidate reaches the watchdog.
+    // 2. Continue-loop remains pending; exhaustion stalls; no-action completes.
+    return switch (watchdog_action) {
+        .continue_loop => .{ .next_act = {} },
+        .exit_loop => .{ .stall = .plan_stalled },
+        .no_action => .{ .complete = {} },
+        else => unreachable,
+    };
+}
+
+test "RFC-023: watchdog maps exhaustion to stall and no-action to completion" {
+    try std.testing.expect(finalAnswerWatchdogTransition(.continue_loop) == .next_act);
+    try std.testing.expectEqual(
+        proto.StallReason.plan_stalled,
+        finalAnswerWatchdogTransition(.exit_loop).stall,
+    );
+    try std.testing.expect(finalAnswerWatchdogTransition(.no_action) == .complete);
 }
 
 fn handleEndTurnStop(
@@ -457,14 +513,11 @@ fn handleEndTurnStop(
     tool_defs: []const proto.ToolDefinition,
     response: *const proto.Response,
 ) !StepResult {
-    // PSEUDOCODE:
-    // 1. The response has already passed action/payload validation.
-    // 2. Ask the plan watchdog for policy continuation.
-    // 3. Only a valid final-text candidate can complete the turn.
     loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{ .exec_type = "none" });
     switch (loop.plan.handleEndTurnWatchdog(loop.current_user_request, loop.hasRecentVerifiedMutation())) {
         .continue_loop => {
             loop.last_agent_decision = .request_continuation;
+            loop.last_step_outcome = .continuation_requested;
             if (main.ui_repl.current_renderer) |r| {
                 r.ensureNewline();
                 r.write(" \x1b[33m[Plan Watchdog: Plan declared without execution. Enforcing Step 1 execution]\x1b[0m\n");
@@ -473,21 +526,24 @@ fn handleEndTurnStop(
                 defer loop.alloc.free(directive);
                 try loop.history.addUser(directive);
             }
-            return .continue_loop;
+            return finalAnswerWatchdogTransition(.continue_loop);
         },
         .exit_loop => {
             loop.last_agent_decision = .fail_stalled;
+            loop.last_step_outcome = .protocol_failure;
             loop.last_turn_outcome = .stalled;
-            return .exit_stalled;
+            return finalAnswerWatchdogTransition(.exit_loop);
         },
-        .no_action => {},
+        .no_action => {
+            loop.last_agent_decision = .deliver_final_answer;
+            loop.last_step_outcome = .final_answer;
+            loop.last_turn_outcome = .completed;
+            if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
+                main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
+            }
+            return finalAnswerWatchdogTransition(.no_action);
+        },
     }
-    loop.last_agent_decision = .deliver_final_answer;
-    loop.last_turn_outcome = .completed;
-    if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
-        main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
-    }
-    return .exit_loop;
 }
 
 fn handleMaxTokensStop(
@@ -501,8 +557,9 @@ fn handleMaxTokensStop(
     loop.max_tokens_continues += 1;
     if (loop.max_tokens_continues > 5) {
         main.stderrPrint("\n\x1b[31m[agent] ⛔ Continued max_tokens {d} consecutive times without completion. Stopping to prevent infinite loop.\x1b[0m\n", .{loop.max_tokens_continues});
+        loop.last_step_outcome = .protocol_failure;
         loop.last_turn_outcome = .stalled;
-        return .exit_stalled;
+        return proto.ActTransition{ .stall = .recovery_budget_exhausted };
     }
     main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response truncated (max_tokens), requesting continuation ({d}/5)...\x1b[0m\n", .{loop.max_tokens_continues});
     try loop.closeOrphanedToolUses(response);
@@ -513,7 +570,8 @@ fn handleMaxTokensStop(
         .{loop.max_tokens_continues},
     );
     try loop.history.addUser(buf.list.items);
-    return .continue_loop;
+    loop.last_step_outcome = .continuation_requested;
+    return proto.ActTransition{ .next_act = {} };
 }
 
 fn handleToolUseStop(
@@ -614,7 +672,7 @@ fn checkRoleCompatibilityHttp400(loop: *AgentLoop, raw: []const u8) ?StepResult 
         _ = loop.history.ensureClaudeCompatible();
         if (loop.role_fix_attempts < 2) {
             loop.role_fix_attempts += 1;
-            return .continue_loop;
+            return proto.ActTransition{ .next_act = {} };
         }
     }
 
@@ -625,7 +683,7 @@ fn checkRoleCompatibilityHttp400(loop: *AgentLoop, raw: []const u8) ?StepResult 
         _ = loop.history.ensureOpenAICompatible();
         if (loop.role_fix_attempts < 2) {
             loop.role_fix_attempts += 1;
-            return .continue_loop;
+            return proto.ActTransition{ .next_act = {} };
         }
     }
     return null;
@@ -739,6 +797,26 @@ fn prepareStepInputMessages(
     return guidance_ctx;
 }
 
+fn extractAssistantText(alloc: std.mem.Allocator, response: *const proto.Response) ?[]u8 {
+    var total_len: usize = 0;
+    for (response.content.items) |block| {
+        if (block == .text) {
+            total_len += block.text.len;
+        }
+    }
+    if (total_len == 0) return null;
+
+    const buf = alloc.alloc(u8, total_len) catch return null;
+    var offset: usize = 0;
+    for (response.content.items) |block| {
+        if (block == .text) {
+            @memcpy(buf[offset .. offset + block.text.len], block.text);
+            offset += block.text.len;
+        }
+    }
+    return buf;
+}
+
 fn executeNativeToolCalling(
     self: *AgentLoop,
     act_id: usize,
@@ -754,39 +832,14 @@ fn executeNativeToolCalling(
     });
     main.stderrPrint("\n", .{});
     if (self.action_loop_tripped) {
+        self.last_step_outcome = .protocol_failure;
         self.last_turn_outcome = .stalled;
-        return .exit_stalled;
+        return proto.ActTransition{ .stall = .action_loop };
     }
-    return .continue_loop;
+    self.last_step_outcome = .actions_executed;
+    return proto.ActTransition{ .next_act = {} };
 }
 
-/// Executes a single agent step:
-/// 1. Status and history preparation (watchdog recap, guidance, plan progress)
-/// 2. Dynamic reasoning effort modulation
-/// 3. AI backend streaming communication
-/// 4. Plan detection & token tracking
-/// 5. Tool execution or CodeAct evaluation or stop reason dispatching
-fn tryExecuteCodeAct(
-    self: *AgentLoop,
-    act_id: usize,
-    input_msgs_count: usize,
-    tool_defs: []const proto.ToolDefinition,
-    response: *const proto.Response,
-) !?StepResult {
-    if (self.config.execution_mode == .tools) return null;
-    if (agent_parsing.findJsCodeInResponse(self.alloc, response)) |js_code| {
-        defer self.alloc.free(js_code);
-        return try executeCodeActBlock(self, act_id, input_msgs_count, tool_defs, response, js_code);
-    }
-    return null;
-}
-
-/// Executes a single agent step:
-/// 1. Status and history preparation (watchdog recap, guidance, plan progress)
-/// 2. Dynamic reasoning effort modulation
-/// 3. AI backend streaming communication
-/// 4. Plan detection & token tracking
-/// 5. Tool execution or CodeAct evaluation or stop reason dispatching
 pub fn executeStep(
     self: *AgentLoop,
     act_id: usize,
@@ -795,6 +848,8 @@ pub fn executeStep(
     think_cb: ?*const fn ([]const u8) void,
 ) !StepResult {
     try renderStepHeader(self, act_id);
+
+    const history_checkpoint = self.history.len();
 
     var input_msgs_count: usize = 0;
     var temp_input_msgs = std.ArrayListUnmanaged(proto.Message).empty;
@@ -812,9 +867,11 @@ pub fn executeStep(
         think_cb,
     );
     main.resetThinkState();
-    if (signals.isInterrupted()) {
+    if (signals.isInterrupted() or self.coordinator.isTimedOut()) {
         response.deinit();
-        return error.Interrupted;
+        self.last_step_outcome = .cancelled;
+        self.last_turn_outcome = .cancelled;
+        return proto.ActTransition{ .cancel = {} };
     }
     defer response.deinit();
 
@@ -822,29 +879,107 @@ pub fn executeStep(
         try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
     }
 
-    const validity = proto.classifyResponse(&response, false);
-    self.last_generation_stop = response.stop_reason;
-    self.last_response_validity = validity;
-    self.last_agent_decision = proto.decideAgentAction(response.stop_reason, validity, false);
-    const was_added = try self.history.addAssistantResponse(&response);
-    const has_tool_use_blocks = scanResponseContent(self, &response, was_added);
+    const gen_stop = response.getGenerationStop();
+    self.last_generation_stop = gen_stop;
+    if (self.journal) |*j| j.recordEvent(self.io, act_id, .llm_generation_ended, "LLM generation ended") catch {};
 
-    if (has_tool_use_blocks) {
-        self.response_recovery_budget = .{};
-        return executeNativeToolCalling(self, act_id, input_msgs_count, tool_defs, &response);
-    }
-
-    if (try tryExecuteCodeAct(self, act_id, input_msgs_count, tool_defs, &response)) |res| {
-        self.response_recovery_budget = .{};
-        return res;
-    }
-
-    if (validity == .final_text or validity == .partial_text or validity == .thinking_only or
-        validity == .whitespace_only or validity == .empty)
-    {
-        if (self.last_agent_decision == .retry_transient or validity == .partial_text) {
-            return handleResponseRecovery(self, act_id, input_msgs_count, tool_defs, &response, validity);
+    if (response.http_code >= 400) {
+        self.setLastErrorContext(response.http_code, response.raw_debug_info);
+        if (response.http_code == 401 or response.http_code == 403) return error.LLMAuthenticationError;
+        if (response.http_code == 429) return error.LLMRateLimitExceeded;
+        if (response.http_code >= 500 and response.http_code < 600) return error.LLMProviderUnavailable;
+        if (response.http_code == 400) {
+            if (response.raw_debug_info) |raw| {
+                try checkContextExceededHttp400(raw);
+                if (checkRoleCompatibilityHttp400(self, raw)) |res| return res;
+            }
         }
     }
-    return dispatchStopReason(self, act_id, input_msgs_count, tool_defs, &response, has_tool_use_blocks);
+
+    const js_code_opt = if (self.config.execution_mode != .tools)
+        agent_parsing.findJsCodeInResponse(self.alloc, &response)
+    else
+        null;
+    defer if (js_code_opt) |c| self.alloc.free(c);
+    const has_codeact = js_code_opt != null;
+
+    const validity = proto.classifyResponse(&response, has_codeact);
+    self.last_response_validity = validity;
+    if (validity != .final_text and validity != .native_tool_calls and validity != .codeact) {
+        if (self.journal) |*j| j.recordEvent(self.io, act_id, .llm_response_invalid, "Invalid LLM response payload") catch {};
+    }
+
+    const decision = proto.decideAgentAction(gen_stop, validity, false);
+    self.last_agent_decision = decision;
+    if (self.journal) |*j| j.recordEvent(self.io, act_id, .agent_decision, @tagName(decision)) catch {};
+
+    switch (decision) {
+        .cancel => {
+            self.history.truncate(history_checkpoint);
+            self.last_step_outcome = .cancelled;
+            self.last_turn_outcome = .cancelled;
+            return proto.ActTransition{ .cancel = {} };
+        },
+        .fail_protocol => {
+            self.history.truncate(history_checkpoint);
+            self.last_step_outcome = .protocol_failure;
+            self.last_turn_outcome = .failed;
+            return proto.ActTransition{ .fail = .protocol_error };
+        },
+        .fail_stalled => {
+            self.history.truncate(history_checkpoint);
+            self.last_step_outcome = .protocol_failure;
+            self.last_turn_outcome = .stalled;
+            return proto.ActTransition{ .stall = .recovery_budget_exhausted };
+        },
+        .retry_transient => {
+            return handleResponseRecovery(self, act_id, input_msgs_count, tool_defs, &response, validity, gen_stop, history_checkpoint);
+        },
+        .execute_native_tools => {
+            const was_added = try self.history.addAssistantResponse(&response);
+            _ = scanResponseContent(self, &response, was_added);
+            self.response_recovery_budget = .{};
+            self.last_recovery_class = null;
+            self.last_step_outcome = .actions_executed;
+            return executeNativeToolCalling(self, act_id, input_msgs_count, tool_defs, &response);
+        },
+        .execute_codeact => {
+            const was_added = try self.history.addAssistantResponse(&response);
+            _ = scanResponseContent(self, &response, was_added);
+            self.response_recovery_budget = .{};
+            self.last_recovery_class = null;
+            self.last_step_outcome = .actions_executed;
+            return executeCodeActBlock(self, act_id, input_msgs_count, tool_defs, &response, js_code_opt.?);
+        },
+        .request_continuation => {
+            // PSEUDOCODE:
+            // 1. Roll back incomplete transport output that cannot be safely resumed.
+            // 2. Commit explicit provider continuations such as max-token truncation.
+            if (proto.responseRecoveryClass(validity, gen_stop)) |_| {
+                return handleResponseRecovery(self, act_id, input_msgs_count, tool_defs, &response, validity, gen_stop, history_checkpoint);
+            }
+
+            const was_added = try self.history.addAssistantResponse(&response);
+            _ = scanResponseContent(self, &response, was_added);
+            self.response_recovery_budget = .{};
+            self.last_recovery_class = null;
+            self.last_step_outcome = .continuation_requested;
+            if (gen_stop == .max_tokens) {
+                return handleMaxTokensStop(self, act_id, input_msgs_count, tool_defs, &response);
+            }
+            try self.history.addUser("[System] The response ended at an explicit stop boundary. Continue from that boundary without repeating prior output.");
+            return proto.ActTransition{ .next_act = {} };
+        },
+        .deliver_final_answer => {
+            const was_added = try self.history.addAssistantResponse(&response);
+            _ = scanResponseContent(self, &response, was_added);
+            self.response_recovery_budget = .{};
+            self.last_recovery_class = null;
+            if (extractAssistantText(self.alloc, &response)) |text| {
+                if (self.last_agent_message) |old| self.alloc.free(old);
+                self.last_agent_message = text;
+            }
+            return handleEndTurnStop(self, act_id, input_msgs_count, tool_defs, &response);
+        },
+    }
 }

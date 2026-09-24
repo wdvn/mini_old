@@ -1,10 +1,13 @@
 # RFC-023: End-Turn Completion Semantics
 
-**Status**: Proposed  
-**Date**: 2026-09-24  
-**Author**: mini-agent team  
-**Related**: RFC-002 (Event Sourcing & CAS), RFC-006 (OpenAI-Compatible Response Standardization), RFC-009 (Thinking Budget & Reasoning Effort), RFC-019 (Structured Planning), RFC-022 (Watchdog False-Positive Elimination)  
+**Status**: Implemented
+**Date**: 2026-09-24
+**Author**: mini-agent team
+**Related**: RFC-002 (Event Sourcing & CAS), RFC-006 (OpenAI-Compatible Response Standardization), RFC-009 (Thinking Budget & Reasoning Effort), RFC-019 (Structured Planning), RFC-022 (Watchdog False-Positive Elimination)
 **Supersedes**: None
+
+**Implementation Contract**: docs/volio/specs/2026-09-24-rfc-023-agent-protocol-design.md
+**Implementation Plan**: docs/volio/plans/2026-09-24-rfc-023-end-turn-completion-semantics.md
 
 ---
 

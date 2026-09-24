@@ -66,7 +66,10 @@ fn runAgentTurn(
     var interrupted = false;
     defer {
         while (!g_renderer_mutex.tryLock()) {
-            if (signals.isInterrupted()) { interrupted = true; break; }
+            if (signals.isInterrupted()) {
+                interrupted = true;
+                break;
+            }
         }
         if (!interrupted) {
             current_renderer = null;
@@ -79,11 +82,16 @@ fn runAgentTurn(
     renderer.startTurn(clean_text);
     const start_ms = utils.milliTimestamp();
 
-    agent.processInputWithImages(clean_text, images, printText, printThinkText) catch |e| {
+    var turn_result = agent.processInputWithImages(clean_text, images, printText, printThinkText) catch |e| {
         if (e != error.Interrupted) {
             main.stdoutPrint("\x1b[31m[error]\x1b[0m {s}\n", .{@errorName(e)});
         }
+        return;
     };
+    defer turn_result.deinit(agent.alloc);
+    if (turn_result.outcome != .completed) {
+        main.stdoutPrint("\x1b[33m[turn {s}]\x1b[0m\n", .{@tagName(turn_result.outcome)});
+    }
     if (signals.checkAndResetInterrupted()) return;
 
     const end_ms = utils.milliTimestamp();
