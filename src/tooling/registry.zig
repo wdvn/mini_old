@@ -704,6 +704,8 @@ pub fn interruptActiveMcp() void {
                         _ = std.posix.kill(srv.child_pid, std.posix.SIG.TERM) catch {};
                     };
                 }
+                // Null child pipes BEFORE closing so child.wait cleanup
+                // doesn't try to re-close already-closed fds (BADF panic).
                 srv.child.stdin = null;
                 srv.child.stdout = null;
                 srv.stdin_file.close(main.g_io);
@@ -727,6 +729,8 @@ pub fn forceKillActiveMcp() void {
                         _ = std.posix.kill(srv.child_pid, std.posix.SIG.KILL) catch {};
                     };
                 }
+                // Null child pipes BEFORE closing so child.wait cleanup
+                // doesn't try to re-close already-closed fds (BADF panic).
                 srv.child.stdin = null;
                 srv.child.stdout = null;
                 srv.stdin_file.close(main.g_io);
