@@ -57,6 +57,15 @@ pub const ActErrorResolution = enum {
 fn resetTurnMetrics(self: *AgentLoop, user_text: []const u8) void {
     self.last_turn_acts = 0;
     self.last_turn_completion_tokens = 0;
+    self.last_generation_stop = .unknown;
+    self.last_response_validity = .empty;
+    self.last_agent_decision = .request_continuation;
+    self.response_recovery_budget = .{};
+    self.turn_recovery_attempts = 0;
+    self.last_agent_message = null;
+    self.last_turn_outcome = .completed;
+    self.current_act_attempt = 1;
+    self.last_recovery_class = null;
     self.role_fix_attempts = 0;
     self.max_tokens_continues = 0;
     self.last_act_failed = false;
@@ -148,6 +157,11 @@ fn flushSnapshotsAndJournal(self: *AgentLoop, act_id: usize) void {
                 .act_id = act_id,
                 .file_snapshots = &.{},
                 .stop_reason = self.last_stop_reason,
+                .generation_stop = if (self.last_stop_reason != null) @tagName(self.last_generation_stop) else null,
+                .response_validity = if (self.last_stop_reason != null) @tagName(self.last_response_validity) else null,
+                .agent_decision = if (self.last_stop_reason != null) @tagName(self.last_agent_decision) else null,
+                .recovery_class = if (self.last_recovery_class) |class| @tagName(class) else null,
+                .attempt = self.current_act_attempt,
             }) catch {};
         }
     }
@@ -460,6 +474,7 @@ const ActAttemptResult = enum {
     retry_act,
     next_act,
     exit_loop,
+    exit_stalled,
     stop_turn,
 };
 
@@ -473,6 +488,7 @@ fn executeSingleActAttempt(
     max_retries: usize,
     rate_limit_retries: *usize,
 ) !ActAttemptResult {
+    self.current_act_attempt = try_count.* + 1;
     if (self.journal) |*j| j.recordEvent(self.io, act_id, .act_started, "Act started") catch {};
 
     const history_len = self.history.messages().len;
@@ -499,8 +515,17 @@ fn executeSingleActAttempt(
         r.resetErrorSignature();
     }
 
-    try flushActProgress(self, act_id);
+    if (result == .retry_act) {
+        return .retry_act;
+    }
 
+    try flushActProgress(self, act_id);
+    if (result == .exit_stalled) {
+        if (self.journal) |*j| j.recordEvent(self.io, act_id, .task_stalled, "Turn stalled") catch {};
+        self.coordinator.finishAct(act_id, false);
+        self.coordinator.notifyTurnComplete();
+        return .exit_stalled;
+    }
     if (result == .exit_loop) {
         if (self.journal) |*j| j.recordEvent(self.io, act_id, .task_completed, "Task completed") catch {};
         self.coordinator.finishAct(act_id, !self.last_act_failed);
@@ -535,7 +560,7 @@ fn runActRetryLoop(
         switch (attempt) {
             .retry_act => continue,
             .next_act => return false,
-            .exit_loop, .stop_turn => return true,
+            .exit_loop, .exit_stalled, .stop_turn => return true,
         }
     } else {
         main.stderrPrint("\n\x1b[31m[agent] ⛔ Act {d} failed after {d} unrecoverable attempts. Terminating task.\x1b[0m\n", .{ act_id, max_retries + 1 });

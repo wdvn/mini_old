@@ -25,7 +25,9 @@ const agent_loop_monitor = @import("agent_loop_monitor.zig");
 
 pub const StepResult = enum {
     continue_loop,
+    retry_act,
     exit_loop,
+    exit_stalled,
 };
 
 /// Manages ephemeral allocations and content blocks for Procedural Graph and Plan progress guidance.
@@ -206,7 +208,8 @@ fn handleCodeActLoopTrip(loop: *AgentLoop, act_id: usize) !StepResult {
         const trip_msg = "[CodeAct System Intervention]: Action loop persisted after multiple replanning attempts. Halting execution. Synthesize your findings and answer the user now.";
         try loop.history.addUser(trip_msg);
         loop.action_loop_tripped = true;
-        return .exit_loop;
+        loop.last_turn_outcome = .stalled;
+        return .exit_stalled;
     }
 }
 
@@ -401,19 +404,50 @@ pub fn executeCodeActBlock(
     }
 }
 
-fn handleEmptyResponseAdvisory(loop: *AgentLoop) !void {
-    main.stderrPrint(
-        "\n\x1b[33m[agent] ⚠️ Empty response detected (whitespace only), requesting continuation...\x1b[0m\n",
-        .{},
-    );
-    if (main.ui_repl.current_renderer) |r| {
-        r.ensureNewline();
-        r.write(" \x1b[33m[Agent Advisory]: Your previous response contained no actionable content. Please proceed with tool execution or provide a substantive answer.\x1b[0m\n");
+fn responseRecoveryClass(validity: proto.ResponseValidity, stop_reason: proto.StopReason) ?proto.RecoveryClass {
+    // PSEUDOCODE:
+    // 1. Map no-action response shapes to the RFC-023 recovery class.
+    // 2. Preserve stop-reason information when it changes the recovery class.
+    return switch (validity) {
+        .thinking_only => .thinking_only,
+        .whitespace_only, .empty => .empty_response,
+        .partial_text => if (stop_reason == .missing_terminal_event) .missing_terminal else .stream_aborted,
+        else => null,
+    };
+}
+
+fn handleResponseRecovery(
+    loop: *AgentLoop,
+    act_id: usize,
+    input_msgs_count: usize,
+    tool_defs: []const proto.ToolDefinition,
+    response: *const proto.Response,
+    validity: proto.ResponseValidity,
+) !StepResult {
+    const class = responseRecoveryClass(validity, response.stop_reason) orelse return .continue_loop;
+    // PSEUDOCODE:
+    // 1. Log the unusable response before removing it from model-visible history.
+    // 2. Rollback only the current Act's assistant message.
+    // 3. Retry the same Act while the failure-class budget remains.
+    // 4. End the turn as stalled when the bounded recovery class is exhausted.
+    loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{
+        .exec_type = "response_recovery",
+        .is_error = true,
+        .error_message = @tagName(validity),
+    });
+    loop.history.truncate(input_msgs_count);
+    loop.last_turn_outcome = .stalled;
+
+    const decision = loop.response_recovery_budget.consume(class);
+    if (decision == .stalled) {
+        loop.last_agent_decision = .fail_stalled;
+        return .exit_stalled;
     }
-    try loop.history.addUser(
-        prompts_mod.empty_response_advisory,
-    );
-    loop.response_content_empty = false;
+
+    loop.turn_recovery_attempts += 1;
+    loop.last_agent_decision = .retry_transient;
+    try loop.history.addUser(prompts_mod.empty_response_advisory);
+    return .retry_act;
 }
 
 fn handleEndTurnStop(
@@ -422,18 +456,15 @@ fn handleEndTurnStop(
     input_msgs_count: usize,
     tool_defs: []const proto.ToolDefinition,
     response: *const proto.Response,
-    has_tool_use_blocks: bool,
 ) !StepResult {
+    // PSEUDOCODE:
+    // 1. The response has already passed action/payload validation.
+    // 2. Ask the plan watchdog for policy continuation.
+    // 3. Only a valid final-text candidate can complete the turn.
     loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{ .exec_type = "none" });
-
-    if (loop.response_content_empty and !has_tool_use_blocks) {
-        try handleEmptyResponseAdvisory(loop);
-        return .continue_loop;
-    }
-    loop.response_content_empty = false;
-
     switch (loop.plan.handleEndTurnWatchdog(loop.current_user_request, loop.hasRecentVerifiedMutation())) {
         .continue_loop => {
+            loop.last_agent_decision = .request_continuation;
             if (main.ui_repl.current_renderer) |r| {
                 r.ensureNewline();
                 r.write(" \x1b[33m[Plan Watchdog: Plan declared without execution. Enforcing Step 1 execution]\x1b[0m\n");
@@ -445,18 +476,14 @@ fn handleEndTurnStop(
             return .continue_loop;
         },
         .exit_loop => {
-            if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
-                main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
-            }
-            if (loop.journal) |*j| {
-                j.recordEvent(loop.io, act_id, .task_completed, "Model responded with text after plan watchdog retries") catch {};
-            }
-            loop.action_loop_tripped = false;
-            loop.consecutive_dup_tool_count = 0;
-            return .exit_loop;
+            loop.last_agent_decision = .fail_stalled;
+            loop.last_turn_outcome = .stalled;
+            return .exit_stalled;
         },
         .no_action => {},
     }
+    loop.last_agent_decision = .deliver_final_answer;
+    loop.last_turn_outcome = .completed;
     if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
         main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
     }
@@ -474,7 +501,8 @@ fn handleMaxTokensStop(
     loop.max_tokens_continues += 1;
     if (loop.max_tokens_continues > 5) {
         main.stderrPrint("\n\x1b[31m[agent] ⛔ Continued max_tokens {d} consecutive times without completion. Stopping to prevent infinite loop.\x1b[0m\n", .{loop.max_tokens_continues});
-        return .exit_loop;
+        loop.last_turn_outcome = .stalled;
+        return .exit_stalled;
     }
     main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response truncated (max_tokens), requesting continuation ({d}/5)...\x1b[0m\n", .{loop.max_tokens_continues});
     try loop.closeOrphanedToolUses(response);
@@ -505,12 +533,14 @@ fn handleToolUseStop(
         });
         main.stderrPrint("\n", .{});
         if (loop.action_loop_tripped) {
-            return .exit_loop;
+            loop.last_turn_outcome = .stalled;
+            return .exit_stalled;
         }
         return .continue_loop;
     }
     loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{ .exec_type = "none" });
-    return .exit_loop;
+    loop.last_turn_outcome = .stalled;
+    return .exit_stalled;
 }
 
 fn handleStreamAbortedStop(
@@ -654,11 +684,21 @@ pub fn dispatchStopReason(
     has_tool_use_blocks: bool,
 ) !StepResult {
     switch (response.stop_reason) {
-        .end_turn, .stop_sequence => return handleEndTurnStop(loop, act_id, input_msgs_count, tool_defs, response, has_tool_use_blocks),
+        .end_turn => {
+            if (loop.last_response_validity == .thinking_only or
+                loop.last_response_validity == .whitespace_only or
+                loop.last_response_validity == .empty)
+            {
+                return handleResponseRecovery(loop, act_id, input_msgs_count, tool_defs, response, loop.last_response_validity);
+            }
+            return handleEndTurnStop(loop, act_id, input_msgs_count, tool_defs, response);
+        },
+        .missing_terminal_event => return handleResponseRecovery(loop, act_id, input_msgs_count, tool_defs, response, loop.last_response_validity),
+        .stop_sequence => return handleResponseRecovery(loop, act_id, input_msgs_count, tool_defs, response, .partial_text),
         .max_tokens => return handleMaxTokensStop(loop, act_id, input_msgs_count, tool_defs, response),
         .tool_use => return handleToolUseStop(loop, act_id, input_msgs_count, tool_defs, response, has_tool_use_blocks),
         .stream_aborted => return handleStreamAbortedStop(loop, act_id, input_msgs_count, tool_defs, response),
-        .unknown => return handleUnknownStopReason(loop, act_id, input_msgs_count, tool_defs, response),
+        .content_filter, .provider_error, .unknown => return handleUnknownStopReason(loop, act_id, input_msgs_count, tool_defs, response),
     }
 }
 
@@ -714,7 +754,8 @@ fn executeNativeToolCalling(
     });
     main.stderrPrint("\n", .{});
     if (self.action_loop_tripped) {
-        return .exit_loop;
+        self.last_turn_outcome = .stalled;
+        return .exit_stalled;
     }
     return .continue_loop;
 }
@@ -781,16 +822,29 @@ pub fn executeStep(
         try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
     }
 
+    const validity = proto.classifyResponse(&response, false);
+    self.last_generation_stop = response.stop_reason;
+    self.last_response_validity = validity;
+    self.last_agent_decision = proto.decideAgentAction(response.stop_reason, validity, false);
     const was_added = try self.history.addAssistantResponse(&response);
     const has_tool_use_blocks = scanResponseContent(self, &response, was_added);
 
     if (has_tool_use_blocks) {
+        self.response_recovery_budget = .{};
         return executeNativeToolCalling(self, act_id, input_msgs_count, tool_defs, &response);
     }
 
     if (try tryExecuteCodeAct(self, act_id, input_msgs_count, tool_defs, &response)) |res| {
+        self.response_recovery_budget = .{};
         return res;
     }
 
+    if (validity == .final_text or validity == .partial_text or validity == .thinking_only or
+        validity == .whitespace_only or validity == .empty)
+    {
+        if (self.last_agent_decision == .retry_transient or validity == .partial_text) {
+            return handleResponseRecovery(self, act_id, input_msgs_count, tool_defs, &response, validity);
+        }
+    }
     return dispatchStopReason(self, act_id, input_msgs_count, tool_defs, &response, has_tool_use_blocks);
 }

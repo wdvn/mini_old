@@ -223,6 +223,16 @@ pub const AgentLoop = struct {
     /// Track whether the most recent LLM response had no meaningful content (empty/whitespace only).
     /// Used to prevent premature exit_loop when model returns nothing but also didn't fail.
     response_content_empty: bool = false,
+    /// RFC-023 response state for the current turn.
+    last_generation_stop: proto.StopReason = .unknown,
+    last_response_validity: proto.ResponseValidity = .empty,
+    last_agent_decision: proto.AgentDecision = .request_continuation,
+    response_recovery_budget: proto.ResponseRecoveryBudget = .{},
+    turn_recovery_attempts: usize = 0,
+    last_agent_message: ?[]const u8 = null,
+    last_turn_outcome: proto.TurnOutcome = .completed,
+    current_act_attempt: usize = 1,
+    last_recovery_class: ?proto.RecoveryClass = null,
 
     current_user_request: ?[]const u8 = null,
 
@@ -462,6 +472,15 @@ pub const AgentLoop = struct {
             .coordinator = coordinator,
             .watchdog = watchdog,
             .response_content_empty = false,
+            .last_generation_stop = .unknown,
+            .last_response_validity = .empty,
+            .last_agent_decision = .request_continuation,
+            .response_recovery_budget = .{},
+            .turn_recovery_attempts = 0,
+            .last_agent_message = null,
+            .last_turn_outcome = .completed,
+            .current_act_attempt = 1,
+            .last_recovery_class = null,
             .plan = plan_integration.PlanState.init(alloc, io, config, cas_ptr),
         };
     }
@@ -654,6 +673,11 @@ pub const AgentLoop = struct {
             .llm_response = .{
                 .http_code = response.http_code,
                 .stop_reason = @tagName(response.stop_reason),
+                .generation_stop = @tagName(self.last_generation_stop),
+                .response_validity = @tagName(self.last_response_validity),
+                .agent_decision = @tagName(self.last_agent_decision),
+                .recovery_class = if (self.last_recovery_class) |class| @tagName(class) else null,
+                .attempt = self.current_act_attempt,
                 .text = summary.text,
                 .thinking = summary.thinking,
                 .js_code = js_code_opt,

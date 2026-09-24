@@ -808,6 +808,7 @@ const StreamCtx = struct {
     event_type: [64]u8 = undefined,
     event_type_len: usize = 0,
     finish_reason_received: bool = false,
+    terminal_event_received: bool = false,
 
     pub fn emitNormalized(self: *StreamCtx, text: []const u8, thinking: bool) !void {
         if (text.len == 0) return;
@@ -880,8 +881,9 @@ const StreamCtx = struct {
         }
     }
 
-    fn handleDoneEvent(self: *StreamCtx, data: []const u8) !void {
-        // PSEUDOCODE: Finalize stream on [DONE] or response.done: usage, filters, thinking, text, stop_reason.
+    fn handleDoneEvent(self: *StreamCtx, data: []const u8, explicit_completion: bool) !void {
+        // PSEUDOCODE: Finalize transport data while preserving whether an explicit
+        // provider terminal event actually proved natural completion.
         self.parseResponsesUsage(data);
         try self.filter.finish(self);
         if (self.think_accum_init and self.think_accum.items.len > 0) {
@@ -894,8 +896,9 @@ const StreamCtx = struct {
             try self.response.content.append(self.alloc, .{ .text = text });
             self.text_accum.clearRetainingCapacity();
         }
-        if (self.response.stop_reason == .unknown and !self.finish_reason_received) {
-            self.response.stop_reason = .end_turn;
+        if (explicit_completion) self.terminal_event_received = true;
+        if (self.response.stop_reason == .unknown) {
+            self.response.stop_reason = if (self.terminal_event_received) .end_turn else .missing_terminal_event;
         }
     }
 
@@ -1014,8 +1017,9 @@ const StreamCtx = struct {
     }
 
     fn applyFinishReason(self: *StreamCtx, reason: []const u8) void {
-        // PSEUDOCODE: Map OpenAI finish_reason to proto.StopReason.
+        // PSEUDOCODE: Map an explicit provider finish reason and mark terminal receipt.
         self.finish_reason_received = true;
+        self.terminal_event_received = true;
         if (std.mem.eql(u8, reason, "tool_calls") or std.mem.eql(u8, reason, "function")) {
             self.response.stop_reason = .tool_use;
         } else if (std.mem.eql(u8, reason, "stop")) {
@@ -1023,7 +1027,7 @@ const StreamCtx = struct {
         } else if (std.mem.eql(u8, reason, "length")) {
             self.response.stop_reason = .max_tokens;
         } else if (std.mem.eql(u8, reason, "content_filter")) {
-            self.response.stop_reason = .unknown;
+            self.response.stop_reason = .content_filter;
         }
     }
 
@@ -1117,7 +1121,8 @@ const StreamCtx = struct {
         }
 
         if (std.mem.eql(u8, data, "[DONE]") or std.mem.eql(u8, ev, "response.done") or std.mem.eql(u8, ev, "response.completed")) {
-            return self.handleDoneEvent(data);
+            const explicit_completion = std.mem.eql(u8, ev, "response.done") or std.mem.eql(u8, ev, "response.completed");
+            return self.handleDoneEvent(data, explicit_completion);
         }
 
         const custom_text = if (self.adapter) |a| a.extractContent(self.alloc, data) else null;
@@ -1225,7 +1230,10 @@ const StreamCtx = struct {
 
     fn finalizeToolCalls(self: *StreamCtx) !void {
         try self.filter.finish(self);
-        // Fallback: if server closed stream without [DONE] or response.completed
+        // PSEUDOCODE:
+        // 1. Preserve partial text/reasoning regardless of transport completion.
+        // 2. Mark EOF without an explicit terminal event as missing_terminal_event.
+        // 3. Do not materialize incomplete tool calls without a terminal event.
         if (self.think_accum_init and self.think_accum.items.len > 0) {
             const think_text = try self.alloc.dupe(u8, self.think_accum.items);
             try self.response.content.append(self.alloc, .{ .thinking = .{ .thinking = think_text, .signature = "" } });
@@ -1236,32 +1244,36 @@ const StreamCtx = struct {
             try self.response.content.append(self.alloc, .{ .text = text });
             self.text_accum.clearRetainingCapacity();
         }
-        if (self.response.content.items.len > 0 and self.response.stop_reason == .unknown and !self.finish_reason_received) {
-            self.response.stop_reason = .end_turn;
+        if (self.response.stop_reason == .unknown) {
+            self.response.stop_reason = if (self.terminal_event_received) .end_turn else .missing_terminal_event;
         }
 
-        for (self.tool_calls.items, 0..) |*tc, ti| {
-            defer tc.deinit(self.alloc);
-            if (tc.name.items.len == 0) continue;
-            const clean_name = sanitizeToolName(tc.name.items) orelse continue;
-            // Provider did not send id (some compat/proxies) → generate fallback id
-            // so tool_result always matches tool_call_id (avoiding 400 from API).
-            const id = if (tc.id.items.len > 0)
-                try self.alloc.dupe(u8, tc.id.items)
-            else
-                try std.fmt.allocPrint(self.alloc, "call_{d}", .{ti});
-            const name = try self.alloc.dupe(u8, clean_name);
-            const args = if (tc.args.items.len > 0)
-                try self.alloc.dupe(u8, tc.args.items)
-            else
-                try self.alloc.dupe(u8, "{}");
-            try self.response.content.append(self.alloc, .{ .tool_use = .{
-                .id = id,
-                .name = name,
-                .input_json = args,
-            } });
+        if (self.terminal_event_received) {
+            for (self.tool_calls.items, 0..) |*tc, ti| {
+                defer tc.deinit(self.alloc);
+                if (tc.name.items.len == 0) continue;
+                const clean_name = sanitizeToolName(tc.name.items) orelse continue;
+                // Provider did not send id (some compat/proxies) → generate fallback id
+                // so tool_result always matches tool_call_id (avoiding 400 from API).
+                const id = if (tc.id.items.len > 0)
+                    try self.alloc.dupe(u8, tc.id.items)
+                else
+                    try std.fmt.allocPrint(self.alloc, "call_{d}", .{ti});
+                const name = try self.alloc.dupe(u8, clean_name);
+                const args = if (tc.args.items.len > 0)
+                    try self.alloc.dupe(u8, tc.args.items)
+                else
+                    try self.alloc.dupe(u8, "{}");
+                try self.response.content.append(self.alloc, .{ .tool_use = .{
+                    .id = id,
+                    .name = name,
+                    .input_json = args,
+                } });
+            }
+        } else {
+            for (self.tool_calls.items) |*tc| tc.deinit(self.alloc);
         }
-        if (self.tool_calls.items.len > 0 and self.response.stop_reason != .tool_use) {
+        if (self.tool_calls.items.len > 0 and self.terminal_event_received and self.response.stop_reason != .tool_use) {
             self.response.stop_reason = .tool_use;
         }
         if (self.think_accum_init) self.think_accum.deinit(self.alloc);
@@ -1373,6 +1385,8 @@ test "openai stream: tool call khong co id — sinh id du phong" {
         ,
         \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"tern\":\"*.zig\"}"}}]}}]}
         ,
+        \\data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+        ,
         \\data: [DONE]
     });
 
@@ -1452,6 +1466,27 @@ test "openai stream: parse usage chunk (RFC-006 §3.1)" {
     try testing.expectEqual(@as(u64, 10), ctx.response.usage.reasoning_tokens);
 }
 
+test "RFC-023: EOF with partial thinking is not natural end_turn" {
+    const alloc = testing.allocator;
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = proto.Response.init(alloc),
+        .line_buf = .empty,
+        .tool_calls = .empty,
+    };
+    defer ctx.response.deinit();
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.tool_calls.deinit(alloc);
+
+    try feedLines(&ctx, &.{
+        \\data: {"choices":[{"delta":{"reasoning_content":"partial reasoning"},"finish_reason":null}]}
+    });
+    try ctx.finalizeToolCalls();
+
+    try testing.expectEqual(proto.StopReason.missing_terminal_event, ctx.response.stop_reason);
+    try testing.expectEqual(@as(usize, 1), ctx.response.content.items.len);
+}
+
 test "openai stream: DeepSeek usage alias prompt_cache_hit_tokens (RFC-006 §3.1)" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
@@ -1514,7 +1549,7 @@ test "openai stream: delta.reasoning parsed as thinking (RFC-006 §3.3)" {
     try testing.expectEqualStrings("The answer is 42", text_block);
 }
 
-test "openai stream: finish_reason content_filter maps to unknown (RFC-006 §3.4)" {
+test "openai stream: finish_reason content_filter maps to content_filter (RFC-023)" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
         .alloc = alloc,
@@ -1534,7 +1569,7 @@ test "openai stream: finish_reason content_filter maps to unknown (RFC-006 §3.4
 
     try ctx.finalizeToolCalls();
     // content_filter → .unknown, NOT .end_turn
-    try testing.expectEqual(proto.StopReason.unknown, ctx.response.stop_reason);
+    try testing.expectEqual(proto.StopReason.content_filter, ctx.response.stop_reason);
 }
 
 test "openai stream: finish_reason function maps to tool_use (RFC-006 §3.4)" {

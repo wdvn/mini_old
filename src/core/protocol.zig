@@ -137,6 +137,12 @@ pub const StopReason = enum {
     /// Stream aborted by idle stall watchdog (RFC-009 Phase 5) — partial
     /// content may have been preserved; agent decides how to recover.
     stream_aborted,
+    /// Provider stream ended without an explicit terminal event.
+    missing_terminal_event,
+    /// Provider explicitly filtered or rejected the response.
+    content_filter,
+    /// Provider failed before producing a usable response.
+    provider_error,
     /// Unknown stop reason.
     unknown,
 };
@@ -196,6 +202,149 @@ pub const Response = struct {
     }
 };
 
+/// RFC-023: Validated shape of a backend response payload.
+pub const ResponseValidity = enum {
+    final_text,
+    native_tool_calls,
+    codeact,
+    thinking_only,
+    whitespace_only,
+    partial_text,
+    malformed_tool_call,
+    empty,
+};
+
+/// RFC-023: Terminal outcome of a complete user turn.
+pub const TurnOutcome = enum {
+    completed,
+    stalled,
+    failed,
+    blocked,
+    cancelled,
+};
+
+/// RFC-023: Public result returned after a normal terminal turn path.
+pub const TurnResult = struct {
+    outcome: TurnOutcome,
+    generation_stop: StopReason,
+    response_validity: ResponseValidity,
+    last_agent_message: ?[]const u8,
+    act_count: usize,
+    recovery_attempts: usize,
+};
+
+/// RFC-023: Agent-level action selected after response classification.
+pub const AgentDecision = enum {
+    execute_native_tools,
+    execute_codeact,
+    deliver_final_answer,
+    request_continuation,
+    retry_transient,
+    fail_stalled,
+    fail_protocol,
+    cancel,
+};
+
+pub const RecoveryClass = enum {
+    thinking_only,
+    empty_response,
+    missing_terminal,
+    stream_aborted,
+};
+
+pub const RecoveryDecision = enum {
+    retry,
+    stalled,
+};
+
+/// Bounded recovery for unusable responses in the current Act.
+/// This is not a task-duration or total-Act limit.
+pub const ResponseRecoveryBudget = struct {
+    thinking_only_retries: u8 = 2,
+    empty_response_retries: u8 = 2,
+    missing_terminal_retries: u8 = 1,
+    stream_aborted_retries: u8 = 2,
+
+    pub fn consume(self: *ResponseRecoveryBudget, class: RecoveryClass) RecoveryDecision {
+        // PSEUDOCODE:
+        // 1. Select the budget for this response failure class.
+        // 2. Consume one retry while capacity remains.
+        // 3. Return stalled once the bounded class is exhausted.
+        const counter = switch (class) {
+            .thinking_only => &self.thinking_only_retries,
+            .empty_response => &self.empty_response_retries,
+            .missing_terminal => &self.missing_terminal_retries,
+            .stream_aborted => &self.stream_aborted_retries,
+        };
+        if (counter.* == 0) return .stalled;
+        counter.* -= 1;
+        return .retry;
+    }
+};
+
+/// Classifies normalized content before stop-reason dispatch.
+pub fn classifyResponse(response: *const Response, has_codeact: bool) ResponseValidity {
+    // PSEUDOCODE:
+    // 1. Native tool calls and CodeAct are actions and take precedence over text.
+    // 2. Partial transport text is never treated as a final answer.
+    // 3. Thinking-only, whitespace-only, and empty payloads remain distinct.
+    var has_tool = false;
+    var has_meaningful_text = false;
+    var has_text = false;
+    var has_thinking = false;
+    for (response.content.items) |block| switch (block) {
+        .tool_use => |tool| {
+            if (tool.name.len == 0) return .malformed_tool_call;
+            has_tool = true;
+        },
+        .text => |text| {
+            has_text = true;
+            if (std.mem.trim(u8, text, " \r\n\t").len > 0) has_meaningful_text = true;
+        },
+        .thinking => has_thinking = true,
+        else => {},
+    };
+    if (has_tool) return .native_tool_calls;
+    if (has_codeact) return .codeact;
+    if (has_meaningful_text) {
+        if (response.stop_reason == .stream_aborted or
+            response.stop_reason == .missing_terminal_event or
+            response.stop_reason == .max_tokens or
+            response.stop_reason == .stop_sequence)
+        {
+            return .partial_text;
+        }
+        return .final_text;
+    }
+    if (has_thinking) return .thinking_only;
+    if (has_text) return .whitespace_only;
+    return .empty;
+}
+
+/// Maps validated provider state to an agent-level action.
+pub fn decideAgentAction(
+    stop_reason: StopReason,
+    validity: ResponseValidity,
+    has_codeact: bool,
+) AgentDecision {
+    // PSEUDOCODE:
+    // 1. Executable actions take precedence over provider termination.
+    // 2. Only natural end with meaningful text can deliver a final answer.
+    // 3. Partial/no-action responses use bounded recovery or protocol failure.
+    _ = has_codeact;
+    return switch (validity) {
+        .native_tool_calls => .execute_native_tools,
+        .codeact => .execute_codeact,
+        .malformed_tool_call => .fail_protocol,
+        .final_text => if (stop_reason == .end_turn) .deliver_final_answer else .request_continuation,
+        .partial_text => if (stop_reason == .stream_aborted or
+            stop_reason == .missing_terminal_event or
+            stop_reason == .max_tokens) .request_continuation else .fail_protocol,
+        .thinking_only => if (stop_reason == .end_turn) .retry_transient else .request_continuation,
+        .whitespace_only, .empty => if (stop_reason == .end_turn) .retry_transient else .fail_protocol,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Tool types
 // ---------------------------------------------------------------------------
@@ -219,3 +368,40 @@ pub const ToolResult = struct {
     /// True if tool reported an error.
     is_error: bool,
 };
+
+// RFC-023 RED tests: response classification and bounded recovery.
+
+test "RFC-023: thinking-only natural end retries then stalls" {
+    const alloc = std.testing.allocator;
+    var response = Response.init(alloc);
+    defer response.deinit();
+    response.stop_reason = .end_turn;
+    try response.content.append(alloc, .{ .thinking = .{
+        .thinking = try alloc.dupe(u8, "partial reasoning"),
+        .signature = try alloc.dupe(u8, ""),
+    } });
+
+    try std.testing.expectEqual(ResponseValidity.thinking_only, classifyResponse(&response, false));
+    try std.testing.expectEqual(AgentDecision.retry_transient, decideAgentAction(.end_turn, .thinking_only, false));
+
+    var budget = ResponseRecoveryBudget{};
+    try std.testing.expectEqual(RecoveryDecision.retry, budget.consume(.thinking_only));
+    try std.testing.expectEqual(RecoveryDecision.retry, budget.consume(.thinking_only));
+    try std.testing.expectEqual(RecoveryDecision.stalled, budget.consume(.thinking_only));
+}
+
+test "RFC-023: native tool takes precedence over final text" {
+    const alloc = std.testing.allocator;
+    var response = Response.init(alloc);
+    defer response.deinit();
+    response.stop_reason = .end_turn;
+    try response.content.append(alloc, .{ .text = try alloc.dupe(u8, "working") });
+    try response.content.append(alloc, .{ .tool_use = .{
+        .id = try alloc.dupe(u8, "call_1"),
+        .name = try alloc.dupe(u8, "bash"),
+        .input_json = try alloc.dupe(u8, "{}"),
+    } });
+
+    try std.testing.expectEqual(ResponseValidity.native_tool_calls, classifyResponse(&response, true));
+    try std.testing.expectEqual(AgentDecision.execute_native_tools, decideAgentAction(.end_turn, .native_tool_calls, true));
+}
