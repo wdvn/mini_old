@@ -47,6 +47,20 @@ fn resolveInputPrompt(
     };
 }
 
+fn turnStatusLabel(
+    buf: []u8,
+    outcome: proto.TurnOutcome,
+    failure_reason: ?proto.FailureReason,
+) ![]const u8 {
+    // PSEUDOCODE:
+    // 1. Render the terminal outcome using the caller's fixed-size buffer.
+    // 2. Append the typed failure cause when the terminal result provides one.
+    if (failure_reason) |reason| {
+        return std.fmt.bufPrint(buf, "{s}: {s}", .{ @tagName(outcome), @tagName(reason) });
+    }
+    return std.fmt.bufPrint(buf, "{s}", .{@tagName(outcome)});
+}
+
 fn runAgentTurn(
     alloc: Allocator,
     io: std.Io,
@@ -90,7 +104,9 @@ fn runAgentTurn(
     };
     defer turn_result.deinit(agent.alloc);
     if (turn_result.outcome != .completed) {
-        main.stdoutPrint("\x1b[33m[turn {s}]\x1b[0m\n", .{@tagName(turn_result.outcome)});
+        var status_buf: [64]u8 = undefined;
+        const status = turnStatusLabel(&status_buf, turn_result.outcome, turn_result.failure_reason) catch "failed";
+        main.stdoutPrint("\x1b[33m[turn {s}]\x1b[0m\n", .{status});
     }
     if (signals.checkAndResetInterrupted()) return;
 
@@ -691,6 +707,15 @@ test "expandCommandTemplate positional and arguments substitution" {
     defer alloc.free(expanded);
 
     try std.testing.expectEqualStrings("Commit: fix-bug main.zig (task=fix-bug, file=main.zig)", expanded);
+}
+
+test "turn status label includes the terminal failure reason" {
+    var reason_buf: [64]u8 = undefined;
+    const failed = try turnStatusLabel(&reason_buf, .failed, .provider_unavailable);
+    try std.testing.expectEqualStrings("failed: provider_unavailable", failed);
+
+    const stalled = try turnStatusLabel(&reason_buf, .stalled, null);
+    try std.testing.expectEqualStrings("stalled", stalled);
 }
 
 // ---------------------------------------------------------------------------

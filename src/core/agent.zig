@@ -42,6 +42,7 @@ const main = @import("../main.zig");
 const utils = @import("utils.zig");
 const quickjs = @import("../runtime/quickjs_engine.zig");
 const js_bindings = @import("../runtime/js_bindings.zig");
+const process_manager = @import("../runtime/process_manager.zig");
 const tokens_mod = @import("memact/tokens.zig");
 const graph_store_mod = @import("memact/graph_store.zig");
 const store_mod = @import("memact/store.zig");
@@ -113,6 +114,9 @@ fn watchdogInterruptHandler() void {
 }
 
 fn watchdogForceKillHandler() void {
+    // PSEUDOCODE:
+    // 1. Interrupt the active CodeAct engine.
+    // 2. Force-kill bash, MCP, and every managed background process group.
     while (!g_agent_mutex.tryLock()) {}
     const agent = g_active_agent;
     g_agent_mutex.unlock();
@@ -121,6 +125,7 @@ fn watchdogForceKillHandler() void {
     }
     tools_mod.forceKillActiveBash();
     tools_mod.forceKillActiveMcp();
+    _ = process_manager.forceKillAllJobs("SIGKILL");
 }
 
 fn watchdogDecisionHandler(ctx: watchdog_mod.DecisionContext) watchdog_mod.TimeoutDecision {
@@ -1725,6 +1730,29 @@ test "agent - extractJsCodeBlock" {
     defer alloc.free(extracted.?);
 
     try std.testing.expectEqualStrings("const a = 10;\nconst b = 20;\nconsole.log(a + b);", extracted.?);
+}
+
+test "watchdog force kill terminates managed background jobs" {
+    if (comptime @import("builtin").os.tag == .windows) return;
+
+    defer signals.setInterrupted(false);
+    const io = std.testing.io;
+    const manager = process_manager.getProcessManager(std.testing.allocator);
+    const info = try manager.spawnBackground(io, "sleep 30");
+    defer _ = process_manager.forceKillAllJobs("SIGKILL");
+    defer process_manager.deinitGlobal();
+
+    watchdogForceKillHandler();
+
+    var running = true;
+    for (0..100) |_| {
+        const status = manager.getJobStatus(info.job_id) orelse return error.TestUnexpectedResult;
+        running = status.running;
+        if (!running) break;
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+
+    try std.testing.expect(!running);
 }
 
 test "agent - convertXmlToolTagsToJs" {
