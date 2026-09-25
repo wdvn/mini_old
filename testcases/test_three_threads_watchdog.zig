@@ -66,6 +66,7 @@ test "ActCoordinator & Watchdog: 3-act trajectory recap for loops and hallucinat
         .tracking_interval_s = 10,
         .act_timeout_secs = 120,
         .verbose_stderr = false,
+        .prompt_enforcement_enabled = true,
     });
     defer watchdog.deinit();
 

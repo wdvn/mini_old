@@ -420,6 +420,7 @@ pub const AgentLoop = struct {
             .recap_interval_acts = config.watchdog_recap_interval,
             .poll_interval_ms = config.watchdog_interval_ms,
             .verbose_stderr = config.action_loop_display,
+            .prompt_enforcement_enabled = config.prompt_enforcement_enabled,
         });
         watchdog.interrupt_fn = &watchdogInterruptHandler;
         watchdog.force_kill_fn = &watchdogForceKillHandler;
@@ -1445,7 +1446,7 @@ pub const AgentLoop = struct {
         var plan = &self.plan.current_plan.?;
         var drift_advisory: ?[]u8 = null;
 
-        if (self.config.plan_drift_detection) {
+        if (self.config.prompt_enforcement_enabled and self.config.plan_drift_detection) {
             if (plan_monitor.checkPlanDrift(plan, &self.plan.plan_ctx, tu.name)) |d| {
                 self.plan.plan_drift_score += d.drift_score;
                 if (self.plan.plan_drift_score > 0.8) {
@@ -1600,7 +1601,10 @@ pub const AgentLoop = struct {
         any_tool_err: *bool,
     ) !struct { dur_ms: u64, should_break: bool } {
         // PSEUDOCODE: Check loop -> handle trip or execute single tool with warning suffix
-        const loop_check = self.checkActionLoop(tu.name, tu.input_json) catch .allow;
+        const loop_check = if (self.config.prompt_enforcement_enabled)
+            self.checkActionLoop(tu.name, tu.input_json) catch .allow
+        else
+            @as(@TypeOf(self.checkActionLoop(tu.name, tu.input_json) catch .allow), .allow);
         if (loop_check == .trip) {
             const trip_reason_str = switch (self.last_loop_reason) {
                 .macro_cycle_2 => "alternating tool loop (A ↔ B) repeated",

@@ -23,6 +23,7 @@
 //!   `MINI_MAX_TOKENS`               Response token limit (default: 24000)
 //!   `MINI_MAX_TOKENS_CONTINUE_CAP`  Max consecutive continuation acts when truncated by max_tokens (default: 3)
 //!   `MINI_SYSTEM_FILE`              Path to system prompt file (.md)
+//!   `MINI_PROMPT_ENFORCEMENT_ENABLED` "1" to inject plan/checkpoint enforcement prompts (default: disabled)
 //!   `MINI_NO_HISTORY`               "1" to disable in-memory history saving
 //!   `MINI_DYNAMIC_THINKING`         "0" to disable dynamic thinking governor (default: 1/enabled)
 //!   `MINI_REASONING_EFFORT`         Reasoning effort ("minimal"|"low"|"medium"|"high"|"none")
@@ -248,6 +249,8 @@ pub const Config = struct {
     plans_dir: ?[]const u8 = null,
     /// Use enhanced progress checkpoint format. Default: true.
     enhanced_progress_checkpoint: bool = true,
+    /// Inject plan, progress, action-loop, and trajectory enforcement prompts. Default: false.
+    prompt_enforcement_enabled: bool = false,
 
     // 3-Thread Watchdog & Act Coordinator (RFC-015)
     act_timeout_secs: u32 = 120,
@@ -493,6 +496,7 @@ pub const Config = struct {
         plan_max_steps: usize,
         plans_dir: ?[]const u8,
         enhanced_progress_checkpoint: bool,
+        prompt_enforcement_enabled: bool,
         act_timeout_secs: u32,
         watchdog_tracking_s: u32,
         watchdog_recap_interval: usize,
@@ -511,6 +515,7 @@ pub const Config = struct {
             .plan_max_steps = if (env_map.get("MINI_PLAN_MAX_STEPS")) |s| std.fmt.parseInt(usize, s, 10) catch 20 else 20,
             .plans_dir = env_map.get("MINI_PLANS_DIR"),
             .enhanced_progress_checkpoint = if (env_map.get("MINI_ENHANCED_PROGRESS_CHECKPOINT")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else true,
+            .prompt_enforcement_enabled = if (env_map.get("MINI_PROMPT_ENFORCEMENT_ENABLED")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false,
             .act_timeout_secs = act_to,
             .watchdog_tracking_s = if (env_map.get("MINI_WATCHDOG_TRACKING_S")) |s| std.fmt.parseInt(u32, s, 10) catch 10 else 10,
             .watchdog_recap_interval = if (env_map.get("MINI_WATCHDOG_RECAP_INTERVAL")) |s| std.fmt.parseInt(usize, s, 10) catch 10 else 10,
@@ -642,6 +647,7 @@ pub const Config = struct {
         cfg.plan_max_steps = p.plan_max_steps;
         cfg.plans_dir = p.plans_dir;
         cfg.enhanced_progress_checkpoint = p.enhanced_progress_checkpoint;
+        cfg.prompt_enforcement_enabled = p.prompt_enforcement_enabled;
     }
 
     /// Load configuration from environment variables (after calling loadDotEnv).
@@ -1102,6 +1108,7 @@ pub const JsonConfig = struct {
     plan_max_steps: ?usize = null,
     plans_dir: ?[]const u8 = null,
     enhanced_progress_checkpoint: ?bool = null,
+    prompt_enforcement_enabled: ?bool = null,
     // 3-Thread Watchdog & Act Coordinator (RFC-015)
     act_timeout_secs: ?u32 = null,
     watchdog_tracking_interval_s: ?u32 = null,
@@ -1318,6 +1325,7 @@ fn applyPlanningAndWatchdogJsonConfig(cfg: *const JsonConfig, env_map: *std.proc
     if (cfg.plan_max_steps) |val| count += setEnvInt(usize, env_map, "MINI_PLAN_MAX_STEPS", val);
     if (cfg.plans_dir) |val| count += setEnvDefault(env_map, "MINI_PLANS_DIR", val);
     if (cfg.enhanced_progress_checkpoint) |val| count += setEnvBool(env_map, "MINI_ENHANCED_PROGRESS_CHECKPOINT", val);
+    if (cfg.prompt_enforcement_enabled) |val| count += setEnvBool(env_map, "MINI_PROMPT_ENFORCEMENT_ENABLED", val);
     if (cfg.act_timeout_secs) |val| count += setEnvInt(u32, env_map, "MINI_ACT_TIMEOUT_SECS", val);
     if (cfg.watchdog_tracking_interval_s) |val| count += setEnvInt(u32, env_map, "MINI_WATCHDOG_TRACKING_S", val);
     if (cfg.watchdog_recap_interval) |val| count += setEnvInt(usize, env_map, "MINI_WATCHDOG_RECAP_INTERVAL", val);
@@ -1559,7 +1567,8 @@ test "JsonConfig parsing RFC-019 planning fields" {
         \\  "plan_drift_detection": true,
         \\  "plan_max_steps": 15,
         \\  "plans_dir": "/tmp/custom_plans",
-        \\  "enhanced_progress_checkpoint": true
+        \\  "enhanced_progress_checkpoint": true,
+        \\  "prompt_enforcement_enabled": false
         \\}
     ;
 
@@ -1572,6 +1581,20 @@ test "JsonConfig parsing RFC-019 planning fields" {
     try std.testing.expectEqual(15, parsed.value.plan_max_steps.?);
     try std.testing.expectEqualStrings("/tmp/custom_plans", parsed.value.plans_dir.?);
     try std.testing.expectEqual(true, parsed.value.enhanced_progress_checkpoint.?);
+    try std.testing.expectEqual(false, parsed.value.prompt_enforcement_enabled.?);
+}
+
+test "Config prompt enforcement is disabled by default" {
+    const alloc = std.testing.allocator;
+    var env_map = std.process.Environ.Map.init(alloc);
+    defer env_map.deinit();
+
+    const settings = Config.resolvePlanningAndWatchdogSettings(&env_map);
+    try std.testing.expectEqual(false, settings.prompt_enforcement_enabled);
+
+    try env_map.put("MINI_PROMPT_ENFORCEMENT_ENABLED", "1");
+    const enabled = Config.resolvePlanningAndWatchdogSettings(&env_map);
+    try std.testing.expectEqual(true, enabled.prompt_enforcement_enabled);
 }
 
 test "Config default memact_pg_enabled is true" {

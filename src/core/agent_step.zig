@@ -52,30 +52,32 @@ pub const GuidanceProgressContext = struct {
         temp_input_msgs: *std.ArrayListUnmanaged(proto.Message),
     ) !void {
         // Procedural Graph (RFC-010): Prepare ephemeral situational guidance block
-        if (loop.pg_store) |pg| {
-            if (loop.config.memact_pg_advisory) {
-                const traj_slice: []const []const u8 = if (loop.turn_tool_trajectory.items.len > 0)
-                    loop.turn_tool_trajectory.items
-                else
-                    loop.recent_tools.items;
+        if (loop.config.prompt_enforcement_enabled) {
+            if (loop.pg_store) |pg| {
+                if (loop.config.memact_pg_advisory) {
+                    const traj_slice: []const []const u8 = if (loop.turn_tool_trajectory.items.len > 0)
+                        loop.turn_tool_trajectory.items
+                    else
+                        loop.recent_tools.items;
 
-                self.ephemeral_guidance = pg.serializeGuidance(
-                    loop.alloc,
-                    loop.last_executed_tool,
-                    traj_slice,
-                    loop.last_act_failed,
-                    loop.config.memact_pg_h,
-                    loop.current_user_request,
-                ) catch null;
+                    self.ephemeral_guidance = pg.serializeGuidance(
+                        loop.alloc,
+                        loop.last_executed_tool,
+                        traj_slice,
+                        loop.last_act_failed,
+                        loop.config.memact_pg_h,
+                        loop.current_user_request,
+                    ) catch null;
 
-                if (self.ephemeral_guidance) |guidance_text| {
-                    const blocks = try loop.alloc.alloc(proto.ContentBlock, 1);
-                    blocks[0] = .{ .text = guidance_text };
-                    self.ephemeral_blocks = blocks;
-                    try temp_input_msgs.append(loop.alloc, .{
-                        .role = .user,
-                        .content = blocks,
-                    });
+                    if (self.ephemeral_guidance) |guidance_text| {
+                        const blocks = try loop.alloc.alloc(proto.ContentBlock, 1);
+                        blocks[0] = .{ .text = guidance_text };
+                        self.ephemeral_blocks = blocks;
+                        try temp_input_msgs.append(loop.alloc, .{
+                            .role = .user,
+                            .content = blocks,
+                        });
+                    }
                 }
             }
         }
@@ -339,7 +341,10 @@ pub fn executeCodeActBlock(
     response: *const proto.Response,
     js_code: []const u8,
 ) !StepResult {
-    const js_loop_check = loop.checkActionLoop("codeact", js_code) catch .allow;
+    const js_loop_check = if (loop.config.prompt_enforcement_enabled)
+        loop.checkActionLoop("codeact", js_code) catch .allow
+    else
+        @as(@TypeOf(loop.checkActionLoop("codeact", js_code) catch .allow), .allow);
     if (js_loop_check == .trip) {
         return handleCodeActLoopTrip(loop, act_id);
     }
@@ -473,7 +478,11 @@ test "RFC-023: missing-terminal recovery uses capped exponential retry backoff" 
 }
 
 test "RFC-023: repeated empty missing-terminal response fails as provider unavailable" {
-    var budget = proto.ResponseRecoveryBudget{};
+    // PSEUDOCODE:
+    // 1. Configure a three-retry missing-terminal budget for this focused boundary test.
+    // 2. Verify the first three responses retry the same Act.
+    // 3. Verify the next response fails as provider unavailable.
+    var budget = proto.ResponseRecoveryBudget{ .missing_terminal = 3 };
 
     for (0..3) |_| {
         const transition = (try nextResponseRecoveryTransition(
@@ -618,7 +627,11 @@ fn handleEndTurnStop(
     response: *const proto.Response,
 ) !StepResult {
     loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{ .exec_type = "none" });
-    switch (loop.plan.handleEndTurnWatchdog(loop.current_user_request, loop.hasRecentVerifiedMutation())) {
+    const watchdog_action = if (loop.config.prompt_enforcement_enabled)
+        loop.plan.handleEndTurnWatchdog(loop.current_user_request, loop.hasRecentVerifiedMutation())
+    else
+        @as(@TypeOf(loop.plan.handleEndTurnWatchdog(loop.current_user_request, loop.hasRecentVerifiedMutation())), .no_action);
+    switch (watchdog_action) {
         .continue_loop => {
             loop.last_agent_decision = .request_continuation;
             loop.last_step_outcome = .continuation_requested;
