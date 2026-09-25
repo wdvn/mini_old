@@ -406,10 +406,16 @@ pub fn executeCodeActBlock(
 
 fn responseRecoveryBackoffSeconds(recovery_class: proto.RecoveryClass, attempt: usize) u64 {
     // PSEUDOCODE:
-    // 1. Retry an empty missing-terminal stream once after a short delay.
-    // 2. Keep the other response recovery paths immediate.
-    if (recovery_class == .missing_terminal and attempt > 0) return 1;
-    return 0;
+    // 1. Retry empty missing-terminal streams with exponential backoff.
+    // 2. Cap the delay at four seconds across the bounded retry budget.
+    // 3. Keep the other response recovery paths immediate.
+    if (recovery_class != .missing_terminal) return 0;
+    return switch (attempt) {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        else => 4,
+    };
 }
 
 fn nextResponseRecoveryTransition(
@@ -457,22 +463,26 @@ test "RFC-023: recovery exhaustion records transient retry while stalling" {
     try std.testing.expectEqual(proto.TurnOutcome.stalled, loop.last_turn_outcome);
 }
 
-test "RFC-023: missing-terminal recovery uses a one-second retry backoff" {
+test "RFC-023: missing-terminal recovery uses capped exponential retry backoff" {
+    try std.testing.expectEqual(@as(u64, 0), responseRecoveryBackoffSeconds(.missing_terminal, 0));
     try std.testing.expectEqual(@as(u64, 1), responseRecoveryBackoffSeconds(.missing_terminal, 1));
+    try std.testing.expectEqual(@as(u64, 2), responseRecoveryBackoffSeconds(.missing_terminal, 2));
+    try std.testing.expectEqual(@as(u64, 4), responseRecoveryBackoffSeconds(.missing_terminal, 3));
+    try std.testing.expectEqual(@as(u64, 4), responseRecoveryBackoffSeconds(.missing_terminal, 4));
     try std.testing.expectEqual(@as(u64, 0), responseRecoveryBackoffSeconds(.empty_response, 1));
 }
 
 test "RFC-023: repeated empty missing-terminal response fails as provider unavailable" {
     var budget = proto.ResponseRecoveryBudget{};
 
-    try std.testing.expectEqual(
-        proto.RecoveryDecision.retry,
-        budget.consume(.missing_terminal),
-    );
-    try std.testing.expectEqual(
-        proto.RecoveryDecision.stalled,
-        budget.consume(.missing_terminal),
-    );
+    for (0..3) |_| {
+        const transition = (try nextResponseRecoveryTransition(
+            .empty,
+            .missing_terminal_event,
+            &budget,
+        )).?;
+        try std.testing.expect(transition == .retry_same_act);
+    }
 
     const transition = (try nextResponseRecoveryTransition(
         .empty,

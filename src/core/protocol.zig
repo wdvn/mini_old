@@ -422,9 +422,9 @@ pub const ModelResponse = struct {
 /// This is not a task-duration or total-Act limit.
 pub const ResponseRecoveryBudget = struct {
     thinking_only: u8 = 2,
-    empty_response: u8 = 2,
-    missing_terminal: u8 = 1,
-    stream_aborted: u8 = 2,
+    empty_response: u8 = 20,
+    missing_terminal: u8 = 3,
+    stream_aborted: u8 = 20,
 
     pub fn consume(self: *ResponseRecoveryBudget, class: RecoveryClass) RecoveryDecision {
         // PSEUDOCODE:

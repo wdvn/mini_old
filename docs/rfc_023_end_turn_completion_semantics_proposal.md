@@ -528,9 +528,9 @@ Recovery is a failure-class budget, not a task-duration limit.
 ```zig
 pub const ResponseRecoveryBudget = struct {
     thinking_only_retries: u8 = 2,
-    empty_response_retries: u8 = 2,
-    missing_terminal_retries: u8 = 1,
-    stream_aborted_retries: u8 = 2,
+    empty_response_retries: u8 = 20,
+    missing_terminal_retries: u8 = 20,
+    stream_aborted_retries: u8 = 20,
 };
 ```
 
