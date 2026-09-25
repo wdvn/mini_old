@@ -645,6 +645,7 @@ fn handleResponseRecovery(
             .missing_terminal => "The model response stream terminated unexpectedly without a terminal event. Please resume and provide the complete tool call or response.",
             .stream_aborted => "The model response stream was interrupted or aborted due to idle timeout. Please resume from where execution stopped.",
             .malformed_tool_call => "Your previous tool call was malformed (invalid JSON arguments or an empty tool name) and could not be executed. Re-emit exactly ONE well-formed tool call (one ```js block with valid `mini.*` calls and JSON-object arguments). Do not include the malformed block.",
+            .truncated_tool_call => "Your previous tool call was truncated (the arguments JSON was cut off before it completed) and could not be executed. Re-emit the SAME tool call with COMPLETE, well-formed JSON-object arguments. Do not include the truncated block.",
         };
         try loop.history.addUser(advisory);
 

@@ -374,6 +374,7 @@ pub const RecoveryClass = enum {
     missing_terminal,
     stream_aborted,
     malformed_tool_call,
+    truncated_tool_call,
 };
 
 pub const RecoveryDecision = enum {
@@ -432,6 +433,7 @@ pub const ResponseRecoveryBudget = struct {
     missing_terminal: u8 = 20,
     stream_aborted: u8 = 20,
     malformed_tool_call: u8 = 2,
+    truncated_tool_call: u8 = 2,
 
     pub fn consume(self: *ResponseRecoveryBudget, class: RecoveryClass) RecoveryDecision {
         // PSEUDOCODE:
@@ -444,6 +446,7 @@ pub const ResponseRecoveryBudget = struct {
             .missing_terminal => &self.missing_terminal,
             .stream_aborted => &self.stream_aborted,
             .malformed_tool_call => &self.malformed_tool_call,
+            .truncated_tool_call => &self.truncated_tool_call,
         };
         if (counter.* == 0) return .stalled;
         counter.* -= 1;
@@ -483,6 +486,9 @@ pub fn responseRecoveryClass(validity: ResponseValidity, gen_stop: GenerationSto
             .thinking_only => .thinking_only,
             .empty, .whitespace_only => .empty_response,
             .malformed_tool_call => .malformed_tool_call,
+            // P-INTERRUPT: a tool_call stop with a truncated tool payload
+            // (classified partial_text) is bounded-retriable.
+            .partial_text => if (gen_stop == .tool_call) .truncated_tool_call else null,
             else => null,
         },
     };
@@ -566,6 +572,11 @@ pub fn decideAgentAction(
         return .request_continuation;
     }
     if (validity == .partial_text) {
+        // PSEUDOCODE:
+        // 1. A partial payload interrupted at a tool_call stop is bounded-retriable.
+        // 2. Other resumable partial payloads request continuation.
+        // 3. Non-resumable partial payloads fail the protocol.
+        if (generation_stop == .tool_call) return .retry_transient;
         if (generation_stop == .stream_aborted or
             generation_stop == .missing_terminal_event or
             generation_stop == .max_tokens or
@@ -757,6 +768,55 @@ test "RFC-023: malformed tool call maps to its own bounded recovery budget" {
     try std.testing.expectEqual(RecoveryDecision.retry, budget.consume(.malformed_tool_call));
     try std.testing.expectEqual(RecoveryDecision.retry, budget.consume(.malformed_tool_call));
     try std.testing.expectEqual(RecoveryDecision.stalled, budget.consume(.malformed_tool_call));
+}
+
+// P-INTERRUPT: a tool_call stop with a truncated tool payload (e.g. provider
+// returned stop_reason "tool_calls" but the arguments stream was cut) is
+// partial_text. It must be bounded-retriable instead of hard fail_protocol.
+test "interrupted tool_call stop with partial tool payload is bounded-retriable" {
+    // Interrupted tool_call stop: retriable with its own class.
+    try std.testing.expectEqual(
+        AgentDecision.retry_transient,
+        decideAgentAction(.tool_call, .partial_text, false),
+    );
+    try std.testing.expectEqual(
+        RecoveryClass.truncated_tool_call,
+        responseRecoveryClass(.partial_text, .tool_call) orelse unreachable,
+    );
+    var budget = ResponseRecoveryBudget{};
+    try std.testing.expectEqual(RecoveryDecision.retry, budget.consume(.truncated_tool_call));
+    try std.testing.expectEqual(RecoveryDecision.retry, budget.consume(.truncated_tool_call));
+    try std.testing.expectEqual(RecoveryDecision.stalled, budget.consume(.truncated_tool_call));
+
+    // Cancellation still takes absolute precedence.
+    try std.testing.expectEqual(AgentDecision.cancel, decideAgentAction(.tool_call, .partial_text, true));
+
+    // Resumable stops remain on the continuation path (no recovery class).
+    for ([_]GenerationStop{ .max_tokens, .stop_sequence, .missing_terminal_event, .stream_aborted }) |stop| {
+        try std.testing.expectEqual(
+            AgentDecision.request_continuation,
+            decideAgentAction(stop, .partial_text, false),
+        );
+        try std.testing.expectEqual(@as(?RecoveryClass, null), responseRecoveryClass(.partial_text, stop));
+    }
+}
+
+test "text plus truncated tool call at tool_call stop classifies as partial_text" {
+    // Observed in session journal_3152517 act 20: the response carried meaningful
+    // text alongside a truncated tool payload, and the stream stopped at tool_call.
+    const alloc = std.testing.allocator;
+    var response = Response.init(alloc);
+    defer response.deinit();
+    response.stop_reason = .tool_use;
+    response.generation_stop = .tool_call;
+    try response.content.append(alloc, .{ .text = try alloc.dupe(u8, "Let me run the build") });
+    try response.content.append(alloc, .{ .tool_use = .{
+        .id = try alloc.dupe(u8, "call_interrupted"),
+        .name = try alloc.dupe(u8, "bash"),
+        .input_json = try alloc.dupe(u8, "{\"command\":\"zig build "),
+    } });
+
+    try std.testing.expectEqual(ResponseValidity.partial_text, classifyResponse(&response, false));
 }
 
 test "RFC-023: max_tokens with thinking-only retries transiently (P0-B)" {
