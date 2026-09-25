@@ -566,20 +566,29 @@ fn jsMiniShStream(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*
     const command = jsStringSlice(ctx, argv[0], engine.alloc) orelse return c.JS_ThrowTypeError(ctx, "invalid command");
     defer engine.alloc.free(command);
 
+    // PSEUDOCODE: Spawn streamed commands in a dedicated managed process group.
     const argv_cmd = [_][]const u8{ "/bin/sh", "-c", command };
-    var child = std.process.spawn(engine.io, .{
-        .argv = &argv_cmd,
-        .stdin = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
-    }) catch |e| {
+    var child = process_manager.spawnManaged(
+        engine.io,
+        &argv_cmd,
+        null,
+        .inherit,
+        .inherit,
+        .inherit,
+    ) catch |e| {
         return c.JS_ThrowInternalError(ctx, "shStream spawn error: %s", @errorName(e).ptr);
     };
 
+    const managed_pid = if (child.id) |pid| @as(i32, @intCast(pid)) else 0;
+    var child_reaped = false;
+    defer if (!child_reaped) process_manager.abortManaged(engine.io, &child);
+
+    // PSEUDOCODE: Wait for the managed command and translate its termination into the JS result.
     const term = child.wait(engine.io) catch |e| {
         return c.JS_ThrowInternalError(ctx, "shStream wait error: %s", @errorName(e).ptr);
     };
-
+    child_reaped = true;
+    process_manager.unregisterProcessGroup(managed_pid);
     engine.renewActivity();
 
     const exit_code: i32 = switch (term) {

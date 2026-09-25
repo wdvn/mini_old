@@ -1,10 +1,8 @@
-//! process_manager.zig — Background job management for mini-agent.
+//! process_manager.zig — Managed child processes and background jobs for mini-agent.
 //!
-//! Provides background execution primitives following the OpenHands Pattern:
-//!   - `spawnBackground(alloc, io, command)`: run a command in the background, redirecting stdout/stderr to a log file
-//!   - `getJobStatus(job_id)`: check process status (running, exitCode)
-//!   - `readJobLogs(alloc, io, job_id, max_lines)`: read the most recent N log lines
-//!   - `killJob(job_id, signal)`: safely stop a background process (killpg)
+//! Tracks foreground, streaming, subagent, and background children in dedicated
+//! process groups. Linux production children run behind a parent-death guardian
+//! so descendants terminate even when mini receives an uncatchable SIGKILL.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -12,6 +10,198 @@ const Allocator = std.mem.Allocator;
 const utils = @import("../core/utils.zig");
 
 extern fn kill(pid: std.c.pid_t, sig: c_int) c_int;
+
+const MAX_TRACKED_PROCESS_GROUPS = 256;
+var tracked_process_groups: [MAX_TRACKED_PROCESS_GROUPS]std.atomic.Value(i32) =
+    [_]std.atomic.Value(i32){std.atomic.Value(i32).init(0)} ** MAX_TRACKED_PROCESS_GROUPS;
+
+/// Register a process-group leader for signal-safe parent cleanup.
+pub fn registerProcessGroup(pid: i32) bool {
+    if (pid <= 0) return false;
+    for (&tracked_process_groups) |*slot| {
+        if (slot.cmpxchgStrong(0, pid, .acq_rel, .acquire) == null) return true;
+    }
+    return false;
+}
+
+/// Remove a process-group leader after its child handle has been reaped.
+pub fn unregisterProcessGroup(pid: i32) void {
+    if (pid <= 0) return;
+    for (&tracked_process_groups) |*slot| {
+        _ = slot.cmpxchgStrong(pid, 0, .acq_rel, .acquire);
+    }
+}
+
+fn reapProcess(pid: i32) void {
+    // PSEUDOCODE:
+    // 1. Wait for the direct child after its process group was killed.
+    // 2. Retry on EINTR and stop on ECHILD or other errors.
+    while (true) {
+        const result = std.c.waitpid(pid, null, 0);
+        switch (std.c.errno(result)) {
+            .INTR => continue,
+            .SUCCESS, .CHILD => return,
+            else => return,
+        }
+    }
+}
+
+fn signalProcessGroup(pid: i32, sig_num: c_int) bool {
+    if (pid <= 0) return false;
+    if (comptime builtin.os.tag != .windows) {
+        if (kill(-pid, sig_num) == 0) return true;
+    }
+    return kill(pid, sig_num) == 0;
+}
+
+/// Signal every currently registered process group without allocating or locking.
+pub fn killAllTrackedProcesses(sig_num: c_int) bool {
+    var all_signaled = true;
+    for (&tracked_process_groups) |*slot| {
+        const pid = slot.load(.acquire);
+        if (pid == 0) continue;
+        if (!signalProcessGroup(pid, sig_num)) all_signaled = false;
+    }
+    return all_signaled;
+}
+
+pub const guardian_flag = "--__process-guardian";
+
+pub fn isGuardianInvocation(args: []const [:0]const u8) bool {
+    return args.len > 1 and std.mem.eql(u8, args[1], guardian_flag);
+}
+
+fn installGuardianSignalHandlers() void {
+    // PSEUDOCODE:
+    // 1. Handle parent-death SIGTERM and terminal SIGHUP.
+    // 2. Kill the guardian's current process group, including every descendant.
+    // 3. Exit immediately without running allocator-backed application teardown.
+    const handler = struct {
+        fn handle(sig: std.posix.SIG) callconv(.c) void {
+            _ = kill(0, 9);
+            std.c._exit(128 + @as(c_int, @intCast(@intFromEnum(sig))));
+        }
+    }.handle;
+
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = handler },
+        .mask = std.mem.zeroes(std.posix.sigset_t),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+    std.posix.sigaction(std.posix.SIG.HUP, &act, null);
+}
+
+/// Run a command behind a Linux parent-death guardian in the guardian's process group.
+pub fn runGuardian(
+    io: std.Io,
+    args: []const [:0]const u8,
+    environ_map: ?*const std.process.Environ.Map,
+) !u8 {
+    // PSEUDOCODE:
+    // 1. Parse the optional expected parent PID and command argv.
+    // 2. Create a dedicated guardian process group.
+    // 3. Arm PR_SET_PDEATHSIG and close the fork/prctl race with a getppid check.
+    // 4. Spawn the real command into the guardian's process group and wait for it.
+    // 5. Preserve the command exit code for the tracked parent.
+    if (builtin.os.tag != .linux) return error.UnsupportedGuardian;
+
+    var rest = args[2..];
+    const expected_parent_pid: i32 = if (rest.len > 0 and !std.mem.eql(u8, rest[0], "--")) blk: {
+        const parsed = try std.fmt.parseInt(i32, rest[0], 10);
+        rest = rest[1..];
+        break :blk parsed;
+    } else std.c.getppid();
+
+    if (rest.len == 0 or !std.mem.eql(u8, rest[0], "--")) return error.InvalidGuardianArgs;
+    const command_argv = rest[1..];
+    if (command_argv.len == 0) return error.InvalidGuardianArgs;
+    if (std.c.setpgid(0, 0) != 0) return error.PermissionDenied;
+
+    const parent_before = std.c.getppid();
+    _ = try std.posix.prctl(.SET_PDEATHSIG, .{@intFromEnum(std.posix.SIG.TERM)});
+    if (std.c.getppid() != parent_before or parent_before != expected_parent_pid) {
+        return error.ParentDied;
+    }
+
+    installGuardianSignalHandlers();
+
+    var child = try std.process.spawn(io, .{
+        .argv = command_argv,
+        .environ_map = environ_map,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+
+    const term = try child.wait(io);
+    return switch (term) {
+        .exited => |code| code,
+        else => 1,
+    };
+}
+
+pub fn spawnManaged(
+    io: std.Io,
+    argv: []const []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+    stdin: std.process.SpawnOptions.StdIo,
+    stdout: std.process.SpawnOptions.StdIo,
+    stderr: std.process.SpawnOptions.StdIo,
+) !std.process.Child {
+    // PSEUDOCODE:
+    // 1. Wrap Linux production commands with a parent-death guardian.
+    // 2. Spawn the wrapper as the leader of a dedicated process group.
+    // 3. Register the leader so parent/signal cleanup can kill descendants.
+    // 4. Fail closed if the bounded registry is exhausted.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var managed_argv: std.ArrayList([]const u8) = .empty;
+    if (comptime builtin.os.tag == .linux and !builtin.is_test) {
+        try managed_argv.appendSlice(arena_alloc, &.{ "/proc/self/exe", guardian_flag });
+        const parent_pid_text = try std.fmt.allocPrint(arena_alloc, "{d}", .{std.c.getpid()});
+        try managed_argv.append(arena_alloc, parent_pid_text);
+        try managed_argv.append(arena_alloc, "--");
+        try managed_argv.appendSlice(arena_alloc, argv);
+    } else {
+        try managed_argv.appendSlice(arena_alloc, argv);
+    }
+
+    var child = try std.process.spawn(io, .{
+        .argv = managed_argv.items,
+        .environ_map = environ_map,
+        .pgid = if (comptime builtin.os.tag != .windows) 0 else null,
+        .stdin = stdin,
+        .stdout = stdout,
+        .stderr = stderr,
+    });
+
+    if (comptime builtin.os.tag != .windows) {
+        if (child.id) |id| {
+            const pid: i32 = @intCast(id);
+            if (!registerProcessGroup(pid)) {
+                child.kill(io);
+                return error.ProcessResources;
+            }
+        }
+    }
+    return child;
+}
+
+pub fn abortManaged(io: std.Io, child: *std.process.Child) void {
+    // PSEUDOCODE:
+    // 1. Kill the managed process group and descendants.
+    // 2. Reap the direct child so no zombie remains.
+    // 3. Remove the group from the shutdown registry.
+    if (child.id) |id| {
+        const pid: i32 = @intCast(id);
+        _ = signalProcessGroup(pid, 9);
+        _ = child.wait(io) catch {};
+        unregisterProcessGroup(pid);
+    }
+}
 
 pub const JobStatus = struct {
     running: bool,
@@ -43,8 +233,17 @@ pub const ProcessManager = struct {
     }
 
     pub fn deinit(self: *ProcessManager) void {
+        // PSEUDOCODE:
+        // 1. Kill retained background process groups before releasing metadata.
+        // 2. Reap direct children without blocking on unrelated process state.
+        // 3. Release all job-owned strings and map storage.
+        _ = self.forceKillAllJobs("SIGKILL");
         var it = self.jobs.valueIterator();
         while (it.next()) |info| {
+            if (info.child.id != null) {
+                reapProcess(info.pid);
+                unregisterProcessGroup(info.pid);
+            }
             self.alloc.free(info.job_id);
             self.alloc.free(info.log_path);
             self.alloc.free(info.command);
@@ -71,15 +270,10 @@ pub const ProcessManager = struct {
 
         const argv = [_][]const u8{ "/bin/sh", "-c", shell_cmd };
         // PSEUDOCODE:
-        // 1. Start /bin/sh as the leader of a dedicated process group.
+        // 1. Start /bin/sh as the leader of a dedicated tracked process group.
         // 2. Keep the Child handle so completed direct children can be reaped.
-        const child = try std.process.spawn(io, .{
-            .argv = &argv,
-            .pgid = 0,
-            .stdin = .ignore,
-            .stdout = .ignore,
-            .stderr = .ignore,
-        });
+        var child = try spawnManaged(io, &argv, null, .ignore, .ignore, .ignore);
+        errdefer abortManaged(io, &child);
 
         const pid: i32 = child.id orelse 0;
 
@@ -92,7 +286,10 @@ pub const ProcessManager = struct {
             .child = child,
         };
 
-        try self.jobs.put(self.alloc, job_id, info);
+        self.jobs.put(self.alloc, job_id, info) catch |e| {
+            abortManaged(io, &child);
+            return e;
+        };
         return info;
     }
 
@@ -114,6 +311,7 @@ pub const ProcessManager = struct {
                     .SUCCESS => {
                         if (result == 0) break;
                         const status: u32 = @intCast(raw_status);
+                        unregisterProcessGroup(pid);
                         info.child.id = null;
                         info.exit_code = if (std.c.W.IFEXITED(status))
                             @intCast(std.c.W.EXITSTATUS(status))
@@ -207,10 +405,7 @@ pub const ProcessManager = struct {
         // 1. Signal the dedicated process group so descendants terminate too.
         // 2. Fall back to the direct shell PID for non-POSIX or unusual cases.
         // 3. Leave non-blocking reaping to getJobStatus or a later status poll.
-        if (comptime builtin.os.tag != .windows) {
-            if (kill(-info.pid, sig_num) == 0) return true;
-        }
-        return kill(info.pid, sig_num) == 0;
+        return signalProcessGroup(info.pid, sig_num);
     }
 };
 
@@ -303,6 +498,30 @@ test "forceKillAllJobs terminates every running background job" {
     }
 }
 
+test "spawnManaged registers child process groups for parent cleanup" {
+    if (comptime @import("builtin").os.tag == .windows) return;
+
+    // PSEUDOCODE:
+    // 1. Spawn a managed shell with a long-lived descendant.
+    // 2. Signal every registered managed process group.
+    // 3. Verify the wrapper child is reaped after cleanup.
+    const io = std.testing.io;
+    const argv = [_][]const u8{ "/bin/sh", "-c", "sleep 30 & wait" };
+
+    var child = try spawnManaged(io, &argv, null, .inherit, .inherit, .inherit);
+    try std.testing.expect(killAllTrackedProcesses(9));
+
+    const pid: i32 = @intCast(child.id.?);
+    var reaped = false;
+    for (0..100) |_| {
+        _ = child.wait(io) catch continue;
+        unregisterProcessGroup(pid);
+        reaped = true;
+        break;
+    }
+    try std.testing.expect(reaped);
+}
+
 test "getJobStatus reaps a completed background shell" {
     if (comptime @import("builtin").os.tag == .windows) return;
 
@@ -343,6 +562,11 @@ pub fn forceKillAllJobs(signal: ?[]const u8) bool {
 }
 
 pub fn deinitGlobal() void {
+    // PSEUDOCODE:
+    // 1. Kill every still-tracked foreground or background process group.
+    // 2. Let the background manager reap its direct children.
+    // 3. Clear the singleton so no stale allocator-backed state remains.
+    _ = killAllTrackedProcesses(9);
     if (g_pm) |*pm| {
         pm.deinit();
         g_pm = null;

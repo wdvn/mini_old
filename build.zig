@@ -144,11 +144,32 @@ pub fn build(b: *std.Build) void {
     const ws_ctx_tests = b.addTest(.{ .root_module = ws_ctx_mod });
     const run_ws_ctx_tests = b.addRunArtifact(ws_ctx_tests);
 
+    // 4. Linux parent-death regression for managed process groups
+    const parent_death_exe = b.addExecutable(.{
+        .name = "test-process-parent-death",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("testcases/test_process_parent_death.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_parent_death = b.addRunArtifact(parent_death_exe);
+    run_parent_death.addArtifactArg(exe);
+    run_parent_death.stdio = .inherit;
+
+    const test_parent_death_step = b.step(
+        "test-process-parent-death",
+        "Verify managed process groups die with their parent",
+    );
+    test_parent_death_step.dependOn(&run_parent_death.step);
+
     // test-unit step: run unit tests and testcases only
     const test_unit_step = b.step("test-unit", "Run unit tests & testcases only (without E2E mock)");
     test_unit_step.dependOn(&run_tests.step);
     test_unit_step.dependOn(&run_testcase_tests.step);
     test_unit_step.dependOn(&run_ws_ctx_tests.step);
+    test_unit_step.dependOn(&run_parent_death.step);
 
     // 3. E2E tests with mock LLM server
     const run_e2e = b.addSystemCommand(&.{

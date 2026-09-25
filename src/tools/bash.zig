@@ -32,6 +32,7 @@ const utils = @import("../core/utils.zig");
 const main = @import("../main.zig");
 const hooks = @import("../core/hooks.zig");
 const signals = @import("../core/signals.zig");
+const process_manager = @import("../runtime/process_manager.zig");
 
 var g_active_pid: std.atomic.Value(std.process.Child.Id) = std.atomic.Value(std.process.Child.Id).init(0);
 
@@ -226,15 +227,16 @@ test "bash tool: process group interruption terminates sleeping command promptly
 // 4. If signals.isInterrupted(), force-kill process group before waiting
 // 5. Wait for child and return output or error.Interrupted
 fn spawnBashChild(io: std.Io, command: []const u8, stdin_str: ?[]const u8) !std.process.Child {
-    // PSEUDOCODE: Spawn /bin/sh with pgid = 0 and deliver stdin if provided.
+    // PSEUDOCODE: Spawn a parent-death-protected managed shell and deliver stdin if provided.
     const argv = [_][]const u8{ "/bin/sh", "-c", command };
-    var child = try std.process.spawn(io, .{
-        .argv = &argv,
-        .pgid = 0,
-        .stdin = if (stdin_str != null) .pipe else .ignore,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    });
+    var child = try process_manager.spawnManaged(
+        io,
+        &argv,
+        null,
+        if (stdin_str != null) .pipe else .ignore,
+        .pipe,
+        .pipe,
+    );
     errdefer {
         if (child.stdin) |in_pipe| in_pipe.close(io);
         if (child.stdout) |out_pipe| out_pipe.close(io);
@@ -297,7 +299,10 @@ fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: 
     // 2. Concurrently drain pipes into allocated buffers.
     // 3. Check for interrupts, await child termination, and format output.
     var child = try spawnBashChild(io, command, stdin_str);
+    const managed_pid = if (child.id) |pid| @as(i32, @intCast(pid)) else 0;
     if (child.id) |pid| g_active_pid.store(pid, .release);
+    var child_reaped = false;
+    errdefer if (!child_reaped) process_manager.abortManaged(io, &child);
     defer g_active_pid.store(0, .release);
 
     const stdout_buf = try alloc.alloc(u8, MAX_OUTPUT);
@@ -315,6 +320,8 @@ fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: 
         if (signals.isInterrupted()) return error.Interrupted;
         return std.fmt.allocPrint(alloc, "Wait error: {s}", .{@errorName(e)});
     };
+    child_reaped = true;
+    process_manager.unregisterProcessGroup(managed_pid);
     if (signals.isInterrupted()) return error.Interrupted;
 
     const exit_code: u8 = switch (term) {
