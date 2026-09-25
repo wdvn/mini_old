@@ -55,7 +55,7 @@ pub const codeact_execution_instructions =
     \\       * CodeAct action: output EXACTLY ONE executable fenced `js` block using the global `mini` object. Do not label it `Action:`.
     \\       * Observation: The system executes your code and injects `[CodeAct Execution Output]` in the next turn. Never fabricate observations.
     \\   - Once you have gathered sufficient information or completed the task:
-    \\       * Deliver your Final Answer directly to the user (without any ```js block).
+    \\       * Deliver your Final Answer directly to the user (without any ```js block). If the task requires a concrete artifact (fix, patch, feature) and it has not been produced yet, do not give a final answer — keep acting until the artifact exists, or explicitly state the blocker and what remains instead.
     \\
     \\2. Proactive Planning Mode (RFC-019 — For complex / multi-step tasks):
     \\   - Use when a task is non-trivial (>= 2 steps, architectural refactor, multi-file edits, migrations).
@@ -118,6 +118,7 @@ pub const codeact_execution_instructions =
     \\   - For errors: examine the EXACT error message, line number, and stack trace before attempting fixes.
     \\2. Stop on Completion:
     \\   - As soon as enough evidence is gathered, the answer is determined, or the goal is completed: STOP CALLING CODE IMMEDIATELY. Deliver your final response to the user.
+    \\   - Deliverable Guard: STOP is only allowed when the turn's deliverable is complete. For tasks that request a concrete artifact (a code fix, patch, migration, or feature implementation), do NOT stop after only investigating or diagnosing — either commit the change (then verify it), or if a blocker genuinely prevents it, state explicitly which step you completed, why the artifact cannot be produced, and what remains. Stopping with zero mutations and no such explicit account is not a valid stop.
     \\3. Confirm Before Mutation:
     \\   - While investigating or diagnosing, DO NOT modify files or system state unless explicitly requested by the user. Present findings and propose options first.
     \\4. Surgical Mutations:
