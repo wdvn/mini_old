@@ -35,6 +35,8 @@ pub const WatchdogConfig = struct {
     verbose_stderr: bool = true,
     /// If true, inject trajectory recap advisories into the next act.
     prompt_enforcement_enabled: bool = false,
+    /// Cooldown in seconds between force-kill escalations to prevent log spam (default: 10s).
+    escalation_cooldown_s: u32 = 10,
 };
 
 /// Decision returned by the 1-call LLM decision handler on timeout.
@@ -83,6 +85,9 @@ pub const Watchdog = struct {
     current_act_timeout_s: u32 = 0,
     extension_count: usize = 0,
     is_consulting_decision: bool = false,
+
+    /// Track last force-kill escalation timestamp to prevent log spam.
+    last_escalation_ms: i64 = 0,
 
     pub fn init(alloc: Allocator, io: std.Io, coordinator: *act_queue.ActCoordinator, config: WatchdogConfig) *Watchdog {
         const self = alloc.create(Watchdog) catch @panic("OOM init Watchdog");
@@ -196,6 +201,13 @@ pub const Watchdog = struct {
 
     fn escalateForceKill(self: *Watchdog, act_id: usize, elapsed_s: u32) void {
         // PSEUDOCODE: Deliver SIGKILL to running process group past timeout deadline.
+        // Rate-limit: only escalate once per escalation_cooldown_s to prevent log spam.
+        const now = utils.milliTimestamp();
+        const cooldown_ms: i64 = @intCast(self.config.escalation_cooldown_s * 1000);
+        // Guard against timestamp wraparound
+        if (now >= self.last_escalation_ms and now - self.last_escalation_ms < cooldown_ms) return;
+        self.last_escalation_ms = now;
+
         signals.setInterrupted(true);
         if (self.force_kill_fn) |fk_fn| {
             fk_fn();

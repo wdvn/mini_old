@@ -340,7 +340,57 @@ test "Watchdog: escalation invokes force_kill_fn when act remains running past t
     try testing.expect(!g_force_kill_invoked);
 
     // Second tick: act is still running past timeout -> triggers force_kill_fn escalation!
+    // Note: with default cooldown (10s), this fires immediately since no time has passed
     watchdog.tick();
     try testing.expect(g_force_kill_invoked);
     try testing.expect(signals.isInterrupted());
+}
+
+test "Watchdog: escalation cooldown prevents log spam" {
+    defer signals.setInterrupted(false);
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var coordinator = act_queue.ActCoordinator.init(alloc);
+    defer coordinator.deinit();
+
+    // Use short cooldown (1s) for this test
+    var watchdog = watchdog_mod.Watchdog.init(alloc, io, coordinator, .{
+        .tracking_interval_s = 10,
+        .act_timeout_secs = 5,
+        .verbose_stderr = false,
+        .escalation_cooldown_s = 1,
+    });
+    defer watchdog.deinit();
+    watchdog.decision_fn = &mockDecisionKill;
+    watchdog.force_kill_fn = &mockForceKillHook;
+
+    coordinator.resetTurn();
+    coordinator.updateStatus(1, .executing_tool, "bash: hung");
+
+    // Exceed initial 5s timeout
+    coordinator.lock();
+    coordinator.state.act_start_ms -= 6000;
+    coordinator.unlock();
+
+    // First tick: LLM KILL decision triggers interrupt (not force_kill yet)
+    g_force_kill_invoked = false;
+    watchdog.tick();
+    try testing.expect(coordinator.getMonitorState().is_timed_out);
+    try testing.expect(signals.isInterrupted());
+    try testing.expect(!g_force_kill_invoked); // force_kill only on escalation
+
+    // Second tick: act still running past timeout -> triggers force_kill escalation
+    watchdog.tick();
+    try testing.expect(g_force_kill_invoked);
+
+    // Third tick: should be suppressed by cooldown
+    g_force_kill_invoked = false;
+    watchdog.tick();
+    try testing.expect(!g_force_kill_invoked);
+
+    // After cooldown expires (manually expire):
+    watchdog.last_escalation_ms = 0;
+    watchdog.tick();
+    try testing.expect(g_force_kill_invoked);
 }
