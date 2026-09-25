@@ -186,7 +186,12 @@ test "RFC-023: provider response diagnostics are bounded" {
 }
 
 pub fn toGenerationStop(stop_reason: StopReason, http_code: u32) GenerationStop {
-    if (http_code >= 400 and http_code != 200) {
+    // PSEUDOCODE:
+    // 1. Distinguish between provider errors (HTTP 5xx) and transport errors (http_code == 0 or custom codes).
+    // 2. http_code == 0 indicates stream was aborted before any HTTP response (idle timeout, connection reset).
+    // 3. Custom codes like 598 are internal markers and should not be treated as provider errors.
+    // 4. Only map to provider_error when actual HTTP 5xx is returned.
+    if (http_code >= 500) {
         if (stop_reason == .missing_terminal_event or stop_reason == .unknown or stop_reason == .provider_error) {
             return .provider_error;
         }
