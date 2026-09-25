@@ -423,7 +423,7 @@ pub const ModelResponse = struct {
 pub const ResponseRecoveryBudget = struct {
     thinking_only: u8 = 2,
     empty_response: u8 = 20,
-    missing_terminal: u8 = 3,
+    missing_terminal: u8 = 20,
     stream_aborted: u8 = 20,
 
     pub fn consume(self: *ResponseRecoveryBudget, class: RecoveryClass) RecoveryDecision {
