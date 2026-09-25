@@ -96,6 +96,27 @@ pub const GuidanceProgressContext = struct {
     }
 };
 
+/// PSEUDOCODE: Cap thinking budget at 85% of max_tokens so at least 15%
+/// headroom remains for the final answer / tool-call payload (same
+/// estimation principle as Claude's thinking budget).
+/// 1. budget null → null (thinking disabled, keep as-is)
+/// 2. budget > 85% of max_tokens → clamp down to the cap
+/// 3. budget <= cap → keep unchanged
+fn capThinkingBudget(max_tokens: u32, budget: ?u32) ?u32 {
+    const b = budget orelse return null;
+    const cap = max_tokens * 85 / 100;
+    if (b > cap) return cap;
+    return b;
+}
+
+test "thinking budget capped at 85% of max_tokens" {
+    try std.testing.expectEqual(@as(?u32, null), capThinkingBudget(24000, null));
+    try std.testing.expectEqual(@as(?u32, 4096), capThinkingBudget(24000, 4096));
+    try std.testing.expectEqual(@as(?u32, 20400), capThinkingBudget(24000, 40000));
+    try std.testing.expectEqual(@as(?u32, 850), capThinkingBudget(1000, 900));
+    try std.testing.expectEqual(@as(?u32, 20400), capThinkingBudget(24000, 20400));
+}
+
 /// Dynamically modulates reasoning effort and thinking budget tokens based on overrides, error state, and stickiness.
 pub fn modulateReasoningEffort(loop: *AgentLoop, act_id: usize) void {
     if (loop.config.reasoning_effort_disabled) return;
@@ -122,6 +143,10 @@ pub fn modulateReasoningEffort(loop: *AgentLoop, act_id: usize) void {
             effective_budget = loop.last_budget;
         }
     }
+
+    // PSEUDOCODE: Clamp thinking budget to 85% of max_tokens so the response
+    // always keeps >=15% headroom for answer / tool-call payload.
+    effective_budget = capThinkingBudget(loop.config.max_tokens, effective_budget);
 
     loop.last_effort = effective_effort;
     loop.last_budget = effective_budget;
@@ -541,6 +566,48 @@ fn markValidActionProgress(loop: *AgentLoop) void {
     loop.stop_sequence_continues = 0;
 }
 
+/// P0-B: Build a thinking-tail hint for a truncated (max_tokens) thinking-only response.
+/// PSEUDOCODE:
+/// 1. Scan response content for the LAST thinking block; a verification signature
+///    means a complete block we should not fragment, so skip entirely.
+/// 2. Take up to max_chars bytes from the END of the thinking text.
+/// 3. Walk back to a valid UTF-8 start boundary (byte class 0xxxxxxx or 11xxxxxx).
+/// 4. If the tail trims to empty, return null.
+/// 5. Compose a resume advisory embedding the tail.
+/// 6. Allocate the result via the provided allocator; caller frees.
+fn buildThinkingTailHint(alloc: std.mem.Allocator, response: *const proto.Response, max_chars: usize) ?[]const u8 {
+    var last_thinking: ?proto.ThinkingBlock = null;
+    for (response.content.items) |block| {
+        if (block == .thinking) last_thinking = block.thinking;
+    }
+    if (last_thinking == null) return null;
+    const th = last_thinking.?;
+    // A non-empty signature means a complete/verified thinking block; do not fragment it.
+    if (th.signature.len > 0) return null;
+
+    const text = th.thinking;
+    const start = if (text.len <= max_chars) 0 else @min(text.len - max_chars, text.len);
+    // Walk back to a UTF-8 start boundary (lead byte 0xxxxxxx or 11xxxxxx).
+    var i = start;
+    while (i < text.len) {
+        const b = text[i];
+        if ((b & 0b11000000) != 0b10000000) break; // lead byte or ASCII: valid start
+        i += 1;
+    }
+    const tail = text[i..];
+    if (std.mem.trim(u8, tail, " \r\n\t").len == 0) return null;
+
+    const tail_trimmed = std.mem.trim(u8, tail, " \r\n\t");
+    if (tail_trimmed.len == 0) return null;
+
+    // Single contiguous allocation; caller owns and frees it.
+    return std.fmt.allocPrint(
+        alloc,
+        "[System] The previous response's reasoning was truncated at the max_tokens limit. You stopped here:\n\n{s}\n\nResume from that point with MINIMAL reasoning (keep thinking to a few sentences, or call mini.setThinking(\"low\")), then emit the next tool call. Do not re-derive completed analysis.",
+        .{tail_trimmed},
+    ) catch return null;
+}
+
 fn handleResponseRecovery(
     loop: *AgentLoop,
     act_id: usize,
@@ -577,8 +644,22 @@ fn handleResponseRecovery(
             .empty_response => "The model response was empty or contained only whitespace. Please provide the necessary tool calls or final response to proceed.",
             .missing_terminal => "The model response stream terminated unexpectedly without a terminal event. Please resume and provide the complete tool call or response.",
             .stream_aborted => "The model response stream was interrupted or aborted due to idle timeout. Please resume from where execution stopped.",
+            .malformed_tool_call => "Your previous tool call was malformed (invalid JSON arguments or an empty tool name) and could not be executed. Re-emit exactly ONE well-formed tool call (one ```js block with valid `mini.*` calls and JSON-object arguments). Do not include the malformed block.",
         };
         try loop.history.addUser(advisory);
+
+        // P0-B: when a thinking-only response was truncated at max_tokens, append a
+        // short UTF-8-safe tail of the reasoning so the model resumes instead of
+        // re-deriving completed analysis. Only when there is no verification
+        // signature (a signature implies a complete thinking block we should not
+        // fragment) and when the tail is non-empty after trimming.
+        if (recovery_class == .thinking_only and gen_stop == .max_tokens) {
+            const thinking_tail = buildThinkingTailHint(loop.alloc, response, 512);
+            if (thinking_tail) |hint| {
+                defer loop.alloc.free(hint);
+                try loop.history.addUser(hint);
+            }
+        }
 
         const backoff_s = responseRecoveryBackoffSeconds(recovery_class, loop.turn_recovery_attempts);
         if (backoff_s > 0) {
@@ -1117,4 +1198,105 @@ pub fn executeStep(
             return handleEndTurnStop(self, act_id, input_msgs_count, tool_defs, &response);
         },
     }
+}
+
+// P0-B tests: thinking-tail hint builder.
+
+fn makeThinkingResponse(alloc: std.mem.Allocator, thinking: []const u8, signature: []const u8) proto.Response {
+    var response = proto.Response.init(alloc);
+    // PSEUDOCODE:
+    // 1. Dupe non-empty buffers into response-owned memory so that the
+    //    caller's `response.deinit()` is the sole owner and frees them.
+    // 2. Pass non-allocated (empty) slices through untouched, since
+    //    deinit() only frees non-empty buffers.
+    const th = if (thinking.len > 0) alloc.dupe(u8, thinking) catch unreachable else thinking;
+    const sig = if (signature.len > 0) alloc.dupe(u8, signature) catch unreachable else signature;
+    response.content.append(alloc, .{
+        .thinking = .{
+            .thinking = th,
+            .signature = sig,
+        },
+    }) catch unreachable;
+    return response;
+}
+
+test "P0-B: signed thinking block yields no tail hint" {
+    const alloc = std.testing.allocator;
+    var response = makeThinkingResponse(alloc, "abc", "sig");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), buildThinkingTailHint(alloc, &response, 512));
+}
+
+test "P0-B: short thinking yields full text in the hint" {
+    const alloc = std.testing.allocator;
+    var response = makeThinkingResponse(alloc, "analysis step 3", "");
+    defer response.deinit();
+    const hint_opt = buildThinkingTailHint(alloc, &response, 512);
+    try std.testing.expect(hint_opt != null);
+    const hint = hint_opt.?;
+    defer alloc.free(hint);
+    try std.testing.expect(std.mem.indexOf(u8, hint, "analysis step 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hint, "truncated at the max_tokens limit") != null);
+}
+
+test "P0-B: long thinking keeps only the tail, not the head" {
+    const alloc = std.testing.allocator;
+    // 613-char ASCII text with a unique head marker; a 512-char tail must not include it.
+    const pad: []const u8 = "b" ** 600;
+    const text = std.mem.concat(alloc, u8, &.{ "HEAD_MARKER_ ", pad, ".done" }) catch unreachable;
+    defer alloc.free(text);
+    var response = makeThinkingResponse(alloc, text, "");
+    defer response.deinit();
+    const hint_opt = buildThinkingTailHint(alloc, &response, 512);
+    try std.testing.expect(hint_opt != null);
+    const hint = hint_opt.?;
+    defer alloc.free(hint);
+    // The head marker (at offset 0) is well outside the 512-char tail.
+    try std.testing.expect(std.mem.indexOf(u8, hint, "HEAD_MARKER_") == null);
+    // The tail ends at the very end of the original text.
+    try std.testing.expect(std.mem.indexOf(u8, hint, ".done") != null);
+    // The embedded tail (between the second blank line and the resume instruction) must be valid UTF-8.
+    const tail_start: usize = std.mem.indexOf(u8, hint, "\n\nb") orelse {
+        try std.testing.expect(false);
+        unreachable;
+    };
+    const resume_idx = std.mem.indexOf(u8, hint, "Resume from that point") orelse unreachable;
+    try std.testing.expect(std.unicode.utf8ValidateSlice(hint[tail_start..resume_idx]));
+}
+
+test "P0-B: tail cut respects UTF-8 boundaries" {
+    const alloc = std.testing.allocator;
+    // 1000 3-byte UTF-8 chars (一 = 0xE4 0xB8 0x80) on the stack; a 512-byte tail cut lands mid-sequence.
+    var buf: [3000]u8 = undefined;
+    for (buf[0..], 0..) |*b, idx| b.* = switch (idx % 3) {
+        0 => 0xE4,
+        1 => 0xB8,
+        else => 0x80,
+    };
+    const text: []const u8 = buf[0..];
+    var response = makeThinkingResponse(alloc, text, "");
+    defer response.deinit();
+    const hint_opt = buildThinkingTailHint(alloc, &response, 512);
+    try std.testing.expect(hint_opt != null);
+    const hint = hint_opt.?;
+    defer alloc.free(hint);
+    // The embedded tail must start at a valid UTF-8 boundary.
+    const tail_start: usize = std.mem.indexOf(u8, hint, "\xe4\xb8\x80") orelse {
+        try std.testing.expect(false);
+        unreachable;
+    };
+    // Every byte from tail_start to the "Resume" marker must be valid UTF-8.
+    const resume_idx = std.mem.indexOf(u8, hint, "Resume from that point") orelse unreachable;
+    const tail_chunk = hint[tail_start..resume_idx];
+    try std.testing.expect(std.unicode.utf8ValidateSlice(tail_chunk));
+    // start = 3000 - 512 = 2488 lands on a continuation byte (2488 % 3 == 1); the walk
+    // back reaches the next lead byte at 2490, so the tail holds 170 complete 3-byte chars.
+    try std.testing.expectEqual(@as(usize, 170), std.mem.count(u8, tail_chunk, "\xe4\xb8\x80"));
+}
+
+test "P0-B: whitespace-only thinking yields no tail hint" {
+    const alloc = std.testing.allocator;
+    var response = makeThinkingResponse(alloc, "   \n\t  ", "");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), buildThinkingTailHint(alloc, &response, 512));
 }

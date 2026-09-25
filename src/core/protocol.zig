@@ -373,6 +373,7 @@ pub const RecoveryClass = enum {
     empty_response,
     missing_terminal,
     stream_aborted,
+    malformed_tool_call,
 };
 
 pub const RecoveryDecision = enum {
@@ -430,6 +431,7 @@ pub const ResponseRecoveryBudget = struct {
     empty_response: u8 = 20,
     missing_terminal: u8 = 20,
     stream_aborted: u8 = 20,
+    malformed_tool_call: u8 = 2,
 
     pub fn consume(self: *ResponseRecoveryBudget, class: RecoveryClass) RecoveryDecision {
         // PSEUDOCODE:
@@ -441,6 +443,7 @@ pub const ResponseRecoveryBudget = struct {
             .empty_response => &self.empty_response,
             .missing_terminal => &self.missing_terminal,
             .stream_aborted => &self.stream_aborted,
+            .malformed_tool_call => &self.malformed_tool_call,
         };
         if (counter.* == 0) return .stalled;
         counter.* -= 1;
@@ -479,6 +482,7 @@ pub fn responseRecoveryClass(validity: ResponseValidity, gen_stop: GenerationSto
         else => switch (validity) {
             .thinking_only => .thinking_only,
             .empty, .whitespace_only => .empty_response,
+            .malformed_tool_call => .malformed_tool_call,
             else => null,
         },
     };
@@ -554,7 +558,7 @@ pub fn decideAgentAction(
     is_cancelled: bool,
 ) AgentDecision {
     if (is_cancelled or generation_stop == .cancelled) return .cancel;
-    if (validity == .malformed_tool_call) return .fail_protocol;
+    if (validity == .malformed_tool_call) return .retry_transient;
     if (validity == .native_tool_calls) return .execute_native_tools;
     if (validity == .codeact) return .execute_codeact;
     if (validity == .final_text) {
@@ -576,7 +580,8 @@ pub fn decideAgentAction(
         if (generation_stop == .natural_end or
             generation_stop == .stream_aborted or
             generation_stop == .missing_terminal_event or
-            generation_stop == .provider_error)
+            generation_stop == .provider_error or
+            generation_stop == .max_tokens)
         {
             return .retry_transient;
         }
@@ -720,7 +725,7 @@ test "RFC-023: tool arguments must be valid JSON objects" {
     try std.testing.expectEqual(ResponseValidity.malformed_tool_call, classifyResponse(&response, false));
 }
 
-test "RFC-023: malformed tool call yields malformed_tool_call and fail_protocol" {
+test "RFC-023: malformed tool call yields malformed_tool_call and bounded retry" {
     const alloc = std.testing.allocator;
     var response = Response.init(alloc);
     defer response.deinit();
@@ -733,7 +738,36 @@ test "RFC-023: malformed tool call yields malformed_tool_call and fail_protocol"
     } });
 
     try std.testing.expectEqual(ResponseValidity.malformed_tool_call, classifyResponse(&response, false));
-    try std.testing.expectEqual(AgentDecision.fail_protocol, decideAgentAction(.tool_call, .malformed_tool_call, false));
+    // P0-A: malformed payloads are now bounded-retriable (no more hard fail_protocol).
+    try std.testing.expectEqual(AgentDecision.retry_transient, decideAgentAction(.tool_call, .malformed_tool_call, false));
+    // Cancellation still wins over malformed payloads.
+    try std.testing.expectEqual(AgentDecision.cancel, decideAgentAction(.tool_call, .malformed_tool_call, true));
+}
+
+test "RFC-023: malformed tool call maps to its own bounded recovery budget" {
+    try std.testing.expectEqual(
+        RecoveryClass.malformed_tool_call,
+        responseRecoveryClass(.malformed_tool_call, .tool_call) orelse unreachable,
+    );
+    try std.testing.expectEqual(
+        RecoveryClass.malformed_tool_call,
+        responseRecoveryClass(.malformed_tool_call, .natural_end) orelse unreachable,
+    );
+    var budget = ResponseRecoveryBudget{};
+    try std.testing.expectEqual(RecoveryDecision.retry, budget.consume(.malformed_tool_call));
+    try std.testing.expectEqual(RecoveryDecision.retry, budget.consume(.malformed_tool_call));
+    try std.testing.expectEqual(RecoveryDecision.stalled, budget.consume(.malformed_tool_call));
+}
+
+test "RFC-023: max_tokens with thinking-only retries transiently (P0-B)" {
+    try std.testing.expectEqual(AgentDecision.retry_transient, decideAgentAction(.max_tokens, .thinking_only, false));
+    // Thinking-only responses map to the thinking_only content-shape budget on max_tokens.
+    try std.testing.expectEqual(
+        RecoveryClass.thinking_only,
+        responseRecoveryClass(.thinking_only, .max_tokens) orelse unreachable,
+    );
+    // Empty responses hit the same max_tokens retry path.
+    try std.testing.expectEqual(AgentDecision.retry_transient, decideAgentAction(.max_tokens, .empty, false));
 }
 
 test "RFC-023: incomplete max-tokens tool call requests continuation" {
