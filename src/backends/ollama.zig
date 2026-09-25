@@ -55,7 +55,12 @@ pub const Client = struct {
     fn finalizeResponse(self: *Client, ctx: *StreamCtx, req_http_code: u32, idle_aborted: bool) !proto.Response {
         _ = self;
         ctx.response.http_code = req_http_code;
-        if (idle_aborted) ctx.response.stop_reason = .stream_aborted;
+        if (idle_aborted) {
+            ctx.response.stop_reason = .stream_aborted;
+            ctx.response.generation_stop = .stream_aborted;
+        } else if (!ctx.seen_done and req_http_code < 400) {
+            ctx.response.stop_reason = .unknown;
+        }
 
         if (ctx.text_accum.items.len > 0) {
             const text = try ctx.alloc.dupe(u8, ctx.text_accum.items);
@@ -67,9 +72,6 @@ pub const Client = struct {
             }
         }
         if (ctx.raw_accum_init) ctx.raw_accum.deinit(ctx.alloc);
-        if (req_http_code < 400 and ctx.response.stop_reason == .unknown) {
-            ctx.response.stop_reason = .end_turn;
-        }
         return ctx.response;
     }
 
@@ -218,6 +220,7 @@ const StreamCtx = struct {
     text_cb: ?*const fn ([]const u8) void,
     line_buf: ArrayList(u8),
     text_accum: ArrayList(u8),
+    seen_done: bool = false,
     raw_accum: ArrayList(u8) = undefined,
     raw_accum_init: bool = false,
 
@@ -227,8 +230,9 @@ const StreamCtx = struct {
             self.raw_accum = .empty;
             self.raw_accum_init = true;
         }
-        if (self.raw_accum.items.len < 64 * 1024) {
-            self.raw_accum.appendSlice(self.alloc, chunk) catch {};
+        const remaining = proto.MAX_RESPONSE_SNIPPET_LEN - @min(self.raw_accum.items.len, proto.MAX_RESPONSE_SNIPPET_LEN);
+        if (remaining > 0) {
+            self.raw_accum.appendSlice(self.alloc, chunk[0..@min(chunk.len, remaining)]) catch {};
         }
 
         for (chunk) |c| {
@@ -267,7 +271,7 @@ const StreamCtx = struct {
                 _ = tc_arr;
                 // Parse tool call from full line
                 if (json.findString(trimmed, "name")) |name| {
-                    const args = json.findObject(trimmed, "arguments") orelse "{}";
+                    const args = json.findObject(trimmed, "arguments") orelse "";
                     const id = try std.fmt.allocPrint(self.alloc, "call_{d}", .{self.response.content.items.len});
                     try self.response.content.append(self.alloc, .{ .tool_use = .{
                         .id = id,
@@ -281,12 +285,56 @@ const StreamCtx = struct {
 
         // done flag
         if (json.findBool(trimmed, "done")) {
+            self.seen_done = true;
             if (self.text_accum.items.len > 0) {
                 const text = try self.alloc.dupe(u8, self.text_accum.items);
                 try self.response.content.append(self.alloc, .{ .text = text });
                 self.text_accum.clearRetainingCapacity();
             }
             if (self.response.stop_reason == .unknown) self.response.stop_reason = .end_turn;
+            self.response.generation_stop = proto.toGenerationStop(self.response.stop_reason, 200);
         }
     }
 };
+
+const testing = std.testing;
+
+test "RFC-023: Ollama idle abort overrides earlier terminal state" {
+    const alloc = testing.allocator;
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = proto.Response.init(alloc),
+        .text_cb = null,
+        .line_buf = .empty,
+        .text_accum = .empty,
+    };
+    ctx.response.stop_reason = .end_turn;
+    ctx.response.generation_stop = .natural_end;
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.text_accum.deinit(alloc);
+
+    var client = Client.init(alloc, "http://localhost:11434", "test", 1024);
+    var response = try client.finalizeResponse(&ctx, 200, true);
+    defer response.deinit();
+
+    try testing.expectEqual(proto.GenerationStop.stream_aborted, response.getGenerationStop());
+}
+
+test "RFC-023: Ollama done populates generation stop" {
+    const alloc = testing.allocator;
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = proto.Response.init(alloc),
+        .text_cb = null,
+        .line_buf = .empty,
+        .text_accum = .empty,
+    };
+    defer ctx.response.deinit();
+    defer ctx.line_buf.deinit(alloc);
+    defer ctx.text_accum.deinit(alloc);
+
+    try ctx.processLine("{\"message\":{\"role\":\"assistant\",\"content\":\"done\"},\"done\":true}");
+
+    try testing.expectEqual(proto.StopReason.end_turn, ctx.response.stop_reason);
+    try testing.expectEqual(proto.GenerationStop.natural_end, ctx.response.generation_stop);
+}

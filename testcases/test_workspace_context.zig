@@ -62,3 +62,52 @@ test "workspace_context: loadSystemPrompt injects context and loads root AGENTS.
     try std.testing.expect(std.mem.indexOf(u8, sp.text, "<RULE[AGENTS.md]>") != null);
     try std.testing.expect(std.mem.indexOf(u8, sp.text, "mini-agent") != null);
 }
+
+test "system prompt: codeact instructions require executable mini JavaScript" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var env_map = std.process.Environ.Map.init(alloc);
+    defer env_map.deinit();
+
+    try env_map.put("OPENAI_COMPAT_URL", "http://127.0.0.1:1/v1");
+    try env_map.put("MINI_EXECUTION_MODE", "codeact");
+
+    var cfg = try config_mod.Config.load(alloc, &env_map, io);
+    defer cfg.deinit(alloc);
+
+    const prompt = cfg.system_prompt;
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "TOOL EXECUTION IS CODEACT-ONLY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not call tools by describing them in Markdown text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "single executable JavaScript block") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "call a real `mini.*` function") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not copy placeholder paths or arguments") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Direct synchronous invocation is required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not use top-level `await`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not assume `mini.*` returns a Promise") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "`tool_call` is not executable CodeAct syntax") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "path/to/file") == null);
+}
+
+test "system prompt: codeact instructions are enabled only for codeact mode" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    for ([_]struct { mode: config_mod.ExecutionMode, expected: bool }{
+        .{ .mode = .codeact, .expected = true },
+        .{ .mode = .tools, .expected = false },
+        .{ .mode = .auto, .expected = false },
+    }) |case| {
+        var env_map = std.process.Environ.Map.init(alloc);
+        defer env_map.deinit();
+
+        try env_map.put("OPENAI_COMPAT_URL", "http://127.0.0.1:1/v1");
+        try env_map.put("MINI_EXECUTION_MODE", @tagName(case.mode));
+
+        var cfg = try config_mod.Config.load(alloc, &env_map, io);
+        defer cfg.deinit(alloc);
+
+        const has_instructions = std.mem.indexOf(u8, cfg.system_prompt, "## CodeAct Execution Instructions") != null;
+        try std.testing.expectEqual(case.expected, has_instructions);
+    }
+}

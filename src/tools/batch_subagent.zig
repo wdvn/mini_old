@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const utils = @import("../core/utils.zig");
 const subagent = @import("subagent.zig");
 const main = @import("../main.zig");
+const process_manager = @import("../runtime/process_manager.zig");
 
 // Thread worker context
 const WorkerContext = struct {
@@ -47,25 +48,31 @@ fn evaluateChildTerm(ctx: *WorkerContext, term: std.process.Child.Term, stdout_b
 
 fn runSubAgentThread(ctx: *WorkerContext) void {
     // PSEUDOCODE:
-    // 1. Spawn subagent child process.
+    // 1. Spawn each worker in its own parent-death-protected process group.
     // 2. Drain stdout and stderr pipes via drainPipe.
     // 3. Await process exit and evaluate termination status.
     const argv = [_][]const u8{ "/proc/self/exe", "-e", ctx.task };
-    var child = std.process.spawn(ctx.io, .{
-        .argv = &argv,
-        .stdout = .pipe,
-        .stderr = .pipe,
-        .stdin = .ignore,
-        .environ_map = main.getEnvironMap(),
-    }) catch |e| {
+    var child = process_manager.spawnManaged(
+        ctx.io,
+        &argv,
+        main.getEnvironMap(),
+        .ignore,
+        .pipe,
+        .pipe,
+    ) catch |e| {
         ctx.error_msg = std.fmt.allocPrint(ctx.alloc, "Spawn error: {s}", .{@errorName(e)}) catch null;
         return;
     };
+
+    var child_reaped = false;
+    defer if (!child_reaped) process_manager.abortManaged(ctx.io, &child);
 
     var stdout_buf = std.ArrayListUnmanaged(u8).empty;
     defer stdout_buf.deinit(ctx.alloc);
     var stderr_buf = std.ArrayListUnmanaged(u8).empty;
     defer stderr_buf.deinit(ctx.alloc);
+
+    const managed_pid = if (child.id) |pid| @as(i32, @intCast(pid)) else 0;
 
     drainPipe(ctx.io, ctx.alloc, child.stdout, &stdout_buf);
     drainPipe(ctx.io, ctx.alloc, child.stderr, &stderr_buf);
@@ -74,6 +81,8 @@ fn runSubAgentThread(ctx: *WorkerContext) void {
         ctx.error_msg = std.fmt.allocPrint(ctx.alloc, "Wait error: {s}", .{@errorName(e)}) catch null;
         return;
     };
+    child_reaped = true;
+    process_manager.unregisterProcessGroup(managed_pid);
     evaluateChildTerm(ctx, term, stdout_buf.items, stderr_buf.items);
 }
 

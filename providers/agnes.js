@@ -69,11 +69,18 @@ export default {
 
     /**
      * Transform outgoing request before dispatch.
-     * Can inject provider-specific headers or modify request body.
+     * Agnes 3.0 Flash enables thinking via chat_template_kwargs.enable_thinking
+     * (per https://www.agnes-ai.com/en/docs/agnes-30-flash#thinking-mode).
+     * The generic pipeline injects "reasoning_effort" which Agnes does not
+     * recognize, so map it to enable_thinking and drop the original field.
      */
     transformRequest(req) {
-        // Add any custom headers or modifications here if needed
-        // Example: req.model = "agnes-2.5-flash";
+        var effort = req.reasoning_effort;
+        var reasoningEffortIsNone = (effort === "none");
+        if (!reasoningEffortIsNone) {
+            req.chat_template_kwargs = { enable_thinking: true };
+        }
+        delete req.reasoning_effort;
         return req;
     }
 };

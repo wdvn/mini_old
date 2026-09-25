@@ -19,6 +19,9 @@ pub const ActEventType = enum {
     act_started,
     act_completed,
     act_failed,
+    llm_generation_ended,
+    llm_response_invalid,
+    agent_decision,
     llm_call_throttled,
     llm_provider_error,
     llm_output_malformed,
@@ -26,6 +29,8 @@ pub const ActEventType = enum {
     rollback_requested,
     rollback_completed,
     task_completed,
+    task_stalled,
+    task_failed,
     task_interrupted,
     /// RFC-003 §4.6: MemAct compaction completed (observable & reversible via Act model).
     memact_compacted,
@@ -67,6 +72,11 @@ pub const StateDelta = struct {
     file_snapshots: []const FileSnapshot,
     /// LLM stop reason for this act (debugging loop/termination).
     stop_reason: ?[]const u8 = null,
+    generation_stop: ?[]const u8 = null,
+    response_validity: ?[]const u8 = null,
+    agent_decision: ?[]const u8 = null,
+    recovery_class: ?[]const u8 = null,
+    attempt: usize = 1,
 };
 
 pub const ActEvent = struct {

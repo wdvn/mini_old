@@ -691,14 +691,16 @@ fn streamResponseLoop(
     watch_fd: ?posix.socket_t,
     opts: StreamOptions,
     deadline_ms: i64,
+    expected_body_len: ?u64,
     on_chunk: StreamChunkFn,
     userdata: *anyopaque,
 ) !void {
     // PSEUDOCODE:
     // 1. Loop checking signals and wall-clock deadline
     // 2. Poll socket with idle timeout if buffer is empty
-    // 3. Peek greedy chunk; break on EOF, invoke on_chunk callback, toss bytes
-    var got_any = false;
+    // 3. Peek greedy chunk; break on complete EOF, reject truncated fixed-length bodies
+    // 4. Invoke on_chunk, count body bytes, and toss them
+    var received_len: u64 = 0;
     while (true) {
         if (signals.isInterrupted()) return error.Interrupted;
 
@@ -717,13 +719,18 @@ fn streamResponseLoop(
         }
 
         const chunk = r.peekGreedy(1) catch |e| switch (e) {
-            error.EndOfStream => break,
+            error.EndOfStream => {
+                if (expected_body_len) |expected| {
+                    if (received_len < expected) return error.EndOfStream;
+                }
+                break;
+            },
             else => return e,
         };
         if (signals.isInterrupted()) return error.Interrupted;
         if (chunk.len == 0) break;
-        got_any = true;
         on_chunk(chunk, userdata);
+        received_len += @intCast(chunk.len);
         r.toss(chunk.len);
     }
 }
@@ -785,7 +792,7 @@ pub fn postStream(
         null;
 
     const deadline_ms = calculateStreamDeadline(opts);
-    try streamResponseLoop(r, watch_fd, opts, deadline_ms, on_chunk, userdata);
+    try streamResponseLoop(r, watch_fd, opts, deadline_ms, response.head.content_length, on_chunk, userdata);
 
     return @intFromEnum(response.head.status);
 }
@@ -1254,7 +1261,7 @@ test "postStream: SSE stream receives all chunks + status" {
     const response =
         "HTTP/1.1 200 OK\r\n" ++
         "content-type: text/event-stream\r\n" ++
-        "content-length: 32\r\n" ++
+        "content-length: 27\r\n" ++
         "\r\n" ++
         "data: a\n\ndata: b\n\ndata: c\n\n";
 
@@ -1281,6 +1288,39 @@ test "postStream: SSE stream receives all chunks + status" {
     try testing.expectEqual(@as(u32, 200), status);
     try testing.expectEqualStrings("data: a\n\ndata: b\n\ndata: c\n\n", ctx.buf.items);
     try testing.expect(ctx.chunks >= 1);
+}
+
+test "postStream: truncated Content-Length stream is a transport error" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // The server announces more body bytes than it sends, then closes the socket.
+    const response =
+        "HTTP/1.1 200 OK\r\n" ++
+        "content-type: text/event-stream\r\n" ++
+        "content-length: 64\r\n" ++
+        "\r\n" ++
+        "data: partial\n\n";
+
+    var h = try FetchHarness.init(io, response, 1);
+    defer h.deinit();
+    try h.start();
+
+    const u = try h.url(alloc, "/v1/stream");
+    defer alloc.free(u);
+
+    var ctx = StreamAccumCtx{ .buf = .empty, .chunks = 0 };
+    defer ctx.buf.deinit(alloc);
+
+    const result = postStream(alloc, io, .{
+        .url = u,
+        .body = "{\"q\":1}",
+        .headers = &.{"Content-Type: application/json"},
+        .timeout_secs = 10,
+    }, StreamAccumCtx.onChunk, &ctx);
+
+    try testing.expectError(error.EndOfStream, result);
+    try testing.expectEqualStrings("data: partial\n\n", ctx.buf.items);
 }
 
 /// Epoch milliseconds via raw clock (Zig 0.16 moved std.time.milliTimestamp).

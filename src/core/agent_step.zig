@@ -23,10 +23,7 @@ const AgentLoop = agent_mod.AgentLoop;
 const prompts_mod = @import("prompts.zig");
 const agent_loop_monitor = @import("agent_loop_monitor.zig");
 
-pub const StepResult = enum {
-    continue_loop,
-    exit_loop,
-};
+pub const StepResult = proto.ActTransition;
 
 /// Manages ephemeral allocations and content blocks for Procedural Graph and Plan progress guidance.
 pub const GuidanceProgressContext = struct {
@@ -55,30 +52,32 @@ pub const GuidanceProgressContext = struct {
         temp_input_msgs: *std.ArrayListUnmanaged(proto.Message),
     ) !void {
         // Procedural Graph (RFC-010): Prepare ephemeral situational guidance block
-        if (loop.pg_store) |pg| {
-            if (loop.config.memact_pg_advisory) {
-                const traj_slice: []const []const u8 = if (loop.turn_tool_trajectory.items.len > 0)
-                    loop.turn_tool_trajectory.items
-                else
-                    loop.recent_tools.items;
+        if (loop.config.prompt_enforcement_enabled) {
+            if (loop.pg_store) |pg| {
+                if (loop.config.memact_pg_advisory) {
+                    const traj_slice: []const []const u8 = if (loop.turn_tool_trajectory.items.len > 0)
+                        loop.turn_tool_trajectory.items
+                    else
+                        loop.recent_tools.items;
 
-                self.ephemeral_guidance = pg.serializeGuidance(
-                    loop.alloc,
-                    loop.last_executed_tool,
-                    traj_slice,
-                    loop.last_act_failed,
-                    loop.config.memact_pg_h,
-                    loop.current_user_request,
-                ) catch null;
+                    self.ephemeral_guidance = pg.serializeGuidance(
+                        loop.alloc,
+                        loop.last_executed_tool,
+                        traj_slice,
+                        loop.last_act_failed,
+                        loop.config.memact_pg_h,
+                        loop.current_user_request,
+                    ) catch null;
 
-                if (self.ephemeral_guidance) |guidance_text| {
-                    const blocks = try loop.alloc.alloc(proto.ContentBlock, 1);
-                    blocks[0] = .{ .text = guidance_text };
-                    self.ephemeral_blocks = blocks;
-                    try temp_input_msgs.append(loop.alloc, .{
-                        .role = .user,
-                        .content = blocks,
-                    });
+                    if (self.ephemeral_guidance) |guidance_text| {
+                        const blocks = try loop.alloc.alloc(proto.ContentBlock, 1);
+                        blocks[0] = .{ .text = guidance_text };
+                        self.ephemeral_blocks = blocks;
+                        try temp_input_msgs.append(loop.alloc, .{
+                            .role = .user,
+                            .content = blocks,
+                        });
+                    }
                 }
             }
         }
@@ -96,6 +95,27 @@ pub const GuidanceProgressContext = struct {
         }
     }
 };
+
+/// PSEUDOCODE: Cap thinking budget at 85% of max_tokens so at least 15%
+/// headroom remains for the final answer / tool-call payload (same
+/// estimation principle as Claude's thinking budget).
+/// 1. budget null → null (thinking disabled, keep as-is)
+/// 2. budget > 85% of max_tokens → clamp down to the cap
+/// 3. budget <= cap → keep unchanged
+fn capThinkingBudget(max_tokens: u32, budget: ?u32) ?u32 {
+    const b = budget orelse return null;
+    const cap = max_tokens * 85 / 100;
+    if (b > cap) return cap;
+    return b;
+}
+
+test "thinking budget capped at 85% of max_tokens" {
+    try std.testing.expectEqual(@as(?u32, null), capThinkingBudget(24000, null));
+    try std.testing.expectEqual(@as(?u32, 4096), capThinkingBudget(24000, 4096));
+    try std.testing.expectEqual(@as(?u32, 20400), capThinkingBudget(24000, 40000));
+    try std.testing.expectEqual(@as(?u32, 850), capThinkingBudget(1000, 900));
+    try std.testing.expectEqual(@as(?u32, 20400), capThinkingBudget(24000, 20400));
+}
 
 /// Dynamically modulates reasoning effort and thinking budget tokens based on overrides, error state, and stickiness.
 pub fn modulateReasoningEffort(loop: *AgentLoop, act_id: usize) void {
@@ -123,6 +143,10 @@ pub fn modulateReasoningEffort(loop: *AgentLoop, act_id: usize) void {
             effective_budget = loop.last_budget;
         }
     }
+
+    // PSEUDOCODE: Clamp thinking budget to 85% of max_tokens so the response
+    // always keeps >=15% headroom for answer / tool-call payload.
+    effective_budget = capThinkingBudget(loop.config.max_tokens, effective_budget);
 
     loop.last_effort = effective_effort;
     loop.last_budget = effective_budget;
@@ -154,7 +178,6 @@ pub fn scanResponseContent(loop: *AgentLoop, response: *const proto.Response, wa
             }
         }
     }
-    loop.response_content_empty = !has_meaningful_text and !has_tool_use_blocks;
 
     for (response.content.items) |block| {
         switch (block) {
@@ -197,7 +220,8 @@ fn handleCodeActLoopTrip(loop: *AgentLoop, act_id: usize) !StepResult {
         try loop.history.addUser(trip_msg);
         loop.action_loop_tripped = false;
         loop.consecutive_dup_tool_count = 0;
-        return .continue_loop;
+        loop.last_step_outcome = .actions_executed;
+        return proto.ActTransition{ .next_act = {} };
     } else {
         main.stderrPrint(
             "\n\x1b[33m[agent] ⚠️ Action loop persisted after replanning attempts: identical CodeAct script repeated. Halting loop.\x1b[0m\n",
@@ -206,7 +230,9 @@ fn handleCodeActLoopTrip(loop: *AgentLoop, act_id: usize) !StepResult {
         const trip_msg = "[CodeAct System Intervention]: Action loop persisted after multiple replanning attempts. Halting execution. Synthesize your findings and answer the user now.";
         try loop.history.addUser(trip_msg);
         loop.action_loop_tripped = true;
-        return .exit_loop;
+        loop.last_step_outcome = .protocol_failure;
+        loop.last_turn_outcome = .stalled;
+        return proto.ActTransition{ .stall = .action_loop };
     }
 }
 
@@ -239,7 +265,8 @@ fn handleCodeActEvalError(
     const err_msg = try std.fmt.allocPrint(loop.alloc, prompts_mod.codeact_system_error_fmt, .{@errorName(e)});
     defer loop.alloc.free(err_msg);
     try loop.history.addUser(err_msg);
-    return .continue_loop;
+    loop.last_step_outcome = .actions_executed;
+    return proto.ActTransition{ .next_act = {} };
 }
 
 fn handleCodeActSuccess(loop: *AgentLoop, res: ExecutionResult, dur_ms: u64) !StepResult {
@@ -273,7 +300,8 @@ fn handleCodeActSuccess(loop: *AgentLoop, res: ExecutionResult, dur_ms: u64) !St
     } else {
         try loop.history.addUser(out_buf.list.items);
     }
-    return .continue_loop;
+    loop.last_step_outcome = .actions_executed;
+    return proto.ActTransition{ .next_act = {} };
 }
 
 fn handleCodeActScriptError(loop: *AgentLoop, res: ExecutionResult, dur_ms: u64) !StepResult {
@@ -306,7 +334,8 @@ fn handleCodeActScriptError(loop: *AgentLoop, res: ExecutionResult, dur_ms: u64)
     }
 
     try loop.history.addUser(err_buf.list.items);
-    return .continue_loop;
+    loop.last_step_outcome = .actions_executed;
+    return proto.ActTransition{ .next_act = {} };
 }
 
 // PSEUDOCODE:
@@ -337,7 +366,10 @@ pub fn executeCodeActBlock(
     response: *const proto.Response,
     js_code: []const u8,
 ) !StepResult {
-    const js_loop_check = loop.checkActionLoop("codeact", js_code) catch .allow;
+    const js_loop_check = if (loop.config.prompt_enforcement_enabled)
+        loop.checkActionLoop("codeact", js_code) catch .allow
+    else
+        @as(@TypeOf(loop.checkActionLoop("codeact", js_code) catch .allow), .allow);
     if (js_loop_check == .trip) {
         return handleCodeActLoopTrip(loop, act_id);
     }
@@ -360,7 +392,8 @@ pub fn executeCodeActBlock(
             );
             defer loop.alloc.free(note);
             try loop.history.addUser(note);
-            return .continue_loop;
+            loop.last_step_outcome = .actions_executed;
+            return proto.ActTransition{ .next_act = {} };
         }
     }
 
@@ -401,19 +434,270 @@ pub fn executeCodeActBlock(
     }
 }
 
-fn handleEmptyResponseAdvisory(loop: *AgentLoop) !void {
-    main.stderrPrint(
-        "\n\x1b[33m[agent] ⚠️ Empty response detected (whitespace only), requesting continuation...\x1b[0m\n",
-        .{},
-    );
-    if (main.ui_repl.current_renderer) |r| {
-        r.ensureNewline();
-        r.write(" \x1b[33m[Agent Advisory]: Your previous response contained no actionable content. Please proceed with tool execution or provide a substantive answer.\x1b[0m\n");
+fn responseRecoveryBackoffSeconds(recovery_class: proto.RecoveryClass, attempt: usize) u64 {
+    // PSEUDOCODE:
+    // 1. Retry empty missing-terminal streams with exponential backoff.
+    // 2. Cap the delay at four seconds across the bounded retry budget.
+    // 3. Keep the other response recovery paths immediate.
+    if (recovery_class != .missing_terminal) return 0;
+    return switch (attempt) {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        else => 4,
+    };
+}
+
+fn nextResponseRecoveryTransition(
+    validity: proto.ResponseValidity,
+    gen_stop: proto.GenerationStop,
+    budget: *proto.ResponseRecoveryBudget,
+) !?proto.ActTransition {
+    // PSEUDOCODE:
+    // 1. Resolve the independent failure-class recovery budget.
+    // 2. Preserve Act identity for retries that still have capacity.
+    // 3. Fail repeated empty missing-terminal streams as provider unavailability.
+    // 4. Return a typed stall when another recovery class is exhausted.
+    const class = proto.responseRecoveryClass(validity, gen_stop) orelse return null;
+    if (budget.consume(class) == .retry) {
+        return proto.ActTransition{ .retry_same_act = {} };
     }
-    try loop.history.addUser(
-        prompts_mod.empty_response_advisory,
+    if (class == .missing_terminal and validity == .empty and gen_stop == .missing_terminal_event) {
+        return proto.ActTransition{ .fail = .provider_unavailable };
+    }
+    return proto.ActTransition{ .stall = .recovery_budget_exhausted };
+}
+
+test "RFC-023: Act 52 provider failure recovers twice then stalls" {
+    var budget = proto.ResponseRecoveryBudget{};
+
+    // Act 52, attempt 1: HTTP 500 is a provider failure.
+    const provider_failure = proto.ActTransition{ .fail = .provider_error };
+    try std.testing.expectEqual(proto.FailureReason.provider_error, provider_failure.fail);
+
+    // Act 52, attempts 2-3: successful HTTP 200 thinking-only responses retry the same Act.
+    const recovery_1 = (try nextResponseRecoveryTransition(.thinking_only, .natural_end, &budget)).?;
+    try std.testing.expect(recovery_1 == .retry_same_act);
+    const recovery_2 = (try nextResponseRecoveryTransition(.thinking_only, .natural_end, &budget)).?;
+    try std.testing.expect(recovery_2 == .retry_same_act);
+
+    // Act 52, attempt 4: class budget exhausted; no new Act and no completion.
+    const stalled = (try nextResponseRecoveryTransition(.thinking_only, .natural_end, &budget)).?;
+    try std.testing.expectEqual(proto.StallReason.recovery_budget_exhausted, stalled.stall);
+}
+
+test "RFC-023: recovery exhaustion records transient retry while stalling" {
+    var loop: AgentLoop = undefined;
+    markRecoveryExhausted(&loop);
+    try std.testing.expectEqual(proto.StepOutcome.transient_retry, loop.last_step_outcome);
+    try std.testing.expectEqual(proto.TurnOutcome.stalled, loop.last_turn_outcome);
+}
+
+test "RFC-023: missing-terminal recovery uses capped exponential retry backoff" {
+    try std.testing.expectEqual(@as(u64, 0), responseRecoveryBackoffSeconds(.missing_terminal, 0));
+    try std.testing.expectEqual(@as(u64, 1), responseRecoveryBackoffSeconds(.missing_terminal, 1));
+    try std.testing.expectEqual(@as(u64, 2), responseRecoveryBackoffSeconds(.missing_terminal, 2));
+    try std.testing.expectEqual(@as(u64, 4), responseRecoveryBackoffSeconds(.missing_terminal, 3));
+    try std.testing.expectEqual(@as(u64, 4), responseRecoveryBackoffSeconds(.missing_terminal, 4));
+    try std.testing.expectEqual(@as(u64, 0), responseRecoveryBackoffSeconds(.empty_response, 1));
+}
+
+test "RFC-023: repeated empty missing-terminal response fails as provider unavailable" {
+    // PSEUDOCODE:
+    // 1. Configure a three-retry missing-terminal budget for this focused boundary test.
+    // 2. Verify the first three responses retry the same Act.
+    // 3. Verify the next response fails as provider unavailable.
+    var budget = proto.ResponseRecoveryBudget{ .missing_terminal = 3 };
+
+    for (0..3) |_| {
+        const transition = (try nextResponseRecoveryTransition(
+            .empty,
+            .missing_terminal_event,
+            &budget,
+        )).?;
+        try std.testing.expect(transition == .retry_same_act);
+    }
+
+    const transition = (try nextResponseRecoveryTransition(
+        .empty,
+        .missing_terminal_event,
+        &budget,
+    )).?;
+    try std.testing.expectEqual(proto.FailureReason.provider_unavailable, transition.fail);
+}
+
+test "RFC-023: valid action resets max-token continuation budget" {
+    var loop: AgentLoop = undefined;
+    loop.max_tokens_continues = 5;
+    markValidActionProgress(&loop);
+    try std.testing.expectEqual(@as(usize, 0), loop.max_tokens_continues);
+}
+
+test "RFC-023: stop-sequence continuation is bounded and eventually stalls" {
+    var count: usize = 0;
+    for (0..5) |_| try std.testing.expect(stopSequenceContinuation(&count) == .next_act);
+    try std.testing.expectEqual(proto.StallReason.recovery_budget_exhausted, stopSequenceContinuation(&count).stall);
+    try std.testing.expectEqual(@as(usize, 6), count);
+}
+
+fn stopSequenceContinuation(count: *usize) proto.ActTransition {
+    // PSEUDOCODE:
+    // 1. Bound controlled stop-sequence continuations.
+    // 2. Stall after five resume boundaries.
+    count.* += 1;
+    if (count.* <= 5) return .{ .next_act = {} };
+    return .{ .stall = .recovery_budget_exhausted };
+}
+
+fn markRecoveryExhausted(loop: *AgentLoop) void {
+    // PSEUDOCODE:
+    // 1. Preserve the business outcome as stalled.
+    // 2. Report exhausted transient recovery as the immediate step outcome.
+    loop.last_step_outcome = .transient_retry;
+    loop.last_turn_outcome = .stalled;
+}
+
+fn markValidActionProgress(loop: *AgentLoop) void {
+    // PSEUDOCODE:
+    // 1. Treat a valid action as a recovery boundary.
+    // 2. Reset consecutive continuation pressure for later truncation.
+    loop.response_recovery_budget = .{};
+    loop.max_tokens_continues = 0;
+    loop.stop_sequence_continues = 0;
+}
+
+/// P0-B: Build a thinking-tail hint for a truncated (max_tokens) thinking-only response.
+/// PSEUDOCODE:
+/// 1. Scan response content for the LAST thinking block; a verification signature
+///    means a complete block we should not fragment, so skip entirely.
+/// 2. Take up to max_chars bytes from the END of the thinking text.
+/// 3. Walk back to a valid UTF-8 start boundary (byte class 0xxxxxxx or 11xxxxxx).
+/// 4. If the tail trims to empty, return null.
+/// 5. Compose a resume advisory embedding the tail.
+/// 6. Allocate the result via the provided allocator; caller frees.
+fn buildThinkingTailHint(alloc: std.mem.Allocator, response: *const proto.Response, max_chars: usize) ?[]const u8 {
+    var last_thinking: ?proto.ThinkingBlock = null;
+    for (response.content.items) |block| {
+        if (block == .thinking) last_thinking = block.thinking;
+    }
+    if (last_thinking == null) return null;
+    const th = last_thinking.?;
+    // A non-empty signature means a complete/verified thinking block; do not fragment it.
+    if (th.signature.len > 0) return null;
+
+    const text = th.thinking;
+    const start = if (text.len <= max_chars) 0 else @min(text.len - max_chars, text.len);
+    // Walk back to a UTF-8 start boundary (lead byte 0xxxxxxx or 11xxxxxx).
+    var i = start;
+    while (i < text.len) {
+        const b = text[i];
+        if ((b & 0b11000000) != 0b10000000) break; // lead byte or ASCII: valid start
+        i += 1;
+    }
+    const tail = text[i..];
+    if (std.mem.trim(u8, tail, " \r\n\t").len == 0) return null;
+
+    const tail_trimmed = std.mem.trim(u8, tail, " \r\n\t");
+    if (tail_trimmed.len == 0) return null;
+
+    // Single contiguous allocation; caller owns and frees it.
+    return std.fmt.allocPrint(
+        alloc,
+        "[System] The previous response's reasoning was truncated at the max_tokens limit. You stopped here:\n\n{s}\n\nResume from that point with MINIMAL reasoning (keep thinking to a few sentences, or call mini.setThinking(\"low\")), then emit the next tool call. Do not re-derive completed analysis.",
+        .{tail_trimmed},
+    ) catch return null;
+}
+
+fn handleResponseRecovery(
+    loop: *AgentLoop,
+    act_id: usize,
+    input_msgs_count: usize,
+    tool_defs: []const proto.ToolDefinition,
+    response: *const proto.Response,
+    validity: proto.ResponseValidity,
+    gen_stop: proto.GenerationStop,
+    history_checkpoint: usize,
+) !StepResult {
+    const recovery_class: proto.RecoveryClass = proto.responseRecoveryClass(validity, gen_stop) orelse {
+        loop.last_step_outcome = .protocol_failure;
+        loop.last_turn_outcome = .failed;
+        return proto.ActTransition{ .fail = .protocol_error };
+    };
+    loop.last_recovery_class = recovery_class;
+
+    loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{
+        .exec_type = "response_recovery",
+        .is_error = true,
+        .error_message = @tagName(validity),
+    });
+
+    loop.history.truncate(history_checkpoint);
+
+    const transition = (try nextResponseRecoveryTransition(validity, gen_stop, &loop.response_recovery_budget)).?;
+    if (transition == .retry_same_act) {
+        loop.turn_recovery_attempts += 1;
+        loop.last_agent_decision = .retry_transient;
+        loop.last_step_outcome = .transient_retry;
+
+        const advisory = switch (recovery_class) {
+            .thinking_only => "The model response contained internal reasoning/thinking only, without any actionable output or tool invocation. Please provide the necessary tool calls or final response to proceed.",
+            .empty_response => "The model response was empty or contained only whitespace. Please provide the necessary tool calls or final response to proceed.",
+            .missing_terminal => "The model response stream terminated unexpectedly without a terminal event. Please resume and provide the complete tool call or response.",
+            .stream_aborted => "The model response stream was interrupted or aborted due to idle timeout. Please resume from where execution stopped.",
+            .malformed_tool_call => "Your previous tool call was malformed (invalid JSON arguments or an empty tool name) and could not be executed. Re-emit exactly ONE well-formed tool call (one ```js block with valid `mini.*` calls and JSON-object arguments). Do not include the malformed block.",
+        };
+        try loop.history.addUser(advisory);
+
+        // P0-B: when a thinking-only response was truncated at max_tokens, append a
+        // short UTF-8-safe tail of the reasoning so the model resumes instead of
+        // re-deriving completed analysis. Only when there is no verification
+        // signature (a signature implies a complete thinking block we should not
+        // fragment) and when the tail is non-empty after trimming.
+        if (recovery_class == .thinking_only and gen_stop == .max_tokens) {
+            const thinking_tail = buildThinkingTailHint(loop.alloc, response, 512);
+            if (thinking_tail) |hint| {
+                defer loop.alloc.free(hint);
+                try loop.history.addUser(hint);
+            }
+        }
+
+        const backoff_s = responseRecoveryBackoffSeconds(recovery_class, loop.turn_recovery_attempts);
+        if (backoff_s > 0) {
+            try loop.waitWithInplaceCountdown(backoff_s, loop.turn_recovery_attempts, 1);
+        }
+        return transition;
+    }
+
+    if (transition == .fail) {
+        loop.last_step_outcome = .provider_failure;
+        loop.last_turn_outcome = .failed;
+        return transition;
+    }
+
+    loop.last_agent_decision = .fail_stalled;
+    markRecoveryExhausted(loop);
+    return transition;
+}
+
+fn finalAnswerWatchdogTransition(watchdog_action: anytype) proto.ActTransition {
+    // PSEUDOCODE:
+    // 1. Only a valid final-text candidate reaches the watchdog.
+    // 2. Continue-loop remains pending; exhaustion stalls; no-action completes.
+    return switch (watchdog_action) {
+        .continue_loop => .{ .next_act = {} },
+        .exit_loop => .{ .stall = .plan_stalled },
+        .no_action => .{ .complete = {} },
+        else => unreachable,
+    };
+}
+
+test "RFC-023: watchdog maps exhaustion to stall and no-action to completion" {
+    try std.testing.expect(finalAnswerWatchdogTransition(.continue_loop) == .next_act);
+    try std.testing.expectEqual(
+        proto.StallReason.plan_stalled,
+        finalAnswerWatchdogTransition(.exit_loop).stall,
     );
-    loop.response_content_empty = false;
+    try std.testing.expect(finalAnswerWatchdogTransition(.no_action) == .complete);
 }
 
 fn handleEndTurnStop(
@@ -422,18 +706,16 @@ fn handleEndTurnStop(
     input_msgs_count: usize,
     tool_defs: []const proto.ToolDefinition,
     response: *const proto.Response,
-    has_tool_use_blocks: bool,
 ) !StepResult {
     loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{ .exec_type = "none" });
-
-    if (loop.response_content_empty and !has_tool_use_blocks) {
-        try handleEmptyResponseAdvisory(loop);
-        return .continue_loop;
-    }
-    loop.response_content_empty = false;
-
-    switch (loop.plan.handleEndTurnWatchdog(loop.current_user_request, loop.hasRecentVerifiedMutation())) {
+    const watchdog_action = if (loop.config.prompt_enforcement_enabled)
+        loop.plan.handleEndTurnWatchdog(loop.current_user_request, loop.hasRecentVerifiedMutation())
+    else
+        @as(@TypeOf(loop.plan.handleEndTurnWatchdog(loop.current_user_request, loop.hasRecentVerifiedMutation())), .no_action);
+    switch (watchdog_action) {
         .continue_loop => {
+            loop.last_agent_decision = .request_continuation;
+            loop.last_step_outcome = .continuation_requested;
             if (main.ui_repl.current_renderer) |r| {
                 r.ensureNewline();
                 r.write(" \x1b[33m[Plan Watchdog: Plan declared without execution. Enforcing Step 1 execution]\x1b[0m\n");
@@ -442,25 +724,24 @@ fn handleEndTurnStop(
                 defer loop.alloc.free(directive);
                 try loop.history.addUser(directive);
             }
-            return .continue_loop;
+            return finalAnswerWatchdogTransition(.continue_loop);
         },
         .exit_loop => {
+            loop.last_agent_decision = .fail_stalled;
+            loop.last_step_outcome = .protocol_failure;
+            loop.last_turn_outcome = .stalled;
+            return finalAnswerWatchdogTransition(.exit_loop);
+        },
+        .no_action => {
+            loop.last_agent_decision = .deliver_final_answer;
+            loop.last_step_outcome = .final_answer;
+            loop.last_turn_outcome = .completed;
             if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
                 main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
             }
-            if (loop.journal) |*j| {
-                j.recordEvent(loop.io, act_id, .task_completed, "Model responded with text after plan watchdog retries") catch {};
-            }
-            loop.action_loop_tripped = false;
-            loop.consecutive_dup_tool_count = 0;
-            return .exit_loop;
+            return finalAnswerWatchdogTransition(.no_action);
         },
-        .no_action => {},
     }
-    if (main.ui_repl.current_renderer == null and !utils.isSubagent()) {
-        main.stderrPrint("\n\x1b[92m[agent] ✓ Completed after {d} loops.\x1b[0m\n", .{act_id});
-    }
-    return .exit_loop;
 }
 
 fn handleMaxTokensStop(
@@ -474,10 +755,11 @@ fn handleMaxTokensStop(
     loop.max_tokens_continues += 1;
     if (loop.max_tokens_continues > 5) {
         main.stderrPrint("\n\x1b[31m[agent] ⛔ Continued max_tokens {d} consecutive times without completion. Stopping to prevent infinite loop.\x1b[0m\n", .{loop.max_tokens_continues});
-        return .exit_loop;
+        loop.last_step_outcome = .protocol_failure;
+        loop.last_turn_outcome = .stalled;
+        return proto.ActTransition{ .stall = .recovery_budget_exhausted };
     }
     main.stderrPrint("\n\x1b[33m[agent] ⚠️ Response truncated (max_tokens), requesting continuation ({d}/5)...\x1b[0m\n", .{loop.max_tokens_continues});
-    try loop.closeOrphanedToolUses(response);
     var buf = utils.BufWriter.init(loop.alloc);
     defer buf.deinit();
     try buf.print(
@@ -485,7 +767,8 @@ fn handleMaxTokensStop(
         .{loop.max_tokens_continues},
     );
     try loop.history.addUser(buf.list.items);
-    return .continue_loop;
+    loop.last_step_outcome = .continuation_requested;
+    return proto.ActTransition{ .next_act = {} };
 }
 
 fn handleToolUseStop(
@@ -505,12 +788,14 @@ fn handleToolUseStop(
         });
         main.stderrPrint("\n", .{});
         if (loop.action_loop_tripped) {
-            return .exit_loop;
+            loop.last_turn_outcome = .stalled;
+            return .exit_stalled;
         }
         return .continue_loop;
     }
     loop.logActDebug(act_id, input_msgs_count, tool_defs, response, null, .{ .exec_type = "none" });
-    return .exit_loop;
+    loop.last_turn_outcome = .stalled;
+    return .exit_stalled;
 }
 
 fn handleStreamAbortedStop(
@@ -584,7 +869,7 @@ fn checkRoleCompatibilityHttp400(loop: *AgentLoop, raw: []const u8) ?StepResult 
         _ = loop.history.ensureClaudeCompatible();
         if (loop.role_fix_attempts < 2) {
             loop.role_fix_attempts += 1;
-            return .continue_loop;
+            return proto.ActTransition{ .next_act = {} };
         }
     }
 
@@ -595,7 +880,7 @@ fn checkRoleCompatibilityHttp400(loop: *AgentLoop, raw: []const u8) ?StepResult 
         _ = loop.history.ensureOpenAICompatible();
         if (loop.role_fix_attempts < 2) {
             loop.role_fix_attempts += 1;
-            return .continue_loop;
+            return proto.ActTransition{ .next_act = {} };
         }
     }
     return null;
@@ -654,11 +939,21 @@ pub fn dispatchStopReason(
     has_tool_use_blocks: bool,
 ) !StepResult {
     switch (response.stop_reason) {
-        .end_turn, .stop_sequence => return handleEndTurnStop(loop, act_id, input_msgs_count, tool_defs, response, has_tool_use_blocks),
+        .end_turn => {
+            if (loop.last_response_validity == .thinking_only or
+                loop.last_response_validity == .whitespace_only or
+                loop.last_response_validity == .empty)
+            {
+                return handleResponseRecovery(loop, act_id, input_msgs_count, tool_defs, response, loop.last_response_validity);
+            }
+            return handleEndTurnStop(loop, act_id, input_msgs_count, tool_defs, response);
+        },
+        .missing_terminal_event => return handleResponseRecovery(loop, act_id, input_msgs_count, tool_defs, response, loop.last_response_validity),
+        .stop_sequence => return handleResponseRecovery(loop, act_id, input_msgs_count, tool_defs, response, .partial_text),
         .max_tokens => return handleMaxTokensStop(loop, act_id, input_msgs_count, tool_defs, response),
         .tool_use => return handleToolUseStop(loop, act_id, input_msgs_count, tool_defs, response, has_tool_use_blocks),
         .stream_aborted => return handleStreamAbortedStop(loop, act_id, input_msgs_count, tool_defs, response),
-        .unknown => return handleUnknownStopReason(loop, act_id, input_msgs_count, tool_defs, response),
+        .content_filter, .provider_error, .unknown => return handleUnknownStopReason(loop, act_id, input_msgs_count, tool_defs, response),
     }
 }
 
@@ -699,6 +994,26 @@ fn prepareStepInputMessages(
     return guidance_ctx;
 }
 
+fn extractAssistantText(alloc: std.mem.Allocator, response: *const proto.Response) ?[]u8 {
+    var total_len: usize = 0;
+    for (response.content.items) |block| {
+        if (block == .text) {
+            total_len += block.text.len;
+        }
+    }
+    if (total_len == 0) return null;
+
+    const buf = alloc.alloc(u8, total_len) catch return null;
+    var offset: usize = 0;
+    for (response.content.items) |block| {
+        if (block == .text) {
+            @memcpy(buf[offset .. offset + block.text.len], block.text);
+            offset += block.text.len;
+        }
+    }
+    return buf;
+}
+
 fn executeNativeToolCalling(
     self: *AgentLoop,
     act_id: usize,
@@ -714,38 +1029,14 @@ fn executeNativeToolCalling(
     });
     main.stderrPrint("\n", .{});
     if (self.action_loop_tripped) {
-        return .exit_loop;
+        self.last_step_outcome = .protocol_failure;
+        self.last_turn_outcome = .stalled;
+        return proto.ActTransition{ .stall = .action_loop };
     }
-    return .continue_loop;
+    self.last_step_outcome = .actions_executed;
+    return proto.ActTransition{ .next_act = {} };
 }
 
-/// Executes a single agent step:
-/// 1. Status and history preparation (watchdog recap, guidance, plan progress)
-/// 2. Dynamic reasoning effort modulation
-/// 3. AI backend streaming communication
-/// 4. Plan detection & token tracking
-/// 5. Tool execution or CodeAct evaluation or stop reason dispatching
-fn tryExecuteCodeAct(
-    self: *AgentLoop,
-    act_id: usize,
-    input_msgs_count: usize,
-    tool_defs: []const proto.ToolDefinition,
-    response: *const proto.Response,
-) !?StepResult {
-    if (self.config.execution_mode == .tools) return null;
-    if (agent_parsing.findJsCodeInResponse(self.alloc, response)) |js_code| {
-        defer self.alloc.free(js_code);
-        return try executeCodeActBlock(self, act_id, input_msgs_count, tool_defs, response, js_code);
-    }
-    return null;
-}
-
-/// Executes a single agent step:
-/// 1. Status and history preparation (watchdog recap, guidance, plan progress)
-/// 2. Dynamic reasoning effort modulation
-/// 3. AI backend streaming communication
-/// 4. Plan detection & token tracking
-/// 5. Tool execution or CodeAct evaluation or stop reason dispatching
 pub fn executeStep(
     self: *AgentLoop,
     act_id: usize,
@@ -754,6 +1045,8 @@ pub fn executeStep(
     think_cb: ?*const fn ([]const u8) void,
 ) !StepResult {
     try renderStepHeader(self, act_id);
+
+    const history_checkpoint = self.history.len();
 
     var input_msgs_count: usize = 0;
     var temp_input_msgs = std.ArrayListUnmanaged(proto.Message).empty;
@@ -771,9 +1064,11 @@ pub fn executeStep(
         think_cb,
     );
     main.resetThinkState();
-    if (signals.isInterrupted()) {
+    if (signals.isInterrupted() or self.coordinator.isTimedOut()) {
         response.deinit();
-        return error.Interrupted;
+        self.last_step_outcome = .cancelled;
+        self.last_turn_outcome = .cancelled;
+        return proto.ActTransition{ .cancel = {} };
     }
     defer response.deinit();
 
@@ -781,16 +1076,227 @@ pub fn executeStep(
         try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
     }
 
-    const was_added = try self.history.addAssistantResponse(&response);
-    const has_tool_use_blocks = scanResponseContent(self, &response, was_added);
+    const gen_stop = response.getGenerationStop();
+    self.last_generation_stop = gen_stop;
+    if (self.journal) |*j| j.recordEvent(self.io, act_id, .llm_generation_ended, "LLM generation ended") catch {};
 
-    if (has_tool_use_blocks) {
-        return executeNativeToolCalling(self, act_id, input_msgs_count, tool_defs, &response);
+    if (response.http_code >= 400) {
+        self.setLastErrorContext(response.http_code, response.raw_debug_info);
+        if (response.http_code == 401 or response.http_code == 403) return error.LLMAuthenticationError;
+        if (response.http_code == 429) return error.LLMRateLimitExceeded;
+        if (response.http_code >= 500 and response.http_code < 600) return error.LLMProviderUnavailable;
+        if (response.http_code == 400) {
+            if (response.raw_debug_info) |raw| {
+                try checkContextExceededHttp400(raw);
+                if (checkRoleCompatibilityHttp400(self, raw)) |res| return res;
+            }
+        }
     }
 
-    if (try tryExecuteCodeAct(self, act_id, input_msgs_count, tool_defs, &response)) |res| {
-        return res;
+    const js_code_opt = if (self.config.execution_mode != .tools)
+        agent_parsing.findJsCodeInResponse(self.alloc, &response)
+    else
+        null;
+    defer if (js_code_opt) |c| self.alloc.free(c);
+    const has_codeact = js_code_opt != null;
+
+    const validity = proto.classifyResponse(&response, has_codeact);
+    self.last_response_validity = validity;
+    if (validity != .final_text and validity != .native_tool_calls and validity != .codeact) {
+        if (self.journal) |*j| j.recordEvent(self.io, act_id, .llm_response_invalid, "Invalid LLM response payload") catch {};
     }
 
-    return dispatchStopReason(self, act_id, input_msgs_count, tool_defs, &response, has_tool_use_blocks);
+    const decision = proto.decideAgentAction(gen_stop, validity, false);
+    self.last_agent_decision = decision;
+    if (self.journal) |*j| j.recordEvent(self.io, act_id, .agent_decision, @tagName(decision)) catch {};
+
+    switch (decision) {
+        .cancel => {
+            self.history.truncate(history_checkpoint);
+            self.last_step_outcome = .cancelled;
+            self.last_turn_outcome = .cancelled;
+            return proto.ActTransition{ .cancel = {} };
+        },
+        .fail_protocol => {
+            self.history.truncate(history_checkpoint);
+            self.last_step_outcome = .protocol_failure;
+            self.last_turn_outcome = .failed;
+            return proto.ActTransition{ .fail = .protocol_error };
+        },
+        .fail_stalled => {
+            self.history.truncate(history_checkpoint);
+            self.last_step_outcome = .protocol_failure;
+            self.last_turn_outcome = .stalled;
+            return proto.ActTransition{ .stall = .recovery_budget_exhausted };
+        },
+        .retry_transient => {
+            return handleResponseRecovery(self, act_id, input_msgs_count, tool_defs, &response, validity, gen_stop, history_checkpoint);
+        },
+        .execute_native_tools => {
+            const was_added = try self.history.addAssistantResponse(&response);
+            _ = scanResponseContent(self, &response, was_added);
+            self.last_recovery_class = null;
+            self.last_step_outcome = .actions_executed;
+            markValidActionProgress(self);
+            return executeNativeToolCalling(self, act_id, input_msgs_count, tool_defs, &response);
+        },
+        .execute_codeact => {
+            const was_added = try self.history.addAssistantResponse(&response);
+            _ = scanResponseContent(self, &response, was_added);
+            self.last_recovery_class = null;
+            self.last_step_outcome = .actions_executed;
+            markValidActionProgress(self);
+            return executeCodeActBlock(self, act_id, input_msgs_count, tool_defs, &response, js_code_opt.?);
+        },
+        .request_continuation => {
+            // PSEUDOCODE:
+            // 1. Roll back incomplete transport output that cannot be safely resumed.
+            // 2. Commit explicit provider continuations such as max-token truncation.
+            if (proto.responseRecoveryClass(validity, gen_stop)) |_| {
+                return handleResponseRecovery(self, act_id, input_msgs_count, tool_defs, &response, validity, gen_stop, history_checkpoint);
+            }
+
+            const was_added = try self.history.addAssistantResponse(&response);
+            _ = scanResponseContent(self, &response, was_added);
+            // PSEUDOCODE:
+            // 1. Interrupted partial responses are committed for safe continuation.
+            // 2. Close every orphaned tool call without executing it.
+            if (validity == .partial_text and switch (gen_stop) {
+                .max_tokens, .stop_sequence, .missing_terminal_event, .stream_aborted => true,
+                else => false,
+            }) try self.closeOrphanedToolUses(&response);
+            self.response_recovery_budget = .{};
+            self.last_recovery_class = null;
+            self.last_step_outcome = .continuation_requested;
+            if (gen_stop == .max_tokens) {
+                return handleMaxTokensStop(self, act_id, input_msgs_count, tool_defs, &response);
+            }
+            if (gen_stop == .stop_sequence) {
+                // PSEUDOCODE:
+                // 1. Keep partial text in history for a safe resume boundary.
+                // 2. Bound controlled continuations and stall on repeated boundaries.
+                try self.history.addUser("[System] The response stopped at a controlled sequence boundary. Continue from that boundary without repeating prior output.");
+                const transition = stopSequenceContinuation(&self.stop_sequence_continues);
+                if (transition == .stall) {
+                    self.last_step_outcome = .continuation_requested;
+                    self.last_turn_outcome = .stalled;
+                }
+                return transition;
+            }
+            try self.history.addUser("[System] The response ended at an explicit stop boundary. Continue from that boundary without repeating prior output.");
+            return proto.ActTransition{ .next_act = {} };
+        },
+        .deliver_final_answer => {
+            const was_added = try self.history.addAssistantResponse(&response);
+            _ = scanResponseContent(self, &response, was_added);
+            self.response_recovery_budget = .{};
+            self.last_recovery_class = null;
+            if (extractAssistantText(self.alloc, &response)) |text| {
+                if (self.last_agent_message) |old| self.alloc.free(old);
+                self.last_agent_message = text;
+            }
+            return handleEndTurnStop(self, act_id, input_msgs_count, tool_defs, &response);
+        },
+    }
+}
+
+// P0-B tests: thinking-tail hint builder.
+
+fn makeThinkingResponse(alloc: std.mem.Allocator, thinking: []const u8, signature: []const u8) proto.Response {
+    var response = proto.Response.init(alloc);
+    // PSEUDOCODE:
+    // 1. Dupe non-empty buffers into response-owned memory so that the
+    //    caller's `response.deinit()` is the sole owner and frees them.
+    // 2. Pass non-allocated (empty) slices through untouched, since
+    //    deinit() only frees non-empty buffers.
+    const th = if (thinking.len > 0) alloc.dupe(u8, thinking) catch unreachable else thinking;
+    const sig = if (signature.len > 0) alloc.dupe(u8, signature) catch unreachable else signature;
+    response.content.append(alloc, .{
+        .thinking = .{
+            .thinking = th,
+            .signature = sig,
+        },
+    }) catch unreachable;
+    return response;
+}
+
+test "P0-B: signed thinking block yields no tail hint" {
+    const alloc = std.testing.allocator;
+    var response = makeThinkingResponse(alloc, "abc", "sig");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), buildThinkingTailHint(alloc, &response, 512));
+}
+
+test "P0-B: short thinking yields full text in the hint" {
+    const alloc = std.testing.allocator;
+    var response = makeThinkingResponse(alloc, "analysis step 3", "");
+    defer response.deinit();
+    const hint_opt = buildThinkingTailHint(alloc, &response, 512);
+    try std.testing.expect(hint_opt != null);
+    const hint = hint_opt.?;
+    defer alloc.free(hint);
+    try std.testing.expect(std.mem.indexOf(u8, hint, "analysis step 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hint, "truncated at the max_tokens limit") != null);
+}
+
+test "P0-B: long thinking keeps only the tail, not the head" {
+    const alloc = std.testing.allocator;
+    // 613-char ASCII text with a unique head marker; a 512-char tail must not include it.
+    const pad: []const u8 = "b" ** 600;
+    const text = std.mem.concat(alloc, u8, &.{ "HEAD_MARKER_ ", pad, ".done" }) catch unreachable;
+    defer alloc.free(text);
+    var response = makeThinkingResponse(alloc, text, "");
+    defer response.deinit();
+    const hint_opt = buildThinkingTailHint(alloc, &response, 512);
+    try std.testing.expect(hint_opt != null);
+    const hint = hint_opt.?;
+    defer alloc.free(hint);
+    // The head marker (at offset 0) is well outside the 512-char tail.
+    try std.testing.expect(std.mem.indexOf(u8, hint, "HEAD_MARKER_") == null);
+    // The tail ends at the very end of the original text.
+    try std.testing.expect(std.mem.indexOf(u8, hint, ".done") != null);
+    // The embedded tail (between the second blank line and the resume instruction) must be valid UTF-8.
+    const tail_start: usize = std.mem.indexOf(u8, hint, "\n\nb") orelse {
+        try std.testing.expect(false);
+        unreachable;
+    };
+    const resume_idx = std.mem.indexOf(u8, hint, "Resume from that point") orelse unreachable;
+    try std.testing.expect(std.unicode.utf8ValidateSlice(hint[tail_start..resume_idx]));
+}
+
+test "P0-B: tail cut respects UTF-8 boundaries" {
+    const alloc = std.testing.allocator;
+    // 1000 3-byte UTF-8 chars (一 = 0xE4 0xB8 0x80) on the stack; a 512-byte tail cut lands mid-sequence.
+    var buf: [3000]u8 = undefined;
+    for (buf[0..], 0..) |*b, idx| b.* = switch (idx % 3) {
+        0 => 0xE4,
+        1 => 0xB8,
+        else => 0x80,
+    };
+    const text: []const u8 = buf[0..];
+    var response = makeThinkingResponse(alloc, text, "");
+    defer response.deinit();
+    const hint_opt = buildThinkingTailHint(alloc, &response, 512);
+    try std.testing.expect(hint_opt != null);
+    const hint = hint_opt.?;
+    defer alloc.free(hint);
+    // The embedded tail must start at a valid UTF-8 boundary.
+    const tail_start: usize = std.mem.indexOf(u8, hint, "\xe4\xb8\x80") orelse {
+        try std.testing.expect(false);
+        unreachable;
+    };
+    // Every byte from tail_start to the "Resume" marker must be valid UTF-8.
+    const resume_idx = std.mem.indexOf(u8, hint, "Resume from that point") orelse unreachable;
+    const tail_chunk = hint[tail_start..resume_idx];
+    try std.testing.expect(std.unicode.utf8ValidateSlice(tail_chunk));
+    // start = 3000 - 512 = 2488 lands on a continuation byte (2488 % 3 == 1); the walk
+    // back reaches the next lead byte at 2490, so the tail holds 170 complete 3-byte chars.
+    try std.testing.expectEqual(@as(usize, 170), std.mem.count(u8, tail_chunk, "\xe4\xb8\x80"));
+}
+
+test "P0-B: whitespace-only thinking yields no tail hint" {
+    const alloc = std.testing.allocator;
+    var response = makeThinkingResponse(alloc, "   \n\t  ", "");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), buildThinkingTailHint(alloc, &response, 512));
 }

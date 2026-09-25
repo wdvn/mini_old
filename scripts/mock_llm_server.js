@@ -8,7 +8,19 @@ const http = require('http');
 const PORT = parseInt(process.argv[2] || '8399', 10);
 
 // ---- Mock case definitions ----
+let rfc023Act52Attempts = 0;
+
 const CASES = {
+  // RFC-023 Act 52 regression: provider failure, then repeated thinking-only responses.
+  rfc023_act52: {
+    match: (b) => Array.isArray(b.messages) && b.messages.some(m => typeof m.content === 'string' && m.content.includes('RFC023-ACT52-REGRESSION')),
+    sse: (reqBody) => ({
+      id: 'mock-rfc023', object: 'chat.completion.chunk', created: Date.now() / 1000 | 0,
+      model: reqBody.model || 'mock-model',
+      choices: [{ index: 0, delta: { role: 'assistant', reasoning_content: 'Reasoning without an answer or tool call.' }, finish_reason: null }],
+    }),
+    finish: 'stop',
+  },
   // Default case: returns simple text
   simple: {
     match: () => true,
@@ -175,6 +187,14 @@ const server = http.createServer((req, res) => {
     console.error('[mock] ' + req.method + ' ' + req.url + ' case=' + (chosen && Object.keys(CASES).find(k => CASES[k] === chosen) || 'simple'));
     if (process.env.MOCK_DEBUG) require('fs').writeFileSync('/tmp/mock_last_request.json', body);
 
+    if (chosen === CASES.rfc023_act52) {
+      rfc023Act52Attempts += 1;
+      if (rfc023Act52Attempts === 1) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'RFC023 deterministic provider failure' } }));
+        return;
+      }
+    }
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
     if (parsed.stream === false) {
       // Non-streaming response

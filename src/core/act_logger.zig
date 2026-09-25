@@ -19,7 +19,12 @@ pub const ActExecutionInfo = struct {
 
 pub const ActLlmResponseInfo = struct {
     http_code: u32 = 0,
-    stop_reason: []const u8 = "unknown",
+    stop_reason: []const u8 = "missing_terminal_event",
+    generation_stop: []const u8 = "unknown",
+    response_validity: []const u8 = "empty",
+    agent_decision: []const u8 = "request_continuation",
+    recovery_class: ?[]const u8 = null,
+    attempt: usize = 1,
     text: ?[]const u8 = null,
     thinking: ?[]const u8 = null,
     js_code: ?[]const u8 = null,
@@ -74,10 +79,10 @@ pub const ActLogger = struct {
         self.alloc.free(self.acts_dir);
     }
 
-    /// Write detailed Act log to file ~/.mini/acts/act_<pid>_<act_id>.json
+    /// Write detailed Act log to file ~/.mini/acts/act_<pid>_<act_id>_<attempt>.json
     pub fn logAct(self: *ActLogger, io: std.Io, data: ActDebugData) !void {
         var file_name_buf: [128]u8 = undefined;
-        const file_name = std.fmt.bufPrint(&file_name_buf, "act_{d}_{d}.json", .{ data.session_pid, data.act_id }) catch return;
+        const file_name = std.fmt.bufPrint(&file_name_buf, "act_{d}_{d}_{d}.json", .{ data.session_pid, data.act_id, data.llm_response.attempt }) catch return;
 
         const full_path = try std.fs.path.join(self.alloc, &.{ self.acts_dir, file_name });
         defer self.alloc.free(full_path);

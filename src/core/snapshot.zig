@@ -23,6 +23,16 @@ pub fn getTracker() ?*SnapshotTracker {
     return g_tracker;
 }
 
+/// RFC-023 response telemetry attached to every Act completion event.
+pub const ActTelemetry = struct {
+    stop_reason: ?[]const u8 = null,
+    generation_stop: []const u8 = "missing_terminal_event",
+    response_validity: []const u8 = "empty",
+    agent_decision: []const u8 = "request_continuation",
+    recovery_class: ?[]const u8 = null,
+    attempt: usize = 1,
+};
+
 /// A single file snapshot tracked in the tracker.
 pub const TrackedFile = struct {
     path: []const u8,
@@ -118,7 +128,10 @@ pub const SnapshotTracker = struct {
     }
 
     /// Flush all tracked snapshots to journal (1 secondary act_completed event).
-    pub fn flush(self: *SnapshotTracker, act_id: usize) void {
+    pub fn flush(self: *SnapshotTracker, act_id: usize, telemetry: ActTelemetry) void {
+        // PSEUDOCODE:
+        // 1. Record file snapshots and RFC-023 response state atomically.
+        // 2. Preserve the same Act completion contract with or without file changes.
         const j = self.journal orelse return;
         if (self.tracked.items.len == 0) return;
 
@@ -135,9 +148,74 @@ pub const SnapshotTracker = struct {
         j.recordActComplete(self.io, act_id, .{
             .act_id = act_id,
             .file_snapshots = snaps[0..n],
+            .stop_reason = telemetry.stop_reason,
+            .generation_stop = telemetry.generation_stop,
+            .response_validity = telemetry.response_validity,
+            .agent_decision = telemetry.agent_decision,
+            .recovery_class = telemetry.recovery_class,
+            .attempt = telemetry.attempt,
         }) catch {};
     }
 };
+
+test "RFC-023: snapshot act completion preserves response state fields" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const journal_path = "/tmp/rfc023_snapshot_journal.jsonl";
+    const cas_path = "/tmp/rfc023_snapshot_cas";
+    const file_path = "/tmp/rfc023_snapshot_file.txt";
+
+    std.Io.Dir.deleteFileAbsolute(io, journal_path) catch {};
+    cwd_delete_tree(io, cas_path);
+    std.Io.Dir.deleteFileAbsolute(io, file_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, journal_path) catch {};
+    defer cwd_delete_tree(io, cas_path);
+    defer std.Io.Dir.deleteFileAbsolute(io, file_path) catch {};
+
+    var journal = try journal_mod.ActJournal.init(alloc, io, journal_path);
+    defer journal.deinit();
+    var cas = try cas_mod.CAS.init(alloc, io, cas_path);
+    defer cas.deinit();
+    var tracker = journal_mod_snapshot_tracker(alloc, io, &cas, &journal);
+    defer tracker.deinit();
+
+    tracker.beforeFileWrite(file_path);
+    var contents = [_]u8{'x'};
+    const cwd = std.Io.Dir.cwd();
+    var f = try cwd.createFile(io, file_path, .{});
+    try f.writeStreamingAll(io, &contents);
+    f.close(io);
+    tracker.flush(1, .{
+        .generation_stop = "natural_end",
+        .response_validity = "actions_executed",
+        .agent_decision = "execute_native_tools",
+        .recovery_class = null,
+        .attempt = 2,
+    });
+
+    var content_buf: [4096]u8 = undefined;
+    const file = try cwd.openFile(io, journal_path, .{});
+    defer file.close(io);
+    const n = try file.readStreaming(io, &.{&content_buf});
+    const content = content_buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"generation_stop\":\"natural_end\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"response_validity\":\"actions_executed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"agent_decision\":\"execute_native_tools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"attempt\":2") != null);
+}
+
+fn journal_mod_snapshot_tracker(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    cas: *cas_mod.CAS,
+    journal: *journal_mod.ActJournal,
+) SnapshotTracker {
+    return SnapshotTracker.init(alloc, io, cas, journal);
+}
+
+fn cwd_delete_tree(io: std.Io, path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(io, path) catch {};
+}
 
 // Helper: read entire file (avoids circular import utils — uses std directly).
 fn readAllFile(io: std.Io, file: std.Io.File, buf: []u8) !usize {

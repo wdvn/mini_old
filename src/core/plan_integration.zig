@@ -307,6 +307,7 @@ pub const PlanState = struct {
     /// Build the progress checkpoint text block to inject before each act.
     /// Returns owned slice on success, null if no progress to report.
     pub fn buildProgressBlock(self: *PlanState, alloc: Allocator, act_id: usize, config: *const config_mod.Config) ?[]u8 {
+        if (!config.prompt_enforcement_enabled) return null;
         if (self.progress_summary_len == 0 or act_id <= 1) return null;
 
         var progress_buf = utils.BufWriter.init(alloc);

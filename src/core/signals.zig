@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const quickjs_engine = @import("../runtime/quickjs_engine.zig");
+const process_manager = @import("../runtime/process_manager.zig");
 
 pub var interrupted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 pub var active_engine: ?*quickjs_engine.Engine = null;
@@ -41,6 +42,11 @@ fn handleSigInt(sig: std.posix.SIG) callconv(.c) void {
     }
 }
 
+fn handleTermination(sig: std.posix.SIG) callconv(.c) void {
+    _ = process_manager.killAllTrackedProcesses(9);
+    std.c._exit(128 + @as(c_int, @intCast(@intFromEnum(sig))));
+}
+
 /// Initialize and register OS signal handlers.
 pub fn initSignalHandlers() void {
     if (comptime builtin.os.tag != .windows) {
@@ -50,6 +56,13 @@ pub fn initSignalHandlers() void {
             .flags = 0,
         };
         std.posix.sigaction(std.posix.SIG.INT, &act, null);
+        const term_act = std.posix.Sigaction{
+            .handler = .{ .handler = handleTermination },
+            .mask = std.mem.zeroes(std.posix.sigset_t),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.TERM, &term_act, null);
+        std.posix.sigaction(std.posix.SIG.HUP, &term_act, null);
     }
 }
 

@@ -10,6 +10,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = @import("../core/json.zig");
 const main = @import("../main.zig");
+const process_manager = @import("../runtime/process_manager.zig");
 
 /// Maximum default subagent depth allowed to prevent infinite recursion.
 pub const DEFAULT_MAX_SUBAGENT_DEPTH: usize = 2;
@@ -109,14 +110,18 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
         if (env_map) |em| em.put("MINI_SUBAGENT_DEPTH", prev_depth orelse "0") catch {};
     }
 
+    // PSEUDOCODE: Spawn the subagent in a dedicated managed process group.
     const argv = [_][]const u8{ "/proc/self/exe", "-e", task };
-    var child = try std.process.spawn(io, .{
-        .argv = &argv,
-        .stdout = .pipe,
-        .stderr = .pipe,
-        .stdin = .ignore,
-        .environ_map = env_map,
-    });
+    var child = try process_manager.spawnManaged(
+        io,
+        &argv,
+        env_map,
+        .ignore,
+        .pipe,
+        .pipe,
+    );
+    const managed_pid = if (child.id) |pid| @as(i32, @intCast(pid)) else 0;
+    errdefer process_manager.abortManaged(io, &child);
 
     var stdout_buf = std.ArrayListUnmanaged(u8).empty;
     defer stdout_buf.deinit(alloc);
@@ -125,6 +130,7 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
 
     drainChildPipes(io, alloc, &child, &stdout_buf, &stderr_buf);
     const term = try child.wait(io);
+    process_manager.unregisterProcessGroup(managed_pid);
     return formatSubagentResult(alloc, term, stdout_buf.items, stderr_buf.items);
 }
 

@@ -65,6 +65,12 @@ pub const cas_mod = @import("core/cas.zig");
 
 pub const VERSION = "1.0.0";
 
+/// Terminate after managed children and background jobs have been cleaned up.
+fn exitAfterProcessCleanup(status: u8) noreturn {
+    process_manager.deinitGlobal();
+    std.process.exit(status);
+}
+
 /// Build info injected at build time (build.zig → options module `build_info`).
 /// Changes on each `zig build`, identifying the binary build version.
 pub const build_info = @import("build_info");
@@ -150,7 +156,7 @@ fn overrideSystemPromptFromFile(alloc: Allocator, io: std.Io, cfg: *config_mod.C
     const cwd = std.Io.Dir.cwd();
     const file = cwd.openFile(io, sfile, .{}) catch |e| {
         stderrPrint("Cannot open system file '{s}': {s}\n", .{ sfile, @errorName(e) });
-        std.process.exit(1);
+        exitAfterProcessCleanup(1);
     };
     defer file.close(io);
     const stat = try file.stat(io);
@@ -163,17 +169,18 @@ fn overrideSystemPromptFromFile(alloc: Allocator, io: std.Io, cfg: *config_mod.C
 
 fn setupConfig(alloc: Allocator, io: std.Io, env_map: *std.process.Environ.Map, args: *const Args) config_mod.Config {
     config_mod.loadDotEnv(alloc, env_map, io);
+    if (args.mode) |m| env_map.put("MINI_EXECUTION_MODE", m) catch {};
     var cfg = config_mod.Config.load(alloc, env_map, io) catch |e| {
         stderrPrint("Error loading config: {s}\n", .{@errorName(e)});
-        std.process.exit(1);
+        exitAfterProcessCleanup(1);
     };
     if (args.system_file) |sfile| {
         overrideSystemPromptFromFile(alloc, io, &cfg, sfile) catch |e| {
             stderrPrint("Error applying system file: {s}\n", .{@errorName(e)});
-            std.process.exit(1);
+            exitAfterProcessCleanup(1);
         };
     }
-    if (args.mode) |m| cfg.execution_mode = config_mod.ExecutionMode.fromString(m);
+    cfg.appendCodeActInstructions(alloc);
     if (args.hook_command) |hcmd| cfg.hook_command = hcmd;
     hooks_mod.setHookCommand(cfg.hook_command);
     if (hooks_mod.getHookCommand()) |hcmd| {
@@ -195,7 +202,7 @@ fn handleCronInstallation(alloc: Allocator, io: std.Io, args: *const Args, exe_a
     const cron_expr = args.cron orelse return false;
     if (args.prompt == null) {
         stderrPrint("Error: --install-cron requires -e <prompt>\n", .{});
-        std.process.exit(1);
+        exitAfterProcessCleanup(1);
     }
     const exe_path = try getAbsoluteExePath(alloc, io, exe_arg);
     defer alloc.free(exe_path);
@@ -204,7 +211,7 @@ fn handleCronInstallation(alloc: Allocator, io: std.Io, args: *const Args, exe_a
             stdoutPrint("This cronjob already exists on the system!\n", .{});
         } else {
             stderrPrint("Error installing cronjob: {s}\n", .{@errorName(e)});
-            std.process.exit(1);
+            exitAfterProcessCleanup(1);
         }
         return true;
     };
@@ -242,7 +249,7 @@ fn readPromptFile(alloc: Allocator, io: std.Io, prompt_file: []const u8) ![]u8 {
     const cwd = std.Io.Dir.cwd();
     const file = cwd.openFile(io, prompt_file, .{}) catch |e| {
         stderrPrint("Cannot open prompt file '{s}': {s}\n", .{ prompt_file, @errorName(e) });
-        std.process.exit(1);
+        exitAfterProcessCleanup(1);
     };
     defer file.close(io);
     const stat = try file.stat(io);
@@ -265,7 +272,7 @@ fn executeSinglePrompt(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop
             .max_bytes = agent.config.image_input_max_bytes,
         }) catch |err| {
             stderrPrint("Failed to process image attachment: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+            exitAfterProcessCleanup(1);
         }
     else
         media_lib.PromptParseResult{ .clean_text = try alloc.dupe(u8, expanded), .images = try alloc.alloc(protocol_mod.ImageBlock, 0) };
@@ -280,8 +287,10 @@ fn executeSinglePrompt(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop
     renderer.startTurn(media_res.clean_text);
     const start_ms = utils.milliTimestamp();
 
-    try agent.processInputWithImages(media_res.clean_text, media_res.images, ui_repl.printText, ui_repl.printThinkText);
-    if (signals_mod.isInterrupted()) std.process.exit(130);
+    var turn_result = try agent.processInputWithImages(media_res.clean_text, media_res.images, ui_repl.printText, ui_repl.printThinkText);
+    defer turn_result.deinit(alloc);
+    if (signals_mod.isInterrupted() or turn_result.outcome == .cancelled) exitAfterProcessCleanup(130);
+    if (turn_result.outcome != .completed) exitAfterProcessCleanup(1);
 
     const end_ms = utils.milliTimestamp();
     const duration = if (end_ms >= start_ms) @as(u64, @intCast(end_ms - start_ms)) else 0;
@@ -314,19 +323,24 @@ fn dispatchExecution(
 
 pub fn main(init: std.process.Init) !void {
     // PSEUDOCODE:
-    // 1. Initialize signal handlers, debug allocator, and parse CLI args
-    // 2. Setup agent workspace, config, and MCP client manager
-    // 3. Initialize AgentLoop and handle cron installation if requested
-    // 4. Setup session backup/restore and dispatch to ACP, single-shot, or REPL
-    signals_mod.initSignalHandlers();
-    g_io = init.io;
-    g_environ_map = init.environ_map;
+    // 1. Convert the native argument vector once.
+    // 2. Run hidden managed-process guardians before application initialization.
+    // 3. Initialize normal signal handling and application resources otherwise.
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
+    g_io = init.io;
+    g_environ_map = init.environ_map;
+
     const args_raw = try init.minimal.args.toSlice(alloc);
     defer alloc.free(args_raw);
+    if (process_manager.isGuardianInvocation(args_raw)) {
+        const exit_code = try process_manager.runGuardian(init.io, args_raw, init.environ_map);
+        std.process.exit(exit_code);
+    }
+    signals_mod.initSignalHandlers();
+    defer process_manager.deinitGlobal();
     const args = try parseArgs(args_raw[1..]);
     if (handleHelpOrVersion(&args)) return;
 
@@ -342,7 +356,7 @@ pub fn main(init: std.process.Init) !void {
 
     var agent = agent_mod.AgentLoop.init(alloc, init.io, &cfg) catch |e| {
         stderrPrint("Error initializing agent: {s}\n", .{@errorName(e)});
-        std.process.exit(1);
+        exitAfterProcessCleanup(1);
     };
     defer agent.deinit();
     if (args.backend) |b| agent.switchBackend(b, null);
@@ -544,6 +558,7 @@ fn printHelp() void {
 test {
     _ = @import("core/artifacts.zig");
     _ = @import("core/agent.zig");
+    _ = @import("core/agent_step.zig");
     _ = @import("core/history.zig");
     _ = @import("backends/openai.zig");
     _ = @import("core/journal.zig");

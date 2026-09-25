@@ -9,7 +9,7 @@ const proto = mini.protocol_mod;
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn unsetenv(name: [*:0]const u8) c_int;
 
-test "act_logger: logAct writes full JSON to act_<pid>_<act_id>.json" {
+test "act_logger: logAct writes full JSON to act_<pid>_<act_id>_<attempt>.json" {
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -33,7 +33,12 @@ test "act_logger: logAct writes full JSON to act_<pid>_<act_id>.json" {
         .tool_definitions = &.{},
         .llm_response = .{
             .http_code = 200,
-            .stop_reason = "end_turn",
+            .stop_reason = "natural_end",
+            .generation_stop = "natural_end",
+            .response_validity = "final_text",
+            .agent_decision = "deliver_final_answer",
+            .recovery_class = null,
+            .attempt = 1,
             .text = "Hello world!",
             .thinking = "Let me think...",
             .js_code = "console.log('hi');",
@@ -55,7 +60,7 @@ test "act_logger: logAct writes full JSON to act_<pid>_<act_id>.json" {
     try logger.logAct(io, data);
 
     // Verify file was created
-    const file_path = "/tmp/test_mini_acts_log/act_99999_1.json";
+    const file_path = "/tmp/test_mini_acts_log/act_99999_1_1.json";
     const file = try cwd.openFile(io, file_path, .{});
     defer file.close(io);
 
@@ -68,6 +73,10 @@ test "act_logger: logAct writes full JSON to act_<pid>_<act_id>.json" {
 
     try testing.expect(std.mem.indexOf(u8, buf, "\"session_pid\": 99999") != null);
     try testing.expect(std.mem.indexOf(u8, buf, "\"act_id\": 1") != null);
+    try testing.expect(std.mem.indexOf(u8, buf, "\"stop_reason\": \"natural_end\"") != null);
+    try testing.expect(std.mem.indexOf(u8, buf, "\"generation_stop\": \"natural_end\"") != null);
+    try testing.expect(std.mem.indexOf(u8, buf, "\"response_validity\": \"final_text\"") != null);
+    try testing.expect(std.mem.indexOf(u8, buf, "\"agent_decision\": \"deliver_final_answer\"") != null);
     try testing.expect(std.mem.indexOf(u8, buf, "\"backend_model\": \"gpt-5.6-luna\"") != null);
     try testing.expect(std.mem.indexOf(u8, buf, "\"thinking\": \"Let me think...\"") != null);
     try testing.expect(std.mem.indexOf(u8, buf, "\"stdout\": \"hi\\n\"") != null);

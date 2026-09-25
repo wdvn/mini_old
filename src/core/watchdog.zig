@@ -33,6 +33,10 @@ pub const WatchdogConfig = struct {
     poll_interval_ms: u32 = 200,
     /// If true, print notifications to stderr (default: true).
     verbose_stderr: bool = true,
+    /// If true, inject trajectory recap advisories into the next act.
+    prompt_enforcement_enabled: bool = false,
+    /// Cooldown in seconds between force-kill escalations to prevent log spam (default: 10s).
+    escalation_cooldown_s: u32 = 10,
 };
 
 /// Decision returned by the 1-call LLM decision handler on timeout.
@@ -81,6 +85,9 @@ pub const Watchdog = struct {
     current_act_timeout_s: u32 = 0,
     extension_count: usize = 0,
     is_consulting_decision: bool = false,
+
+    /// Track last force-kill escalation timestamp to prevent log spam.
+    last_escalation_ms: i64 = 0,
 
     pub fn init(alloc: Allocator, io: std.Io, coordinator: *act_queue.ActCoordinator, config: WatchdogConfig) *Watchdog {
         const self = alloc.create(Watchdog) catch @panic("OOM init Watchdog");
@@ -194,6 +201,13 @@ pub const Watchdog = struct {
 
     fn escalateForceKill(self: *Watchdog, act_id: usize, elapsed_s: u32) void {
         // PSEUDOCODE: Deliver SIGKILL to running process group past timeout deadline.
+        // Rate-limit: only escalate once per escalation_cooldown_s to prevent log spam.
+        const now = utils.milliTimestamp();
+        const cooldown_ms: i64 = @intCast(self.config.escalation_cooldown_s * 1000);
+        // Guard against timestamp wraparound
+        if (now >= self.last_escalation_ms and now - self.last_escalation_ms < cooldown_ms) return;
+        self.last_escalation_ms = now;
+
         signals.setInterrupted(true);
         if (self.force_kill_fn) |fk_fn| {
             fk_fn();
@@ -244,7 +258,8 @@ pub const Watchdog = struct {
         }
 
         const completed = state.completed_acts;
-        if (completed >= self.config.recap_interval_acts and
+        if (self.config.prompt_enforcement_enabled and
+            completed >= self.config.recap_interval_acts and
             completed % self.config.recap_interval_acts == 0 and
             completed != self.last_evaluated_act_count)
         {
@@ -290,7 +305,7 @@ pub const Watchdog = struct {
             return .{
                 .diagnosis = prompts_mod.watchdog_diag_cycle,
                 .advisory = prompts_mod.watchdog_adv_repeat,
-        };
+            };
         }
         if (count >= 3 and read_only_count == count) {
             return .{
@@ -404,6 +419,34 @@ test "Watchdog: timeout intervention" {
     try std.testing.expect(signals.isInterrupted());
 }
 
+test "Watchdog: prompt enforcement is opt-in and does not disable timeout" {
+    defer signals.setInterrupted(false);
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var coord = act_queue.ActCoordinator.init(alloc);
+    defer coord.deinit();
+    var dog = Watchdog.init(alloc, io, coord, .{
+        .recap_interval_acts = 1,
+        .act_timeout_secs = 1,
+        .verbose_stderr = false,
+    });
+    defer dog.deinit();
+
+    coord.resetTurn();
+    coord.recordToolExecution("file_read", 111, true);
+    coord.finishAct(1, true);
+    dog.tick();
+    try std.testing.expect(coord.popPendingRecapAdvisory() == null);
+
+    coord.updateStatus(2, .executing_tool, "bash: sleep 10");
+    coord.lock();
+    coord.state.act_start_ms -= 2000;
+    coord.unlock();
+    dog.tick();
+    try std.testing.expect(coord.isTimedOut());
+}
+
 test "Watchdog: recap analysis and advisory injection (10-act interval)" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
@@ -414,6 +457,7 @@ test "Watchdog: recap analysis and advisory injection (10-act interval)" {
     var dog = Watchdog.init(alloc, io, coord, .{
         .recap_interval_acts = 3,
         .verbose_stderr = false,
+        .prompt_enforcement_enabled = true,
     });
     defer dog.deinit();
 

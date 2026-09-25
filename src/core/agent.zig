@@ -42,6 +42,7 @@ const main = @import("../main.zig");
 const utils = @import("utils.zig");
 const quickjs = @import("../runtime/quickjs_engine.zig");
 const js_bindings = @import("../runtime/js_bindings.zig");
+const process_manager = @import("../runtime/process_manager.zig");
 const tokens_mod = @import("memact/tokens.zig");
 const graph_store_mod = @import("memact/graph_store.zig");
 const store_mod = @import("memact/store.zig");
@@ -113,6 +114,9 @@ fn watchdogInterruptHandler() void {
 }
 
 fn watchdogForceKillHandler() void {
+    // PSEUDOCODE:
+    // 1. Interrupt the active CodeAct engine.
+    // 2. Force-kill bash, MCP, and every managed background process group.
     while (!g_agent_mutex.tryLock()) {}
     const agent = g_active_agent;
     g_agent_mutex.unlock();
@@ -121,6 +125,7 @@ fn watchdogForceKillHandler() void {
     }
     tools_mod.forceKillActiveBash();
     tools_mod.forceKillActiveMcp();
+    _ = process_manager.forceKillAllJobs("SIGKILL");
 }
 
 fn watchdogDecisionHandler(ctx: watchdog_mod.DecisionContext) watchdog_mod.TimeoutDecision {
@@ -169,6 +174,7 @@ pub const AgentLoop = struct {
     role_fix_attempts: usize = 0,
     /// Consecutive response continuations due to max_tokens in current turn.
     max_tokens_continues: usize = 0,
+    stop_sequence_continues: usize = 0,
     /// Token estimator (MemAct).
     token_estimator: tokens_mod.TokenEstimator,
     /// Content-Addressed Storage (RFC-002).
@@ -221,8 +227,18 @@ pub const AgentLoop = struct {
     /// Stop reason from the most recent LLM response (for journal debugging).
     last_stop_reason: ?[]const u8 = null,
     /// Track whether the most recent LLM response had no meaningful content (empty/whitespace only).
-    /// Used to prevent premature exit_loop when model returns nothing but also didn't fail.
-    response_content_empty: bool = false,
+    /// RFC-023 response state for the current turn.
+    last_generation_stop: proto.GenerationStop = .missing_terminal_event,
+    last_response_validity: proto.ResponseValidity = .empty,
+    last_agent_decision: proto.AgentDecision = .request_continuation,
+    last_step_outcome: proto.StepOutcome = .final_answer,
+    response_recovery_budget: proto.ResponseRecoveryBudget = .{},
+    turn_recovery_attempts: usize = 0,
+    last_agent_message: ?[]const u8 = null,
+    last_turn_outcome: proto.TurnOutcome = .completed,
+    current_act_attempt: usize = 1,
+    last_recovery_class: ?proto.RecoveryClass = null,
+    last_failure_reason: ?proto.FailureReason = null,
 
     current_user_request: ?[]const u8 = null,
 
@@ -404,6 +420,7 @@ pub const AgentLoop = struct {
             .recap_interval_acts = config.watchdog_recap_interval,
             .poll_interval_ms = config.watchdog_interval_ms,
             .verbose_stderr = config.action_loop_display,
+            .prompt_enforcement_enabled = config.prompt_enforcement_enabled,
         });
         watchdog.interrupt_fn = &watchdogInterruptHandler;
         watchdog.force_kill_fn = &watchdogForceKillHandler;
@@ -461,7 +478,16 @@ pub const AgentLoop = struct {
             .recent_tools = .empty,
             .coordinator = coordinator,
             .watchdog = watchdog,
-            .response_content_empty = false,
+            .last_generation_stop = .missing_terminal_event,
+            .last_response_validity = .empty,
+            .last_agent_decision = .request_continuation,
+            .last_step_outcome = .final_answer,
+            .response_recovery_budget = .{},
+            .turn_recovery_attempts = 0,
+            .last_agent_message = null,
+            .last_turn_outcome = .completed,
+            .current_act_attempt = 1,
+            .last_recovery_class = null,
             .plan = plan_integration.PlanState.init(alloc, io, config, cas_ptr),
         };
     }
@@ -503,6 +529,14 @@ pub const AgentLoop = struct {
         }
         self.recent_tools.deinit(self.alloc);
         self.deinitTurnToolRecords();
+        if (self.last_agent_message) |msg| {
+            self.alloc.free(msg);
+            self.last_agent_message = null;
+        }
+        if (self.last_stop_reason) |sr| {
+            self.alloc.free(sr);
+            self.last_stop_reason = null;
+        }
         self.plan.deinit();
     }
 
@@ -536,7 +570,10 @@ pub const AgentLoop = struct {
         if (self.last_backend_raw_error) |old| self.alloc.free(old);
         self.last_backend_raw_error = null;
         if (raw) |r| {
-            self.last_backend_raw_error = self.alloc.dupe(u8, r) catch null;
+            self.last_backend_raw_error = self.alloc.dupe(
+                u8,
+                proto.boundedResponseSnippet(r),
+            ) catch null;
         }
     }
 
@@ -638,8 +675,9 @@ pub const AgentLoop = struct {
         defer snapshots_list.deinit(self.alloc);
         collectSnapshots(self.alloc, self.snapshot_tracker, &snapshots_list);
 
+        const normalized_stop = @tagName(response.getGenerationStop());
         if (self.last_stop_reason) |old| self.alloc.free(old);
-        self.last_stop_reason = self.alloc.dupe(u8, @tagName(response.stop_reason)) catch null;
+        self.last_stop_reason = self.alloc.dupe(u8, normalized_stop) catch null;
         const pid: u32 = @intCast(std.c.getpid());
         logger.logAct(self.io, .{
             .session_pid = pid,
@@ -653,7 +691,12 @@ pub const AgentLoop = struct {
             .tool_definitions = tool_defs,
             .llm_response = .{
                 .http_code = response.http_code,
-                .stop_reason = @tagName(response.stop_reason),
+                .stop_reason = normalized_stop,
+                .generation_stop = @tagName(self.last_generation_stop),
+                .response_validity = @tagName(self.last_response_validity),
+                .agent_decision = @tagName(self.last_agent_decision),
+                .recovery_class = if (self.last_recovery_class) |class| @tagName(class) else null,
+                .attempt = self.current_act_attempt,
                 .text = summary.text,
                 .thinking = summary.thinking,
                 .js_code = js_code_opt,
@@ -741,7 +784,7 @@ pub const AgentLoop = struct {
         user_text: []const u8,
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
-    ) !void {
+    ) !proto.TurnResult {
         return self.processInputWithImages(user_text, &.{}, text_cb, think_cb);
     }
 
@@ -751,7 +794,7 @@ pub const AgentLoop = struct {
         images: []const proto.ImageBlock,
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
-        result: anyerror!void = {},
+        result: anyerror!proto.TurnResult = error.Unexpected,
     };
 
     fn turnWorkerThreadEntry(ctx: *TurnWorkerContext) void {
@@ -770,7 +813,7 @@ pub const AgentLoop = struct {
         images: []const proto.ImageBlock,
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
-    ) !void {
+    ) !proto.TurnResult {
         self.coordinator.resetTurn();
         defer self.coordinator.notifyTurnComplete();
 
@@ -925,7 +968,7 @@ pub const AgentLoop = struct {
                 .model = self.backend.model(),
                 .error_name = @errorName(e),
                 .http_code = self.last_backend_http_code,
-                .attempt = 1,
+                .attempt = self.current_act_attempt,
                 .raw_snippet = self.last_backend_raw_error,
             }) catch {};
         }
@@ -1403,7 +1446,7 @@ pub const AgentLoop = struct {
         var plan = &self.plan.current_plan.?;
         var drift_advisory: ?[]u8 = null;
 
-        if (self.config.plan_drift_detection) {
+        if (self.config.prompt_enforcement_enabled and self.config.plan_drift_detection) {
             if (plan_monitor.checkPlanDrift(plan, &self.plan.plan_ctx, tu.name)) |d| {
                 self.plan.plan_drift_score += d.drift_score;
                 if (self.plan.plan_drift_score > 0.8) {
@@ -1558,7 +1601,10 @@ pub const AgentLoop = struct {
         any_tool_err: *bool,
     ) !struct { dur_ms: u64, should_break: bool } {
         // PSEUDOCODE: Check loop -> handle trip or execute single tool with warning suffix
-        const loop_check = self.checkActionLoop(tu.name, tu.input_json) catch .allow;
+        const loop_check = if (self.config.prompt_enforcement_enabled)
+            self.checkActionLoop(tu.name, tu.input_json) catch .allow
+        else
+            @as(@TypeOf(self.checkActionLoop(tu.name, tu.input_json) catch .allow), .allow);
         if (loop_check == .trip) {
             const trip_reason_str = switch (self.last_loop_reason) {
                 .macro_cycle_2 => "alternating tool loop (A ↔ B) repeated",
@@ -1688,6 +1734,29 @@ test "agent - extractJsCodeBlock" {
     defer alloc.free(extracted.?);
 
     try std.testing.expectEqualStrings("const a = 10;\nconst b = 20;\nconsole.log(a + b);", extracted.?);
+}
+
+test "watchdog force kill terminates managed background jobs" {
+    if (comptime @import("builtin").os.tag == .windows) return;
+
+    defer signals.setInterrupted(false);
+    const io = std.testing.io;
+    const manager = process_manager.getProcessManager(std.testing.allocator);
+    const info = try manager.spawnBackground(io, "sleep 30");
+    defer _ = process_manager.forceKillAllJobs("SIGKILL");
+    defer process_manager.deinitGlobal();
+
+    watchdogForceKillHandler();
+
+    var running = true;
+    for (0..100) |_| {
+        const status = manager.getJobStatus(info.job_id) orelse return error.TestUnexpectedResult;
+        running = status.running;
+        if (!running) break;
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+
+    try std.testing.expect(!running);
 }
 
 test "agent - convertXmlToolTagsToJs" {
