@@ -125,6 +125,7 @@ fn watchdogForceKillHandler() void {
     }
     tools_mod.forceKillActiveBash();
     tools_mod.forceKillActiveMcp();
+    _ = process_manager.killAllTrackedProcesses(9);
     _ = process_manager.forceKillAllJobs("SIGKILL");
 }
 
@@ -1734,6 +1735,55 @@ test "agent - extractJsCodeBlock" {
     defer alloc.free(extracted.?);
 
     try std.testing.expectEqualStrings("const a = 10;\nconst b = 20;\nconsole.log(a + b);", extracted.?);
+}
+
+fn waitManagedChildForTest(
+    io: std.Io,
+    child: *std.process.Child,
+    completed: *std.atomic.Value(bool),
+    wait_failed: *std.atomic.Value(bool),
+) void {
+    // PSEUDOCODE:
+    // 1. Wait for the direct child in a helper thread.
+    // 2. Publish successful completion separately from wait errors.
+    if (child.wait(io)) |_| {
+        completed.store(true, .release);
+    } else |_| {
+        wait_failed.store(true, .release);
+    }
+}
+
+test "watchdog force kill terminates managed foreground process groups" {
+    if (comptime @import("builtin").os.tag == .windows) return;
+
+    defer signals.setInterrupted(false);
+    const io = std.testing.io;
+    const argv = [_][]const u8{ "/bin/sh", "-c", "sleep 30" };
+    var child = try process_manager.spawnManaged(io, &argv, null, .ignore, .ignore, .ignore);
+    const managed_pid: i32 = if (child.id) |pid| @as(i32, @intCast(pid)) else 0;
+    var completed = std.atomic.Value(bool).init(false);
+    var wait_failed = std.atomic.Value(bool).init(false);
+    const waiter = try std.Thread.spawn(.{}, waitManagedChildForTest, .{ io, &child, &completed, &wait_failed });
+    var child_reaped = false;
+    defer if (!child_reaped) {
+        process_manager.abortManaged(io, &child);
+        child_reaped = true;
+    };
+
+    watchdogForceKillHandler();
+    for (0..100) |_| {
+        if (completed.load(.acquire) or wait_failed.load(.acquire)) break;
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    const terminated_by_watchdog = completed.load(.acquire);
+    if (!terminated_by_watchdog and managed_pid > 0) {
+        _ = std.posix.kill(-managed_pid, std.posix.SIG.KILL) catch {};
+    }
+    waiter.join();
+    child_reaped = true;
+    process_manager.unregisterProcessGroup(managed_pid);
+    try std.testing.expect(!wait_failed.load(.acquire));
+    try std.testing.expect(terminated_by_watchdog);
 }
 
 test "watchdog force kill terminates managed background jobs" {
