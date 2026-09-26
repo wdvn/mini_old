@@ -53,6 +53,7 @@ const prompts_mod = @import("prompts.zig");
 const plan_parser = @import("plan_parser.zig");
 const plan_executor = @import("plan_executor.zig");
 const plan_monitor = @import("plan_monitor.zig");
+const plan_mod = @import("plan.zig");
 const plan_store_mod = @import("plan_store.zig");
 const plan_integration = @import("plan_integration.zig");
 pub const journal_mod = @import("journal.zig");
@@ -784,6 +785,93 @@ pub const AgentLoop = struct {
         return ok;
     }
 
+    /// RFC-024 §3.4: dispatch a set of independent parallel plan steps in one
+    /// `batch_invoke_subagents` call. On success (or unblocked review) every
+    /// batched step is completed via `completeStepByIndex` and `ctx` advances
+    /// to the next ready step; a blocked review yields a re-run advisory
+    /// instead. Returns the note to surface to the model.
+    fn maybeBatchPlanStep(
+        self: *AgentLoop,
+        act_id: usize,
+        plan: *plan_mod.Plan,
+        ctx: *plan_executor.ExecutionContext,
+        ids: []const u64,
+        mode: []const u8,
+    ) ![]u8 {
+        const out = try plan_dispatch.dispatchParallelBatch(
+            self.io,
+            self.alloc,
+            plan,
+            ids,
+            &batchSubagentRunner,
+            self.config.plan_review_gate,
+        );
+        defer self.alloc.free(out.subagent_output);
+
+        // Journal the review verdict when a review ran.
+        if (self.config.plan_review_gate) {
+            if (self.journal) |*j| {
+                const desc = try std.fmt.allocPrint(self.alloc,
+                    "batch review ({d} steps): critical={d} important={d} minor={d} blocked={}",
+                    .{ ids.len, out.verdict.critical, out.verdict.important, out.verdict.minor, out.blocked });
+                j.recordEvent(self.io, act_id, .plan_review_outcome, desc) catch {};
+                self.alloc.free(desc);
+            }
+        }
+
+        if (out.blocked) {
+            const adv = try std.fmt.allocPrint(self.alloc,
+                \\[plan] Parallel batch ({d} steps, mode={s}) was blocked by the review gate
+                \\(critical={d} important={d} minor={d}). The steps are NOT complete — fix and re-run.
+            , .{ ids.len, mode, out.verdict.critical, out.verdict.important, out.verdict.minor });
+            return adv;
+        }
+
+        // Unblocked: complete every batched step (idempotent) and advance ctx.
+        for (ids) |sid| {
+            if (plan_executor.findStepIndexById(plan, sid)) |idx| {
+                _ = plan_executor.completeStepByIndex(plan, ctx, idx);
+            }
+        }
+        // Advance ctx to the next dependency-ready step (or mark complete).
+        if (plan.findReadyStepIndex()) |next_idx| {
+            ctx.current_step_idx = next_idx;
+            plan.steps.items[next_idx].status = .active;
+        } else {
+            ctx.is_complete = true;
+        }
+
+        // Persist the running plan (RFC-024 §3.2 persistence trigger).
+        if (self.plan.plan_store) |ps| {
+            ps.save(plan) catch |e| main.stderrPrint("[agent] Warning: Failed to persist running plan: {s}\n", .{@errorName(e)});
+        }
+
+        // Build a "3 steps [1,2,3]" descriptor for the note.
+        var id_buf = utils.BufWriter.init(self.alloc);
+        defer id_buf.deinit();
+        try id_buf.print("{d} steps [", .{ids.len});
+        for (ids, 0..) |sid, i| {
+            if (i > 0) try id_buf.writeByte(',');
+            try id_buf.print("{d}", .{sid});
+        }
+        try id_buf.writeByte(']');
+        const ids_joined = try id_buf.toOwnedSlice();
+        defer self.alloc.free(ids_joined);
+
+        return try std.fmt.allocPrint(self.alloc,
+            \\[plan] Parallel batch of {s} dispatched via batch_invoke_subagents
+            \\(mode={s}); review verdict critical={d} important={d} minor={d}.
+            \\Aggregate result:\n{s}
+        , .{
+            ids_joined,
+            mode,
+            out.verdict.critical,
+            out.verdict.important,
+            out.verdict.minor,
+            out.subagent_output,
+        });
+    }
+
     /// RFC-024 §3.4: when subagent dispatch is enabled and the current step
     /// requests a `subagent` / `parallel` executor mode, dispatch the step to
     /// a child process and optionally run the two-stage review gate. The step
@@ -799,6 +887,20 @@ pub const AgentLoop = struct {
         const step = &plan.steps.items[ctx.current_step_idx];
         const mode = step.executor_mode orelse return null;
         if (!std.mem.startsWith(u8, mode, "subagent") and !plan_dispatch.isParallelMode(mode)) return null;
+
+        // RFC-024 §3.4 auto-batching: when the current step requests a
+        // parallel mode and >= 2 mutually-independent parallel steps are
+        // ready, dispatch them ALL in one `batch_invoke_subagents` call
+        // instead of one-per-step. A single ready step falls through to
+        // the single-step dispatch below.
+        if (plan_dispatch.isParallelMode(mode)) {
+            if (plan_dispatch.findParallelBatch(plan, self.alloc) catch null) |ids| {
+                defer self.alloc.free(ids);
+                if (ids.len >= 2) {
+                    return try self.maybeBatchPlanStep(act_id, plan, ctx, ids, mode);
+                }
+            }
+        }
 
         const out = try plan_dispatch.dispatchStep(
             self.io, self.alloc, plan, step,
@@ -844,6 +946,32 @@ pub fn subagentRunner(io: std.Io, alloc: std.mem.Allocator, task: []const u8) an
     const input = try std.fmt.allocPrint(alloc, "{{\"task\":\"{s}\"}}", .{esc});
     defer alloc.free(input);
     return tools_mod.executeTool(alloc, io, "invoke_subagent", input);
+}
+
+/// RFC-024 §3.4: batch subagent runner — wraps `batch_invoke_subagents` so
+/// multiple independent plan steps are executed in one parallel dispatch.
+/// Builds `{"tasks":[t1,t2,...]}` JSON, escaped.
+pub fn batchSubagentRunner(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    tasks: []const []const u8,
+) anyerror![]u8 {
+    // PSEUDOCODE:
+    // 1. Build a JSON array of escaped task strings.
+    // 2. Wrap in {"tasks":[...]} and call batch_invoke_subagents.
+    var buf = utils.BufWriter.init(alloc);
+    errdefer buf.deinit();
+    try buf.writeAll("{\"tasks\":[");
+    for (tasks, 0..) |task, i| {
+        if (i > 0) try buf.writeByte(',');
+        const esc = try json_mod.escape(alloc, task);
+        defer alloc.free(esc);
+        try buf.writeAll(esc);
+    }
+    try buf.writeAll("]}");
+    const input = try buf.toOwnedSlice();
+    defer alloc.free(input);
+    return tools_mod.executeTool(alloc, io, "batch_invoke_subagents", input);
 }
 
 /// RFC-024 §3.3: record that a skill's content was read this session so the

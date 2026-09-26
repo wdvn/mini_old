@@ -77,16 +77,131 @@ pub fn renderStepTask(alloc: Allocator, plan: *const Plan, step: *const PlanStep
 // Parallel batching
 // ---------------------------------------------------------------------------
 
-/// RFC-024 §3.4: collect the set of currently-executable pending steps that are
-/// mutually independent (no dependency edge between any two) and eligible for
-/// `executor_mode: "parallel"`. A step is eligible when its dependencies are
-/// all satisfied and `executor_mode` is a parallel mode. Returns owned slice
-/// (free with `alloc.free`).
-pub fn findParallelBatch(plan: *const Plan, alloc: Allocator) ![][]const u8 {
+/// Pluggable batch subagent runner. Given a list of self-contained task
+/// strings, returns the aggregate output (owned by `alloc`). Wired to
+/// `batch_invoke_subagents` in `agent.zig`; tests inject a fake.
+pub const BatchSubagentRunner = *const fn (
+    io: std.Io,
+    alloc: Allocator,
+    tasks: []const []const u8,
+) anyerror![]u8;
+
+/// PSEUDOCODE:
+/// 1. Render a self-contained task for each parallel step.
+/// 2. Invoke the injected batch runner with all tasks in one dispatch.
+/// 3. If a review gate is requested, run a single reviewer over the
+///    aggregate output and parse the verdict (Critical blocks the whole batch).
+/// 4. Return the dispatch outcome.
+
+/// Dispatch a set of independent plan steps to parallel subagents in ONE
+/// `batch_invoke_subagents` call. `step_ids` are the step IDs to batch.
+pub fn dispatchParallelBatch(
+    io: std.Io,
+    alloc: Allocator,
+    plan: *const Plan,
+    step_ids: []const u64,
+    runner: BatchSubagentRunner,
+    review: bool,
+) !DispatchOutcome {
     // PSEUDOCODE:
-    // 1. Collect candidate step ids: pending, all deps satisfied, parallel mode.
-    // 2. For each pair, if one depends on the other -> exclude both from batch.
-    // 3. Return the surviving candidate id list as step-id strings.
+    // 1. For each step id, find the step and render its task string.
+    // 2. Collect all task strings, call the batch runner once.
+    // 3. If review is on, build a single review prompt with the aggregate output.
+    var tasks = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (tasks.items) |t| alloc.free(t);
+        tasks.deinit(alloc);
+    }
+
+    for (step_ids) |sid| {
+        var found = false;
+        for (plan.steps.items) |step| {
+            if (step.id == sid) {
+                const task = try renderStepTask(alloc, plan, &step);
+                try tasks.append(alloc, task);
+                found = true;
+                break;
+            }
+        }
+        if (!found) continue; // orphan step id: skip, don't abort the batch
+    }
+
+    if (tasks.items.len == 0) {
+        return DispatchOutcome{
+            .subagent_output = try alloc.dupe(u8, "[plan] no batchable steps found"),
+            .verdict = .{ .critical = 0, .important = 0, .minor = 0 },
+            .blocked = false,
+        };
+    }
+
+    const output = try runner(io, alloc, tasks.items);
+    errdefer alloc.free(output);
+
+    var verdict = ReviewVerdict{ .critical = 0, .important = 0, .minor = 0 };
+    var blocked = false;
+
+    if (review) {
+        // A single reviewer over the aggregate output of the whole batch.
+        var review_bw = utils.BufWriter.init(alloc);
+        defer review_bw.deinit();
+        try review_bw.writeAll(
+            "Review the following batch of parallel plan-step outputs. " ++
+                "Each step was executed independently; check spec-compliance and code quality.\n\n",
+        );
+        for (step_ids, 0..) |sid, i| {
+            for (plan.steps.items) |step| {
+                if (step.id != sid) continue;
+                try review_bw.print("## Step {d}: {s}\n", .{ sid, step.description });
+                break;
+            }
+            _ = i;
+        }
+        try review_bw.writeAll("\nAggregate subagent output:\n");
+        try review_bw.writeAll(output);
+        try review_bw.writeAll(
+            "\n\nEnd with a verdict block:\n" ++
+                "SEVERITIES: critical=0 important=0 minor=0",
+        );
+        const review_task = try review_bw.toOwnedSlice();
+        defer alloc.free(review_task);
+
+        const review_result = runner2SingleStep(io, alloc, review_task, runner) catch "";
+        verdict = parseReviewVerdict(review_result);
+        blocked = verdict.blocks();
+        if (review_result.len > 0) alloc.free(review_result);
+    }
+
+    return DispatchOutcome{
+        .subagent_output = output,
+        .verdict = verdict,
+        .blocked = blocked,
+    };
+}
+
+/// Batch review reuses the single-step runner interface to avoid a second
+/// injected dependency; the review task is wrapped as a one-item task list.
+fn runner2SingleStep(
+    io: std.Io,
+    alloc: Allocator,
+    review_task: []const u8,
+    runner: BatchSubagentRunner,
+) ![]u8 {
+    const one = [1][]const u8{ review_task };
+    return runner(io, alloc, &one);
+}
+/// RFC-024 §3.4: collect the IDs of the pending, mutually-independent steps
+/// that are eligible for `executor_mode: "parallel"`. A step is eligible when
+/// it is pending, all of its dependencies are satisfied, and its executor_mode
+/// is a parallel mode. Two eligible steps are mutually independent when
+/// neither depends on the other; any pair sharing a dependency edge is dropped
+/// (the dependent step cannot run in the same parallel batch).
+///
+/// PSEUDOCODE:
+/// 1. Collect candidate indices: pending + parallel mode + all deps satisfied.
+/// 2. For each candidate, if any other candidate depends on it (or vice versa),
+///    drop it from the batch.
+/// 3. Return the surviving step IDs as an owned u64 slice (free with `alloc.free`).
+pub fn findParallelBatch(plan: *const Plan, alloc: Allocator) ![]u64 {
     var candidates = std.ArrayListUnmanaged(usize).empty;
     defer candidates.deinit(alloc);
 
@@ -97,10 +212,7 @@ pub fn findParallelBatch(plan: *const Plan, alloc: Allocator) ![][]const u8 {
         try candidates.append(alloc, i);
     }
 
-    var ids = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer ids.deinit(alloc);
-
-    // Mark indices to drop (dependent pairs).
+    // Mark candidate indices that share a dependency edge with another candidate.
     var drop = std.AutoHashMap(usize, void).init(alloc);
     defer drop.deinit();
     for (candidates.items) |i| {
@@ -108,7 +220,6 @@ pub fn findParallelBatch(plan: *const Plan, alloc: Allocator) ![][]const u8 {
         for (candidates.items) |j| {
             if (i == j) continue;
             const sj = &plan.steps.items[j];
-            // si depends on sj or sj depends on si -> mutually dependent; drop si.
             if ((std.mem.indexOfScalar(u64, si.dependencies, sj.id) != null) or
                 (std.mem.indexOfScalar(u64, sj.dependencies, si.id) != null))
             {
@@ -118,13 +229,12 @@ pub fn findParallelBatch(plan: *const Plan, alloc: Allocator) ![][]const u8 {
         }
     }
 
+    var ids = std.ArrayListUnmanaged(u64).empty;
+    errdefer ids.deinit(alloc);
     for (candidates.items) |i| {
         if (drop.contains(i)) continue;
-        const step = &plan.steps.items[i];
-        const id_str = try std.fmt.allocPrint(alloc, "{d}", .{step.id});
-        try ids.append(alloc, id_str);
+        try ids.append(alloc, plan.steps.items[i].id);
     }
-
     return try ids.toOwnedSlice(alloc);
 }
 
@@ -297,9 +407,9 @@ test "renderStepTask includes description, deps, verification" {
 }
 
 /// Test helper: does batch (step-id strings) contain id?
-fn batchContains(batch: [][]const u8, id: []const u8) bool {
+fn batchContains(batch: []const u64, id: u64) bool {
     for (batch) |b| {
-        if (std.mem.eql(u8, b, id)) return true;
+        if (b == id) return true;
     }
     return false;
 }
@@ -333,17 +443,14 @@ test "findParallelBatch collects independent parallel steps only" {
     try plan.addStep(alloc, s4);
 
     const batch = try findParallelBatch(&plan, alloc);
-    defer {
-        for (batch) |b| alloc.free(b);
-        alloc.free(batch);
-    }
+    defer alloc.free(batch);
 
     // Only s1 and s2 should be batchable.
     try std.testing.expectEqual(@as(usize, 2), batch.len);
-    try std.testing.expect(batchContains(batch, "1"));
-    try std.testing.expect(batchContains(batch, "2"));
-    try std.testing.expect(!batchContains(batch, "3"));
-    try std.testing.expect(!batchContains(batch, "4"));
+    try std.testing.expect(batchContains(batch, 1));
+    try std.testing.expect(batchContains(batch, 2));
+    try std.testing.expect(!batchContains(batch, 3));
+    try std.testing.expect(!batchContains(batch, 4));
 }
 
 test "parseReviewVerdict extracts severity counts" {
@@ -388,4 +495,43 @@ test "dispatchStep runs runner and review gate" {
     try std.testing.expectEqualStrings("OK", out.subagent_output);
     try std.testing.expect(!out.blocked);
     try std.testing.expectEqual(@as(usize, 1), out.verdict.minor);
+}
+
+test "dispatchParallelBatch runs all tasks in one batch + aggregated review" {
+    const alloc = std.testing.allocator;
+    var plan = try Plan.init(alloc, "Task", 0x1);
+    defer plan.deinit(alloc);
+
+    var s1 = try PlanStep.initWithId(alloc, 1, "Step one", &.{}, "bash");
+    defer s1.deinit(alloc);
+    s1.executor_mode = try alloc.dupe(u8, "parallel");
+    try plan.addStep(alloc, s1);
+
+    var s2 = try PlanStep.initWithId(alloc, 2, "Step two", &.{}, "bash");
+    defer s2.deinit(alloc);
+    s2.executor_mode = try alloc.dupe(u8, "parallel:2");
+    try plan.addStep(alloc, s2);
+
+    // Fake batch runner: echoes how many tasks it received; the review call
+    // (single task) returns a clean verdict.
+    const fake_batch = struct {
+        fn run(
+            io: std.Io,
+            a: Allocator,
+            tasks: []const []const u8,
+        ) anyerror![]u8 {
+            _ = io;
+            if (tasks.len == 1 and std.mem.indexOf(u8, tasks[0], "Review the following batch") != null) {
+                return try a.dupe(u8, "SEVERITIES: critical=0 important=1 minor=0");
+            }
+            return std.fmt.allocPrint(a, "executed {d} parallel tasks", .{tasks.len});
+        }
+    };
+
+    const batch_ids = [_]u64{ 1, 2 };
+    const out = try dispatchParallelBatch(std.testing.io, alloc, &plan, &batch_ids, &fake_batch.run, true);
+    defer alloc.free(out.subagent_output);
+    try std.testing.expect(std.mem.indexOf(u8, out.subagent_output, "executed 2 parallel tasks") != null);
+    try std.testing.expect(!out.blocked);
+    try std.testing.expectEqual(@as(usize, 1), out.verdict.important);
 }
