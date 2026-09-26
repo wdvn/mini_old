@@ -78,6 +78,7 @@ if [ -d "${PROJECT_ROOT}/.agent/skills" ]; then
             target_skill="${MINI_HOME}/skills/${skill_name}"
             
             if [ ! -d "$target_skill" ] || [ "$FORCE_UPDATE" -eq 1 ]; then
+                rm -rf "$target_skill"
                 mkdir -p "$target_skill"
                 cp -r "$skill_dir"/* "$target_skill"/
                 # Grant execute permissions to scripts if present
@@ -88,6 +89,14 @@ if [ -d "${PROJECT_ROOT}/.agent/skills" ]; then
             else
                 echo -e "  • Skill already exists (skipped): ${skill_name} ${YELLOW}(use -f to update)${NC}"
             fi
+        fi
+    done
+
+    # Prune retired skills no longer compatible with mini (superpowers leftovers)
+    for retired in using-superpowers diagnosing-superpowers dispatching-parallel-agents; do
+        if [ -d "${MINI_HOME}/skills/${retired}" ]; then
+            rm -rf "${MINI_HOME}/skills/${retired}"
+            echo -e "  ${GREEN}✓ Removed retired skill:${NC} ${retired}"
         fi
     done
 else
