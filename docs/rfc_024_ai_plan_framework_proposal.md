@@ -11,11 +11,14 @@
 
 ## 1. Executive Summary
 
-mini already ships a substantial planning substrate (RFC-019): a DAG plan model with dependency
-resolution, JSON/Markdown parsing, drift monitoring, CAS-based cross-turn persistence, plan
-rendering in the REPL, a skills system, and parallel subagent dispatch. What mini does **not**
+mini already ships a substantial planning substrate (RFC-019): a DAG plan model
+(dependency resolution is implemented in the library layer — `executePlanStep()` checks
+prerequisites — but the production runtime today completes steps sequentially by
+`tool_hint` match, §2.1), JSON/Markdown parsing, drift monitoring, CAS-based cross-turn
+persistence, plan rendering in the REPL, a skills system, and parallel subagent dispatch. What mini does **not**
 have is a **plan framework** — the layer that turns a parsed plan into a disciplined
-engineering process: verified task boundaries, user sign-off before mutation,
+engineering process: verified task boundaries, an explicit proposed→approved plan
+advisory before mutation,
 compaction-resistant context re-injection, per-step review gates, and skill-driven orchestration.
 
 Superpowers fills exactly that layer, but with two properties that don't transfer directly:
@@ -29,8 +32,12 @@ possible:
 
 1. **Verification-gated plan steps** — a step is not "completed" when its hint tool ran, but
    when an explicit verification (test/build command, expected file state) passes.
-2. **Plan approval gate** — plans are *proposed*, not auto-executed; user sign-off is a
-   first-class state (`proposed → approved`), with `/plan` REPL control.
+2. **Plan approval advisory** — plans are *proposed*, not silently executed; `proposed →
+   approved` is a first-class phase with `/plan` REPL control. Approval is an **advisory
+   gate by design** (mutating tools are not hard-blocked; the model receives a standing
+   advisory), consistent with RFC-020's "guidance, not hard block" — a hard dispatch-time
+   gate is explicitly out of scope (§8), and the detection-vs-dispatch timing window is
+   documented as a known limitation (§3.2).
 3. **Compaction-resilient plan context** — after `compactMemAct`, the active plan and
    in-use skills are re-injected into history (Superpowers' Pi extension does the same for its
    bootstrap).
@@ -55,13 +62,14 @@ possible:
 | Plan data model (DAG, `StepStatus`, `PlanDrift`) | `src/core/plan.zig` (747 lines) | `PlanStep { id, description, dependencies, tool_hint, estimated_acts, ... }`; `Plan.findActiveStepIndex()` (L254), `Plan.isComplete()` (L267), custom JSON (de)serialization |
 | Plan parser (JSON + Markdown fallback) | `src/core/plan_parser.zig` (561 lines) | `extractStructuredPlan()` fenced-JSON then numbered-list fallback; validates `tool_hint` against registry |
 | Step executor + progress | `src/core/plan_executor.zig` (387 lines) | `executePlanStep()` (dependency check), `completeStep`/`failStep`/`skipStep`, `generateProgressSummary()`, `getProgressPercent()` |
+| ⚠ Runtime wiring (capability vs reality) | `src/core/agent.zig:1461-1479` | Production completion is **sequential by `tool_hint` name match**; `executePlanStep()` is called only from the module itself and tests — the dependency-resolution path is not wired into the agent loop. `findActiveStepIndex()` (`plan.zig:253`) returns the first pending/active step, ignoring dependencies |
 | Drift monitor | `src/core/plan_monitor.zig` (286 lines) | `checkPlanDrift()`, `calculateDriftScore()` (0.3 same category / 0.8 cross-category), `generateDriftCorrection()` |
 | CAS persistence | `src/core/plan_store.zig` (309 lines) | `save()`/`restore(request_hash)` via Content-Addressed Store + `metadata.jsonl`; `listPlans()` |
 | Orchestration state | `src/core/plan_integration.zig` | `PlanState` (legacy watchdog + RFC-019 fields consolidated); `setStructuredPlan()` + `renderPlanDisplay()` writes full plan to the active `TurnRenderer`; `tryRestoreFromStore()` called at turn start (`agent_turn.zig:95`) |
 | Auto completion detection | `src/core/agent.zig:1455-1478` | after each tool act: if executed tool == `tool_hint` of active step → `completeStep()`; when `is_complete` → `plan_store.save()` + `clearPlan()` |
 | Prompt-side planning modes | `src/core/prompts.zig` | "ReAct Mode (Default)" vs "Proactive Planning Mode (RFC-019)" with JSON plan template; `plan_replan_suggestion_fmt`, `plan_drift_significant`, `plan_step_enforcement_head` |
 | REPL control | `src/ui/repl.zig:249, 335-346` | `/plan on\|off\|status` toggles `enable_structured_planning` |
-| Config | `src/core/config.zig:240-253` | `enable_structured_planning` (default **true**), `plan_drift_detection`, `plan_max_steps` (20), `plans_dir`, `enhanced_progress_checkpoint`, `prompt_enforcement_enabled` (default **false**) |
+| Config | `src/core/config.zig:240-253, 506-519` | Struct field default for `enable_structured_planning` is **true**, but the env-resolved loader default (the *actual runtime value*) is **false** (`config.zig:512` — no `MINI_ENABLE_STRUCTURED_PLANNING` env var → false). Also: `plan_drift_detection`, `plan_max_steps` (20), `plans_dir`, `enhanced_progress_checkpoint` (parsed but unused outside config — gates nothing), `prompt_enforcement_enabled` (default **false**; gates the progress block) |
 
 ### 2.2 Skills system (subset of Superpowers, prompt-based)
 
@@ -182,10 +190,34 @@ pub const StepVerification = struct {
   `plan_replan_suggestion_fmt` (REALIGN / REPLAN / CONCLUDE), closing the loop with
   RFC-022's completion semantics.
 
+- **Verification result states (normative):** a `StepVerification` run yields one of
+  `passed | failed | timed_out | error | skipped` (skipped = no verification field,
+  legacy behavior). Only `passed` transitions the step to `.completed`;
+  `failed`/`timed_out`/`error` keep it in `.verifying` and emit
+  `verification_failed` drift (below). Result + wall-time + trimmed output are stored
+  on the step and journaled.
+- **Safety bounds for `shell` verification:** hard timeout (bounded by
+  `act_timeout_secs` class, per-verification cap), cancellation via process-group
+  kill on timeout, and a read-only allowlist default: verification commands are
+  run in a restricted profile that blocks file-mutating tools
+  (`file_write`/`file_edit`/`rm`/`git commit` class) — a verification command
+  that *mutates* state is treated as a `failed` verification with an advisory,
+  not executed to completion.
+- **No double-counting:** `verifyStep()` runs the check *outside* the tool
+  registry's lifecycle hook path (or uses a hook-suppressed variant of the
+  registry call) so a verification run is never journaled as an agent tool
+  call that advances step progress or the tool trajectory.
+- **CodeAct mode:** when the agent executes a step via JavaScript
+  (`executeCodeActBlock`) instead of native tool dispatch, verification is
+  evaluated from the CodeAct turn's terminal state (final tool results inside
+  the JS block), not by re-running native `bash`/`file_read` — `verifyStep()`
+  accepts a `?[]const u8` of observed terminal outputs so both paths converge
+  on the same result-state machine.
+
 Superpowers parallel: *writing-plans* "every task has verification steps" +
 *verification-before-completion* "evidence before assertions".
 
-### 3.2 Phase 2 — Plan approval gate
+### 3.2 Phase 2 — Plan approval advisory (soft gate)
 
 New plan lifecycle state in `plan.zig`:
 
@@ -199,10 +231,23 @@ pub const PlanPhase = enum { proposed, approved, executing, complete, rejected }
   injected as guidance when phase == `approved`; before that the model may still explore
   (read-only tools), but mutating tools carry an advisory: "plan is proposed, not
   approved — call `/plan approve` or execute the next step as user confirmation".
+- **Design decision (normative): this is an *advisory*, not a hard gate.** Mutating
+  tools are not blocked anywhere; enforcement is prompt-level, per RFC-020's
+  "guidance, not hard block" policy. A hard gate would require blocking at the
+  native-tool dispatch point — and is defeated today anyway by a timing window:
+  plans are detected while scanning response *text* (`agent_step.zig:182-187`)
+  after the tool definitions for that same response were already selected
+  (`agent_turn.zig:104-127`), so the mutation calls riding in the very response
+  that produced the plan execute before the plan object even exists. Documented
+  as a known limitation; a hard gate is out of scope (see §8).
 - REPL: extend `/plan` with `approve | reject | status | list` (`repl.zig`, backed by
   `plan_store.listPlans()`).
-- `plan_store` persists `PlanPhase`, so a restore across sessions revives a plan in
-  `proposed` state, not auto-executing.
+- `plan_store` persists `PlanPhase`. **Persistence triggers (normative):** on every
+  phase transition (`proposed → approved`, `approved → executing`, step
+  verification results), *not only* at completion — today `save()` fires only at
+  `is_complete` (`agent.zig:1471-1476`), so a crash mid-plan loses the running plan.
+  `restore()` must filter metadata by `!is_complete` when reviving a running plan;
+  a completed plan is retained for reference but not re-activated.
 
 Superpowers parallel: "After you've signed off on the design … once you say 'go', it
 launches subagent-driven-development".
@@ -219,10 +264,17 @@ launches subagent-driven-development".
 - This mirrors Superpowers' Pi extension behavior ("injects the bootstrap at session
   startup and again after compaction") and revives the `using-superpowers` "check for
   relevant skills before any action" rule that compaction today silently kills.
-- Also re-inject the `skills_guidance_header` list — today it lives only in `msgs[0]`,
-  which *is* preserved, but only for the default system prompt; `MINI_SYSTEM_FILE` users
-  and subagent one-shot runs have different index-0 shapes, so the block is rebuilt from
-  `skills.getSkills()` at compaction time.
+- **Mechanism correction (what is actually lost):** the `skills_guidance_header`
+  *list* (name + description + path of every available skill) lives in the
+  **system prompt**, which is re-sent on every request — it is *not* dropped by
+  `compactMemAct()` (that only rewrites the history array, not the system prompt).
+  What *is* lost is **skill *content* that was read into the conversation**
+  (`mini.read` of a SKILL.md becomes a history tool-result, which compaction
+  discards). The reinject block therefore targets the read-skill content list
+  (item (b) above), not the guidance list. Rebuilding the guidance list from
+  `skills.getSkills()` at compaction time is a defensive measure only for
+  `MINI_SYSTEM_FILE` users and subagent one-shot runs whose index-0 shape differs
+  from the default system prompt.
 
 ### 3.4 Phase 4 — Step-scoped subagent orchestration + review gates
 
@@ -244,7 +296,12 @@ executor_mode: ?[]const u8 = null,
   (`review_outcome`, with Critical/Important/Minor severity, Critical → step `failed`).
 - `batch_invoke_subagents` mapping: independent steps (no dependency edge between them)
   can be auto-batched in one `parallel` dispatch; this is the plan-aware upgrade of
-  Superpowers' `dispatching-parallel-agents`.
+  Superpowers' `dispatching-parallel-agents`. **Dependency:** the runtime today only
+  completes steps sequentially by `tool_hint` match (§2.1 runtime-wiring gap), so
+  auto-batching additionally requires wiring a dependency-aware ready-set selector
+  into the production loop (`executePlanStep()` / first-ready-step selection,
+  replacing `findActiveStepIndex()`'s sequential scan) — that wiring is a
+  precondition of this phase and is scoped into §3.4 work.
 
 All off by default: `plan_subagent_dispatch = false`, `plan_review_gate = false`.
 
@@ -265,10 +322,14 @@ New `ActEventType`s in `journal.zig`: `plan_phase_changed`, `plan_step_verified`
 
 ### 3.6 Plan Mode Off / No Active Plan — Explicit Fallback Semantics
 
-The RFC must state precisely what happens when planning is *not* active, because today this
-is underspecified: `enable_structured_planning` defaults **true** but only *enables* the
-parser/monitor; whether a plan actually exists depends on the LLM emitting a parseable plan
-in a response. There are four distinct states, each with defined behavior under this RFC.
+The RFC must state precisely what happens when planning is *not* active. Note on the
+baseline: the struct-field default for `enable_structured_planning` is `true`
+(`config.zig:241`), but the **actual runtime value** comes from the env-resolved
+loader (`config.zig:512`), which defaults to **false** when the env var is absent —
+so, out of the box, the feature is OFF and State A describes default behavior.
+The flag only *enables* the parser/monitor; whether a plan actually exists depends
+on the LLM emitting a parseable plan in a response. There are four distinct
+states, each with defined behavior under this RFC.
 
 **State A — `enable_structured_planning = false` (feature fully off):**
 - `tryDetectPlanInResponse` falls to the legacy `detectPlanInText` string-matching path
@@ -279,8 +340,8 @@ in a response. There are four distinct states, each with defined behavior under 
 
 **State B — Feature on, but no structured plan was parsed for the current task:**
 - The model is in **ReAct mode** (default). It may freely explore and act; there is no
-  `PlanPhase`, no verification gate, no approval gate, no review gate — none of §3.1–§3.4
-  machinery has a plan object to attach to, so none of it fires.
+  `PlanPhase`, no verification gate, no approval advisory, no review gate — none of
+  §3.1–§3.4 machinery has a plan object to attach to, so none of it fires.
 - **Post-compaction reinjection (§3.3) still applies** but degrades gracefully: if there is
   no active plan, the index-2 block contains only the read-skill names + task reminder
   (`msgs[0]` restated), *not* a plan summary. This is the only RFC-024 behavior that runs
@@ -344,7 +405,7 @@ model already had before compaction).
 |---|---|
 | `src/core/plan.zig` | `StepVerification`, `PlanPhase`, `executor_mode` fields + JSON (de)serialization + `verifyStep()` storage |
 | `src/core/plan_parser.zig` | parse `verification` / `executor_mode` / `phase` |
-| `src/core/plan_executor.zig` | `verifyStep()`, `dispatchStep()` |
+| `src/core/plan_executor.zig` | `verifyStep()`, `dispatchStep()`, and a dependency-aware ready-set selector that picks the next actionable step from `dependencies` (wired into the runtime to replace the sequential `tool_hint`-match completion, §3.4) |
 | `src/core/plan_monitor.zig` | `verification_failed` drift classification |
 | `src/core/plan_integration.zig` | phase-aware `renderPlanDisplay()`, approval-state gating, skill-read tracking |
 | `src/core/plan_store.zig` | persist `PlanPhase`, `verification` results |
@@ -415,7 +476,7 @@ Acceptance criteria per phase:
 
 | Risk | Mitigation |
 |---|---|
-| Approval gate adds a turn of latency to simple tasks | Gate only applies to parsed **structured** plans; ReAct-mode single-step tasks (no plan detected) are untouched. |
+| Approval advisory adds a turn of latency to simple tasks | Advisory only applies to parsed **structured** plans; ReAct-mode single-step tasks (no plan detected) are untouched. A hard dispatch-time gate was considered and rejected: plans are detected after the response's tool definitions are already chosen, so the timing window (§3.2) makes any in-response hard block unreliable; out of scope. |
 | `verification: shell` commands re-run expensive suites per step | Verification is per-step, not per-act; cached negative results within the step's `active` window; config cap on verification duration (reuse `act_timeout_secs` class). |
 | Review subagent cost doubles token usage on every step | `plan_review_gate` defaults off; recommend "final step + after each `mutate`-category step" as the sane preset, exposed as `/plan review on\|off`. |
 | Post-compaction block bloats context | Reinject block capped at ~2 KB (plan summary reuses `generateProgressSummary` which is already bounded; skill list is name+path only). |
@@ -523,3 +584,10 @@ RFC-024 cũng nên chỉnh lại hai chi tiết hiện trạng:
 2. Approval là hard gate hay chỉ advisory; nếu hard gate, chặn chính xác ở điểm nào trước mutation.
 3. Runtime có thực sự điều phối DAG dependency, hay chỉ tuần tự hoàn tất step theo tool_hint.
 4. Verification và lifecycle event có schema, timeout, lỗi và quy tắc rollback cụ thể nào.
+
+## Chốt 4 quyết định (đã phản ánh vào RFC)
+
+1. **Default thực tế = TẮT** (env-resolved loader, `config.zig:512`). §2.1 và §3.6 đã sửa để mô tả giá trị mặc định *khi chạy*, không phải struct default.
+2. **Approval = advisory (soft gate)**, giữ nhất quán RFC-020; hard gate bị loại bỏ khỏi phạm vi do timing window (detection sau khi tool definitions đã chọn). §3.2 đổi tên thành "Plan approval advisory", ghi rõ decision normative + known limitation; §8 cập nhật risk.
+3. **Runtime hiện chỉ tuần tự theo tool_hint** — capability DAG nằm trong lib, chưa nối vào production. §2.1 thêm hàng "⚠ Runtime wiring (capability vs reality)"; §3.4 yêu cầu wiring dependency-aware ready-set selector là precondition của auto-batching; §5 (plan_executor) cập nhật scope.
+4. **Verification schema + persistence triggers**: §3.1 bổ sung result-state machine `passed | failed | timed_out | error | skipped` (chỉ `passed` → `.completed`), safety bounds cho `shell` (timeout + process-group kill + read-only allowlist), no-double-counting (chạy ngoài lifecycle hook path), và CodeAct convergence; rollback không phát minh mới — kế thừa CAS snapshot (RFC-002). §3.2 quy định save tại mọi phase transition (không chỉ completion) + restore filter `!is_complete`.
