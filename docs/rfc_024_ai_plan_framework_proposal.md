@@ -433,3 +433,93 @@ Acceptance criteria per phase:
 - `docs/rfc_020_semantic_advisory_enforcement.md` (telemetry phase — plan-path coverage via §3.5).
 - `docs/rfc_022_watchdog_false_positive_proposal.md` (completion semantics consumed by §3.1).
 - `docs/rfc_023_end_turn_completion_semantics_proposal.md` (typed response state; "CONCLUDE" replan option).
+
+
+# Đánh giá RFC-024: AI Plan Framework
+
+## Kết luận
+
+RFC-024 nhắm đúng các thiếu hụt về xác minh step, duyệt kế hoạch, giữ ngữ cảnh sau compaction và review kết quả subagent. **Tuy nhiên, bản hiện tại chưa sẵn sàng để triển khai**: một số mô tả hiện trạng sai hoặc mâu thuẫn, và “approval gate” như thiết kế chưa thực sự đảm bảo người dùng đã chấp thuận trước khi có thay đổi.
+
+## Các điểm cần sửa trước — ưu tiên cao
+
+### 1. Mâu thuẫn về mặc định của structured planning
+
+RFC nói enable_structured_planning mặc định bật (§2.1, §3.6). Struct Config có giá trị khởi tạo true, nhưng config loader lấy từ resolvePlanningAndWatchdogSettings() với giá trị môi trường mặc định **false** (src/core/config.zig:239-253, 506-519). Cần thống nhất RFC mô tả **giá trị mặc định thực tế khi chạy**, không chỉ giá trị mặc định của struct.
+
+Mâu thuẫn này tác động trực tiếp đến fallback semantics, test no-op và các tuyên bố tương thích ngược.
+
+### 2. Approval gate hiện chỉ là advisory, không phải user sign-off
+
+RFC gọi đây là approval gate và nhấn mạnh user sign-off, nhưng §3.6 lại ghi rõ tool làm thay đổi dữ liệu **không bị chặn** — model chỉ nhận lời nhắc. Như vậy đây là **soft advisory**, không đảm bảo người dùng đã duyệt.
+
+Có thêm một lỗ hổng về thời điểm: plan được nhận diện khi quét nội dung response (src/core/agent_step.zig:182-187), rồi các native tool call trong chính response đó được dispatch (src/core/agent_step.zig:1136-1142). Các tool definitions lại đã được chọn trước khi response đến (src/core/agent_turn.zig:104-127). Vì thế một plan mới được phát hiện chưa thể ngăn tool mutation đi kèm response đó.
+
+Nếu mục tiêu là yêu cầu phê duyệt thật, RFC cần quy định **hard gate tại đường dispatch tool**, trước khi mutation chạy. Nếu chỉ muốn gợi ý, nên đổi tên và tiêu chí thành “approval advisory”; hiện hai mục tiêu đang bị trộn lẫn.
+
+### 3. Phần mô tả “DAG execution” đang đánh giá quá cao hiện trạng
+
+Mô hình plan có dependencies, và executePlanStep() kiểm tra dependency (src/core/plan.zig:48-68; src/core/plan_executor.zig:45-67). Nhưng lượt rà soát call sites chỉ thấy hàm này được gọi trong chính module và test; luồng agent production đánh dấu step hoàn tất bằng cách so sánh tên tool với tool_hint, rồi tăng chỉ số step tuần tự (src/core/agent.zig:1461-1479). findActiveStepIndex() cũng chọn step pending hoặc active đầu tiên mà không xét dependency (src/core/plan.zig:253-264).
+
+Do đó, câu RFC-024 rằng mini hiện có “DAG plan model with dependency resolution” cần phân biệt **khả năng trong thư viện** với **dependency resolution đang được nối vào runtime**. Điều này đặc biệt quan trọng cho §3.4: không thể chỉ kiểm tra hai step “không có dependency edge” rồi batch nếu luồng hiện tại chưa xác định tập step sẵn sàng.
+
+### 4. Plan đang được lưu khi hoàn thành, không phải ở các trạng thái đang chạy
+
+PlanStore.save() serial hóa plan và ghi CAS (src/core/plan_store.zig:84-103), nhưng call site trong agent là lúc plan đã hoàn tất, ngay trước khi xóa plan khỏi trạng thái hiện tại (src/core/agent.zig:1471-1476). tryRestoreFromStore() có thể khôi phục plan theo request hash (src/core/plan_integration.zig:274-289), nhưng điều đó chưa đồng nghĩa plan đang thực hiện được lưu bền vững qua crash/turn.
+
+Vì approval và review phụ thuộc lifecycle như proposed, approved, executing, RFC cần định nghĩa **lưu ở các transition nào**, tránh chỉ lưu trạng thái hoàn tất. Cũng cần quy định khôi phục một plan đã hoàn tất; restore hiện đọc plan mới nhất khớp request hash, không thấy lọc theo metadata is_complete ở đường khôi phục.
+
+## Các điểm cần làm rõ theo phase
+
+### Phase 1 — Verification-gated steps
+
+Hiện PlanStep chưa có trường verification (src/core/plan.zig:48-67), parser chỉ đọc id, description, dependencies, tool_hint, status (src/core/plan_parser.zig:33-74), và auto-completion xảy ra khi tool thành công có tên khớp chính xác tool_hint (src/core/agent.zig:1461-1468).
+
+RFC cần xác định thêm:
+
+- Schema JSON chính thức: ví dụ {"shell": ...} chưa khớp trực tiếp với struct kind + value; file_contains cũng cần định dạng path/pattern cụ thể.
+- Verification có trạng thái passed / failed / error / timed_out / skipped hay chỉ bool; nơi lưu output, thời gian và kết quả.
+- Ranh giới an toàn của shell: một lệnh verification có thể gây thay đổi, không chỉ kiểm tra. Quy định phải bao gồm timeout, hủy, phạm vi path và cách xử lý lệnh không an toàn.
+- Cách chạy verifier để không bị tính nhầm như tool hành động của agent. Nếu gọi registry tool bình thường, nó phát lifecycle hook như tool call (src/tooling/registry.zig:172-205); cần tránh double-count hoặc làm thay đổi tiến độ/tool trajectory ngoài ý muốn.
+- CodeAct mode: tool dispatch của agent không đi qua cùng đường native-tool tracking. RFC nên nêu rõ verification và ghi nhận step hoạt động thế nào khi agent thực thi JavaScript thay vì native tool (src/core/agent_step.zig:1097-1100, 1144-1150).
+
+### Phase 3 — Post-compaction reinjection
+
+compactMemAct() giữ yêu cầu gốc ở msgs[0], tạo summary ở index 1 và xóa các message còn lại (src/core/history.zig:363-388). RFC vì thế không cần “nhắc lại” yêu cầu gốc theo cách trùng lặp; nên nói rõ phần nào chỉ được khôi phục để chống việc summary bỏ sót.
+
+RFC cũng nói skills guidance bị mất. **Danh sách skill được build thành system prompt** (src/core/config.zig:960-976, 998-1012) và system_prompt được gửi trong request tiếp theo (src/core/agent_step.zig:1059-1065), nên phần danh sách không bị compactMemAct() xóa khỏi history theo cách RFC mô tả. Khác với danh sách, **nội dung skill đã được đọc vào conversation** có thể biến mất sau compaction. Nên theo dõi skill content đã nạp, thay vì giả định toàn bộ skill guidance đã mất.
+
+post_compact_reinject mặc định bật nhưng §3.6 nói State A phải không có behavior mới; RFC cần quy định cờ này bị giới hạn bởi enable_structured_planning hay được phép chạy cả khi planning tắt. “Chỉ bổ sung thông tin nên không thể phá luồng” chưa đủ để bảo đảm không đổi hành vi, token budget hoặc cách model phản hồi.
+
+Cuối cùng, RFC cần chỉ rõ vai trò và tier của context block ở index 2. Summary tại index 1 phải là .user để giữ tương thích Claude; việc thêm block và compaction tiếp theo cần có contract rõ.
+
+### Phase 4 — Subagent và review
+
+Có thể tái sử dụng subagent hiện có, nhưng giao diện của chúng là task string / mảng task tự do, không nhận đối tượng PlanStep có cấu trúc (src/tools/subagent.zig:88-135; src/tools/batch_subagent.zig:138-181). RFC cần định nghĩa:
+
+- Mapping task ID ↔ kết quả ↔ review ↔ verification.
+- Cấu trúc phản hồi bắt buộc từ worker và reviewer; quy tắc khi subagent lỗi, không có output, bị kill hoặc vượt giới hạn.
+- Quyền thao tác, tool policy, timeout và snapshot/rollback cho mutation do child process thực hiện.
+- Review “hai giai đoạn” là một hay hai lần chạy reviewer; output và severity có schema máy đọc được nào.
+- Cách tắt approval/review gate trong subagent được dispatch. Subagent khởi chạy tiến trình mini mới và nhận environment hiện tại (src/tools/subagent.zig:104-120), nên các config mới có thể được kế thừa nếu không xử lý riêng.
+
+### Phase 5 — Telemetry và config
+
+ActEventType hiện chưa có các event RFC đề xuất (src/core/journal.zig:18-39). Journal event có event_type và description, nhưng chưa có payload chuyên biệt cho step ID, verification status hoặc review severity (src/core/journal.zig:82-91). Chỉ thêm tên event sẽ chưa đủ để tính các metrics đã liệt kê; RFC nên định nghĩa schema sự kiện và mẫu số/tập hợp của từng metric.
+
+session_diagnostics detail hiện hiển thị trạng thái tiến trình, lỗi và tối đa 10 event cuối, chưa tổng hợp plan metrics (src/tools/session_diagnostics.zig:396-433). Cần nêu rõ phần metrics sẽ đọc toàn journal nào, xử lý event cũ/thiếu dữ liệu ra sao và có giới hạn chi phí không.
+
+RFC-024 cũng nên chỉnh lại hai chi tiết hiện trạng:
+
+- planning_min_task_length được parse nhưng chưa thấy dùng trong logic; nhận xét này phù hợp với code.
+- actual_acts được gán từ current_step_acts khi complete, nhưng không tìm thấy đường production tăng các bộ đếm current_step_acts/total_acts (src/core/plan_executor.zig:22-33, 64-67, 83-94; chỉ có field/serialization và gán). Vì vậy nên viết chính xác là **đường đếm act chưa được nối đầy đủ**, không phải completion không bao giờ cập nhật actual_acts.
+- enhanced_progress_checkpoint được cấu hình, nhưng progress block đang gate bằng prompt_enforcement_enabled (src/core/config.zig:250-253; src/core/plan_integration.zig:309-344). Việc đề xuất hợp nhất hai cờ là hợp lý, nhưng cần nêu rõ giữ giá trị mặc định/hành vi nào.
+
+## Kết luận review
+
+**Khuyến nghị: sửa RFC trước khi viết implementation plan.** Nên chốt trước bốn quyết định nền tảng:
+
+1. Structured planning mặc định bật hay tắt khi khởi tạo cấu hình thực tế.
+2. Approval là hard gate hay chỉ advisory; nếu hard gate, chặn chính xác ở điểm nào trước mutation.
+3. Runtime có thực sự điều phối DAG dependency, hay chỉ tuần tự hoàn tất step theo tool_hint.
+4. Verification và lifecycle event có schema, timeout, lỗi và quy tắc rollback cụ thể nào.
