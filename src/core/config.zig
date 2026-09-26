@@ -252,6 +252,18 @@ pub const Config = struct {
     /// Inject plan, progress, action-loop, and trajectory enforcement prompts. Default: false.
     prompt_enforcement_enabled: bool = false,
 
+    // RFC-024: AI Plan Framework
+    /// Gate plan step completion on explicit verification. Default: false.
+    plan_verification_gate: bool = false,
+    /// Require user approval before executing a parsed plan (advisory gate). Default: false.
+    plan_approval_gate: bool = false,
+    /// Re-inject plan + skill + task context after MemAct compaction. Default: true.
+    post_compact_reinject: bool = true,
+    /// Dispatch plan steps to subagents (per-step or auto-parallel for independent steps). Default: false.
+    plan_subagent_dispatch: bool = false,
+    /// Two-stage review gate after subagent-executed steps. Default: false.
+    plan_review_gate: bool = false,
+
     // 3-Thread Watchdog & Act Coordinator (RFC-015)
     act_timeout_secs: u32 = 120,
     watchdog_tracking_interval_s: u32 = 10,
@@ -497,6 +509,11 @@ pub const Config = struct {
         plans_dir: ?[]const u8,
         enhanced_progress_checkpoint: bool,
         prompt_enforcement_enabled: bool,
+        plan_verification_gate: bool,
+        plan_approval_gate: bool,
+        post_compact_reinject: bool,
+        plan_subagent_dispatch: bool,
+        plan_review_gate: bool,
         act_timeout_secs: u32,
         watchdog_tracking_s: u32,
         watchdog_recap_interval: usize,
@@ -516,6 +533,11 @@ pub const Config = struct {
             .plans_dir = env_map.get("MINI_PLANS_DIR"),
             .enhanced_progress_checkpoint = if (env_map.get("MINI_ENHANCED_PROGRESS_CHECKPOINT")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else true,
             .prompt_enforcement_enabled = if (env_map.get("MINI_PROMPT_ENFORCEMENT_ENABLED")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false,
+            .plan_verification_gate = if (env_map.get("MINI_PLAN_VERIFICATION_GATE")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false,
+            .plan_approval_gate = if (env_map.get("MINI_PLAN_APPROVAL_GATE")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false,
+            .post_compact_reinject = if (env_map.get("MINI_POST_COMPACT_REINJECT")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else true,
+            .plan_subagent_dispatch = if (env_map.get("MINI_PLAN_SUBAGENT_DISPATCH")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false,
+            .plan_review_gate = if (env_map.get("MINI_PLAN_REVIEW_GATE")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false,
             .act_timeout_secs = act_to,
             .watchdog_tracking_s = if (env_map.get("MINI_WATCHDOG_TRACKING_S")) |s| std.fmt.parseInt(u32, s, 10) catch 10 else 10,
             .watchdog_recap_interval = if (env_map.get("MINI_WATCHDOG_RECAP_INTERVAL")) |s| std.fmt.parseInt(usize, s, 10) catch 10 else 10,
@@ -648,6 +670,11 @@ pub const Config = struct {
         cfg.plans_dir = p.plans_dir;
         cfg.enhanced_progress_checkpoint = p.enhanced_progress_checkpoint;
         cfg.prompt_enforcement_enabled = p.prompt_enforcement_enabled;
+        cfg.plan_verification_gate = p.plan_verification_gate;
+        cfg.plan_approval_gate = p.plan_approval_gate;
+        cfg.post_compact_reinject = p.post_compact_reinject;
+        cfg.plan_subagent_dispatch = p.plan_subagent_dispatch;
+        cfg.plan_review_gate = p.plan_review_gate;
     }
 
     /// Load configuration from environment variables (after calling loadDotEnv).
@@ -1109,6 +1136,12 @@ pub const JsonConfig = struct {
     plans_dir: ?[]const u8 = null,
     enhanced_progress_checkpoint: ?bool = null,
     prompt_enforcement_enabled: ?bool = null,
+    // RFC-024: AI Plan Framework
+    plan_verification_gate: ?bool = null,
+    plan_approval_gate: ?bool = null,
+    post_compact_reinject: ?bool = null,
+    plan_subagent_dispatch: ?bool = null,
+    plan_review_gate: ?bool = null,
     // 3-Thread Watchdog & Act Coordinator (RFC-015)
     act_timeout_secs: ?u32 = null,
     watchdog_tracking_interval_s: ?u32 = null,
@@ -1326,6 +1359,11 @@ fn applyPlanningAndWatchdogJsonConfig(cfg: *const JsonConfig, env_map: *std.proc
     if (cfg.plans_dir) |val| count += setEnvDefault(env_map, "MINI_PLANS_DIR", val);
     if (cfg.enhanced_progress_checkpoint) |val| count += setEnvBool(env_map, "MINI_ENHANCED_PROGRESS_CHECKPOINT", val);
     if (cfg.prompt_enforcement_enabled) |val| count += setEnvBool(env_map, "MINI_PROMPT_ENFORCEMENT_ENABLED", val);
+    if (cfg.plan_verification_gate) |val| count += setEnvBool(env_map, "MINI_PLAN_VERIFICATION_GATE", val);
+    if (cfg.plan_approval_gate) |val| count += setEnvBool(env_map, "MINI_PLAN_APPROVAL_GATE", val);
+    if (cfg.post_compact_reinject) |val| count += setEnvBool(env_map, "MINI_POST_COMPACT_REINJECT", val);
+    if (cfg.plan_subagent_dispatch) |val| count += setEnvBool(env_map, "MINI_PLAN_SUBAGENT_DISPATCH", val);
+    if (cfg.plan_review_gate) |val| count += setEnvBool(env_map, "MINI_PLAN_REVIEW_GATE", val);
     if (cfg.act_timeout_secs) |val| count += setEnvInt(u32, env_map, "MINI_ACT_TIMEOUT_SECS", val);
     if (cfg.watchdog_tracking_interval_s) |val| count += setEnvInt(u32, env_map, "MINI_WATCHDOG_TRACKING_S", val);
     if (cfg.watchdog_recap_interval) |val| count += setEnvInt(usize, env_map, "MINI_WATCHDOG_RECAP_INTERVAL", val);

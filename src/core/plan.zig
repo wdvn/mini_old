@@ -42,6 +42,87 @@ pub fn parseStepStatus(str: []const u8) StepStatus {
 }
 
 // ---------------------------------------------------------------------------
+// Plan Phase (RFC-024 §3.2)
+// ---------------------------------------------------------------------------
+
+/// Plan lifecycle phase. `proposed` is the default for a freshly parsed plan;
+/// execution guidance is gated on `approved` (advisory, per RFC-020).
+pub const PlanPhase = enum {
+    /// Parsed but not yet user-approved (default).
+    proposed,
+    /// User has approved (`/plan approve`); steps are now actionable.
+    approved,
+    /// An approved step is currently in flight.
+    executing,
+    /// All steps complete.
+    complete,
+    /// User rejected the plan.
+    rejected,
+};
+
+/// Parse PlanPhase from a string tag.
+pub fn parsePlanPhase(str: []const u8) PlanPhase {
+    if (std.mem.eql(u8, str, "approved")) return .approved;
+    if (std.mem.eql(u8, str, "executing")) return .executing;
+    if (std.mem.eql(u8, str, "complete")) return .complete;
+    if (std.mem.eql(u8, str, "rejected")) return .rejected;
+    return .proposed;
+}
+
+/// Parse VerificationStatus from a string tag.
+pub fn parseVerificationStatus(str: []const u8) VerificationStatus {
+    if (std.mem.eql(u8, str, "passed")) return .passed;
+    if (std.mem.eql(u8, str, "failed")) return .failed;
+    if (std.mem.eql(u8, str, "timed_out")) return .timed_out;
+    if (std.mem.eql(u8, str, "error")) return .check_error;
+    return .skipped;
+}
+
+// ---------------------------------------------------------------------------
+// Step Verification (RFC-024 §3.1)
+// ---------------------------------------------------------------------------
+
+/// Result of running a step's verification check (normative state machine).
+/// Only `passed` transitions the step to `.completed`.
+pub const VerificationStatus = enum {
+    /// No verification field present (legacy behavior).
+    skipped,
+    /// Check succeeded.
+    passed,
+    /// Check ran and failed.
+    failed,
+    /// Check hit its time budget.
+    timed_out,
+    /// Check errored (bad input, unsupported kind, IO error).
+    check_error,
+};
+
+/// Kind of acceptance check for a plan step.
+pub const VerificationKind = enum { shell, file_exists, file_contains };
+
+/// Optional acceptance check on a plan step. A step is "completed" only when
+/// this passes; without it, tool_hint-match completion is unchanged (backward
+/// compatible).
+pub const StepVerification = struct {
+    /// What kind of check to run.
+    kind: VerificationKind,
+    /// shell: command to run (must exit 0). file_exists: path.
+    /// file_contains: "<path> <pattern>" (single leading space separates them).
+    value: []const u8,
+
+    pub fn deinit(self: *StepVerification, alloc: Allocator) void {
+        alloc.free(self.value);
+    }
+
+    pub fn clone(self: *const StepVerification, alloc: Allocator) !StepVerification {
+        return .{
+            .kind = self.kind,
+            .value = try alloc.dupe(u8, self.value),
+        };
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Plan Step
 // ---------------------------------------------------------------------------
 
@@ -65,6 +146,12 @@ pub const PlanStep = struct {
     created_at: i64,
     /// Timestamp when step completed (null if not done).
     completed_at: ?i64 = null,
+    /// Optional acceptance check (RFC-024 §3.1); null = legacy tool_hint completion.
+    verification: ?StepVerification = null,
+    /// Latest verification result state (RFC-024 §3.1).
+    verification_status: VerificationStatus = .skipped,
+    /// "inline" (default) | "subagent" | "parallel:<batch>" (RFC-024 §3.4).
+    executor_mode: ?[]const u8 = null,
 
     // PSEUDOCODE:
     // 1. Allocate copies of description, dependencies, and tool_hint with alloc
@@ -93,6 +180,9 @@ pub const PlanStep = struct {
             .actual_acts = 0,
             .created_at = utils.milliTimestamp(),
             .completed_at = null,
+            .verification = null,
+            .verification_status = .skipped,
+            .executor_mode = null,
         };
     }
 
@@ -116,6 +206,10 @@ pub const PlanStep = struct {
         errdefer alloc.free(deps);
         const tool = if (self.tool_hint) |t| try alloc.dupe(u8, t) else null;
         errdefer if (tool) |t| alloc.free(t);
+        const exec = if (self.executor_mode) |em| try alloc.dupe(u8, em) else null;
+        errdefer if (exec) |em| alloc.free(em);
+        const verif = if (self.verification) |v| try v.clone(alloc) else null;
+        errdefer if (verif) |v| v.deinit(alloc);
 
         return PlanStep{
             .id = self.id,
@@ -127,6 +221,9 @@ pub const PlanStep = struct {
             .actual_acts = self.actual_acts,
             .created_at = self.created_at,
             .completed_at = self.completed_at,
+            .verification = verif,
+            .verification_status = self.verification_status,
+            .executor_mode = exec,
         };
     }
 
@@ -135,6 +232,8 @@ pub const PlanStep = struct {
         alloc.free(self.description);
         alloc.free(self.dependencies);
         if (self.tool_hint) |t| alloc.free(t);
+        if (self.executor_mode) |em| alloc.free(em);
+        if (self.verification) |v| alloc.free(v.value);
     }
 };
 
@@ -158,6 +257,8 @@ pub const Plan = struct {
     parent_plan_id: ?u64 = null,
     /// Hash of user request for plan matching/restore.
     request_hash: u64,
+    /// Lifecycle phase (RFC-024 §3.2); `proposed` for freshly parsed plans.
+    phase: PlanPhase = .proposed,
 
     /// Initialize a new empty plan.
     pub fn init(alloc: Allocator, task_description: []const u8, request_hash: u64) !Plan {
@@ -171,6 +272,7 @@ pub const Plan = struct {
             .completed_at = null,
             .parent_plan_id = null,
             .request_hash = request_hash,
+            .phase = .proposed,
         };
     }
 
@@ -185,6 +287,7 @@ pub const Plan = struct {
         copy.created_at = self.created_at;
         copy.completed_at = self.completed_at;
         copy.parent_plan_id = self.parent_plan_id;
+        copy.phase = self.phase;
 
         for (self.steps.items) |step| {
             try copy.addStep(alloc, step);
@@ -200,6 +303,14 @@ pub const Plan = struct {
         errdefer alloc.free(deps);
         const tool = if (step.tool_hint) |t| try alloc.dupe(u8, t) else null;
         errdefer if (tool) |t| alloc.free(t);
+        const exec = if (step.executor_mode) |em| try alloc.dupe(u8, em) else null;
+        errdefer if (exec) |em| alloc.free(em);
+        const verif = if (step.verification) |v| blk: {
+            const val = try alloc.dupe(u8, v.value);
+            errdefer alloc.free(val);
+            break :blk StepVerification{ .kind = v.kind, .value = val };
+        } else null;
+        errdefer if (verif) |v| alloc.free(v.value);
 
         const new_step = PlanStep{
             .id = step.id,
@@ -211,6 +322,9 @@ pub const Plan = struct {
             .actual_acts = step.actual_acts,
             .created_at = step.created_at,
             .completed_at = step.completed_at,
+            .verification = verif,
+            .verification_status = step.verification_status,
+            .executor_mode = exec,
         };
 
         try self.steps.append(alloc, new_step);
@@ -253,19 +367,49 @@ pub const Plan = struct {
     /// Get the index of the first pending or active step.
     pub fn findActiveStepIndex(self: *const Plan) ?usize {
         var i: usize = 0;
-        while (i < self.steps.items.len) {
+        while (i < self.steps.items.len) : (i += 1) {
             const step = self.steps.items[i];
             if (step.status == .pending or step.status == .active) {
                 return i;
             }
-            i += 1;
         }
         return null;
     }
 
+    /// RFC-024: dependency-aware ready-set selector. Returns the index of the
+    /// first step whose prerequisites are all satisfied (completed/skipped) and
+    /// which is not yet finished — replacing the sequential `findActiveStepIndex`
+    /// scan in the runtime. A step that is `.active` with unmet deps is left as-is
+    /// (never force-completed). Steps whose dependencies cannot be met are
+    /// skipped by the caller if all remaining steps are blocked.
+    pub fn findReadyStepIndex(self: *const Plan) ?usize {
+        var i: usize = 0;
+        while (i < self.steps.items.len) : (i += 1) {
+            const step = self.steps.items[i];
+            if (step.status != .pending and step.status != .active) continue;
+            if (self.allDependenciesSatisfied(&step)) {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    /// Whether every dependency of `step` is completed or skipped. A dependency
+    /// id that names no step is treated as satisfied (orphan reference), matching
+    /// executePlanStep's lenient behavior.
+    pub fn allDependenciesSatisfied(self: *const Plan, step: *const PlanStep) bool {
+        for (step.dependencies) |dep_id| {
+            for (self.steps.items) |s| {
+                if (s.id == dep_id) {
+                    if (s.status != .completed and s.status != .skipped) return false;
+                }
+            }
+        }
+        return true;
+    }
+
     /// Check if all steps are completed or skipped.
-    pub fn isComplete(self: *const Plan) bool {
-        if (self.steps.items.len == 0) return false;
+    pub fn isComplete(self: *const Plan) bool {        if (self.steps.items.len == 0) return false;
         var i: usize = 0;
         while (i < self.steps.items.len) {
             const step = self.steps.items[i];
@@ -302,6 +446,27 @@ pub const Plan = struct {
             try buf.appendSlice(alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{cmp_at}));
         } else {
             try buf.appendSlice(alloc, ",\"completed_at\":null");
+        }
+
+        if (step.executor_mode) |em| {
+            const esc_em = try json.escape(alloc, em);
+            defer alloc.free(esc_em);
+            try buf.appendSlice(alloc, ",\"executor_mode\":\"");
+            try buf.appendSlice(alloc, esc_em);
+            try buf.append(alloc, '"');
+        }
+
+        if (step.verification) |v| {
+            const esc_v = try json.escape(alloc, v.value);
+            defer alloc.free(esc_v);
+            try buf.appendSlice(alloc, ",\"verification\":{\"kind\":\"");
+            try buf.appendSlice(alloc, @tagName(v.kind));
+            try buf.appendSlice(alloc, "\",\"value\":\"");
+            try buf.appendSlice(alloc, esc_v);
+            try buf.appendSlice(alloc, "\"}");
+            try buf.appendSlice(alloc, ",\"verification_status\":\"");
+            try buf.appendSlice(alloc, @tagName(step.verification_status));
+            try buf.append(alloc, '"');
         }
     }
 
@@ -376,6 +541,10 @@ pub const Plan = struct {
             try buf.appendSlice(alloc, ",\"parent_plan_id\":null");
         }
 
+        try buf.appendSlice(alloc, ",\"phase\":\"");
+        try buf.appendSlice(alloc, @tagName(self.phase));
+        try buf.append(alloc, '"');
+
         try buf.appendSlice(alloc, ",\"steps\":[");
     }
 
@@ -413,9 +582,12 @@ pub const Plan = struct {
         if (root_obj.get("parent_plan_id")) |pid_val| {
             if (pid_val == .integer and pid_val.integer > 0) plan.parent_plan_id = @as(u64, @intCast(pid_val.integer));
         }
+        if (root_obj.get("phase")) |ph_val| {
+            if (ph_val == .string) plan.phase = parsePlanPhase(ph_val.string);
+        }
     }
 
-    fn populateStepAttributes(step: *PlanStep, s_obj: std.json.ObjectMap) void {
+    fn populateStepAttributes(alloc: Allocator, step: *PlanStep, s_obj: std.json.ObjectMap) !void {
         if (s_obj.get("status")) |st_val| {
             if (st_val == .string) step.status = parseStepStatus(st_val.string);
         }
@@ -430,6 +602,55 @@ pub const Plan = struct {
         }
         if (s_obj.get("completed_at")) |scmp_val| {
             if (scmp_val == .integer) step.completed_at = scmp_val.integer;
+        }
+        if (s_obj.get("executor_mode")) |em_val| {
+            if (em_val == .string) {
+                step.executor_mode = alloc.dupe(u8, em_val.string) catch step.executor_mode;
+            }
+        }
+        if (s_obj.get("verification_status")) |vs_val| {
+            if (vs_val == .string) step.verification_status = parseVerificationStatus(vs_val.string);
+        }
+        if (s_obj.get("verification")) |v_val| {
+            if (try parseVerificationFromJson(alloc, v_val)) |verif| {
+                step.verification = verif;
+            }
+        }
+    }
+
+    /// Parse a StepVerification from a JSON object `{"kind": ..., "value": ...}`
+    /// or a string shorthand (interpreted as a shell command).
+    fn parseVerificationFromJson(alloc: Allocator, v: std.json.Value) !?StepVerification {
+        switch (v) {
+            .string => |s| {
+                if (s.len == 0) return null;
+                const val = try alloc.dupe(u8, s);
+                errdefer alloc.free(val);
+                return StepVerification{ .kind = .shell, .value = val };
+            },
+            .object => |o| {
+                const kind_val = o.get("kind") orelse return null;
+                const value_val = o.get("value") orelse return null;
+                const kind_str = switch (kind_val) {
+                    .string => |s| s,
+                    else => return null,
+                };
+                const value_str = switch (value_val) {
+                    .string => |s| s,
+                    else => return null,
+                };
+                if (value_str.len == 0) return null;
+                const val = try alloc.dupe(u8, value_str);
+                errdefer alloc.free(val);
+                const kind: VerificationKind = if (std.mem.eql(u8, kind_str, "file_exists"))
+                    .file_exists
+                else if (std.mem.eql(u8, kind_str, "file_contains"))
+                    .file_contains
+                else
+                    .shell;
+                return StepVerification{ .kind = kind, .value = val };
+            },
+            else => return null,
         }
     }
 
@@ -470,7 +691,7 @@ pub const Plan = struct {
         var step = try PlanStep.initWithId(alloc, step_id, desc_str, deps_list.items, tool_hint);
         errdefer step.deinit(alloc);
 
-        populateStepAttributes(&step, s_obj);
+        try populateStepAttributes(alloc, &step, s_obj);
         return step;
     }
 
@@ -744,4 +965,70 @@ test "DAG validation - cycle detected" {
     const cyclic_steps = [_]PlanStep{ step1, step2 };
     try std.testing.expect(!validateDAG(&cyclic_steps));
     try std.testing.expect(checkCycles(&cyclic_steps));
+}
+
+test "RFC-024: verification + executor_mode + phase JSON round-trip" {
+    const alloc = std.testing.allocator;
+
+    var plan = try Plan.init(alloc, "Plan with verification", 0xabcd);
+    defer plan.deinit(alloc);
+    plan.phase = .approved;
+
+    const ver_value = try alloc.dupe(u8, "zig build test");
+    // NOTE: ver_value is now owned by step1.verification and freed by
+    // step1.deinit below — do NOT free it separately (double-free).
+    var step1 = try PlanStep.initWithId(alloc, 1, "Run build", &.{}, "bash");
+    defer step1.deinit(alloc);
+    step1.verification = StepVerification{ .kind = .shell, .value = ver_value };
+    step1.executor_mode = try alloc.dupe(u8, "inline");
+    try plan.addStep(alloc, step1);
+
+    const json_str = try plan.toJson(alloc);
+    defer alloc.free(json_str);
+
+    var restored = try Plan.fromJson(alloc, json_str);
+    defer restored.deinit(alloc);
+
+    try std.testing.expectEqual(PlanPhase.approved, restored.phase);
+    const s = &restored.steps.items[0];
+    try std.testing.expect(s.verification != null);
+    try std.testing.expectEqual(VerificationKind.shell, s.verification.?.kind);
+    try std.testing.expectEqualStrings("zig build test", s.verification.?.value);
+    try std.testing.expectEqualStrings("inline", s.executor_mode.?);
+}
+
+test "RFC-024: string-shorthand verification parses as shell" {
+    const alloc = std.testing.allocator;
+    const json_text =
+        \\{"task":"t","phase":"proposed","request_hash":1,"steps":[
+        \\  {"id":1,"description":"d","verification":"echo ok"}
+        \\]}
+    ;
+    var plan = try Plan.fromJson(alloc, json_text);
+    defer plan.deinit(alloc);
+    try std.testing.expectEqual(VerificationKind.shell, plan.steps.items[0].verification.?.kind);
+}
+
+test "RFC-024: ready-step selector honors dependencies" {
+    const alloc = std.testing.allocator;
+
+    var plan = try Plan.init(alloc, "Ready-set", 0x1);
+    defer plan.deinit(alloc);
+
+    var s1 = try PlanStep.initWithId(alloc, 1, "one", &.{}, null);
+    defer s1.deinit(alloc);
+    try plan.addStep(alloc, s1);
+
+    var s2 = try PlanStep.initWithId(alloc, 2, "two", &[_]u64{1}, null);
+    defer s2.deinit(alloc);
+    try plan.addStep(alloc, s2);
+
+    // Both pending: s1 is ready (no deps), s2 is not (s1 not complete).
+    try std.testing.expectEqual(@as(usize, 0), plan.findReadyStepIndex().?);
+
+    plan.steps.items[0].status = .completed;
+    try std.testing.expectEqual(@as(usize, 1), plan.findReadyStepIndex().?);
+
+    plan.steps.items[1].status = .completed;
+    try std.testing.expect(plan.findReadyStepIndex() == null);
 }

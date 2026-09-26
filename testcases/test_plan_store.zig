@@ -63,12 +63,7 @@ test "plan_store: save and restore by request_hash" {
 
     // Read metadata
     const metadata_list = try store.readMetadata();
-    defer {
-        for (metadata_list) |*m| {
-            alloc.free(m.content_hash);
-        }
-        alloc.free(metadata_list);
-    }
+    defer store.freeMetadata(metadata_list);
 
     try std.testing.expectEqual(@as(usize, 1), metadata_list.len);
     try std.testing.expectEqual(request_hash, metadata_list[0].request_hash);

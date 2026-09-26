@@ -1441,11 +1441,31 @@ pub const AgentLoop = struct {
     }
 
     /// Updates structured plan progress, step completion, and drift monitoring.
-    fn trackPlanToolExecution(self: *AgentLoop, tu: proto.ToolUse) !?[]u8 {
-        // PSEUDOCODE: Check drift, advance step if matching tool hint, save if complete
+    fn trackPlanToolExecution(self: *AgentLoop, act_id: usize, tu: proto.ToolUse) !?[]u8 {
+        // PSEUDOCODE:
+        // 1. Guard: structured planning off or no plan -> null
+        // 2. RFC-024: bump act counters so actual_acts accounting is maintained
+        // 3. RFC-024: approval gate — a proposed plan is not actionable; emit advisory
+        // 4. Check drift (existing)
+        // 5. On tool_hint match: run verification gate when enabled, then complete/advance
+        // 6. Persist at phase transitions (step complete, plan complete), not only at the end
         if (!self.plan.enable_structured_planning or self.plan.current_plan == null) return null;
         var plan = &self.plan.current_plan.?;
         var drift_advisory: ?[]u8 = null;
+
+        plan_executor.bumpActCounters(&self.plan.plan_ctx);
+
+        // RFC-024 §3.2: approval gate (advisory). A plan that is still `proposed`
+        // is not actionable — steps do not advance and the model gets a standing
+        // advisory instead of silent execution.
+        if (self.config.plan_approval_gate and plan.phase == .proposed) {
+            const note = try std.fmt.allocPrint(self.alloc,
+                \\[plan] The parsed plan is `proposed` — it is not actionable yet. Run `/plan approve` to start executing, or proceed with explicit user confirmation.
+            , .{});
+            return note;
+        }
+        if (plan.phase == .rejected) return null;
+        if (plan.phase == .approved) plan.phase = .executing;
 
         if (self.config.prompt_enforcement_enabled and self.config.plan_drift_detection) {
             if (plan_monitor.checkPlanDrift(plan, &self.plan.plan_ctx, tu.name)) |d| {
@@ -1462,21 +1482,61 @@ pub const AgentLoop = struct {
             const current_step = &plan.steps.items[self.plan.plan_ctx.current_step_idx];
             if (current_step.tool_hint) |hint| {
                 if (std.mem.eql(u8, tu.name, hint)) {
-                    plan_executor.completeStep(plan, &self.plan.plan_ctx);
-                    if (!utils.isSubagent()) main.stderrPrint("[agent] Plan step completed: {s}\n", .{current_step.description});
+                    // RFC-024 §3.1: verification gate. When enabled and the step
+                    // carries a verification, the hint match is necessary-not-
+                    // sufficient: run the check and only complete on .passed.
+                    if (self.config.plan_verification_gate and current_step.verification != null) {
+                        const vstatus = plan_executor.verifyStep(
+                            self.io, self.alloc, plan, &self.plan.plan_ctx,
+                            &plan_executor.defaultVerificationRunner,
+                        );
+                        const step_desc = current_step.description;
+                        const vtext = try std.fmt.allocPrint(self.alloc,
+                            "step \"{s}\" -> {s}", .{ step_desc, @tagName(vstatus) });
+                        if (self.journal) |*j| j.recordEvent(self.io, act_id, .plan_step_verified, vtext) catch {};
+                        self.alloc.free(vtext);
+
+                        if (vstatus == .passed) {
+                            plan_executor.completeStep(plan, &self.plan.plan_ctx);
+                            if (!utils.isSubagent()) main.stderrPrint("[agent] Plan step verified & completed: {s}\n", .{step_desc});
+                        } else {
+                            const adv = try std.fmt.allocPrint(self.alloc,
+                                \\[plan] Verification for "{s}" returned {s} — the step is NOT complete. Fix and re-run verification.
+                            , .{ step_desc, @tagName(vstatus) });
+                            drift_advisory = adv;
+                        }
+                    } else {
+                        // Legacy path (no gate or no verification): hint match completes.
+                        plan_executor.completeStep(plan, &self.plan.plan_ctx);
+                        if (!utils.isSubagent()) main.stderrPrint("[agent] Plan step completed: {s}\n", .{current_step.description});
+                    }
+
+                    // RFC-024 §3.2: persistence trigger — a step transition is a
+                    // phase transition; save the running plan so a crash revives it.
+                    if (self.plan.plan_store) |ps| {
+                        ps.save(plan) catch |e| main.stderrPrint("[agent] Warning: Failed to persist running plan: {s}\n", .{@errorName(e)});
+                    }
                 }
             }
         }
 
         if (self.plan.plan_ctx.is_complete or plan.isComplete()) {
+            plan.phase = .complete;
             if (!utils.isSubagent()) main.stderrPrint("[agent] Plan completed! Saving to store...\n", .{});
             if (self.plan.plan_store) |ps| {
                 ps.save(plan) catch |e| main.stderrPrint("[agent] Warning: Failed to save plan: {s}\n", .{@errorName(e)});
             }
             self.plan.clearPlan();
-        } else if (self.plan.plan_ctx.current_step_idx + 1 < plan.stepCount()) {
-            self.plan.plan_ctx.current_step_idx += 1;
-            plan.steps.items[self.plan.plan_ctx.current_step_idx].status = .active;
+        } else {
+            // RFC-024: advance via the dependency-aware ready-set selector instead
+            // of a sequential index scan, so independent steps can go ready the
+            // moment their dependencies complete (runtime DAG wiring, §3.4).
+            if (plan.findReadyStepIndex()) |next_idx| {
+                self.plan.plan_ctx.current_step_idx = next_idx;
+                plan.steps.items[next_idx].status = .active;
+            } else {
+                self.plan.plan_ctx.is_complete = true;
+            }
         }
         return drift_advisory;
     }
@@ -1500,6 +1560,7 @@ pub const AgentLoop = struct {
 
     fn postProcessToolResult(
         self: *AgentLoop,
+        act_id: usize,
         tu: proto.ToolUse,
         result: []const u8,
         warn_suffix: ?[]const u8,
@@ -1525,7 +1586,7 @@ pub const AgentLoop = struct {
             self.plan.plan_execution_pending = false;
             self.plan.plan_watchdog_retries = 0;
             if (!isExploratoryToolCall(tu.name, tu.input_json)) {
-                if (try self.trackPlanToolExecution(tu)) |adv| {
+                if (try self.trackPlanToolExecution(act_id, tu)) |adv| {
                     try allocated_strings.append(self.alloc, adv);
                     try results.append(self.alloc, .{ .tool_use_id = tu.id, .content = adv, .is_error = false });
                 }
@@ -1571,7 +1632,7 @@ pub const AgentLoop = struct {
         }
         try allocated_strings.append(self.alloc, result);
 
-        try self.postProcessToolResult(tu, result, warn_suffix, is_err, results, allocated_strings);
+        try self.postProcessToolResult(act_id, tu, result, warn_suffix, is_err, results, allocated_strings);
 
         const end_tool_ms = utils.milliTimestamp();
         const dur_ms = if (end_tool_ms >= start_tool_ms) @as(u64, @intCast(end_tool_ms - start_tool_ms)) else 0;

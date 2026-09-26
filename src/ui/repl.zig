@@ -246,7 +246,7 @@ fn printHelp(io: std.Io) void {
         \\  /config protocol <auto|chat|responses>  Set OpenAI protocol mode
         \\  /config thinking <on|off>               Toggle dynamic thinking governor
         \\  /config reasoning <auto|low|med|high|none> Set reasoning effort
-        \\  /plan on/off/status                       Toggle structured planning mode
+        \\  /plan on/off/status/approve/reject/list  Structured planning control
         \\  /artifact [list]    View session artifacts list
         \\  /artifact show <fn> Read an artifact content
         \\  /terminal-setup     Inspect & configure Shift+Enter / multiline terminal support
@@ -342,8 +342,22 @@ fn handlePlanSlash(agent: *agent_mod.AgentLoop, sub_raw: []const u8) void {
     } else if (std.mem.eql(u8, sub, "off") or std.mem.eql(u8, sub, "false") or std.mem.eql(u8, sub, "0")) {
         agent.plan.enable_structured_planning = false;
         main.stdoutPrint("[plan] Structured planning disabled.\n", .{});
+    } else if (std.mem.eql(u8, sub, "approve") or std.mem.eql(u8, sub, "yes")) {
+        if (agent.plan.approve()) {
+            main.stdoutPrint("[plan] Plan approved — execution active.\n", .{});
+        } else {
+            main.stdoutPrint("[plan] No active plan to approve.\n", .{});
+        }
+    } else if (std.mem.eql(u8, sub, "reject") or std.mem.eql(u8, sub, "no")) {
+        if (agent.plan.reject()) {
+            main.stdoutPrint("[plan] Plan rejected.\n", .{});
+        } else {
+            main.stdoutPrint("[plan] No active plan to reject.\n", .{});
+        }
+    } else if (std.mem.eql(u8, sub, "list")) {
+        _ = agent.plan.listPlans(); // prints summary / error to stderr
     } else {
-        main.stdoutPrint("Usage: /plan on | off | status\n", .{});
+        main.stdoutPrint("Usage: /plan on | off | status | approve | reject | list\n", .{});
     }
 }
 

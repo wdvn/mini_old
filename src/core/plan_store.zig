@@ -34,6 +34,8 @@ pub const PlanMetadata = struct {
     is_complete: bool,
     /// Number of steps completed.
     steps_completed: usize,
+    /// Plan lifecycle phase (RFC-024 §3.2).
+    phase: []const u8,
 };
 
 // ---------------------------------------------------------------------------
@@ -98,16 +100,16 @@ pub const PlanStore = struct {
             .content_hash = content_hash,
             .is_complete = plan.isComplete(),
             .steps_completed = plan.completedCount(),
+            .phase = @tagName(plan.phase),
         };
 
         try self.writeMetadata(&metadata);
     }
 
     // PSEUDOCODE:
-    // 1. Read metadata entries from metadata.jsonl using readMetadata
-    // 2. Scan from newest to oldest for matching request_hash
-    // 3. If found, retrieve JSON string from CAS using content_hash
-    // 4. Parse JSON back into Plan with Plan.fromJson and return ?Plan
+    // 1. Read metadata entries from metadata.jsonl
+    // 2. Scan newest→oldest for matching request_hash
+    // 3. Retrieve JSON from CAS, parse into Plan, return ?Plan
 
     /// Restore a plan by request hash. Returns null if not found.
     pub fn restore(self: *PlanStore, request_hash: u64) !?Plan {
@@ -121,6 +123,28 @@ pub const PlanStore = struct {
         while (idx > 0) {
             idx -= 1;
             if (metas[idx].request_hash == request_hash) {
+                const meta = metas[idx];
+                const json_bytes = try self.cas.retrieve(self.io, meta.content_hash);
+                defer self.alloc.free(json_bytes);
+
+                return try Plan.fromJson(self.alloc, json_bytes);
+            }
+        }
+
+        return null;
+    }
+
+    /// RFC-024 §3.2: restore the newest *running* (non-complete) plan for a
+    /// request, so a mid-plan crash revives the in-progress plan rather than a
+    /// finished one. Returns null if none.
+    pub fn restoreRunning(self: *PlanStore, request_hash: u64) !?Plan {
+        const metas = try self.readMetadata();
+        defer self.freeMetadata(metas);
+
+        var idx = metas.len;
+        while (idx > 0) {
+            idx -= 1;
+            if (metas[idx].request_hash == request_hash and !metas[idx].is_complete) {
                 const meta = metas[idx];
                 const json_bytes = try self.cas.retrieve(self.io, meta.content_hash);
                 defer self.alloc.free(json_bytes);
@@ -166,7 +190,7 @@ pub const PlanStore = struct {
         defer self.alloc.free(esc_hash);
 
         try bw.print(
-            "{{\"plan_id\":{d},\"request_hash\":{d},\"steps_count\":{d},\"created_at\":{d},\"updated_at\":{d},\"content_hash\":\"{s}\",\"is_complete\":{},\"steps_completed\":{d}}}\n",
+            "{{\"plan_id\":{d},\"request_hash\":{d},\"steps_count\":{d},\"created_at\":{d},\"updated_at\":{d},\"content_hash\":\"{s}\",\"is_complete\":{},\"steps_completed\":{d},\"phase\":\"{s}\"}}\n",
             .{
                 meta.plan_id,
                 meta.request_hash,
@@ -176,6 +200,7 @@ pub const PlanStore = struct {
                 esc_hash,
                 meta.is_complete,
                 meta.steps_completed,
+                meta.phase,
             },
         );
 
@@ -200,7 +225,10 @@ pub const PlanStore = struct {
     pub fn readMetadata(self: *PlanStore) ![]PlanMetadata {
         var metas = std.ArrayListUnmanaged(PlanMetadata).empty;
         errdefer {
-            for (metas.items) |*m| self.alloc.free(m.content_hash);
+            for (metas.items) |*m| {
+                self.alloc.free(m.content_hash);
+                self.alloc.free(m.phase);
+            }
             metas.deinit(self.alloc);
         }
 
@@ -240,6 +268,7 @@ pub const PlanStore = struct {
                 .content_hash = try self.alloc.dupe(u8, parsed.value.content_hash),
                 .is_complete = parsed.value.is_complete,
                 .steps_completed = parsed.value.steps_completed,
+                .phase = try self.alloc.dupe(u8, parsed.value.phase),
             };
             try metas.append(self.alloc, meta);
         }
@@ -254,6 +283,7 @@ pub const PlanStore = struct {
     pub fn freeMetadata(self: *PlanStore, metas: []PlanMetadata) void {
         for (metas) |*m| {
             self.alloc.free(m.content_hash);
+            self.alloc.free(m.phase);
         }
         self.alloc.free(metas);
     }
@@ -272,6 +302,8 @@ const PlanMetadataJson = struct {
     content_hash: []const u8,
     is_complete: bool,
     steps_completed: usize,
+    /// RFC-024 §3.2. Old files without this key parse to the default.
+    phase: []const u8 = "proposed",
 };
 
 // ---------------------------------------------------------------------------

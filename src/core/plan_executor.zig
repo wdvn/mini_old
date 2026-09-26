@@ -151,6 +151,109 @@ pub fn getUnsatisfiedDependencies(plan: *const Plan, step_idx: usize, alloc: All
 }
 
 // ---------------------------------------------------------------------------
+// Verification (RFC-024 §3.1)
+// ---------------------------------------------------------------------------
+
+/// Pluggable verification runner. Given a check kind + value, returns a
+/// VerificationStatus. Injectable so tests can avoid real process/file IO.
+pub const VerificationRunner = *const fn (
+    io: std.Io,
+    alloc: Allocator,
+    kind: plan_mod.VerificationKind,
+    value: []const u8,
+) plan_mod.VerificationStatus;
+
+const process_manager = @import("../runtime/process_manager.zig");
+
+/// Default runner: file_exists / file_contains use the local filesystem; shell
+/// runs the command (parent-death-guarded) and reports .passed on exit 0.
+pub fn defaultVerificationRunner(
+    io: std.Io,
+    alloc: Allocator,
+    kind: plan_mod.VerificationKind,
+    value: []const u8,
+) plan_mod.VerificationStatus {
+    switch (kind) {
+        .file_exists => {
+            const cwd = std.Io.Dir.cwd();
+            return if (cwd.statFile(io, value, .{})) |_| .passed else |_| .failed;
+        },
+        .file_contains => {
+            // value = "<path> <pattern>"
+            const sp = std.mem.indexOfScalar(u8, value, ' ') orelse return .check_error;
+            const path = value[0..sp];
+            const pattern = value[sp + 1 ..];
+            const cwd = std.Io.Dir.cwd();
+            const file = cwd.openFile(io, path, .{}) catch return .failed;
+            defer file.close(io);
+            const stat = file.stat(io) catch return .failed;
+            const buf = alloc.alloc(u8, @as(usize, @min(stat.size, 1 << 20))) catch return .check_error;
+            defer alloc.free(buf);
+            const read = utils.readAll(io, file, buf) catch return .check_error;
+            return if (std.mem.indexOf(u8, buf[0..read], pattern) != null) .passed else .failed;
+        },
+        .shell => {
+            var child = process_manager.spawnManaged(
+                io,
+                &.{ "sh", "-c", value },
+                null,
+                .ignore,
+                .ignore,
+                .ignore,
+            ) catch return .check_error;
+            const term = child.wait(io) catch return .check_error;
+            return switch (term) {
+                .exited => |code| if (code == 0) .passed else .failed,
+                else => .check_error,
+            };
+        },
+    }
+}
+
+// PSEUDOCODE:
+// 1. Guard: no verification on current step -> .skipped (legacy)
+// 2. Run the check via the provided runner
+// 3. Record status on the step and return it (caller advances on .passed)
+
+/// Run the current step's verification check and record its status. Returns
+/// .skipped if the step has no verification (legacy tool_hint behavior stands).
+pub fn verifyStep(
+    io: std.Io,
+    alloc: Allocator,
+    plan: *Plan,
+    ctx: *ExecutionContext,
+    runner: VerificationRunner,
+) plan_mod.VerificationStatus {
+    const step = getCurrentStep(plan, ctx) orelse return .skipped;
+    const step_mut = &plan.steps.items[ctx.current_step_idx];
+    const verif = step.verification orelse {
+        step_mut.verification_status = .skipped;
+        return .skipped;
+    };
+    const status = runner(io, alloc, verif.kind, verif.value);
+    step_mut.verification_status = status;
+    return status;
+}
+
+/// RFC-024: count acts consumed toward the active step so `actual_acts`
+/// accounting is maintained (was unwired; the counters were only ever reset).
+pub fn bumpActCounters(ctx: *ExecutionContext) void {
+    ctx.current_step_acts += 1;
+    ctx.total_acts += 1;
+}
+
+/// RFC-024: execute the next ready step by dependency-aware ready-set, instead
+/// of the sequential findActiveStepIndex scan. Falls back to .complete when no
+/// ready step exists.
+pub fn executeReadyStep(plan: *Plan, ctx: *ExecutionContext) !void {
+    const idx = plan.findReadyStepIndex() orelse {
+        ctx.is_complete = true;
+        return;
+    };
+    return executePlanStep(plan, ctx, idx);
+}
+
+// ---------------------------------------------------------------------------
 // Progress Tracking
 // ---------------------------------------------------------------------------
 
