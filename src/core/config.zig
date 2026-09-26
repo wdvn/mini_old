@@ -239,17 +239,16 @@ pub const Config = struct {
     // RFC-019: Structured Planning System
     /// Enable structured planning system. Default: true.
     enable_structured_planning: bool = true,
-    /// Minimum task length (chars) to trigger planning. Default: 50.
-    planning_min_task_length: usize = 50,
     /// Enable drift detection. Default: true.
     plan_drift_detection: bool = true,
     /// Max plan steps (prevent infinite planning). Default: 20.
     plan_max_steps: usize = 20,
     /// Plan persistence directory. Null = ~/.mini/plans/.
     plans_dir: ?[]const u8 = null,
-    /// Use enhanced progress checkpoint format. Default: true.
-    enhanced_progress_checkpoint: bool = true,
     /// Inject plan, progress, action-loop, and trajectory enforcement prompts. Default: false.
+    /// (The enhanced progress checkpoint block is gated on this — one key, one
+    /// behavior; the former separate `enhanced_progress_checkpoint` key was
+    /// parsed but unused, so it was collapsed here, RFC-024 §3.5.)
     prompt_enforcement_enabled: bool = false,
 
     // RFC-024: AI Plan Framework
@@ -503,11 +502,9 @@ pub const Config = struct {
 
     const PlanningAndWatchdogSettings = struct {
         enable_structured_planning: bool,
-        planning_min_task_length: usize,
         plan_drift_detection: bool,
         plan_max_steps: usize,
         plans_dir: ?[]const u8,
-        enhanced_progress_checkpoint: bool,
         prompt_enforcement_enabled: bool,
         plan_verification_gate: bool,
         plan_approval_gate: bool,
@@ -527,11 +524,9 @@ pub const Config = struct {
         };
         return .{
             .enable_structured_planning = if (env_map.get("MINI_ENABLE_STRUCTURED_PLANNING")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false,
-            .planning_min_task_length = if (env_map.get("MINI_PLANNING_MIN_TASK_LENGTH")) |s| std.fmt.parseInt(usize, s, 10) catch 50 else 50,
             .plan_drift_detection = if (env_map.get("MINI_PLAN_DRIFT_DETECTION")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else true,
             .plan_max_steps = if (env_map.get("MINI_PLAN_MAX_STEPS")) |s| std.fmt.parseInt(usize, s, 10) catch 20 else 20,
             .plans_dir = env_map.get("MINI_PLANS_DIR"),
-            .enhanced_progress_checkpoint = if (env_map.get("MINI_ENHANCED_PROGRESS_CHECKPOINT")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else true,
             .prompt_enforcement_enabled = if (env_map.get("MINI_PROMPT_ENFORCEMENT_ENABLED")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false,
             .plan_verification_gate = if (env_map.get("MINI_PLAN_VERIFICATION_GATE")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false,
             .plan_approval_gate = if (env_map.get("MINI_PLAN_APPROVAL_GATE")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false,
@@ -664,11 +659,9 @@ pub const Config = struct {
         cfg.watchdog_recap_interval = p.watchdog_recap_interval;
         cfg.watchdog_interval_ms = p.watchdog_interval_ms;
         cfg.enable_structured_planning = p.enable_structured_planning;
-        cfg.planning_min_task_length = p.planning_min_task_length;
         cfg.plan_drift_detection = p.plan_drift_detection;
         cfg.plan_max_steps = p.plan_max_steps;
         cfg.plans_dir = p.plans_dir;
-        cfg.enhanced_progress_checkpoint = p.enhanced_progress_checkpoint;
         cfg.prompt_enforcement_enabled = p.prompt_enforcement_enabled;
         cfg.plan_verification_gate = p.plan_verification_gate;
         cfg.plan_approval_gate = p.plan_approval_gate;
@@ -1130,11 +1123,9 @@ pub const JsonConfig = struct {
     video_poll_timeout_secs: ?u32 = null,
     // RFC-019: Structured Planning System
     enable_structured_planning: ?bool = null,
-    planning_min_task_length: ?usize = null,
     plan_drift_detection: ?bool = null,
     plan_max_steps: ?usize = null,
     plans_dir: ?[]const u8 = null,
-    enhanced_progress_checkpoint: ?bool = null,
     prompt_enforcement_enabled: ?bool = null,
     // RFC-024: AI Plan Framework
     plan_verification_gate: ?bool = null,
@@ -1353,11 +1344,9 @@ fn applyActionLoopAndMediaJsonConfig(cfg: *const JsonConfig, env_map: *std.proce
 fn applyPlanningAndWatchdogJsonConfig(cfg: *const JsonConfig, env_map: *std.process.Environ.Map) usize {
     var count: usize = 0;
     if (cfg.enable_structured_planning) |val| count += setEnvBool(env_map, "MINI_ENABLE_STRUCTURED_PLANNING", val);
-    if (cfg.planning_min_task_length) |val| count += setEnvInt(usize, env_map, "MINI_PLANNING_MIN_TASK_LENGTH", val);
     if (cfg.plan_drift_detection) |val| count += setEnvBool(env_map, "MINI_PLAN_DRIFT_DETECTION", val);
     if (cfg.plan_max_steps) |val| count += setEnvInt(usize, env_map, "MINI_PLAN_MAX_STEPS", val);
     if (cfg.plans_dir) |val| count += setEnvDefault(env_map, "MINI_PLANS_DIR", val);
-    if (cfg.enhanced_progress_checkpoint) |val| count += setEnvBool(env_map, "MINI_ENHANCED_PROGRESS_CHECKPOINT", val);
     if (cfg.prompt_enforcement_enabled) |val| count += setEnvBool(env_map, "MINI_PROMPT_ENFORCEMENT_ENABLED", val);
     if (cfg.plan_verification_gate) |val| count += setEnvBool(env_map, "MINI_PLAN_VERIFICATION_GATE", val);
     if (cfg.plan_approval_gate) |val| count += setEnvBool(env_map, "MINI_PLAN_APPROVAL_GATE", val);
@@ -1601,11 +1590,9 @@ test "JsonConfig parsing RFC-019 planning fields" {
     const json_str =
         \\{
         \\  "enable_structured_planning": true,
-        \\  "planning_min_task_length": 100,
         \\  "plan_drift_detection": true,
         \\  "plan_max_steps": 15,
         \\  "plans_dir": "/tmp/custom_plans",
-        \\  "enhanced_progress_checkpoint": true,
         \\  "prompt_enforcement_enabled": false
         \\}
     ;
@@ -1614,11 +1601,9 @@ test "JsonConfig parsing RFC-019 planning fields" {
     defer parsed.deinit();
 
     try std.testing.expectEqual(true, parsed.value.enable_structured_planning.?);
-    try std.testing.expectEqual(100, parsed.value.planning_min_task_length.?);
     try std.testing.expectEqual(true, parsed.value.plan_drift_detection.?);
-    try std.testing.expectEqual(15, parsed.value.plan_max_steps.?);
+    try std.testing.expectEqual(@as(usize, 15), parsed.value.plan_max_steps.?);
     try std.testing.expectEqualStrings("/tmp/custom_plans", parsed.value.plans_dir.?);
-    try std.testing.expectEqual(true, parsed.value.enhanced_progress_checkpoint.?);
     try std.testing.expectEqual(false, parsed.value.prompt_enforcement_enabled.?);
 }
 

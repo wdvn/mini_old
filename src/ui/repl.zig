@@ -343,13 +343,13 @@ fn handlePlanSlash(agent: *agent_mod.AgentLoop, sub_raw: []const u8) void {
         agent.plan.enable_structured_planning = false;
         main.stdoutPrint("[plan] Structured planning disabled.\n", .{});
     } else if (std.mem.eql(u8, sub, "approve") or std.mem.eql(u8, sub, "yes")) {
-        if (agent.plan.approve()) {
+        if (agent.approvePlan()) {
             main.stdoutPrint("[plan] Plan approved — execution active.\n", .{});
         } else {
             main.stdoutPrint("[plan] No active plan to approve.\n", .{});
         }
     } else if (std.mem.eql(u8, sub, "reject") or std.mem.eql(u8, sub, "no")) {
-        if (agent.plan.reject()) {
+        if (agent.rejectPlan()) {
             main.stdoutPrint("[plan] Plan rejected.\n", .{});
         } else {
             main.stdoutPrint("[plan] No active plan to reject.\n", .{});

@@ -760,6 +760,30 @@ pub const AgentLoop = struct {
         self.memory_store.?.append(self.io, &entry) catch return;
     }
 
+    /// RFC-024 §3.5: approve the current plan and journal the phase change
+    /// (REPL `/plan approve` path).
+    pub fn approvePlan(self: *AgentLoop) bool {
+        const ok = self.plan.approve();
+        if (ok) {
+            if (self.journal) |*j| {
+                j.recordEvent(self.io, 0, .plan_phase_changed, "user approved plan (proposed/approved -> executing)") catch {};
+            }
+        }
+        return ok;
+    }
+
+    /// RFC-024 §3.5: reject the current plan and journal the phase change
+    /// (REPL `/plan reject` path).
+    pub fn rejectPlan(self: *AgentLoop) bool {
+        const ok = self.plan.reject();
+        if (ok) {
+            if (self.journal) |*j| {
+                j.recordEvent(self.io, 0, .plan_phase_changed, "user rejected plan (-> rejected)") catch {};
+            }
+        }
+        return ok;
+    }
+
     /// RFC-024 §3.4: when subagent dispatch is enabled and the current step
     /// requests a `subagent` / `parallel` executor mode, dispatch the step to
     /// a child process and optionally run the two-stage review gate. The step
@@ -848,6 +872,10 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         if (self.alloc.dupe(u8, name)) |owned| {
             self.read_skills.append(self.alloc, owned) catch self.alloc.free(owned);
         } else |_| {}
+        // RFC-024 §3.5: telemetry — a skill was read into the conversation.
+        if (self.journal) |*j| {
+            j.recordEvent(self.io, 0, .skill_loaded, name) catch {};
+        }
     }
 
     pub fn onToolCompleted(self: *AgentLoop, tool_name: []const u8, input_json: ?[]const u8, is_error: bool) void {
@@ -1348,8 +1376,11 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
 
         // RFC-024 §3.3: after a successful compaction, re-inject the active plan
         // progress, read-skill names, and the task reminder so the model keeps
-        // its bearings (a pure information add — cannot suppress existing flow).
-        if (self.config.post_compact_reinject) {
+        // its bearings. §3.6 State A: when structured planning is fully off,
+        // ALL RFC-024 behavior must be a no-op — so the reinject is additionally
+        // gated on enable_structured_planning (it only re-emits plan/skill
+        // context that would not exist in State A anyway).
+        if (self.config.post_compact_reinject and self.config.enable_structured_planning) {
             self.reinjectPostCompactContext(act_id);
         }
     }
@@ -1638,7 +1669,12 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
             return note;
         }
         if (plan.phase == .rejected) return null;
-        if (plan.phase == .approved) plan.phase = .executing;
+        if (plan.phase == .approved) {
+            plan.phase = .executing;
+            if (self.journal) |*j| {
+                j.recordEvent(self.io, act_id, .plan_phase_changed, "approved -> executing") catch {};
+            }
+        }
 
         if (self.config.prompt_enforcement_enabled and self.config.plan_drift_detection) {
             if (plan_monitor.checkPlanDrift(plan, &self.plan.plan_ctx, tu.name)) |d| {
@@ -1695,6 +1731,9 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
 
         if (self.plan.plan_ctx.is_complete or plan.isComplete()) {
             plan.phase = .complete;
+            if (self.journal) |*j| {
+                j.recordEvent(self.io, act_id, .plan_phase_changed, "executing -> complete") catch {};
+            }
             if (!utils.isSubagent()) main.stderrPrint("[agent] Plan completed! Saving to store...\n", .{});
             if (self.plan.plan_store) |ps| {
                 ps.save(plan) catch |e| main.stderrPrint("[agent] Warning: Failed to save plan: {s}\n", .{@errorName(e)});
