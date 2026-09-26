@@ -68,6 +68,19 @@ pub var g_agent_mutex = std.atomic.Mutex.unlocked;
 
 var g_active_agent: ?*AgentLoop = null;
 
+/// RFC-024 §3.3: extract a skill name from a `.../skills/<name>/SKILL.md`
+/// path, or null if the path does not look like a skill file.
+pub fn skillNameFromSkillPath(path: []const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, path, "SKILL.md")) return null;
+    // .../skills/<name>/SKILL.md -> strip trailing "SKILL.md", parent dir = skill name
+    const base = path[0 .. path.len - "SKILL.md".len];
+    const trimmed = std.mem.trim(u8, base, "/");
+    if (std.mem.lastIndexOfScalar(u8, trimmed, '/')) |slash| {
+        return trimmed[slash + 1 ..];
+    }
+    return null;
+}
+
 fn agentToolListener(tool_name: []const u8, input_json: ?[]const u8, is_error: bool) void {
     while (!g_agent_mutex.tryLock()) {}
     const agent = g_active_agent;
@@ -210,6 +223,9 @@ pub const AgentLoop = struct {
     last_executed_tool: ?[]u8 = null,
     /// Recent tool execution sequence (w acts window).
     recent_tools: std.ArrayListUnmanaged([]u8) = .empty,
+    /// RFC-024 §3.3: skill names read into the conversation this session
+    /// (for post-compaction re-injection; name only, deduplicated).
+    read_skills: std.ArrayListUnmanaged([]u8) = .empty,
     /// Action Loop Guard: tool signatures executed in current turn.
     turn_tool_records: std.ArrayListUnmanaged(ToolCallRecord) = .empty,
     /// Hard dedupe cache: recent read-only tool results served on exact repeat
@@ -477,6 +493,7 @@ pub const AgentLoop = struct {
             .memory_store = memory_store_ptr,
             .last_executed_tool = null,
             .recent_tools = .empty,
+            .read_skills = .empty,
             .coordinator = coordinator,
             .watchdog = watchdog,
             .last_generation_stop = .missing_terminal_event,
@@ -742,12 +759,41 @@ pub const AgentLoop = struct {
         self.memory_store.?.append(self.io, &entry) catch return;
     }
 
+    /// RFC-024 §3.3: record that a skill's content was read this session so the
+    /// post-compaction reinject block can restate it. `skills` (operation=detail)
+    /// and `file_read` of a SKILL.md path are the two signals.
+    fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]const u8) void {
+        if (std.mem.eql(u8, tool_name, "skills")) {
+            const op = json_mod.findString(input_json orelse "", "operation") orelse return;
+            if (!std.mem.eql(u8, op, "detail")) return;
+            if (json_mod.findString(input_json orelse "", "name")) |skill_name| {
+                self.trackSkillName(skill_name);
+            }
+        } else if (std.mem.eql(u8, tool_name, "file_read") or std.mem.eql(u8, tool_name, "read_file")) {
+            const path = json_mod.findString(input_json orelse "", "path") orelse return;
+            if (skillNameFromSkillPath(path)) |skill_name| {
+                self.trackSkillName(skill_name);
+            }
+        }
+    }
+
+    /// Deduplicate + append a skill name to read_skills.
+    fn trackSkillName(self: *AgentLoop, name: []const u8) void {
+        for (self.read_skills.items) |existing| {
+            if (std.mem.eql(u8, existing, name)) return;
+        }
+        if (self.alloc.dupe(u8, name)) |owned| {
+            self.read_skills.append(self.alloc, owned) catch self.alloc.free(owned);
+        } else |_| {}
+    }
+
     pub fn onToolCompleted(self: *AgentLoop, tool_name: []const u8, input_json: ?[]const u8, is_error: bool) void {
         if (self.pg_store) |pg| {
             if (self.last_executed_tool) |prev_tool| {
                 pg.recordTransition(self.io, prev_tool, tool_name) catch {};
             }
         }
+        self.recordSkillLoaded(tool_name, input_json);
         self.appendEpisodicMemory(tool_name, is_error);
 
         if (self.last_executed_tool) |old_t| {
@@ -1236,6 +1282,70 @@ pub const AgentLoop = struct {
                 self.history.compact();
             }
         }
+
+        // RFC-024 §3.3: after a successful compaction, re-inject the active plan
+        // progress, read-skill names, and the task reminder so the model keeps
+        // its bearings (a pure information add — cannot suppress existing flow).
+        if (self.config.post_compact_reinject) {
+            self.reinjectPostCompactContext(act_id);
+        }
+    }
+
+    /// RFC-024 §3.3: build and append a `.summarized`-tier user message at the
+    /// next history index containing (a) the active plan progress summary,
+    /// (b) skill names read this session, and (c) the task reminder. Skips
+    /// silently when there is nothing to reinject (no plan, no skills, no task).
+    /// State B fallback (§3.6): plan-less variant contains only skills + task
+    /// reminder.
+    fn reinjectPostCompactContext(self: *AgentLoop, act_id: usize) void {
+        var bw = utils.BufWriter.init(self.alloc);
+        errdefer bw.deinit();
+
+        var has_content = false;
+
+        // (a) active plan progress summary (degrades to nothing if no plan)
+        if (self.plan.current_plan != null) {
+            const plan = &self.plan.current_plan.?;
+            if (plan_executor.generateProgressSummary(plan, &self.plan.plan_ctx, self.alloc) catch null) |summary| {
+                defer self.alloc.free(summary);
+                if (summary.len > 0) {
+                    bw.writeAll("[Post-Compact Plan Context]\n") catch return;
+                    bw.writeAll(summary) catch return;
+                    has_content = true;
+                }
+            }
+        }
+
+        // (b) read-skill names (restated because their content was dropped)
+        if (self.read_skills.items.len > 0) {
+            bw.writeAll("\n[Skills already read this session] ") catch return;
+            var first = true;
+            for (self.read_skills.items) |name| {
+                if (!first) bw.writeAll(", ") catch return;
+                bw.print("`{s}`", .{name}) catch return;
+                first = false;
+            }
+            has_content = true;
+        }
+
+        // (c) task reminder (original request, restated — cf. pg_task_reminder_fmt)
+        if (self.current_user_request) |req| {
+            const trunc = if (req.len > 200) req[0..200] ++ "..." else req;
+            bw.print(prompts_mod.pg_task_reminder_fmt, .{trunc}) catch return;
+            has_content = true;
+        }
+
+        if (!has_content) return;
+
+        const block = bw.toOwnedSlice() catch return;
+        defer self.alloc.free(block);
+
+        self.history.addUser(block) catch return;
+
+        if (self.journal) |*j| {
+            j.recordEvent(self.io, act_id, .post_compact_reinject, "post-compact plan/skill/task re-injected") catch {};
+        }
+        if (!utils.isSubagent()) main.stderrPrint("[agent] Re-injected post-compact context (plan/skills/task).\n", .{});
     }
 
     /// Execution summary returned by executeTools for act debug logging.
@@ -2345,4 +2455,20 @@ test "agent - parseTimeoutDecision" {
     const d4 = parseTimeoutDecision(text4);
     try std.testing.expect(d4.should_kill);
     try std.testing.expect(std.mem.indexOf(u8, d4.reason(), "Deadlock detected") != null);
+}
+
+test "agent - skillNameFromSkillPath" {
+    // A SKILL.md inside a skills/<name>/ directory -> skill name is the dir.
+    try std.testing.expectEqualStrings(
+        "brainstorming",
+        skillNameFromSkillPath("/home/u/.mini/skills/brainstorming/SKILL.md").?,
+    );
+    // A project-relative skills path also works.
+    try std.testing.expectEqualStrings(
+        "codebase-analysis",
+        skillNameFromSkillPath(".agent/skills/codebase-analysis/SKILL.md").?,
+    );
+    // Non-skill paths return null.
+    try std.testing.expect(skillNameFromSkillPath("/home/u/rfc_003_summary.md") == null);
+    try std.testing.expect(skillNameFromSkillPath("/home/u/notskilled/SKILL.md.bak") == null);
 }
