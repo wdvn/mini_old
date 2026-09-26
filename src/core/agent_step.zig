@@ -1056,6 +1056,23 @@ pub fn executeStep(
     var guidance_ctx = try prepareStepInputMessages(self, act_id, &temp_input_msgs, &input_msgs_count);
     defer guidance_ctx.deinit(self.alloc);
 
+    // RFC-024 §3.4: step-scoped subagent dispatch + two-stage review gate.
+    // When the active step requests subagent/parallel executor mode and the
+    // feature is enabled, dispatch it (and optionally review it) ahead of the
+    // LLM step, then surface the outcome to the model as a user message.
+    var p4_note: ?[]const u8 = null;
+    var p4_blocks: ?[]proto.ContentBlock = null;
+    if (self.maybeDispatchPlanStep(act_id) catch null) |note| {
+        const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+        blocks[0] = .{ .text = note };
+        try temp_input_msgs.append(self.alloc, .{ .role = .user, .content = blocks });
+        p4_note = note;
+        p4_blocks = blocks;
+    }
+    // Freed at act end (after sendToBackend below has consumed the message).
+    defer if (p4_note) |n| self.alloc.free(n);
+    defer if (p4_blocks) |b| self.alloc.free(b);
+
     var response = try self.sendToBackend(
         act_id,
         self.config.system_prompt,

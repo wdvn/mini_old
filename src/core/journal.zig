@@ -40,6 +40,9 @@ pub const ActEventType = enum {
     plan_phase_changed,
     /// RFC-024: step verification check outcome (passed/failed/timed_out/error).
     plan_step_verified,
+    /// RFC-024: two-stage review gate verdict (Critical/Important/Minor) on a
+    /// subagent-executed plan step.
+    plan_review_outcome,
     /// RFC-024: a skill was read into the conversation (tracked for post-compaction reinjection).
     skill_loaded,
     /// RFC-024: plan/skill/task context re-injected after MemAct compaction.

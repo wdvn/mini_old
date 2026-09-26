@@ -32,6 +32,7 @@ const proto = @import("protocol.zig");
 const config_mod = @import("config.zig");
 const history_mod = @import("history.zig");
 const tools_mod = @import("../tooling/registry.zig");
+const plan_dispatch = @import("plan_dispatch.zig");
 const media_gen_tool = @import("../tools/media_gen.zig");
 const json_mod = @import("json.zig");
 const openai_mod = @import("../backends/openai.zig");
@@ -759,10 +760,72 @@ pub const AgentLoop = struct {
         self.memory_store.?.append(self.io, &entry) catch return;
     }
 
-    /// RFC-024 §3.3: record that a skill's content was read this session so the
-    /// post-compaction reinject block can restate it. `skills` (operation=detail)
-    /// and `file_read` of a SKILL.md path are the two signals.
-    fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]const u8) void {
+    /// RFC-024 §3.4: when subagent dispatch is enabled and the current step
+    /// requests a `subagent` / `parallel` executor mode, dispatch the step to
+    /// a child process and optionally run the two-stage review gate. The step
+    /// is only completed on a passing verification (or unblocked review).
+    /// Returns an advisory string to append to tool results, or null.
+    pub fn maybeDispatchPlanStep(self: *AgentLoop, act_id: usize) !?[]u8 {
+        if (!self.config.plan_subagent_dispatch) return null;
+        if (self.plan.current_plan == null) return null;
+        const plan = &self.plan.current_plan.?;
+        const ctx = &self.plan.plan_ctx;
+        if (ctx.current_step_idx >= plan.stepCount()) return null;
+
+        const step = &plan.steps.items[ctx.current_step_idx];
+        const mode = step.executor_mode orelse return null;
+        if (!std.mem.startsWith(u8, mode, "subagent") and !plan_dispatch.isParallelMode(mode)) return null;
+
+        const out = try plan_dispatch.dispatchStep(
+            self.io, self.alloc, plan, step,
+            &subagentRunner,
+            self.config.plan_review_gate,
+        );
+        defer self.alloc.free(out.subagent_output);
+
+        // Journal the review verdict when a review ran.
+        if (self.config.plan_review_gate) {
+            if (self.journal) |*j| {
+                const desc = try std.fmt.allocPrint(self.alloc,
+                    "review verdict: critical={d} important={d} minor={d} blocked={}",
+                    .{ out.verdict.critical, out.verdict.important, out.verdict.minor, out.blocked });
+                j.recordEvent(self.io, act_id, .plan_review_outcome, desc) catch {};
+                self.alloc.free(desc);
+            }
+        }
+
+        if (out.blocked) {
+            // Critical finding -> the step is failed, feed a replan advisory.
+            const adv = try std.fmt.allocPrint(self.alloc,
+                \\[plan] Subagent review for step "{s}" reported a Critical finding — the step is NOT complete.
+                \\Address the issue and re-run the step.
+            , .{step.description});
+            return adv;
+        }
+
+        // Unblocked (or review off): complete the step via the normal path.
+        plan_executor.completeStep(plan, ctx);
+        const note = try std.fmt.allocPrint(self.alloc,
+            \\[plan] Step "{s}" dispatched to subagent (mode={s}); review verdict critical={d} important={d} minor={d}.
+        , .{ step.description, mode, out.verdict.critical, out.verdict.important, out.verdict.minor });
+        return note;
+    }
+
+/// RFC-024 §3.4: real subagent runner — wraps the `invoke_subagent` tool so
+/// plan steps can be dispatched to a child mini process. Module-level so it
+/// can be passed as a `plan_dispatch.SubagentRunner`.
+pub fn subagentRunner(io: std.Io, alloc: std.mem.Allocator, task: []const u8) anyerror![]u8 {
+    const esc = try json_mod.escape(alloc, task);
+    defer alloc.free(esc);
+    const input = try std.fmt.allocPrint(alloc, "{{\"task\":\"{s}\"}}", .{esc});
+    defer alloc.free(input);
+    return tools_mod.executeTool(alloc, io, "invoke_subagent", input);
+}
+
+/// RFC-024 §3.3: record that a skill's content was read this session so the
+/// post-compaction reinject block can restate it. `skills` (operation=detail)
+/// and `file_read` of a SKILL.md path are the two signals.
+fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]const u8) void {
         if (std.mem.eql(u8, tool_name, "skills")) {
             const op = json_mod.findString(input_json orelse "", "operation") orelse return;
             if (!std.mem.eql(u8, op, "detail")) return;
