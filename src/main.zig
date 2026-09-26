@@ -58,6 +58,7 @@ pub const file_mod = @import("tools/file.zig");
 pub const plan_mod = @import("core/plan.zig");
 pub const plan_parser_mod = @import("core/plan_parser.zig");
 pub const plan_executor_mod = @import("core/plan_executor.zig");
+pub const plan_dispatch_mod = @import("core/plan_dispatch.zig");
 pub const plan_monitor_mod = @import("core/plan_monitor.zig");
 pub const plan_store_mod = @import("core/plan_store.zig");
 pub const plan_integration_mod = @import("core/plan_integration.zig");
@@ -589,6 +590,7 @@ test {
     _ = plan_mod;
     _ = plan_parser_mod;
     _ = plan_executor_mod;
+    _ = plan_dispatch_mod;
     _ = plan_monitor_mod;
     _ = plan_store_mod;
     _ = plan_integration_mod;

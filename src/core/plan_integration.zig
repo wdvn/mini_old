@@ -157,7 +157,19 @@ pub const PlanState = struct {
         var buf = utils.BufWriter.init(self.alloc);
         errdefer buf.deinit();
 
-        buf.print("📋 Plan ({d} steps):\n", .{plan.stepCount()}) catch return;
+        buf.print("📋 Plan ({d} steps):", .{plan.stepCount()}) catch return;
+        // RFC-024 §3.2: surface the lifecycle phase so the user knows whether
+        // the plan is actionable or still awaiting approval.
+        if (plan.phase != .executing and plan.phase != .complete) {
+            buf.print(" \x1b[36m[{s}]\x1b[0m", .{@tagName(plan.phase)}) catch return;
+            if (plan.phase == .proposed) {
+                buf.writeAll(" — run `/plan approve` to activate\n") catch return;
+            } else {
+                buf.writeAll("\n") catch return;
+            }
+        } else {
+            buf.writeAll("\n") catch return;
+        }
         for (plan.steps.items, 0..) |step, i| {
             buf.print("  {d}. {s}", .{ i + 1, step.description }) catch return;
             if (step.tool_hint) |hint| {
@@ -176,6 +188,60 @@ pub const PlanState = struct {
         } else {
             main.stderrPrint("{s}", .{display});
         }
+    }
+
+    /// RFC-024 §3.2: approve the current plan (proposed/approved → executing).
+    /// Idempotent for already-advancing phases. Returns false if no plan active.
+    pub fn approve(self: *PlanState) bool {
+        const plan = &(self.current_plan orelse return false);
+        switch (plan.phase) {
+            .proposed, .approved => {
+                plan.phase = .executing;
+                self.renderPlanDisplay();
+            },
+            else => {}, // executing / complete / rejected: no-op
+        }
+        return true;
+    }
+
+    /// RFC-024 §3.2: reject the current plan (proposed → rejected).
+    pub fn reject(self: *PlanState) bool {
+        const plan = &(self.current_plan orelse return false);
+        if (plan.phase == .rejected or plan.phase == .complete) return false;
+        plan.phase = .rejected;
+        self.renderPlanDisplay();
+        return true;
+    }
+
+    /// RFC-024 §3.2: list stored plans (delegates to plan_store) and prints a
+    /// summary. Returns true if the store was available.
+    pub fn listPlans(self: *PlanState) bool {
+        const store = self.plan_store orelse {
+            main.stderrPrint("[plan] Plan store unavailable.\n", .{});
+            return false;
+        };
+        const metas = store.listPlans() catch {
+            main.stderrPrint("[plan] Failed to list plans.\n", .{});
+            return false;
+        };
+        defer store.freeMetadata(metas);
+
+        if (utils.isSubagent()) return true;
+        if (metas.len == 0) {
+            main.stderrPrint("[plan] No stored plans.\n", .{});
+            return true;
+        }
+        for (metas) |m| {
+            main.stderrPrint("[plan] id={d} steps={d} completed={d} complete={} phase={s} updated={d}\n", .{
+                m.plan_id,
+                m.steps_count,
+                m.steps_completed,
+                m.is_complete,
+                m.phase,
+                m.updated_at,
+            });
+        }
+        return true;
     }
 
     pub fn setPlan(self: *PlanState, summary: []const u8) void {
@@ -278,13 +344,19 @@ pub const PlanState = struct {
             if (self.current_plan != null) return;
 
             const req_hash = std.hash.Fnv1a_64.hash(user_text);
-            if (self.plan_store.?.restore(req_hash) catch null) |plan| {
+            // RFC-024 §3.2: prefer a running (non-complete) plan so a crash
+            // revives the in-progress plan; a completed plan is kept for
+            // reference but not re-activated.
+            const restored = self.plan_store.?.restoreRunning(req_hash) catch null;
+            if (restored) |plan| {
                 self.setStructuredPlan(plan);
-                if (self.current_plan.?.findActiveStepIndex()) |idx| {
+                if (self.current_plan.?.findReadyStepIndex()) |idx| {
                     self.plan_ctx.current_step_idx = idx;
                 }
                 if (!utils.isSubagent()) {
-                    main.stderrPrint("[agent] Plan restored from store: {d} steps\n", .{self.current_plan.?.stepCount()});
+                    main.stderrPrint("[agent] Running plan restored from store: {d} steps\n", .{
+                        self.current_plan.?.stepCount(),
+                    });
                 }
             }
         }

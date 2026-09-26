@@ -246,7 +246,7 @@ fn printHelp(io: std.Io) void {
         \\  /config protocol <auto|chat|responses>  Set OpenAI protocol mode
         \\  /config thinking <on|off>               Toggle dynamic thinking governor
         \\  /config reasoning <auto|low|med|high|none> Set reasoning effort
-        \\  /plan on/off/status                       Toggle structured planning mode
+        \\  /plan on/off/status/approve/reject/list  Structured planning control
         \\  /artifact [list]    View session artifacts list
         \\  /artifact show <fn> Read an artifact content
         \\  /terminal-setup     Inspect & configure Shift+Enter / multiline terminal support
@@ -342,8 +342,22 @@ fn handlePlanSlash(agent: *agent_mod.AgentLoop, sub_raw: []const u8) void {
     } else if (std.mem.eql(u8, sub, "off") or std.mem.eql(u8, sub, "false") or std.mem.eql(u8, sub, "0")) {
         agent.plan.enable_structured_planning = false;
         main.stdoutPrint("[plan] Structured planning disabled.\n", .{});
+    } else if (std.mem.eql(u8, sub, "approve") or std.mem.eql(u8, sub, "yes")) {
+        if (agent.approvePlan()) {
+            main.stdoutPrint("[plan] Plan approved — execution active.\n", .{});
+        } else {
+            main.stdoutPrint("[plan] No active plan to approve.\n", .{});
+        }
+    } else if (std.mem.eql(u8, sub, "reject") or std.mem.eql(u8, sub, "no")) {
+        if (agent.rejectPlan()) {
+            main.stdoutPrint("[plan] Plan rejected.\n", .{});
+        } else {
+            main.stdoutPrint("[plan] No active plan to reject.\n", .{});
+        }
+    } else if (std.mem.eql(u8, sub, "list")) {
+        _ = agent.plan.listPlans(); // prints summary / error to stderr
     } else {
-        main.stdoutPrint("Usage: /plan on | off | status\n", .{});
+        main.stdoutPrint("Usage: /plan on | off | status | approve | reject | list\n", .{});
     }
 }
 
@@ -469,7 +483,8 @@ fn printConfig(agent: *agent_mod.AgentLoop) void {
     // PSEUDOCODE:
     // 1. Format backend protocol and endpoint details.
     // 2. Format reasoning effort string.
-    // 3. Print unified configuration summary to stdout.
+    // 3. Format tools/hooks/session/loop-cap/watchdog lines into stack buffers.
+    // 4. Print unified configuration summary to stdout.
     var proto_buf: [64]u8 = undefined;
     const be_info = getBackendInfo(agent, &proto_buf);
 
@@ -478,8 +493,55 @@ fn printConfig(agent: *agent_mod.AgentLoop) void {
 
     const dynamic_thinking_str: []const u8 = if (agent.dynamic_thinking) "enabled (Cognitive Governor)" else "disabled";
     const memact_str: []const u8 = if (agent.config.memact_enabled) "enabled" else "disabled";
+    const pg_str: []const u8 = if (agent.config.memact_pg_enabled) "enabled" else "disabled";
+    const planning_str: []const u8 = if (agent.plan.enable_structured_planning) "enabled" else "disabled";
     const image_gen_str: []const u8 = if (agent.config.image_gen_enabled) agent.config.image_gen_model else "disabled";
     const video_gen_str: []const u8 = if (agent.config.video_gen_enabled) agent.config.video_gen_model else "disabled";
+
+    var ctx_buf: [64]u8 = undefined;
+    const ctx_str = std.fmt.bufPrint(
+        &ctx_buf,
+        "{d} tokens (margin {}, compact @ {})",
+        .{ agent.config.context_window, agent.config.ctx_safety_margin, agent.config.ctx_compact_threshold },
+    ) catch "{d} tokens";
+
+    var maxtok_buf: [48]u8 = undefined;
+    const maxtok_str = std.fmt.bufPrint(
+        &maxtok_buf,
+        "{d} tokens (budget: {d})",
+        .{ agent.config.max_tokens, agent.config.budget_max_tokens },
+    ) catch "{d} tokens";
+
+    var tools_buf: [256]u8 = undefined;
+    const tools_str = blk: {
+        if (agent.config.tool_allowlist) |allow| break :blk allow;
+        if (agent.config.tool_blocklist) |block| {
+            break :blk std.fmt.bufPrint(&tools_buf, "all (blocked: {s})", .{block}) catch "all";
+        }
+        break :blk "all";
+    };
+
+    var session_buf: [128]u8 = undefined;
+    const session_str = blk: {
+        if (agent.config.session_file) |f| break :blk f;
+        if (agent.config.session_id) |s| break :blk s;
+        _ = std.fmt.bufPrint(&session_buf, "auto", .{}) catch {};
+        break :blk "auto";
+    };
+
+    var caps_buf: [96]u8 = undefined;
+    const caps_str = std.fmt.bufPrint(
+        &caps_buf,
+        "consec {d}, window {d}, macro {d}, orbit {d}, readonly {d}/{d}",
+        .{
+            agent.config.action_loop_consecutive_cap,
+            agent.config.action_loop_window_cap,
+            agent.config.action_loop_macro_cycle_cap,
+            agent.config.action_loop_orbit_cap,
+            agent.config.action_loop_readonly_warn_cap,
+            agent.config.action_loop_readonly_trip_cap,
+        },
+    ) catch "consec 3, window 4, macro 2, orbit 2, readonly 5/10";
 
     main.stdoutPrint(
         "\n\x1b[1;36mmini-agent Configuration\x1b[0m\n" ++
@@ -489,14 +551,23 @@ fn printConfig(agent: *agent_mod.AgentLoop) void {
             "  \x1b[1mProtocol:\x1b[0m         {s}\n" ++
             "  \x1b[1mAPI Key:\x1b[0m          {s}\n" ++
             "  \x1b[1mExecution Mode:\x1b[0m   {s}\n" ++
-            "  \x1b[1mContext Window:\x1b[0m   {d} tokens\n" ++
-            "  \x1b[1mMax Tokens:\x1b[0m       {d} tokens\n" ++
+            "  \x1b[1mContext Window:\x1b[0m   {s}\n" ++
+            "  \x1b[1mMax Tokens:\x1b[0m       {s}\n" ++
             "  \x1b[1mDynamic Thinking:\x1b[0m {s}\n" ++
             "  \x1b[1mReasoning Effort:\x1b[0m {s}\n" ++
             "  \x1b[1mMemAct:\x1b[0m           {s}\n" ++
+            "  \x1b[1mProcedural Graph:\x1b[0m {s}\n" ++
+            "  \x1b[1mPlanning:\x1b[0m          {s}\n" ++
             "  \x1b[1mImage Input:\x1b[0m        {s}\n" ++
             "  \x1b[1mImage Gen:\x1b[0m          {s}\n" ++
-            "  \x1b[1mVideo Gen:\x1b[0m          {s}\n\n",
+            "  \x1b[1mVideo Gen:\x1b[0m          {s}\n" ++
+            "  \x1b[1mTools:\x1b[0m             {s}\n" ++
+            "  \x1b[1mHooks:\x1b[0m             {s}\n" ++
+            "  \x1b[1mSession:\x1b[0m           {s}\n" ++
+            "  \x1b[1mHistory:\x1b[0m           {s}\n" ++
+            "  \x1b[1mAction Loop Caps:\x1b[0m  {s}\n" ++
+            "  \x1b[1mAct Timeout:\x1b[0m      {d}s\n" ++
+            "  \x1b[1mWatchdog:\x1b[0m         track {d}s, recap every {d}, poll {d}ms\n\n",
         .{
             agent.backend.name(),
             agent.backend.model(),
@@ -504,14 +575,25 @@ fn printConfig(agent: *agent_mod.AgentLoop) void {
             be_info.proto_str,
             be_info.api_key_status,
             @tagName(agent.config.execution_mode),
-            agent.config.context_window,
-            agent.config.max_tokens,
+            ctx_str,
+            maxtok_str,
             dynamic_thinking_str,
             reasoning_str,
             memact_str,
+            pg_str,
+            planning_str,
             if (agent.config.image_input_enabled) "enabled" else "disabled",
             image_gen_str,
             video_gen_str,
+            tools_str,
+            if (agent.config.hooks_config_path) |p| p else "none",
+            session_str,
+            if (agent.config.history_enabled) "enabled" else "disabled",
+            caps_str,
+            agent.config.act_timeout_secs,
+            agent.config.watchdog_tracking_interval_s,
+            agent.config.watchdog_recap_interval,
+            agent.config.watchdog_interval_ms,
         },
     );
 }

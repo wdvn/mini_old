@@ -32,6 +32,7 @@ const proto = @import("protocol.zig");
 const config_mod = @import("config.zig");
 const history_mod = @import("history.zig");
 const tools_mod = @import("../tooling/registry.zig");
+const plan_dispatch = @import("plan_dispatch.zig");
 const media_gen_tool = @import("../tools/media_gen.zig");
 const json_mod = @import("json.zig");
 const openai_mod = @import("../backends/openai.zig");
@@ -52,6 +53,7 @@ const prompts_mod = @import("prompts.zig");
 const plan_parser = @import("plan_parser.zig");
 const plan_executor = @import("plan_executor.zig");
 const plan_monitor = @import("plan_monitor.zig");
+const plan_mod = @import("plan.zig");
 const plan_store_mod = @import("plan_store.zig");
 const plan_integration = @import("plan_integration.zig");
 pub const journal_mod = @import("journal.zig");
@@ -67,6 +69,19 @@ const spinner_mod = @import("../ui/spinner.zig");
 pub var g_agent_mutex = std.atomic.Mutex.unlocked;
 
 var g_active_agent: ?*AgentLoop = null;
+
+/// RFC-024 §3.3: extract a skill name from a `.../skills/<name>/SKILL.md`
+/// path, or null if the path does not look like a skill file.
+pub fn skillNameFromSkillPath(path: []const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, path, "SKILL.md")) return null;
+    // .../skills/<name>/SKILL.md -> strip trailing "SKILL.md", parent dir = skill name
+    const base = path[0 .. path.len - "SKILL.md".len];
+    const trimmed = std.mem.trim(u8, base, "/");
+    if (std.mem.lastIndexOfScalar(u8, trimmed, '/')) |slash| {
+        return trimmed[slash + 1 ..];
+    }
+    return null;
+}
 
 fn agentToolListener(tool_name: []const u8, input_json: ?[]const u8, is_error: bool) void {
     while (!g_agent_mutex.tryLock()) {}
@@ -125,6 +140,7 @@ fn watchdogForceKillHandler() void {
     }
     tools_mod.forceKillActiveBash();
     tools_mod.forceKillActiveMcp();
+    _ = process_manager.killAllTrackedProcesses(9);
     _ = process_manager.forceKillAllJobs("SIGKILL");
 }
 
@@ -209,6 +225,9 @@ pub const AgentLoop = struct {
     last_executed_tool: ?[]u8 = null,
     /// Recent tool execution sequence (w acts window).
     recent_tools: std.ArrayListUnmanaged([]u8) = .empty,
+    /// RFC-024 §3.3: skill names read into the conversation this session
+    /// (for post-compaction re-injection; name only, deduplicated).
+    read_skills: std.ArrayListUnmanaged([]u8) = .empty,
     /// Action Loop Guard: tool signatures executed in current turn.
     turn_tool_records: std.ArrayListUnmanaged(ToolCallRecord) = .empty,
     /// Hard dedupe cache: recent read-only tool results served on exact repeat
@@ -476,6 +495,7 @@ pub const AgentLoop = struct {
             .memory_store = memory_store_ptr,
             .last_executed_tool = null,
             .recent_tools = .empty,
+            .read_skills = .empty,
             .coordinator = coordinator,
             .watchdog = watchdog,
             .last_generation_stop = .missing_terminal_event,
@@ -741,12 +761,258 @@ pub const AgentLoop = struct {
         self.memory_store.?.append(self.io, &entry) catch return;
     }
 
+    /// RFC-024 §3.5: approve the current plan and journal the phase change
+    /// (REPL `/plan approve` path).
+    pub fn approvePlan(self: *AgentLoop) bool {
+        const ok = self.plan.approve();
+        if (ok) {
+            if (self.journal) |*j| {
+                j.recordEvent(self.io, 0, .plan_phase_changed, "user approved plan (proposed/approved -> executing)") catch {};
+            }
+        }
+        return ok;
+    }
+
+    /// RFC-024 §3.5: reject the current plan and journal the phase change
+    /// (REPL `/plan reject` path).
+    pub fn rejectPlan(self: *AgentLoop) bool {
+        const ok = self.plan.reject();
+        if (ok) {
+            if (self.journal) |*j| {
+                j.recordEvent(self.io, 0, .plan_phase_changed, "user rejected plan (-> rejected)") catch {};
+            }
+        }
+        return ok;
+    }
+
+    /// RFC-024 §3.4: dispatch a set of independent parallel plan steps in one
+    /// `batch_invoke_subagents` call. On success (or unblocked review) every
+    /// batched step is completed via `completeStepByIndex` and `ctx` advances
+    /// to the next ready step; a blocked review yields a re-run advisory
+    /// instead. Returns the note to surface to the model.
+    fn maybeBatchPlanStep(
+        self: *AgentLoop,
+        act_id: usize,
+        plan: *plan_mod.Plan,
+        ctx: *plan_executor.ExecutionContext,
+        ids: []const u64,
+        mode: []const u8,
+    ) ![]u8 {
+        const out = try plan_dispatch.dispatchParallelBatch(
+            self.io,
+            self.alloc,
+            plan,
+            ids,
+            &batchSubagentRunner,
+            self.config.plan_review_gate,
+        );
+        defer self.alloc.free(out.subagent_output);
+
+        // Journal the review verdict when a review ran.
+        if (self.config.plan_review_gate) {
+            if (self.journal) |*j| {
+                const desc = try std.fmt.allocPrint(self.alloc,
+                    "batch review ({d} steps): critical={d} important={d} minor={d} blocked={}",
+                    .{ ids.len, out.verdict.critical, out.verdict.important, out.verdict.minor, out.blocked });
+                j.recordEvent(self.io, act_id, .plan_review_outcome, desc) catch {};
+                self.alloc.free(desc);
+            }
+        }
+
+        if (out.blocked) {
+            const adv = try std.fmt.allocPrint(self.alloc,
+                \\[plan] Parallel batch ({d} steps, mode={s}) was blocked by the review gate
+                \\(critical={d} important={d} minor={d}). The steps are NOT complete — fix and re-run.
+            , .{ ids.len, mode, out.verdict.critical, out.verdict.important, out.verdict.minor });
+            return adv;
+        }
+
+        // Unblocked: complete every batched step (idempotent) and advance ctx.
+        for (ids) |sid| {
+            if (plan_executor.findStepIndexById(plan, sid)) |idx| {
+                _ = plan_executor.completeStepByIndex(plan, ctx, idx);
+            }
+        }
+        // Advance ctx to the next dependency-ready step (or mark complete).
+        if (plan.findReadyStepIndex()) |next_idx| {
+            ctx.current_step_idx = next_idx;
+            plan.steps.items[next_idx].status = .active;
+        } else {
+            ctx.is_complete = true;
+        }
+
+        // Persist the running plan (RFC-024 §3.2 persistence trigger).
+        if (self.plan.plan_store) |ps| {
+            ps.save(plan) catch |e| main.stderrPrint("[agent] Warning: Failed to persist running plan: {s}\n", .{@errorName(e)});
+        }
+
+        // Build a "3 steps [1,2,3]" descriptor for the note.
+        var id_buf = utils.BufWriter.init(self.alloc);
+        defer id_buf.deinit();
+        try id_buf.print("{d} steps [", .{ids.len});
+        for (ids, 0..) |sid, i| {
+            if (i > 0) try id_buf.writeByte(',');
+            try id_buf.print("{d}", .{sid});
+        }
+        try id_buf.writeByte(']');
+        const ids_joined = try id_buf.toOwnedSlice();
+        defer self.alloc.free(ids_joined);
+
+        return try std.fmt.allocPrint(self.alloc,
+            \\[plan] Parallel batch of {s} dispatched via batch_invoke_subagents
+            \\(mode={s}); review verdict critical={d} important={d} minor={d}.
+            \\Aggregate result:\n{s}
+        , .{
+            ids_joined,
+            mode,
+            out.verdict.critical,
+            out.verdict.important,
+            out.verdict.minor,
+            out.subagent_output,
+        });
+    }
+
+    /// RFC-024 §3.4: when subagent dispatch is enabled and the current step
+    /// requests a `subagent` / `parallel` executor mode, dispatch the step to
+    /// a child process and optionally run the two-stage review gate. The step
+    /// is only completed on a passing verification (or unblocked review).
+    /// Returns an advisory string to append to tool results, or null.
+    pub fn maybeDispatchPlanStep(self: *AgentLoop, act_id: usize) !?[]u8 {
+        if (!self.config.plan_subagent_dispatch) return null;
+        if (self.plan.current_plan == null) return null;
+        const plan = &self.plan.current_plan.?;
+        const ctx = &self.plan.plan_ctx;
+        if (ctx.current_step_idx >= plan.stepCount()) return null;
+
+        const step = &plan.steps.items[ctx.current_step_idx];
+        const mode = step.executor_mode orelse return null;
+        if (!std.mem.startsWith(u8, mode, "subagent") and !plan_dispatch.isParallelMode(mode)) return null;
+
+        // RFC-024 §3.4 auto-batching: when the current step requests a
+        // parallel mode and >= 2 mutually-independent parallel steps are
+        // ready, dispatch them ALL in one `batch_invoke_subagents` call
+        // instead of one-per-step. A single ready step falls through to
+        // the single-step dispatch below.
+        if (plan_dispatch.isParallelMode(mode)) {
+            if (plan_dispatch.findParallelBatch(plan, self.alloc) catch null) |ids| {
+                defer self.alloc.free(ids);
+                if (ids.len >= 2) {
+                    return try self.maybeBatchPlanStep(act_id, plan, ctx, ids, mode);
+                }
+            }
+        }
+
+        const out = try plan_dispatch.dispatchStep(
+            self.io, self.alloc, plan, step,
+            &subagentRunner,
+            self.config.plan_review_gate,
+        );
+        defer self.alloc.free(out.subagent_output);
+
+        // Journal the review verdict when a review ran.
+        if (self.config.plan_review_gate) {
+            if (self.journal) |*j| {
+                const desc = try std.fmt.allocPrint(self.alloc,
+                    "review verdict: critical={d} important={d} minor={d} blocked={}",
+                    .{ out.verdict.critical, out.verdict.important, out.verdict.minor, out.blocked });
+                j.recordEvent(self.io, act_id, .plan_review_outcome, desc) catch {};
+                self.alloc.free(desc);
+            }
+        }
+
+        if (out.blocked) {
+            // Critical finding -> the step is failed, feed a replan advisory.
+            const adv = try std.fmt.allocPrint(self.alloc,
+                \\[plan] Subagent review for step "{s}" reported a Critical finding — the step is NOT complete.
+                \\Address the issue and re-run the step.
+            , .{step.description});
+            return adv;
+        }
+
+        // Unblocked (or review off): complete the step via the normal path.
+        plan_executor.completeStep(plan, ctx);
+        const note = try std.fmt.allocPrint(self.alloc,
+            \\[plan] Step "{s}" dispatched to subagent (mode={s}); review verdict critical={d} important={d} minor={d}.
+        , .{ step.description, mode, out.verdict.critical, out.verdict.important, out.verdict.minor });
+        return note;
+    }
+
+/// RFC-024 §3.4: real subagent runner — wraps the `invoke_subagent` tool so
+/// plan steps can be dispatched to a child mini process. Module-level so it
+/// can be passed as a `plan_dispatch.SubagentRunner`.
+pub fn subagentRunner(io: std.Io, alloc: std.mem.Allocator, task: []const u8) anyerror![]u8 {
+    const esc = try json_mod.escape(alloc, task);
+    defer alloc.free(esc);
+    const input = try std.fmt.allocPrint(alloc, "{{\"task\":\"{s}\"}}", .{esc});
+    defer alloc.free(input);
+    return tools_mod.executeTool(alloc, io, "invoke_subagent", input);
+}
+
+/// RFC-024 §3.4: batch subagent runner — wraps `batch_invoke_subagents` so
+/// multiple independent plan steps are executed in one parallel dispatch.
+/// Builds `{"tasks":[t1,t2,...]}` JSON, escaped.
+pub fn batchSubagentRunner(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    tasks: []const []const u8,
+) anyerror![]u8 {
+    // PSEUDOCODE:
+    // 1. Build a JSON array of escaped task strings.
+    // 2. Wrap in {"tasks":[...]} and call batch_invoke_subagents.
+    var buf = utils.BufWriter.init(alloc);
+    errdefer buf.deinit();
+    try buf.writeAll("{\"tasks\":[");
+    for (tasks, 0..) |task, i| {
+        if (i > 0) try buf.writeByte(',');
+        const esc = try json_mod.escape(alloc, task);
+        defer alloc.free(esc);
+        try buf.writeAll(esc);
+    }
+    try buf.writeAll("]}");
+    const input = try buf.toOwnedSlice();
+    defer alloc.free(input);
+    return tools_mod.executeTool(alloc, io, "batch_invoke_subagents", input);
+}
+
+/// RFC-024 §3.3: record that a skill's content was read this session so the
+/// post-compaction reinject block can restate it. `skills` (operation=detail)
+/// and `file_read` of a SKILL.md path are the two signals.
+fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]const u8) void {
+        if (std.mem.eql(u8, tool_name, "skills")) {
+            const op = json_mod.findString(input_json orelse "", "operation") orelse return;
+            if (!std.mem.eql(u8, op, "detail")) return;
+            if (json_mod.findString(input_json orelse "", "name")) |skill_name| {
+                self.trackSkillName(skill_name);
+            }
+        } else if (std.mem.eql(u8, tool_name, "file_read") or std.mem.eql(u8, tool_name, "read_file")) {
+            const path = json_mod.findString(input_json orelse "", "path") orelse return;
+            if (skillNameFromSkillPath(path)) |skill_name| {
+                self.trackSkillName(skill_name);
+            }
+        }
+    }
+
+    /// Deduplicate + append a skill name to read_skills.
+    fn trackSkillName(self: *AgentLoop, name: []const u8) void {
+        for (self.read_skills.items) |existing| {
+            if (std.mem.eql(u8, existing, name)) return;
+        }
+        if (self.alloc.dupe(u8, name)) |owned| {
+            self.read_skills.append(self.alloc, owned) catch self.alloc.free(owned);
+        } else |_| {}
+        // RFC-024 §3.5: telemetry — a skill was read into the conversation.
+        if (self.journal) |*j| {
+            j.recordEvent(self.io, 0, .skill_loaded, name) catch {};
+        }
+    }
+
     pub fn onToolCompleted(self: *AgentLoop, tool_name: []const u8, input_json: ?[]const u8, is_error: bool) void {
         if (self.pg_store) |pg| {
             if (self.last_executed_tool) |prev_tool| {
                 pg.recordTransition(self.io, prev_tool, tool_name) catch {};
             }
         }
+        self.recordSkillLoaded(tool_name, input_json);
         self.appendEpisodicMemory(tool_name, is_error);
 
         if (self.last_executed_tool) |old_t| {
@@ -1235,6 +1501,73 @@ pub const AgentLoop = struct {
                 self.history.compact();
             }
         }
+
+        // RFC-024 §3.3: after a successful compaction, re-inject the active plan
+        // progress, read-skill names, and the task reminder so the model keeps
+        // its bearings. §3.6 State A: when structured planning is fully off,
+        // ALL RFC-024 behavior must be a no-op — so the reinject is additionally
+        // gated on enable_structured_planning (it only re-emits plan/skill
+        // context that would not exist in State A anyway).
+        if (self.config.post_compact_reinject and self.config.enable_structured_planning) {
+            self.reinjectPostCompactContext(act_id);
+        }
+    }
+
+    /// RFC-024 §3.3: build and append a `.summarized`-tier user message at the
+    /// next history index containing (a) the active plan progress summary,
+    /// (b) skill names read this session, and (c) the task reminder. Skips
+    /// silently when there is nothing to reinject (no plan, no skills, no task).
+    /// State B fallback (§3.6): plan-less variant contains only skills + task
+    /// reminder.
+    fn reinjectPostCompactContext(self: *AgentLoop, act_id: usize) void {
+        var bw = utils.BufWriter.init(self.alloc);
+        errdefer bw.deinit();
+
+        var has_content = false;
+
+        // (a) active plan progress summary (degrades to nothing if no plan)
+        if (self.plan.current_plan != null) {
+            const plan = &self.plan.current_plan.?;
+            if (plan_executor.generateProgressSummary(plan, &self.plan.plan_ctx, self.alloc) catch null) |summary| {
+                defer self.alloc.free(summary);
+                if (summary.len > 0) {
+                    bw.writeAll("[Post-Compact Plan Context]\n") catch return;
+                    bw.writeAll(summary) catch return;
+                    has_content = true;
+                }
+            }
+        }
+
+        // (b) read-skill names (restated because their content was dropped)
+        if (self.read_skills.items.len > 0) {
+            bw.writeAll("\n[Skills already read this session] ") catch return;
+            var first = true;
+            for (self.read_skills.items) |name| {
+                if (!first) bw.writeAll(", ") catch return;
+                bw.print("`{s}`", .{name}) catch return;
+                first = false;
+            }
+            has_content = true;
+        }
+
+        // (c) task reminder (original request, restated — cf. pg_task_reminder_fmt)
+        if (self.current_user_request) |req| {
+            const trunc = if (req.len > 200) req[0..200] ++ "..." else req;
+            bw.print(prompts_mod.pg_task_reminder_fmt, .{trunc}) catch return;
+            has_content = true;
+        }
+
+        if (!has_content) return;
+
+        const block = bw.toOwnedSlice() catch return;
+        defer self.alloc.free(block);
+
+        self.history.addUser(block) catch return;
+
+        if (self.journal) |*j| {
+            j.recordEvent(self.io, act_id, .post_compact_reinject, "post-compact plan/skill/task re-injected") catch {};
+        }
+        if (!utils.isSubagent()) main.stderrPrint("[agent] Re-injected post-compact context (plan/skills/task).\n", .{});
     }
 
     /// Execution summary returned by executeTools for act debug logging.
@@ -1440,11 +1773,36 @@ pub const AgentLoop = struct {
     }
 
     /// Updates structured plan progress, step completion, and drift monitoring.
-    fn trackPlanToolExecution(self: *AgentLoop, tu: proto.ToolUse) !?[]u8 {
-        // PSEUDOCODE: Check drift, advance step if matching tool hint, save if complete
+    fn trackPlanToolExecution(self: *AgentLoop, act_id: usize, tu: proto.ToolUse) !?[]u8 {
+        // PSEUDOCODE:
+        // 1. Guard: structured planning off or no plan -> null
+        // 2. RFC-024: bump act counters so actual_acts accounting is maintained
+        // 3. RFC-024: approval gate — a proposed plan is not actionable; emit advisory
+        // 4. Check drift (existing)
+        // 5. On tool_hint match: run verification gate when enabled, then complete/advance
+        // 6. Persist at phase transitions (step complete, plan complete), not only at the end
         if (!self.plan.enable_structured_planning or self.plan.current_plan == null) return null;
         var plan = &self.plan.current_plan.?;
         var drift_advisory: ?[]u8 = null;
+
+        plan_executor.bumpActCounters(&self.plan.plan_ctx);
+
+        // RFC-024 §3.2: approval gate (advisory). A plan that is still `proposed`
+        // is not actionable — steps do not advance and the model gets a standing
+        // advisory instead of silent execution.
+        if (self.config.plan_approval_gate and plan.phase == .proposed) {
+            const note = try std.fmt.allocPrint(self.alloc,
+                \\[plan] The parsed plan is `proposed` — it is not actionable yet. Run `/plan approve` to start executing, or proceed with explicit user confirmation.
+            , .{});
+            return note;
+        }
+        if (plan.phase == .rejected) return null;
+        if (plan.phase == .approved) {
+            plan.phase = .executing;
+            if (self.journal) |*j| {
+                j.recordEvent(self.io, act_id, .plan_phase_changed, "approved -> executing") catch {};
+            }
+        }
 
         if (self.config.prompt_enforcement_enabled and self.config.plan_drift_detection) {
             if (plan_monitor.checkPlanDrift(plan, &self.plan.plan_ctx, tu.name)) |d| {
@@ -1461,21 +1819,64 @@ pub const AgentLoop = struct {
             const current_step = &plan.steps.items[self.plan.plan_ctx.current_step_idx];
             if (current_step.tool_hint) |hint| {
                 if (std.mem.eql(u8, tu.name, hint)) {
-                    plan_executor.completeStep(plan, &self.plan.plan_ctx);
-                    if (!utils.isSubagent()) main.stderrPrint("[agent] Plan step completed: {s}\n", .{current_step.description});
+                    // RFC-024 §3.1: verification gate. When enabled and the step
+                    // carries a verification, the hint match is necessary-not-
+                    // sufficient: run the check and only complete on .passed.
+                    if (self.config.plan_verification_gate and current_step.verification != null) {
+                        const vstatus = plan_executor.verifyStep(
+                            self.io, self.alloc, plan, &self.plan.plan_ctx,
+                            &plan_executor.defaultVerificationRunner,
+                        );
+                        const step_desc = current_step.description;
+                        const vtext = try std.fmt.allocPrint(self.alloc,
+                            "step \"{s}\" -> {s}", .{ step_desc, @tagName(vstatus) });
+                        if (self.journal) |*j| j.recordEvent(self.io, act_id, .plan_step_verified, vtext) catch {};
+                        self.alloc.free(vtext);
+
+                        if (vstatus == .passed) {
+                            plan_executor.completeStep(plan, &self.plan.plan_ctx);
+                            if (!utils.isSubagent()) main.stderrPrint("[agent] Plan step verified & completed: {s}\n", .{step_desc});
+                        } else {
+                            const adv = try std.fmt.allocPrint(self.alloc,
+                                \\[plan] Verification for "{s}" returned {s} — the step is NOT complete. Fix and re-run verification.
+                            , .{ step_desc, @tagName(vstatus) });
+                            drift_advisory = adv;
+                        }
+                    } else {
+                        // Legacy path (no gate or no verification): hint match completes.
+                        plan_executor.completeStep(plan, &self.plan.plan_ctx);
+                        if (!utils.isSubagent()) main.stderrPrint("[agent] Plan step completed: {s}\n", .{current_step.description});
+                    }
+
+                    // RFC-024 §3.2: persistence trigger — a step transition is a
+                    // phase transition; save the running plan so a crash revives it.
+                    if (self.plan.plan_store) |ps| {
+                        ps.save(plan) catch |e| main.stderrPrint("[agent] Warning: Failed to persist running plan: {s}\n", .{@errorName(e)});
+                    }
                 }
             }
         }
 
         if (self.plan.plan_ctx.is_complete or plan.isComplete()) {
+            plan.phase = .complete;
+            if (self.journal) |*j| {
+                j.recordEvent(self.io, act_id, .plan_phase_changed, "executing -> complete") catch {};
+            }
             if (!utils.isSubagent()) main.stderrPrint("[agent] Plan completed! Saving to store...\n", .{});
             if (self.plan.plan_store) |ps| {
                 ps.save(plan) catch |e| main.stderrPrint("[agent] Warning: Failed to save plan: {s}\n", .{@errorName(e)});
             }
             self.plan.clearPlan();
-        } else if (self.plan.plan_ctx.current_step_idx + 1 < plan.stepCount()) {
-            self.plan.plan_ctx.current_step_idx += 1;
-            plan.steps.items[self.plan.plan_ctx.current_step_idx].status = .active;
+        } else {
+            // RFC-024: advance via the dependency-aware ready-set selector instead
+            // of a sequential index scan, so independent steps can go ready the
+            // moment their dependencies complete (runtime DAG wiring, §3.4).
+            if (plan.findReadyStepIndex()) |next_idx| {
+                self.plan.plan_ctx.current_step_idx = next_idx;
+                plan.steps.items[next_idx].status = .active;
+            } else {
+                self.plan.plan_ctx.is_complete = true;
+            }
         }
         return drift_advisory;
     }
@@ -1499,6 +1900,7 @@ pub const AgentLoop = struct {
 
     fn postProcessToolResult(
         self: *AgentLoop,
+        act_id: usize,
         tu: proto.ToolUse,
         result: []const u8,
         warn_suffix: ?[]const u8,
@@ -1524,7 +1926,7 @@ pub const AgentLoop = struct {
             self.plan.plan_execution_pending = false;
             self.plan.plan_watchdog_retries = 0;
             if (!isExploratoryToolCall(tu.name, tu.input_json)) {
-                if (try self.trackPlanToolExecution(tu)) |adv| {
+                if (try self.trackPlanToolExecution(act_id, tu)) |adv| {
                     try allocated_strings.append(self.alloc, adv);
                     try results.append(self.alloc, .{ .tool_use_id = tu.id, .content = adv, .is_error = false });
                 }
@@ -1570,7 +1972,7 @@ pub const AgentLoop = struct {
         }
         try allocated_strings.append(self.alloc, result);
 
-        try self.postProcessToolResult(tu, result, warn_suffix, is_err, results, allocated_strings);
+        try self.postProcessToolResult(act_id, tu, result, warn_suffix, is_err, results, allocated_strings);
 
         const end_tool_ms = utils.milliTimestamp();
         const dur_ms = if (end_tool_ms >= start_tool_ms) @as(u64, @intCast(end_tool_ms - start_tool_ms)) else 0;
@@ -1734,6 +2136,55 @@ test "agent - extractJsCodeBlock" {
     defer alloc.free(extracted.?);
 
     try std.testing.expectEqualStrings("const a = 10;\nconst b = 20;\nconsole.log(a + b);", extracted.?);
+}
+
+fn waitManagedChildForTest(
+    io: std.Io,
+    child: *std.process.Child,
+    completed: *std.atomic.Value(bool),
+    wait_failed: *std.atomic.Value(bool),
+) void {
+    // PSEUDOCODE:
+    // 1. Wait for the direct child in a helper thread.
+    // 2. Publish successful completion separately from wait errors.
+    if (child.wait(io)) |_| {
+        completed.store(true, .release);
+    } else |_| {
+        wait_failed.store(true, .release);
+    }
+}
+
+test "watchdog force kill terminates managed foreground process groups" {
+    if (comptime @import("builtin").os.tag == .windows) return;
+
+    defer signals.setInterrupted(false);
+    const io = std.testing.io;
+    const argv = [_][]const u8{ "/bin/sh", "-c", "sleep 30" };
+    var child = try process_manager.spawnManaged(io, &argv, null, .ignore, .ignore, .ignore);
+    const managed_pid: i32 = if (child.id) |pid| @as(i32, @intCast(pid)) else 0;
+    var completed = std.atomic.Value(bool).init(false);
+    var wait_failed = std.atomic.Value(bool).init(false);
+    const waiter = try std.Thread.spawn(.{}, waitManagedChildForTest, .{ io, &child, &completed, &wait_failed });
+    var child_reaped = false;
+    defer if (!child_reaped) {
+        process_manager.abortManaged(io, &child);
+        child_reaped = true;
+    };
+
+    watchdogForceKillHandler();
+    for (0..100) |_| {
+        if (completed.load(.acquire) or wait_failed.load(.acquire)) break;
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    const terminated_by_watchdog = completed.load(.acquire);
+    if (!terminated_by_watchdog and managed_pid > 0) {
+        _ = std.posix.kill(-managed_pid, std.posix.SIG.KILL) catch {};
+    }
+    waiter.join();
+    child_reaped = true;
+    process_manager.unregisterProcessGroup(managed_pid);
+    try std.testing.expect(!wait_failed.load(.acquire));
+    try std.testing.expect(terminated_by_watchdog);
 }
 
 test "watchdog force kill terminates managed background jobs" {
@@ -2234,4 +2685,20 @@ test "agent - parseTimeoutDecision" {
     const d4 = parseTimeoutDecision(text4);
     try std.testing.expect(d4.should_kill);
     try std.testing.expect(std.mem.indexOf(u8, d4.reason(), "Deadlock detected") != null);
+}
+
+test "agent - skillNameFromSkillPath" {
+    // A SKILL.md inside a skills/<name>/ directory -> skill name is the dir.
+    try std.testing.expectEqualStrings(
+        "brainstorming",
+        skillNameFromSkillPath("/home/u/.mini/skills/brainstorming/SKILL.md").?,
+    );
+    // A project-relative skills path also works.
+    try std.testing.expectEqualStrings(
+        "codebase-analysis",
+        skillNameFromSkillPath(".agent/skills/codebase-analysis/SKILL.md").?,
+    );
+    // Non-skill paths return null.
+    try std.testing.expect(skillNameFromSkillPath("/home/u/rfc_003_summary.md") == null);
+    try std.testing.expect(skillNameFromSkillPath("/home/u/notskilled/SKILL.md.bak") == null);
 }

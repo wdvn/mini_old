@@ -645,6 +645,7 @@ fn handleResponseRecovery(
             .missing_terminal => "The model response stream terminated unexpectedly without a terminal event. Please resume and provide the complete tool call or response.",
             .stream_aborted => "The model response stream was interrupted or aborted due to idle timeout. Please resume from where execution stopped.",
             .malformed_tool_call => "Your previous tool call was malformed (invalid JSON arguments or an empty tool name) and could not be executed. Re-emit exactly ONE well-formed tool call (one ```js block with valid `mini.*` calls and JSON-object arguments). Do not include the malformed block.",
+            .truncated_tool_call => "Your previous tool call was truncated (the arguments JSON was cut off before it completed) and could not be executed. Re-emit the SAME tool call with COMPLETE, well-formed JSON-object arguments. Do not include the truncated block.",
         };
         try loop.history.addUser(advisory);
 
@@ -1054,6 +1055,23 @@ pub fn executeStep(
 
     var guidance_ctx = try prepareStepInputMessages(self, act_id, &temp_input_msgs, &input_msgs_count);
     defer guidance_ctx.deinit(self.alloc);
+
+    // RFC-024 §3.4: step-scoped subagent dispatch + two-stage review gate.
+    // When the active step requests subagent/parallel executor mode and the
+    // feature is enabled, dispatch it (and optionally review it) ahead of the
+    // LLM step, then surface the outcome to the model as a user message.
+    var p4_note: ?[]const u8 = null;
+    var p4_blocks: ?[]proto.ContentBlock = null;
+    if (self.maybeDispatchPlanStep(act_id) catch null) |note| {
+        const blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+        blocks[0] = .{ .text = note };
+        try temp_input_msgs.append(self.alloc, .{ .role = .user, .content = blocks });
+        p4_note = note;
+        p4_blocks = blocks;
+    }
+    // Freed at act end (after sendToBackend below has consumed the message).
+    defer if (p4_note) |n| self.alloc.free(n);
+    defer if (p4_blocks) |b| self.alloc.free(b);
 
     var response = try self.sendToBackend(
         act_id,

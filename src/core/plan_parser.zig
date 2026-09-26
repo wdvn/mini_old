@@ -25,11 +25,15 @@ const registry = @import("../tooling/registry.zig");
 /// Expected JSON structure:
 /// {
 ///   "task": "Implement feature X",
+///   "phase": "proposed",
 ///   "steps": [
 ///     {"id": 1, "description": "Read config", "dependencies": [], "tool_hint": "file_read"},
-///     {"id": 2, "description": "Write code", "dependencies": [1], "tool_hint": "file_edit"}
+///     {"id": 2, "description": "Write code", "dependencies": [1], "tool_hint": "file_edit",
+///      "verification": {"kind": "shell", "value": "zig build"}, "executor_mode": "subagent"}
 ///   ]
 /// }
+/// `phase` (RFC-024) is optional; defaults to "proposed". `verification` may be
+/// a string shorthand ("zig build test") or an object; `executor_mode` is optional.
 fn parseJsonStep(alloc: Allocator, step_val: std.json.Value, fallback_id: u64) !?PlanStep {
     // PSEUDOCODE: Extract step fields (id, description, dependencies, tool_hint, status) from JSON object.
     const step_obj = switch (step_val) {
@@ -71,7 +75,54 @@ fn parseJsonStep(alloc: Allocator, step_val: std.json.Value, fallback_id: u64) !
             step.status = plan_mod.parseStepStatus(st_val.string);
         }
     }
+
+    // RFC-024 §3.1/§3.4: optional per-step verification and executor mode.
+    if (step_obj.get("executor_mode")) |em_val| {
+        if (em_val == .string and em_val.string.len > 0) {
+            step.executor_mode = try alloc.dupe(u8, em_val.string);
+        }
+    }
+    if (step_obj.get("verification")) |v_val| {
+        step.verification = try parseVerification(alloc, v_val);
+    }
+
     return step;
+}
+
+/// Parse an optional step `verification` field: either a string shorthand
+/// (treated as a shell command) or an object `{"kind": ..., "value": ...}`.
+fn parseVerification(alloc: Allocator, v_val: std.json.Value) !?plan_mod.StepVerification {
+    switch (v_val) {
+        .string => |s| {
+            if (s.len == 0) return null;
+            const val = try alloc.dupe(u8, s);
+            errdefer alloc.free(val);
+            return plan_mod.StepVerification{ .kind = .shell, .value = val };
+        },
+        .object => |o| {
+            const value_val = o.get("value") orelse return null;
+            const value_str = switch (value_val) {
+                .string => |s| s,
+                else => return null,
+            };
+            if (value_str.len == 0) return null;
+            const val = try alloc.dupe(u8, value_str);
+            errdefer alloc.free(val);
+            const kind_str = switch (o.get("kind") orelse .null) {
+                .string => |s| s,
+                .null => "shell",
+                else => return null,
+            };
+            const kind = if (std.mem.eql(u8, kind_str, "file_exists"))
+                plan_mod.VerificationKind.file_exists
+            else if (std.mem.eql(u8, kind_str, "file_contains"))
+                plan_mod.VerificationKind.file_contains
+            else
+                plan_mod.VerificationKind.shell;
+            return plan_mod.StepVerification{ .kind = kind, .value = val };
+        },
+        else => return null,
+    }
 }
 
 pub fn parsePlanJson(text: []const u8, alloc: Allocator) !Plan {
@@ -96,6 +147,11 @@ pub fn parsePlanJson(text: []const u8, alloc: Allocator) !Plan {
 
     var plan = try Plan.init(alloc, task, std.hash.Fnv1a_64.hash(task));
     errdefer plan.deinit(alloc);
+
+    // RFC-024 §3.2: optional plan-level phase (defaults to .proposed).
+    if (obj.get("phase")) |ph_val| {
+        if (ph_val == .string) plan.phase = plan_mod.parsePlanPhase(ph_val.string);
+    }
 
     const steps_val = obj.get("steps") orelse return error.MissingStepsField;
     const steps_arr = switch (steps_val) {
