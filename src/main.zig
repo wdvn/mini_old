@@ -569,6 +569,7 @@ test {
     _ = @import("core/memact/tokens.zig");
     _ = @import("core/memact/store.zig");
     _ = @import("core/memact/graph_store.zig");
+    _ = @import("core/memact/bm25.zig");
     _ = @import("tooling/registry.zig");
     _ = @import("lib/http_request.zig");
     _ = @import("lib/graph.zig");

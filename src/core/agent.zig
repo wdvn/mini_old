@@ -47,6 +47,7 @@ const process_manager = @import("../runtime/process_manager.zig");
 const tokens_mod = @import("memact/tokens.zig");
 const graph_store_mod = @import("memact/graph_store.zig");
 const store_mod = @import("memact/store.zig");
+const bm25_mod = @import("memact/bm25.zig");
 const snapshot_mod = @import("snapshot.zig");
 const cas_mod = @import("cas.zig");
 const prompts_mod = @import("prompts.zig");
@@ -729,38 +730,6 @@ pub const AgentLoop = struct {
         }) catch {};
     }
 
-    /// Processes user input through agentic loop.
-    /// Handle tool completion lifecycle event (RFC-010 Procedural Graph tracking)
-    /// Appends episodic memory entry for the completed tool call (RFC-003).
-    fn appendEpisodicMemory(self: *AgentLoop, tool_name: []const u8, is_error: bool) void {
-        // PSEUDOCODE:
-        // 1. Guard check if memory store is enabled and tool execution succeeded
-        // 2. Prepare stack MemoryEntry referencing tool_name
-        // 3. Append to memory store
-        // 4. Free generated entry ID
-        if (self.memory_store == null) return;
-        if (!self.config.memact_enabled) return;
-        if (is_error) return;
-
-        var kw_slice = [_][]u8{@constCast(tool_name)};
-
-        var entry = store_mod.MemoryEntry{
-            .id = &.{},
-            .ts = utils.milliTimestamp(),
-            .type = "episodic",
-            .content = @constCast(tool_name),
-            .keywords = &kw_slice,
-            .source_session = null,
-            .confidence = 0.7,
-            .supersedes = null,
-            .access_count = 0,
-            .last_access = 0,
-        };
-        defer if (entry.id.len > 0) self.alloc.free(entry.id);
-
-        self.memory_store.?.append(self.io, &entry) catch return;
-    }
-
     /// RFC-024 §3.5: approve the current plan and journal the phase change
     /// (REPL `/plan approve` path).
     pub fn approvePlan(self: *AgentLoop) bool {
@@ -1013,7 +982,6 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
             }
         }
         self.recordSkillLoaded(tool_name, input_json);
-        self.appendEpisodicMemory(tool_name, is_error);
 
         if (self.last_executed_tool) |old_t| {
             self.alloc.free(old_t);
@@ -1254,56 +1222,51 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         const entries = self.memory_store.?.loadIndex(self.io) catch return alloc.dupe(u8, current_prompt);
         defer store_mod.MemoryStore.freeEntries(alloc, entries);
 
-        // Extract keywords from current prompt and user request
-        var keywords = ArrayList([]const u8).empty;
-        defer keywords.deinit(alloc);
+        // RFC-025 Phase 1: dual-path retrieval, Path A = BM25 on the original
+        // query (user request; falls back to the prompt). Guarantees exact
+        // lexical recall of private entities (error codes, identifiers).
+        const query: []const u8 = self.current_user_request orelse current_prompt;
 
-        // Extract keywords from current prompt AND user request
-        var prompt_it = std.mem.splitScalar(u8, current_prompt, ' ');
-        while (prompt_it.next()) |word| {
-            const trimmed = std.mem.trim(u8, word, " \t\r\n");
-            if (trimmed.len >= 3 and trimmed.len <= 30) {
-                try keywords.append(alloc, trimmed);
-            }
-        }
-        // Add keywords from user request if available
-        if (self.current_user_request) |req| {
-            var it = std.mem.splitScalar(u8, req, ' ');
-            while (it.next()) |word| {
-                const trimmed = std.mem.trim(u8, word, " \t\r\n");
-                if (trimmed.len >= 3 and trimmed.len <= 30) {
-                    try keywords.append(alloc, trimmed);
-                }
-            }
+        // Build doc texts (content + keywords) from eligible entries.
+        var doc_entries = ArrayList(*store_mod.MemoryEntry).empty;
+        defer doc_entries.deinit(alloc);
+        var doc_texts = ArrayList([]u8).empty;
+        defer {
+            for (doc_texts.items) |t| alloc.free(t);
+            doc_texts.deinit(alloc);
         }
 
-        // Score and filter entries
+        for (entries) |*entry| {
+            // RFC-025 Phase 0: reject tool-name-only rows defensively
+            // (legacy episodic entries may still exist on disk).
+            if (entry.content.len < 20) continue;
+
+            var buf = ArrayList(u8).empty;
+            defer buf.deinit(alloc);
+            try buf.appendSlice(alloc, entry.content);
+            for (entry.keywords) |kw| {
+                try buf.append(alloc, ' ');
+                try buf.appendSlice(alloc, kw);
+            }
+            try doc_entries.append(alloc, entry);
+            try doc_texts.append(alloc, try buf.toOwnedSlice(alloc));
+        }
+
+        if (doc_texts.items.len == 0) return alloc.dupe(u8, current_prompt);
+
+        var index = try bm25_mod.Index.build(alloc, doc_texts.items);
+        defer index.deinit(alloc);
+
+        const ranked = index.rank(alloc, query, doc_texts.items.len) catch &.{};
+        defer alloc.free(ranked);
+
+        // Scored entries in BM25 ranking order (descending fused score).
         const ScoredEntry = struct { entry: *store_mod.MemoryEntry, score: f32 };
         var scored = ArrayList(ScoredEntry).empty;
         defer scored.deinit(alloc);
-
-        for (entries) |*entry| {
-            var score: f32 = entry.confidence * @as(f32, @floatFromInt(entry.access_count + 1));
-            var matches: usize = 0;
-            for (entry.keywords) |kw| {
-                for (keywords.items) |qkw| {
-                    if (store_mod.matchKeyword(qkw, kw) or store_mod.matchKeyword(kw, qkw)) {
-                        matches += 1;
-                        score += 0.5;
-                    }
-                }
-            }
-            if (matches > 0) {
-                try scored.append(alloc, .{ .entry = entry, .score = score });
-            }
+        for (ranked) |r| {
+            try scored.append(alloc, .{ .entry = doc_entries.items[r.doc_index], .score = r.score });
         }
-
-        // Sort by score descending
-        std.mem.sort(ScoredEntry, scored.items, {}, struct {
-            fn lessThan(_: void, a: ScoredEntry, b: ScoredEntry) bool {
-                return a.score > b.score;
-            }
-        }.lessThan);
 
         // Take top_k and build memory block
         const top_k = @min(self.config.memact_top_k, @as(u32, @intCast(scored.items.len)));
