@@ -254,7 +254,7 @@ const StreamCtx = struct {
             if (json.findString(msg_obj, "content")) |content| {
                 if (content.len > 0) {
                     const unescaped = json.unescape(self.alloc, content) catch content;
-                    defer self.alloc.free(unescaped);
+                    defer if (unescaped.ptr != content.ptr) self.alloc.free(unescaped);
                     try self.text_accum.appendSlice(self.alloc, unescaped);
                     if (self.text_cb) |cb| cb(unescaped);
                 }

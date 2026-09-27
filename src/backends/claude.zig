@@ -393,7 +393,7 @@ const StreamCtx = struct {
             if (json.findString(data, "thinking")) |thinking| {
                 if (thinking.len > 0) {
                     const unescaped = json.unescape(self.alloc, thinking) catch thinking;
-                    defer self.alloc.free(unescaped);
+                    defer if (unescaped.ptr != thinking.ptr) self.alloc.free(unescaped);
                     try self.think_accum.appendSlice(self.alloc, unescaped);
                     if (self.think_cb) |cb| cb(unescaped);
                     hooks.dispatch(self.alloc, main.g_io, .{
@@ -408,7 +408,7 @@ const StreamCtx = struct {
         if (json.findString(data, "text")) |text| {
             if (text.len > 0) {
                 const unescaped = json.unescape(self.alloc, text) catch text;
-                defer self.alloc.free(unescaped);
+                defer if (unescaped.ptr != text.ptr) self.alloc.free(unescaped);
                 try self.text_accum.appendSlice(self.alloc, unescaped);
                 if (self.text_cb) |cb| cb(unescaped);
                 hooks.dispatch(self.alloc, main.g_io, .{
