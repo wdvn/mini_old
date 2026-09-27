@@ -444,6 +444,31 @@ test "pg: recordTransition rejects cycle and generic observational pairs" {
     try testing.expectEqual(initial_edges + 1, store.graph.active_edge_count);
 }
 
+test "pg: enrichNode renders causal context for a node with active edges" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+
+    var buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, "/tmp/mini_pgstore_test_{d}_rfc25_enrich", .{std.os.linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var store = try PGraphStore.init(alloc, io, dir);
+    defer store.deinit();
+    try store.loadIndex(io);
+
+    // file_edit leads to bash by default — enrichNode must surface it.
+    const nid = store.matchNode("file_edit") orelse return;
+    const ctx = try store.enrichNode(alloc, nid, 4);
+    try testing.expect(ctx != null);
+    defer alloc.free(ctx.?);
+    try testing.expect(std.mem.indexOf(u8, ctx.?, "Procedural Context") != null);
+    try testing.expect(std.mem.indexOf(u8, ctx.?, "file_edit") != null);
+
+    // Dangling node id degrades to null (record renders without context).
+    const dangling = try store.enrichNode(alloc, 0xFFFFFFFF, 4);
+    try testing.expect(dangling == null);
+}
+
 test "pg: serializeGuidance suppresses recent actions in trajectory window" {
     const alloc = testing.allocator;
     const io = std.testing.io;

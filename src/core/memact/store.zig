@@ -48,6 +48,9 @@ pub const MemoryEntry = struct {
     confidence: f32,
     /// ID of the entry that this entry supersedes (null if none).
     supersedes: ?[]u8,
+    /// RFC-025 Phase 3: reference into the procedural graph (Node ID).
+    /// Nullable; legacy lines parse as null.
+    node_ref: ?u32 = null,
     access_count: u32,
     last_access: i64,
 
@@ -258,6 +261,12 @@ pub const MemoryStore = struct {
         } else {
             try writer.writeAll("null");
         }
+        try writer.writeAll(",\"node_ref\":");
+        if (entry.node_ref) |nr| {
+            try writer.print("{d}", .{nr});
+        } else {
+            try writer.writeAll("null");
+        }
         try writer.writeAll(",\"access_count\":");
         try writer.print("{d}", .{entry.access_count});
         try writer.writeAll(",\"last_access\":");
@@ -328,6 +337,12 @@ fn parseLine(alloc: Allocator, line: []const u8) !MemoryEntry {
         else => 0.0,
     };
 
+    const node_ref: ?u32 = switch (obj.get("node_ref") orelse .null) {
+        .integer => |i| if (i >= 0) @intCast(i) else null,
+        .float => |f| if (f >= 0) @intFromFloat(f) else null,
+        else => null,
+    };
+
     return .{
         .id = id,
         .ts = jsonInt(obj.get("ts") orelse return error.MissingField, 0),
@@ -337,6 +352,7 @@ fn parseLine(alloc: Allocator, line: []const u8) !MemoryEntry {
         .source_session = try parseOptionalString(alloc, obj.get("source_session")),
         .confidence = confidence,
         .supersedes = try parseOptionalString(alloc, obj.get("supersedes")),
+        .node_ref = node_ref,
         .access_count = @intCast(@max(0, jsonInt(obj.get("access_count") orelse .null, 0))),
         .last_access = jsonInt(obj.get("last_access") orelse .null, 0),
     };
@@ -383,6 +399,7 @@ test "append → loadIndex round-trip with all fields" {
         .source_session = @constCast("sess_test_01"),
         .confidence = 0.9,
         .supersedes = null,
+        .node_ref = 42,
         .access_count = 0,
         .last_access = 0,
     };
@@ -402,6 +419,7 @@ test "append → loadIndex round-trip with all fields" {
     try std.testing.expectEqualStrings("Zig", e.keywords[0]);
     try std.testing.expectEqualStrings("build", e.keywords[1]);
     try std.testing.expectEqualStrings("sess_test_01", e.source_session.?);
+    try std.testing.expectEqual(@as(?u32, 42), e.node_ref);
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), e.confidence, 0.001);
     try std.testing.expect(e.supersedes == null);
     try std.testing.expectEqual(@as(u32, 0), e.access_count);

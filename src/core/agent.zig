@@ -222,6 +222,9 @@ pub const AgentLoop = struct {
     pg_store: ?*graph_store_mod.PGraphStore = null,
     /// Semantic/Episodic Memory Store (RFC-003).
     memory_store: ?*store_mod.MemoryStore = null,
+    /// RFC-025 Phase 2: cached LLM query expansion per distinct user request.
+    memact_expansion_cache: ?[]u8 = null,
+    memact_expansion_cache_key: ?[]u8 = null,
     /// Last executed tool name (RFC-010 active node anchor).
     last_executed_tool: ?[]u8 = null,
     /// Recent tool execution sequence (w acts window).
@@ -545,6 +548,8 @@ pub const AgentLoop = struct {
             self.alloc.free(t);
             self.last_executed_tool = null;
         }
+        if (self.memact_expansion_cache) |c| self.alloc.free(c);
+        if (self.memact_expansion_cache_key) |k| self.alloc.free(k);
         for (self.recent_tools.items) |t| {
             self.alloc.free(t);
         }
@@ -1209,6 +1214,247 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         return e;
     }
 
+    /// RFC-025 Phase 2: LLM query expansion (Path B). Stateless keyword
+    /// expansion of the retrieval query; returns null when expansion fails or
+    /// yields nothing (graceful degrade — Path A stands alone). Results are
+    /// cached per user request in `memact_expansion_cache`.
+    fn expandMemActQuery(self: *AgentLoop, alloc: Allocator, query: []const u8) !?[]u8 {
+        // PSEUDOCODE:
+        // 1. Serve the cache when the query is unchanged.
+        // 2. Build a stateless expansion request (user message only).
+        // 3. Call backend directly (bypass sendToBackend -> avoids recursion
+        //    into injectSemanticMemory).
+        // 4. Parse at most 12 keyword lines; store in cache; return text.
+        if (self.memact_expansion_cache) |cached| {
+            if (self.memact_expansion_cache_key) |key| {
+                if (std.mem.eql(u8, key, query)) return cached;
+            }
+        }
+
+        const expansion_system_prompt =
+            \\You are the MemAct query expander. Expand the retrieval query into related keywords,
+            \\synonyms, identifiers, and error codes likely to appear in project memory records.
+            \\Output keywords only — one per line, max 12 lines, no numbering, no prose.
+            \\
+        ;
+
+        var msg_blocks = try alloc.alloc(proto.ContentBlock, 1);
+        errdefer {
+            alloc.free(msg_blocks[0].text);
+            alloc.free(msg_blocks);
+        }
+        msg_blocks[0] = .{ .text = try alloc.dupe(u8, query) };
+        const user_msg = proto.Message{ .role = .user, .content = msg_blocks };
+
+        var resp = self.backend.send(expansion_system_prompt, &.{ user_msg }, &[_]proto.ToolDefinition{}, null, null) catch {
+            // Graceful degrade: Path A results stand alone.
+            alloc.free(msg_blocks[0].text);
+            alloc.free(msg_blocks);
+            return null;
+        };
+        defer resp.deinit();
+        alloc.free(msg_blocks[0].text);
+        alloc.free(msg_blocks);
+
+        // Collect response text blocks.
+        var response_text = ArrayList(u8).empty;
+        defer response_text.deinit(alloc);
+        for (resp.content.items) |block| {
+            if (block == .text) try response_text.appendSlice(alloc, block.text);
+        }
+
+        // Keep at most 12 keyword lines (latency/cost cap, RFC-025 §4).
+        var keyword_buf = ArrayList(u8).empty;
+        defer keyword_buf.deinit(alloc);
+        var line_count: u32 = 0;
+        var it = std.mem.splitScalar(u8, response_text.items, '\n');
+        while (it.next()) |line| {
+            if (line_count >= 12) break;
+            line_count += 1;
+            const keyword = std.mem.trim(u8, line, " \t\r-");
+            if (keyword.len == 0) continue;
+            if (keyword_buf.items.len > 0) try keyword_buf.append(alloc, ' ');
+            try keyword_buf.appendSlice(alloc, keyword);
+        }
+
+        const keywords_text = try keyword_buf.toOwnedSlice(alloc);
+        if (keywords_text.len == 0) {
+            alloc.free(keywords_text);
+            return null;
+        }
+
+        // Update cache (replacing any stale entry).
+        if (self.memact_expansion_cache) |old| alloc.free(old);
+        self.memact_expansion_cache = keywords_text;
+        if (self.memact_expansion_cache_key) |old_key| alloc.free(old_key);
+        self.memact_expansion_cache_key = try alloc.dupe(u8, query);
+
+        return keywords_text;
+    }
+
+    /// RFC-025 Phase 3: end-of-turn LLM extraction of durable facts/lessons
+    /// into the declarative store (`semantic` / `project_state` records with
+    /// meaningful self-reported confidence, optional `related_tool` mapped to
+    /// a procedural-graph `node_ref`). Wired from `executeTurnWorker` when
+    /// `memact_extract != "off"`. No-op on failure (extraction must never
+    /// break the turn outcome).
+    pub fn maybeExtractMemories(self: *AgentLoop) !void {
+        // PSEUDOCODE:
+        // 1. Guards: memory store present, memact enabled, extract mode not "off",
+        //    completed/stalled outcome only (failed turns produce no lessons).
+        // 2. Build extraction request: user request + recent tools + final message.
+        // 3. Parse JSON array of {content, keywords, type, confidence, related_tool}.
+        // 4. Append eligible records to the store (cap 5, content >= 20 chars).
+        if (self.memory_store == null) return;
+        if (!self.config.memact_enabled) return;
+        if (std.mem.eql(u8, self.config.memact_extract, "off")) return;
+        if (self.last_turn_outcome != .completed and self.last_turn_outcome != .stalled) return;
+
+        var prompt = ArrayList(u8).empty;
+        defer prompt.deinit(self.alloc);
+        try prompt.appendSlice(self.alloc, "Extract at most 5 durable facts or lessons from this completed task that would help future sessions. Output a JSON array only, each item: {\"content\": \"<informative sentence, min 20 chars>\", \"keywords\": [\"k1\",\"k2\"], \"type\": \"semantic\"|\"project_state\", \"confidence\": 0.0-1.0 (1.0 = confirmed by a successful test/build, lower = inferred), \"related_tool\": \"<tool name if a tool caused/verified it else null>\"}. No prose outside the JSON.\n\nUser request:\n");
+        if (self.current_user_request) |req| try prompt.appendSlice(self.alloc, req);
+        try prompt.appendSlice(self.alloc, "\n\nTools executed:\n");
+        for (self.recent_tools.items) |t| {
+            try prompt.appendSlice(self.alloc, "- ");
+            try prompt.appendSlice(self.alloc, t);
+            try prompt.appendSlice(self.alloc, "\n");
+        }
+        if (self.last_agent_message) |msg| {
+            try prompt.appendSlice(self.alloc, "\nFinal response (tail):\n");
+            const tail = if (msg.len > 400) msg[msg.len - 400 ..] else msg;
+            try prompt.appendSlice(self.alloc, tail);
+        }
+        const request_text = prompt.toOwnedSlice(self.alloc) catch return;
+
+        const extraction_system_prompt =
+            \\You are the MemAct memory extractor. Extract durable, reusable knowledge
+            \\(project facts, state, verified lessons, error causes) from a completed agent task.
+            \\Output JSON only.
+            \\
+        ;
+
+        var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+        errdefer {
+            self.alloc.free(msg_blocks[0].text);
+            self.alloc.free(msg_blocks);
+        }
+        msg_blocks[0] = .{ .text = request_text };
+        const user_msg = proto.Message{ .role = .user, .content = msg_blocks };
+
+        var resp = self.backend.send(extraction_system_prompt, &.{ user_msg }, &[_]proto.ToolDefinition{}, null, null) catch return;
+        defer resp.deinit();
+        self.alloc.free(msg_blocks);
+        self.alloc.free(request_text);
+
+        // Collect response text.
+        var response_text = ArrayList(u8).empty;
+        defer response_text.deinit(self.alloc);
+        for (resp.content.items) |block| {
+            if (block == .text) response_text.appendSlice(self.alloc, block.text) catch return;
+        }
+
+        // Parse the JSON array (tolerate a leading/trailing fence line).
+        const json_text = std.mem.trim(u8, response_text.items, " \t\r\n`");
+        const parsed = std.json.parseFromSlice(std.json.Value, self.alloc, json_text, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        const arr = switch (parsed.value) {
+            .array => |a| a.items,
+            else => return,
+        };
+
+        var extracted: u32 = 0;
+        for (arr) |item| {
+            if (extracted >= 5) break;
+            const obj = switch (item) {
+                .object => |o| o,
+                else => continue,
+            };
+            const content = switch (obj.get("content") orelse .null) {
+                .string => |s| s,
+                else => continue,
+            };
+            // Injection filter (RFC-025 §3.2 rule 3): reject tool-name-only rows.
+            if (content.len < 20) continue;
+
+            // Confidence: model self-report, clamped; banned constants are
+            // replaced by the extraction prompt (RFC-025 §3.2 rule 2).
+            const confidence: f32 = switch (obj.get("confidence") orelse .null) {
+                .float => |f| @min(1.0, @max(0.0, @as(f32, @floatCast(f)))),
+                .integer => |i| @min(1.0, @max(0.0, @as(f32, @floatFromInt(i)))),
+                else => 0.5,
+            };
+
+            const mem_type: []const u8 = switch (obj.get("type") orelse .null) {
+                .string => |s| if (std.mem.eql(u8, s, "project_state")) "project_state" else "semantic",
+                else => "semantic",
+            };
+
+            // related_tool -> procedural graph node_ref (dangling-safe).
+            var node_ref: ?u32 = null;
+            if (obj.get("related_tool")) |v| {
+                const tool_name = switch (v) {
+                    .string => |s| s,
+                    else => "",
+                };
+                if (tool_name.len > 0) {
+                    if (self.pg_store) |pg| {
+                        node_ref = pg.matchNode(tool_name);
+                    }
+                }
+            }
+
+            // Keywords (optional).
+            var kw_list = ArrayList([]const u8).empty;
+            defer kw_list.deinit(self.alloc);
+            if (obj.get("keywords")) |kw_val| {
+                switch (kw_val) {
+                    .array => |kw_arr| {
+                        for (kw_arr.items) |k| {
+                            if (kw_list.items.len >= 4) break;
+                            switch (k) {
+                                .string => |s| if (s.len > 0) kw_list.append(self.alloc, s) catch continue,
+                                else => {},
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+            const kw_owned: [][]u8 = blk: {
+                var owned = try self.alloc.alloc([]u8, kw_list.items.len);
+                for (kw_list.items, 0..) |k, i| owned[i] = try self.alloc.dupe(u8, k);
+                break :blk owned;
+            };
+
+            var entry = store_mod.MemoryEntry{
+                .id = &.{},
+                .ts = utils.milliTimestamp(),
+                .type = mem_type,
+                .content = self.alloc.dupe(u8, content) catch continue,
+                .keywords = kw_owned,
+                .source_session = null,
+                .confidence = confidence,
+                .supersedes = null,
+                .node_ref = node_ref,
+                .access_count = 0,
+                .last_access = 0,
+            };
+            self.memory_store.?.append(self.io, &entry) catch {
+                self.alloc.free(entry.id);
+                self.alloc.free(entry.content);
+                for (entry.keywords) |k| self.alloc.free(k);
+                self.alloc.free(entry.keywords);
+                continue;
+            };
+            self.alloc.free(entry.id);
+            self.alloc.free(entry.content);
+            for (entry.keywords) |k| self.alloc.free(k);
+            self.alloc.free(entry.keywords);
+            extracted += 1;
+        }
+    }
+
     /// Injects top-k semantic memories into system prompt based on keyword matching (RFC-003).
     fn injectSemanticMemory(self: *AgentLoop, alloc: Allocator, current_prompt: []const u8) ![]u8 {
         // PSEUDOCODE:
@@ -1257,15 +1503,33 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         var index = try bm25_mod.Index.build(alloc, doc_texts.items);
         defer index.deinit(alloc);
 
-        const ranked = index.rank(alloc, query, doc_texts.items.len) catch &.{};
-        defer alloc.free(ranked);
+        // Path A: BM25 on the original query (guarantees exact lexical recall
+        // of private entities — RFC-025 §3.1).
+        const ranked_a_opt = index.rank(alloc, query, doc_texts.items.len) catch null;
+        defer if (ranked_a_opt) |r| alloc.free(r);
+        const ranked_a: []const bm25_mod.Ranked = ranked_a_opt orelse &.{};
 
-        // Scored entries in BM25 ranking order (descending fused score).
+        // Path B: BM25 on the LLM-expanded query (semantic safety net).
+        // Graceful degrade: when expansion is disabled or fails, Path A stands
+        // alone (ranked_b empty -> RRF keeps Path A ranking).
+        var ranked_b_opt: ?[]bm25_mod.Ranked = null;
+        if (self.config.memact_expansion) {
+            if (self.expandMemActQuery(alloc, query) catch null) |kw| {
+                ranked_b_opt = index.rank(alloc, kw, doc_texts.items.len) catch null;
+            }
+        }
+        defer if (ranked_b_opt) |r| alloc.free(r);
+        const ranked_b: []const bm25_mod.Ranked = ranked_b_opt orelse &.{};
+
+        const fused = try bm25_mod.rrfFuse(alloc, ranked_a, ranked_b);
+        defer alloc.free(fused);
+
+        // Scored entries in fused ranking order (descending RRF score).
         const ScoredEntry = struct { entry: *store_mod.MemoryEntry, score: f32 };
         var scored = ArrayList(ScoredEntry).empty;
         defer scored.deinit(alloc);
-        for (ranked) |r| {
-            try scored.append(alloc, .{ .entry = doc_entries.items[r.doc_index], .score = r.score });
+        for (fused) |f| {
+            try scored.append(alloc, .{ .entry = doc_entries.items[f.doc_index], .score = f.score });
         }
 
         // Take top_k and build memory block
@@ -1289,6 +1553,30 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
             budget_used += tokens;
 
             try mem_buf.print("- [{s}] {s}\n", .{ entry.type, entry_text });
+
+            // RFC-025 Phase 3: graph enrichment. A record carrying `node_ref`
+            // is enriched with its 2-hop procedural context (causes/effects +
+            // guidance/pitfalls). Dangling refs degrade to the plain record.
+            if (entry.node_ref) |node_ref| {
+                if (self.pg_store) |pg| {
+                    const ctx = pg.enrichNode(alloc, node_ref, 4) catch null;
+                    if (ctx) |ctx_text| {
+                        const ctx_tokens = self.token_estimator.estimate(ctx_text);
+                        if (budget_used + ctx_tokens <= budget) {
+                            budget_used += ctx_tokens;
+                            // Indent the context lines under the record.
+                            var ctx_it = std.mem.splitScalar(u8, ctx_text, '\n');
+                            while (ctx_it.next()) |line| {
+                                if (line.len > 0) {
+                                    try mem_buf.print("    {s}\n", .{line});
+                                }
+                            }
+                        }
+                        alloc.free(ctx_text);
+                    }
+                }
+            }
+
             count += 1;
         }
 

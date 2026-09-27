@@ -732,6 +732,11 @@ pub fn executeTurnWorker(
     self.coordinator.finishAct(act_id, outcome == .completed);
     self.coordinator.notifyTurnComplete();
 
+    // RFC-025 Phase 3: background LLM extraction of durable memories
+    // (sync end-of-turn dispatch; no-op when memact_extract == "off").
+    // Extraction must never alter the turn outcome.
+    self.maybeExtractMemories() catch {};
+
     const duped_last_message = if (self.last_agent_message) |msg|
         self.alloc.dupe(u8, msg) catch null
     else

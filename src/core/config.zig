@@ -155,6 +155,8 @@ pub const Config = struct {
     memact_memory_budget: u32 = 2000,
     /// Memory extraction mode: async | sync | off (RFC-003).
     memact_extract: []const u8 = "async",
+    /// LLM query expansion for dual-path retrieval (RFC-025 Phase 2).
+    memact_expansion: bool = true,
     /// Memory directory. Null = caller builds ~/.mini/memory.
     memory_dir: ?[]const u8 = null,
 
@@ -347,6 +349,7 @@ pub const Config = struct {
         top_k: u32,
         memory_budget: u32,
         extract: []const u8,
+        expansion: bool,
         memory_dir: ?[]const u8,
         pg_enabled: bool,
         pg_advisory: bool,
@@ -392,6 +395,10 @@ pub const Config = struct {
             .top_k = if (env_map.get("MINI_MEMACT_TOP_K")) |s| std.fmt.parseInt(u32, s, 10) catch 8 else 8,
             .memory_budget = if (env_map.get("MINI_MEMACT_MEMORY_BUDGET")) |s| std.fmt.parseInt(u32, s, 10) catch 2000 else 2000,
             .extract = extract,
+            .expansion = blk: {
+                const s = env_map.get("MINI_MEMACT_EXPANSION") orelse "1";
+                break :blk !std.mem.eql(u8, s, "0") and !std.mem.eql(u8, s, "false");
+            },
             .memory_dir = env_map.get("MINI_MEMORY_DIR"),
             .pg_enabled = pg_en,
             .pg_advisory = pg_adv,
@@ -550,8 +557,8 @@ pub const Config = struct {
         });
         if (m.enabled) {
             const window_src = if (env_map.get("MINI_CONTEXT_WINDOW") != null) "env" else "auto/backend";
-            main.stderrPrint("[config] MemAct: window={d} ({s}), top_k={d}, budget={d}, extract={s}\n", .{
-                m.context_window, window_src, m.top_k, m.memory_budget, m.extract,
+            main.stderrPrint("[config] MemAct: window={d} ({s}), top_k={d}, budget={d}, extract={s}, expansion={}\n", .{
+                m.context_window, window_src, m.top_k, m.memory_budget, m.extract, m.expansion,
             });
         }
         if (m.pg_enabled) {
@@ -601,6 +608,7 @@ pub const Config = struct {
         cfg.memact_top_k = m.top_k;
         cfg.memact_memory_budget = m.memory_budget;
         cfg.memact_extract = m.extract;
+        cfg.memact_expansion = m.expansion;
         cfg.memory_dir = m.memory_dir;
         cfg.memact_pg_enabled = m.pg_enabled;
         cfg.memact_pg_advisory = m.pg_advisory;
@@ -1081,6 +1089,7 @@ pub const JsonConfig = struct {
     memact_top_k: ?u32 = null,
     memact_memory_budget: ?u32 = null,
     memact_extract: ?[]const u8 = null,
+    memact_expansion: ?bool = null,
     memory_dir: ?[]const u8 = null,
     // Procedural Graph (RFC-010)
     memact_pg_enabled: ?bool = null,
@@ -1301,6 +1310,7 @@ fn applyThinkingAndMemActJsonConfig(cfg: *const JsonConfig, env_map: *std.proces
     if (cfg.memact_top_k) |val| count += setEnvInt(u32, env_map, "MINI_MEMACT_TOP_K", val);
     if (cfg.memact_memory_budget) |val| count += setEnvInt(u32, env_map, "MINI_MEMACT_MEMORY_BUDGET", val);
     if (cfg.memact_extract) |val| count += setEnvDefault(env_map, "MINI_MEMACT_EXTRACT", val);
+    if (cfg.memact_expansion) |val| count += setEnvBool(env_map, "MINI_MEMACT_EXPANSION", val);
     if (cfg.memory_dir) |val| count += setEnvDefault(env_map, "MINI_MEMORY_DIR", val);
     if (cfg.memact_pg_enabled) |val| count += setEnvBool(env_map, "MINI_MEMACT_PG_ENABLED", val);
     if (cfg.memact_pg_advisory) |val| count += setEnvBool(env_map, "MINI_MEMACT_PG_ADVISORY", val);

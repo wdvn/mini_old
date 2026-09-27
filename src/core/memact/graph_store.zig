@@ -252,6 +252,54 @@ pub const PGraphStore = struct {
         try self.seedDefaultEdges(io);
     }
 
+    /// RFC-025 Phase 3: render a compact 2-hop causal chain for a node by
+    /// its Node ID (from a memory entry's `node_ref`). Returns the node name,
+    /// up to `max` cause/effect neighbors with LEADS_TO guidance. `null` when
+    /// the id is dangling (node missing or no active edges) — the record then
+    /// renders without graph context (RFC-025 §7).
+    pub fn enrichNode(
+        self: *PGraphStore,
+        alloc: Allocator,
+        node_id: NodeId,
+        max: usize,
+    ) !?[]u8 {
+        // PSEUDOCODE:
+        // 1. Null-guard: node id must be within the active graph.
+        // 2. Collect active out (effects) and in (causes) edges, cap at `max`.
+        // 3. Render "[Procedural Context (name)]" header + edge lines.
+        //    Empty (no active edges) -> null, so the record renders plain.
+        if (node_id >= self.graph.nodes.items.len) return null;
+        const node_name = self.graph.nodes.items[node_id].name;
+
+        var body = utils.BufWriter.init(alloc);
+        errdefer body.deinit();
+
+        var emitted: usize = 0;
+        // Outgoing effects: node -> next.
+        for (self.graph.edges.items) |edge| {
+            if (emitted >= max) break;
+            if (!edge.is_active or edge.src != node_id) continue;
+            if (edge.dst >= self.graph.nodes.items.len) continue;
+            try self.formatSuggestedEdge(&body, edge);
+            emitted += 1;
+        }
+        // Incoming causes: prev -> node.
+        for (self.graph.edges.items) |edge| {
+            if (emitted >= max) break;
+            if (!edge.is_active or edge.dst != node_id) continue;
+            if (edge.src >= self.graph.nodes.items.len) continue;
+            try self.formatSuggestedEdge(&body, edge);
+            emitted += 1;
+        }
+
+        if (emitted == 0) return null;
+
+        // `toOwnedSlice` empties `body` (its `deinit` is then a no-op).
+        const body_text = try body.toOwnedSlice();
+        defer alloc.free(body_text);
+        return std.fmt.allocPrint(alloc, "[Procedural Context ({s})]\n{s}", .{ node_name, body_text }) catch return null;
+    }
+
     /// Match tool action string to known node ID (with common alias normalization).
     pub fn matchNode(self: *const PGraphStore, action_name: []const u8) ?NodeId {
         const normalized = if (std.mem.eql(u8, action_name, "run_command") or std.mem.eql(u8, action_name, "sh"))
