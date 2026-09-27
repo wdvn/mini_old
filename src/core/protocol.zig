@@ -464,10 +464,18 @@ pub fn isExecutableToolUse(tool: ToolUse, stop: GenerationStop) bool {
     if (stop != .tool_call and stop != .natural_end) return false;
     if (std.mem.trim(u8, tool.name, " \r\n\t").len == 0) return false;
 
+    return isValidJsonObject(tool.input_json);
+}
+
+/// Returns true when `raw` parses as a JSON object.
+/// Truncated tool-call arguments (invalid JSON) must never be sent to
+/// upstreams verbatim — OpenAI-compatible providers reject the whole
+/// request with HTTP 400 "tool call arguments must be valid JSON".
+pub fn isValidJsonObject(raw: []const u8) bool {
     var parsed = std.json.parseFromSlice(
         std.json.Value,
         std.heap.page_allocator,
-        tool.input_json,
+        raw,
         .{},
     ) catch return false;
     defer parsed.deinit();
@@ -734,6 +742,18 @@ test "RFC-023: tool arguments must be valid JSON objects" {
     } });
 
     try std.testing.expectEqual(ResponseValidity.malformed_tool_call, classifyResponse(&response, false));
+}
+
+test "isValidJsonObject accepts objects, rejects truncated and non-object JSON" {
+    try std.testing.expect(isValidJsonObject("{\"command\":\"ls\"}"));
+    try std.testing.expect(isValidJsonObject("{}"));
+    // Truncated tool-call arguments (the exact case that triggers upstream HTTP 400).
+    try std.testing.expect(!isValidJsonObject("{\"name\": \"plan.md\", \"title\": \"plan\""));
+    // Valid JSON but not an object.
+    try std.testing.expect(!isValidJsonObject("[1,2,3]"));
+    try std.testing.expect(!isValidJsonObject("\"string\""));
+    try std.testing.expect(!isValidJsonObject(""));
+    try std.testing.expect(!isValidJsonObject("not a json"));
 }
 
 test "RFC-023: malformed tool call yields malformed_tool_call and bounded retry" {

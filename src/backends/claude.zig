@@ -187,7 +187,10 @@ fn appendClaudeContentBlock(w: *utils.BufWriter, alloc: Allocator, block: proto.
             try w.print("{{\"type\":\"thinking\",\"thinking\":\"{s}\",\"signature\":\"{s}\"}}", .{ t, s });
         },
         .tool_use => |tu| {
-            try w.print("{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{s}}}", .{ tu.id, tu.name, tu.input_json });
+            // PSEUDOCODE: Coerce truncated/malformed tool arguments to "{}" so
+            // the request body is always valid JSON for the Claude API.
+            const args = if (proto.isValidJsonObject(tu.input_json)) tu.input_json else "{}";
+            try w.print("{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{s}}}", .{ tu.id, tu.name, args });
         },
         .tool_result => |tr| {
             const e = try json.escape(alloc, tr.content);
