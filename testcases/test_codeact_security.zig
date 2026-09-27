@@ -22,6 +22,7 @@ test {
     _ = @import("test_openai_dual_protocol.zig");
     _ = @import("test_act_logger.zig");
     _ = @import("test_backend_error_inplace.zig");
+    _ = @import("test_backend_edge_cases.zig");
     _ = @import("test_session_diagnostics.zig");
     _ = @import("test_procedural_graph.zig");
     _ = @import("test_dynamic_thinking.zig");

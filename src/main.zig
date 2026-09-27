@@ -21,6 +21,7 @@ pub const backends = struct {
     pub const ollama_mod = @import("backends/ollama.zig");
     pub const provider_mod = @import("backends/provider.zig");
     pub const js_provider = @import("backends/js_provider.zig");
+    pub const thinking_filter_mod = @import("backends/thinking_filter.zig");
 };
 pub const tools_mod = @import("tooling/registry.zig");
 pub const session_diagnostics = @import("tools/session_diagnostics.zig");
@@ -569,6 +570,7 @@ test {
     _ = @import("core/memact/tokens.zig");
     _ = @import("core/memact/store.zig");
     _ = @import("core/memact/graph_store.zig");
+    _ = @import("core/memact/bm25.zig");
     _ = @import("tooling/registry.zig");
     _ = @import("lib/http_request.zig");
     _ = @import("lib/graph.zig");

@@ -436,7 +436,8 @@ fn appendResponsesContentBlock(
         .tool_use => |tu| {
             if (!first_item.*) try w.writeByte(',');
             first_item.* = false;
-            const escaped_args = try json.escape(alloc, tu.input_json);
+            const args = if (proto.isValidJsonObject(tu.input_json)) tu.input_json else "{}";
+            const escaped_args = try json.escape(alloc, args);
             defer alloc.free(escaped_args);
             try w.print(
                 \\{{"type":"function_call","call_id":"{s}","name":"{s}","arguments":"{s}"}}
@@ -606,6 +607,8 @@ fn appendChatTextContent(w: *utils.BufWriter, alloc: Allocator, content: []const
 
 fn appendChatToolCalls(w: *utils.BufWriter, alloc: Allocator, content: []const proto.ContentBlock) !void {
     // PSEUDOCODE: Write assistant tool_calls array if any tool_use blocks exist.
+    // PSEUDOCODE: Coerce truncated/malformed tool arguments to "{}" so the
+    // request body never contains invalid tool-call JSON (upstream HTTP 400).
     var has_tool_calls = false;
     for (content) |b| if (b == .tool_use) {
         has_tool_calls = true;
@@ -620,7 +623,8 @@ fn appendChatToolCalls(w: *utils.BufWriter, alloc: Allocator, content: []const p
             const tu = block.tool_use;
             if (!first_tc) try w.writeByte(',');
             first_tc = false;
-            const escaped_args = try json.escape(alloc, tu.input_json);
+            const args = if (proto.isValidJsonObject(tu.input_json)) tu.input_json else "{}";
+            const escaped_args = try json.escape(alloc, args);
             defer alloc.free(escaped_args);
             try w.print(
                 \\{{"type":"function","id":"{s}","function":{{"name":"{s}","arguments":"{s}"}}}}
@@ -1505,6 +1509,38 @@ test "openai buildRequestBody includes stream_options, static tools prefix and c
     const msgs_pos = std.mem.indexOf(u8, body, "\"messages\":[");
     try testing.expect(tools_pos != null and msgs_pos != null);
     try testing.expect(tools_pos.? < msgs_pos.?);
+}
+
+test "openai buildRequestBody coerces truncated tool-call arguments to valid JSON" {
+    const alloc = testing.allocator;
+    // Simulates history containing a truncated tool_use (invalid JSON args).
+    const msgs = [_]proto.Message{
+        .{
+            .role = .user,
+            .content = &.{.{ .text = "start" }},
+        },
+        .{
+            .role = .assistant,
+            .content = &.{
+                .{ .text = "calling tool" },
+                .{ .tool_use = .{
+                    .id = "call_trunc",
+                    .name = "artifact_write",
+                    .input_json = "{\"name\": \"plan.md\", \"title\": \"plan\" (TRUNCATED",
+                } },
+            },
+        },
+    };
+    const tools = [_]proto.ToolDefinition{
+        .{ .name = "artifact_write", .description = "Write artifact", .input_schema_json = "{}" },
+    };
+
+    const body = try buildRequestBody(alloc, "gpt-4o", 1024, false, false, null, false, "sys", &msgs, &tools);
+    defer alloc.free(body);
+
+    // Truncated arguments must never reach the wire — they are coerced to "{}".
+    try testing.expect(std.mem.indexOf(u8, body, "TRUNCATED") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"id\":\"call_trunc\",\"function\":{\"name\":\"artifact_write\",\"arguments\":\"{}\"}") != null);
 }
 
 // --- RFC-006 Tests ---

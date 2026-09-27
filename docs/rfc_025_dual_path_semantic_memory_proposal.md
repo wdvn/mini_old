@@ -1,6 +1,6 @@
 # RFC-025: Dual-Path Semantic Memory — Declarative Store + Procedural Graph Consolidation
 
-**Status**: Proposed
+**Status**: Implemented (Phases 0–3, landed on `feat/rfc_025`; Phase 4 deferred to 2026)
 **Date**: 2026-09-25
 **Author**: MemAct Engineering
 **Related**: RFC-003 (MemAct MemoryStore), RFC-010 (Procedural Graph)
