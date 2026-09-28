@@ -32,7 +32,7 @@ pub const WatchdogConfig = struct {
     /// Watchdog polling interval in milliseconds (default: 200ms).
     poll_interval_ms: u32 = 200,
     /// If true, print notifications to stderr (default: true).
-    verbose_stderr: bool = true,
+    verbose_stderr: bool = false,
     /// If true, inject trajectory recap advisories into the next act.
     prompt_enforcement_enabled: bool = false,
     /// Cooldown in seconds between force-kill escalations to prevent log spam (default: 10s).
