@@ -346,12 +346,15 @@ fn probeIpv4Reachable(
     const fd = rc;
     defer _ = std.c.close(fd);
 
-    // 2. Build the IPv4 sockaddr and start the connect.
-    //    `addr` holds the in_addr in network byte order — `addr4` stores the
-    //    dotted-quad bytes already in network order, so a big-endian read is exact.
+    // PSEUDOCODE:
+    // 1. target.addr4 stores the dotted-quad IPv4 bytes already in network byte order.
+    // 2. Bitcast target.addr4 ([4]u8) directly to u32 without endianness distortion,
+    //    matching std.Io.Threaded.address4ToPosix (.addr = @bitCast(a.bytes)).
+    // 3. Convert target.port (native host byte order) to big-endian network byte order.
+    // 4. Construct std.c.sockaddr.in with port and addr.
     var sa: std.c.sockaddr.in = .{
-        .port = std.mem.bigToNative(u16, target.port),
-        .addr = std.mem.readInt(u32, &target.addr4, .big),
+        .port = std.mem.nativeToBig(u16, target.port),
+        .addr = @bitCast(target.addr4),
     };
     const sa_ptr: *const std.c.sockaddr = @ptrCast(&sa);
     const len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);

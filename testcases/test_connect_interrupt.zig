@@ -104,3 +104,47 @@ test "connect: pre-set interrupt short-circuits before the probe socket opens" {
 
     try testing.expectError(error.Interrupted, http_request.preconnectIpv4Interruptible(&client, uri));
 }
+
+test "connect: reachable target succeeds promptly" {
+    // PSEUDOCODE:
+    // 1. Listen on ephemeral loopback address (127.0.0.1:0).
+    // 2. Build ConnectTarget for 127.0.0.1:bound_port with network-order addr4.
+    // 3. Call connectTargetInterruptible with a 2s budget.
+    // 4. Assert reachable probe succeeds and returns active connection promptly.
+    const io = testing.io;
+
+    signals.setInterrupted(false);
+    defer signals.setInterrupted(false);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    var client = std.http.Client{ .allocator = testing.allocator, .io = io };
+    defer client.deinit();
+
+    const host_str = "127.0.0.1";
+    var target = http_request.ConnectTarget{
+        .ip_str = undefined,
+        .ip_len = host_str.len,
+        .addr4 = .{ 127, 0, 0, 1 },
+        .port = port,
+        .protocol = .plain,
+        .host_name = .{ .bytes = host_str },
+    };
+    @memcpy(target.ip_str[0..target.ip_len], host_str);
+
+    const started = mini.utils.milliTimestamp();
+    const conn = try http_request.connectTargetInterruptible(&client, target, 2_000);
+    const elapsed_ms = mini.utils.milliTimestamp() - started;
+
+    try testing.expect(conn != null);
+    if (conn) |c| {
+        c.closing = true;
+        client.connection_pool.release(c, io);
+    }
+    try testing.expect(elapsed_ms < 1_000);
+}
+
+
