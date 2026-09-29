@@ -78,10 +78,10 @@ $MINI_HOME/memory/
   same type and the same schema — no new fields, no scope attribute on
   entries. The tier is the directory, not an entry property.
 - **No `global/pgraph.jsonl`.** Procedural graphs stay strictly
-  per-project (decision §7.1). Global entries therefore never carry a
-  resolvable `node_ref` into a global graph; `node_ref` on global
-  inserts is stored but left `null` (inserts to the global tier do not
-  populate `node_ref`).
+  per-project (decision §7.1). The `node_ref` schema field still
+  exists on global entries, but global inserts never populate it
+  (it is `null`); consequently global retrieval results render
+  without graph enrichment.
 - The directory is auto-created on first write by the existing
   `MemoryStore.init` behavior; an absent/empty global store is a no-op
   (zero-cost early return in retrieval, reusing RFC-025's
