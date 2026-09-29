@@ -105,6 +105,17 @@ pub const McpServer = struct {
     argv_owned: []const []const u8 = &.{},
     /// Stream buffer for line reader.
     recv_buf: ArrayList(u8) = .empty,
+    /// Per-server mutex. Serializes access to the child pipe fds and
+    /// child.stdin/stdout between the agent worker thread (tools/call
+    /// reads, shutdown close) and the watchdog/SIGINT thread. The kill
+    /// path only signals the child process; every fd close and
+    /// child.stdin/stdout mutation happens here, on the owning thread,
+    /// so the worker can never race a cross-thread close.
+    mu: std.atomic.Mutex = .unlocked,
+    /// True once the pipes have been closed. Ensures each fd is closed
+    /// exactly once across interrupt, force-kill, and shutdown paths
+    /// (a second close of an already-closed fd hits std's BADF panic).
+    pipes_closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Read 1 line from stdout_file (regardless of length), buffering 8KB chunks.
     /// Returns slice owned by caller (must free via self.alloc) or error.McpEof on EOF.
@@ -342,13 +353,29 @@ pub const McpServer = struct {
         return self.alloc.dupe(u8, "MCP: No result");
     }
 
-    /// Shut down server and release resources.
-    pub fn shutdown(self: *McpServer) void {
+    /// Close stdin/stdout pipes exactly once (idempotent, thread-safe).
+    /// Guards the fd close and child.stdin/stdout nulling under the
+    /// server mutex so concurrent paths (tool-call worker vs. shutdown /
+    /// watchdog escalation) can never double-close an fd — a second close
+    /// of an already-closed fd hits std's BADF panic. Returns true if
+    /// this call closed the pipes.
+    pub fn closePipesOnce(self: *McpServer) bool {
+        while (!self.mu.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
+        defer self.mu.unlock();
+        if (self.pipes_closed.swap(true, .acq_rel)) return false;
         // Close pipes first so the kernel doesn't re-close them on child exit.
         self.stdin_file.close(main.g_io);
         self.stdout_file.close(main.g_io);
         self.child.stdin = null;
         self.child.stdout = null;
+        return true;
+    }
+
+    /// Shut down server and release resources.
+    pub fn shutdown(self: *McpServer) void {
+        _ = self.closePipesOnce();
 
         if (self.child_pid > 0) {
             if (comptime builtin.os.tag != .windows) {
