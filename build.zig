@@ -144,6 +144,21 @@ pub fn build(b: *std.Build) void {
     const ws_ctx_tests = b.addTest(.{ .root_module = ws_ctx_mod });
     const run_ws_ctx_tests = b.addRunArtifact(ws_ctx_tests);
 
+    // 3b. Connect/interrupt regression (Ctrl+C must not stall on blackholed TCP)
+    const connect_mod = b.createModule(.{
+        .root_source_file = b.path("testcases/test_connect_interrupt.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    connect_mod.addImport("mini", test_mod);
+    connect_mod.addIncludePath(qjs_path);
+    connect_mod.linkLibrary(qjs_lib);
+    const connect_tests = b.addTest(.{ .root_module = connect_mod });
+    const run_connect_tests = b.addRunArtifact(connect_tests);
+    const test_connect_step = b.step("test-connect", "Run connect/interrupt regression tests only");
+    test_connect_step.dependOn(&run_connect_tests.step);
+
     // 4. Linux parent-death regression for managed process groups
     const parent_death_exe = b.addExecutable(.{
         .name = "test-process-parent-death",
@@ -169,6 +184,7 @@ pub fn build(b: *std.Build) void {
     test_unit_step.dependOn(&run_tests.step);
     test_unit_step.dependOn(&run_testcase_tests.step);
     test_unit_step.dependOn(&run_ws_ctx_tests.step);
+    test_unit_step.dependOn(&run_connect_tests.step);
     test_unit_step.dependOn(&run_parent_death.step);
 
     // 3. E2E tests with mock LLM server

@@ -292,6 +292,9 @@ fn preferIpv4() bool {
 /// Returns `null` when disabled, when the host has no IPv4 address, when the
 /// host is already an IP literal, or on any error — callers then fall back to
 /// std's default connection logic (IPv6-only hosts keep working).
+const CONNECT_BUDGET_MS: i64 = 10_000;
+const CONNECT_POLL_MS: i64 = 100;
+
 fn resolveFirstIpv4(io: std.Io, host_name: net.HostName, port: u16) ?net.Ip4Address {
     // PSEUDOCODE:
     // 1. Lookup IPv4 addresses for host_name and port
@@ -315,22 +318,106 @@ fn resolveFirstIpv4(io: std.Io, host_name: net.HostName, port: u16) ?net.Ip4Addr
     return ip4;
 }
 
-fn preconnectIpv4(client: *std.http.Client, uri: std.Uri) ?*std.http.Client.Connection {
+/// Bounded, interruptible IPv4 reachability probe on the calling thread.
+///
+/// Opens a non-blocking socket, starts `connect()`, and polls for completion
+/// in CONNECT_POLL_MS slices, checking `signals.isInterrupted()` and the
+/// deadline after each slice. Every exit path closes the probe fd.
+///
+/// PSEUDOCODE:
+/// 1. socket(AF_INET, SOCK_STREAM|NONBLOCK|CLOEXEC, TCP); any error → fall
+///    back to std (`null`), preserving legacy behaviour.
+/// 2. start connect: SUCCESS/ALREADY/ISCONN → route reachable; INPROGRESS →
+///    poll loop; anything else → close + fall back (`null`).
+/// 3. poll loop: interrupt → error.Interrupted; deadline → error.ConnectTimeout;
+///    fd writable → SO_ERROR == 0 ? close + return null (reachable; std's own
+///    connect will now be fast) : close + return null (fall back).
+fn probeIpv4Reachable(
+    target: ConnectTarget,
+    budget_ms: i64,
+) ConnectOutcome!void {
+    // 1. Open the probe socket.
+    const flags: u32 = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+    const rc = std.c.socket(posix.AF.INET, flags, posix.IPPROTO.TCP);
+    switch (std.c.errno(rc)) {
+        .SUCCESS => {},
+        else => return, // unsupported platform combination — let std handle it.
+    }
+    const fd = rc;
+    defer _ = std.c.close(fd);
+
+    // 2. Build the IPv4 sockaddr and start the connect.
+    //    `addr` holds the in_addr in network byte order — `addr4` stores the
+    //    dotted-quad bytes already in network order, so a big-endian read is exact.
+    var sa: std.c.sockaddr.in = .{
+        .port = std.mem.bigToNative(u16, target.port),
+        .addr = std.mem.readInt(u32, &target.addr4, .big),
+    };
+    const sa_ptr: *const std.c.sockaddr = @ptrCast(&sa);
+    const len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    const conn_rc = std.c.connect(fd, sa_ptr, len);
+    switch (std.c.errno(conn_rc)) {
+        .SUCCESS, .ALREADY, .ISCONN => return, // reachable
+        .INPROGRESS => {}, // continue to poll
+        else => return, // hard failure — let std produce its own error
+    }
+
+    // 3. Poll until established, interrupted, or the budget expires.
+    var pfd: [1]std.c.pollfd = .{.{
+        .fd = fd,
+        .events = @intCast(std.c.POLL.OUT | std.c.POLL.ERR | std.c.POLL.HUP),
+        .revents = 0,
+    }};
+    const deadline = budgetMsNow() + budget_ms;
+    while (true) {
+        if (signals.isInterrupted()) return error.Interrupted;
+        if (budgetMsNow() >= deadline) return error.ConnectTimeout;
+        const poll_rc = std.c.poll(&pfd, 1, @intCast(CONNECT_POLL_MS));
+        if (poll_rc < 0) return; // poll error — fall back to std
+        if (poll_rc > 0) {
+            // The connect attempt has finished (success or failure). std will do
+            // the real connect: immediate when the route is live, a fast
+            // failure-class error otherwise — so we can simply hand off here.
+            return;
+        }
+        // rc == 0: still connecting; loop back to re-check interrupt/budget.
+    }
+}
+
+/// Resolve the IPv4 address the reachability probe will dial, and any early-exit
+/// reason. Returns `null` (meaning "fall back to std") only for conditions that
+/// are NOT interrupt/timeout — those must propagate as errors.
+pub const ConnectTarget = struct {
+    ip_str: [net.HostName.max_len]u8,
+    ip_len: usize,
+    /// Binary IPv4 address bytes (network order), used by the reachability probe.
+    addr4: [4]u8,
+    port: u16,
+    protocol: std.http.Client.Protocol,
+    host_name: net.HostName,
+
+    /// Dotted-quad bytes actually in use (tests build targets without DNS).
+    pub fn ip_buf_slice(self: *const ConnectTarget) []const u8 {
+        return self.ip_str[0..self.ip_len];
+    }
+};
+
+fn resolveConnectTarget(
+    io: std.Io,
+    uri: std.Uri,
+    host_buf: *[net.HostName.max_len]u8,
+) ?ConnectTarget {
     // PSEUDOCODE:
-    // 1. Check if IPv4 preference enabled and protocol supported
-    // 2. Extract host name; return null if already IP literal
-    // 3. Resolve first IPv4 address
-    // 4. Initialize TLS state if needed and connect with proxied host
+    // 1. IPv4 preference and TLS support gate the whole pre-connect path.
+    // 2. Skip host names that are already IP literals.
+    // 3. Resolve the first A record and render it as a dotted quad.
     if (!preferIpv4()) return null;
 
     const protocol = std.http.Client.Protocol.fromUri(uri) orelse return null;
     if (protocol == .tls and std.http.Client.disable_tls) return null;
 
-    const io = client.io;
-    var host_buf: [net.HostName.max_len]u8 = undefined;
-    const host_name = uri.getHost(&host_buf) catch return null;
+    const host_name = uri.getHost(host_buf) catch return null;
 
-    // Already an IP literal — std connects directly, no DNS/race involved.
     if (net.IpAddress.parseIp4(host_name.bytes, uri.port orelse 0)) |_| return null else |_| {}
     if (net.IpAddress.parseIp6(host_name.bytes, uri.port orelse 0)) |_| return null else |_| {}
 
@@ -341,21 +428,113 @@ fn preconnectIpv4(client: *std.http.Client, uri: std.Uri) ?*std.http.Client.Conn
 
     const addr = resolveFirstIpv4(io, host_name, port) orelse return null;
 
-    var ip_buf: [net.HostName.max_len]u8 = undefined;
-    const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{
+    var target = ConnectTarget{
+        .ip_str = undefined,
+        .ip_len = 0,
+        .addr4 = .{ addr.bytes[0], addr.bytes[1], addr.bytes[2], addr.bytes[3] },
+        .port = port,
+        .protocol = protocol,
+        .host_name = host_name,
+    };
+    const s = std.fmt.bufPrint(&target.ip_str, "{d}.{d}.{d}.{d}", .{
         addr.bytes[0], addr.bytes[1], addr.bytes[2], addr.bytes[3],
     }) catch return null;
+    target.ip_len = s.len;
+    return target;
+}
+
+/// Interruptible IPv4 pre-connect (RFC-009 follow-up: Ctrl+C must not stall).
+///
+/// Zig 0.16.0 offers no bounded connect: `ConnectTcpOptions.timeout` is declared
+/// but never read, and the POSIX backend `@panic`s if one is passed
+/// (`std/Io/Threaded.zig: netConnectIpPosix`). A blackholed route therefore blocks
+/// in `connect(2)` for the kernel's full SYN-retry window (~127s at
+/// `tcp_syn_retries=6`), during which `signals.interrupted` is never observed and
+/// Ctrl+C appears to do nothing.
+///
+/// Fix: run a bounded, interruptible reachability probe on the calling thread
+/// (non-blocking `socket` + `connect` + `poll` slices), then hand off to std's
+/// own `connectTcpOptions`. The probe returns as soon as the user interrupts
+/// (or the budget expires) instead of inheriting the kernel retry window.
+///
+/// PSEUDOCODE:
+/// 1. Short-circuit if already interrupted (no socket opened, nothing leaked).
+/// 2. Resolve the connect target; return `null` to fall back for non-interrupt
+///    reasons only.
+/// 3. Probe reachability in CONNECT_POLL_MS slices, checking
+///    `signals.isInterrupted()` and the deadline each slice.
+/// 4. On interrupt/timeout: return the error (probe fd already closed).
+/// 5. On success: hand off to `connectTcpOptions`, which now completes fast
+///    since the route is proven reachable. A failed connect falls back to
+///    std's error path so behaviour is unchanged from before.
+pub fn preconnectIpv4Interruptible(
+    client: *std.http.Client,
+    uri: std.Uri,
+) ConnectOutcome!?*std.http.Client.Connection {
+    return preconnectIpv4InterruptibleBudget(client, uri, CONNECT_BUDGET_MS);
+}
+
+pub const ConnectOutcome = error{ Interrupted, ConnectTimeout };
+
+/// Same as `preconnectIpv4Interruptible` with an explicit connect budget in ms.
+pub fn preconnectIpv4InterruptibleBudget(
+    client: *std.http.Client,
+    uri: std.Uri,
+    budget_ms: i64,
+) ConnectOutcome!?*std.http.Client.Connection {
+    // PSEUDOCODE (see `preconnectIpv4Interruptible` for the full rationale):
+    // 1. Already interrupted? Return immediately — no socket, no leak.
+    // 2. Resolve target; `null` means "fall back to std" (not an error).
+    // 3. Probe reachability; interrupt/timeout propagate as errors.
+    // 4. Hand off to std's connectTcpOptions (fast now; fall back on failure).
+    if (signals.isInterrupted()) return error.Interrupted;
+
+    const io = client.io;
+    var host_buf: [net.HostName.max_len]u8 = undefined;
+    const target = resolveConnectTarget(io, uri, &host_buf) orelse return null;
 
     // TLS needs `now` + CA bundle warmed before `Tls.create` runs.
     if (client.now == null) initTlsState(client, io);
 
+    return connectTargetInterruptible(client, target, budget_ms);
+}
+
+/// Interruptible IPv4 pre-connect: probe reachability within `budget_ms`,
+/// then hand off to std's own `connectTcpOptions`.
+///
+/// std 0.16.0's POSIX connect is blocking and has no timeout (passing one
+/// panics in `netConnectIpPosix`), so on a blackholed route it sits inside
+/// `connect(2)` for the kernel's full SYN-retry window (~127s at
+/// `tcp_syn_retries=6`) with no chance to observe Ctrl+C. The probe (raw
+/// non-blocking socket + poll slices) keeps the call bounded: on interrupt or
+/// budget expiry it returns the error; on success it returns a ready
+/// connection (std's connect then completes immediately, since the route is
+/// proven reachable).
+///
+/// PSEUDOCODE:
+/// 1. Run the bounded reachability probe (interrupt/timeout propagate).
+/// 2. Acquire a connection via std's connectTcpOptions — fast now, and errors
+///    out cleanly if the probe result raced (server went down mid-flight).
+pub fn connectTargetInterruptible(
+    client: *std.http.Client,
+    target: ConnectTarget,
+    budget_ms: i64,
+) ConnectOutcome!?*std.http.Client.Connection {
+    probeIpv4Reachable(target, budget_ms) catch |err| return err;
+
     return client.connectTcpOptions(.{
-        .host = .{ .bytes = ip_str },
-        .port = port,
-        .protocol = protocol,
-        .proxied_host = host_name,
-        .proxied_port = port,
-    }) catch null;
+        .host = .{ .bytes = target.ip_buf_slice() },
+        .port = target.port,
+        .protocol = target.protocol,
+        .proxied_host = target.host_name,
+        .proxied_port = target.port,
+    }) catch null; // Real connect failed — preserve legacy fall-back behaviour.
+}
+
+fn budgetMsNow() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1000000);
 }
 
 fn sendRequestBody(req: *std.http.Client.Request, body: ?[]const u8) !void {
@@ -497,7 +676,7 @@ pub fn fetchWithClient(alloc: Allocator, client: *std.http.Client, opts: Options
         .extra_headers = extra.headers,
         .headers = .{ .accept_encoding = .omit },
         .keep_alive = false,
-        .connection = preconnectIpv4(client, uri),
+        .connection = try preconnectIpv4Interruptible(client, uri),
     });
     defer req.deinit();
 
@@ -590,7 +769,7 @@ pub fn downloadToFile(
         .extra_headers = extra.headers,
         .headers = .{ .accept_encoding = .omit },
         .keep_alive = false,
-        .connection = preconnectIpv4(&client, uri),
+        .connection = try preconnectIpv4Interruptible(&client, uri),
     });
     defer req.deinit();
 
@@ -774,7 +953,7 @@ pub fn postStream(
         .extra_headers = extra_headers,
         .headers = .{ .accept_encoding = .omit },
         .keep_alive = false,
-        .connection = preconnectIpv4(&client, uri),
+        .connection = try preconnectIpv4Interruptible(&client, uri),
     });
     defer req.deinit();
 
