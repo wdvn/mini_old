@@ -144,7 +144,12 @@ event-sourcing posture of both stores.
 The dual-path pipeline currently inline in `injectSemanticMemory`
 is extracted to a reusable function (single caller in `agent.zig`
 today, two callers after this RFC — tool `retrieve` and passive
-injection):
+injection). **Extraction boundary:** only the rank + fuse + budget
+slice moves to `search.zig`. `expandMemActQuery` — the LLM backend
+call and its cache fields (`memact_expansion_cache`,
+`memact_expansion_cache_key`) — stays in `agent.zig` because it is
+tied to `AgentLoop`'s backend pointer; `searchTier` receives it as
+a closure (`query → ?[]u8`) so the module has no backend dependency:
 
 ```text
 PSEUDOCODE (searchTier):
@@ -187,8 +192,8 @@ Wiring follows the existing `config.zig` pattern
 | File | Change |
 |---|---|
 | `src/tools/memory.zig` | **NEW** — tool implementation: action dispatch, tier routing, guards (§3.3), merged retrieval (§3.4) |
-| `src/core/memact/search.zig` | **NEW** — extracted `searchTier` dual-path pipeline (BM25 A/B + RRF + expansion); reused by tool and passive injection |
-| `src/tooling/registry.zig` | register `memory` (15 → 16 tools) with the prompt-facing description (§3.2) |
+| `src/core/memact/search.zig` | **NEW** — extracted `searchTier` (rank + RRF fuse + token budget; LLM expansion passed in as a closure — §3.4 extraction boundary); reused by tool and passive injection |
+| `src/tooling/registry.zig` | register `memory` (15 → 16 tools) with the prompt-facing description (§3.2); add `memory` to the built-in tool classification lists (`core_tools`, `isPermitted`, §3.3) so `guardPolicy("memory")` passes |
 | `src/runtime/js_bindings.zig` | `mini.memory(action, args)` binding, `guardPolicy("memory")` entry, docs header line |
 | `src/core/agent.zig` | `initGlobalMemoryStore()` (second `MemoryStore` instance at `{mem_base}/global`); `AgentLoop` gains `global_memory_store: ?*MemoryStore`; `injectSemanticMemory` refactored onto `search.zig` + quota merge |
 | `src/core/config.zig` | two new flags (§3.5) |
@@ -240,6 +245,7 @@ behavior change (global writes simply have no reader yet).
 | Extra LLM expansion latency on `retrieve` | Expansion runs once per call, capped, Path A stands alone on failure — identical to RFC-025's graceful degrade |
 | Global store absence / empty on fresh install | Early-return no-op (existing empty-index guard), zero cost until first insert |
 | Quota starves local knowledge | Local takes *remaining* budget after the capped global slice (never inverted); quota configurable; default 0.3 chosen conservative |
+| Per-turn cost of the global read path | Passive injection `loadIndex`-parses the global JSONL every turn, and the user-global corpus grows unboundedly across projects. Mitigation: cache the parsed index keyed on file size + mtime (invalidation is O(1) stat per turn); fall back to full re-parse only on change |
 
 ## 9. Success Metrics
 
