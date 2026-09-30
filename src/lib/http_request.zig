@@ -295,6 +295,10 @@ fn preferIpv4() bool {
 const CONNECT_BUDGET_MS: i64 = 10_000;
 const CONNECT_POLL_MS: i64 = 100;
 
+/// Poll slice for the SSE idle-receive watchdog (ms). Keeps idle-poll Ctrl+C
+/// latency bounded: between slices the interrupt flag is re-checked.
+const STREAM_WATCHDOG_POLL_MS: i64 = 100;
+
 fn resolveFirstIpv4(io: std.Io, host_name: net.HostName, port: u16) ?net.Ip4Address {
     // PSEUDOCODE:
     // 1. Lookup IPv4 addresses for host_name and port
@@ -859,13 +863,49 @@ fn calculateStreamDeadline(opts: StreamOptions) i64 {
     return start_ms + @as(i64, @intCast(abs_max)) * 1000;
 }
 
-fn checkStreamWatchdog(watch_fd: ?posix.socket_t, idle_timeout_secs: u32, buffered_len: usize) !bool {
+/// Interruptible idle-receive wait on the stream socket.
+///
+/// Polls in STREAM_WATCHDOG_POLL_MS slices (instead of one blocking poll for
+/// the whole idle window) so a Ctrl+C during an idle stream is observed within
+/// ~100ms. The caller tracks the last-data timestamp via `last_data_ms`,
+/// which is reset whenever bytes are (re-)received.
+///
+/// PSEUDOCODE:
+/// 1. No watch fd, or watchdog disabled → ready (true).
+/// 2. Bytes already buffered → idle timer just refreshed; ready.
+/// 3. Else loop: interrupt → error.Interrupted; overall/idle deadline hit →
+///    false; poll one slice; ready (prc > 0) → refresh idle timer, true.
+fn checkStreamWatchdog(
+    watch_fd: ?posix.socket_t,
+    idle_timeout_secs: u32,
+    buffered_len: usize,
+    deadline_ms: i64,
+    last_data_ms: *i64,
+) !bool {
     const fd = watch_fd orelse return true;
-    if (buffered_len > 0) return true;
+    if (idle_timeout_secs == 0) return true;
+    if (buffered_len > 0) {
+        last_data_ms.* = budgetMsNow();
+        return true;
+    }
+
     var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    const timeout_ms: i32 = @intCast(@as(u64, idle_timeout_secs) * 1000);
-    const prc = try posix.poll(&fds, timeout_ms);
-    return prc > 0;
+    const idle_deadline = last_data_ms.* + @as(i64, @intCast(idle_timeout_secs)) * 1000;
+    while (true) {
+        if (signals.isInterrupted()) return error.Interrupted;
+        const now = budgetMsNow();
+        if (now >= deadline_ms or now >= idle_deadline) return false;
+        const wait_ms: i64 = @min(
+            STREAM_WATCHDOG_POLL_MS,
+            @min(idle_deadline - now, deadline_ms - now),
+        );
+        const prc = try posix.poll(&fds, @as(i32, @intCast(wait_ms)));
+        if (prc > 0) {
+            last_data_ms.* = budgetMsNow();
+            return true;
+        }
+        // prc == 0: slice elapsed with no data — re-check interrupt/deadlines.
+    }
 }
 
 fn streamResponseLoop(
@@ -879,10 +919,11 @@ fn streamResponseLoop(
 ) !void {
     // PSEUDOCODE:
     // 1. Loop checking signals and wall-clock deadline
-    // 2. Poll socket with idle timeout if buffer is empty
+    // 2. Interruptible idle-poll (STREAM_WATCHDOG_POLL_MS slices) when empty
     // 3. Peek greedy chunk; break on complete EOF, reject truncated fixed-length bodies
-    // 4. Invoke on_chunk, count body bytes, and toss them
+    // 4. Invoke on_chunk, count body bytes, and refresh last-data timestamp
     var received_len: u64 = 0;
+    var last_data_ms = budgetMsNow();
     while (true) {
         if (signals.isInterrupted()) return error.Interrupted;
 
@@ -894,7 +935,13 @@ fn streamResponseLoop(
             return error.StreamIdleTimeout;
         }
 
-        const socket_ready = try checkStreamWatchdog(watch_fd, opts.idle_timeout_secs, r.bufferedLen());
+        const socket_ready = try checkStreamWatchdog(
+            watch_fd,
+            opts.idle_timeout_secs,
+            r.bufferedLen(),
+            deadline_ms,
+            &last_data_ms,
+        );
         if (!socket_ready) {
             if (opts.out_idle_aborted) |flag| flag.* = true;
             return error.StreamIdleTimeout;
@@ -914,6 +961,7 @@ fn streamResponseLoop(
         on_chunk(chunk, userdata);
         received_len += @intCast(chunk.len);
         r.toss(chunk.len);
+        last_data_ms = budgetMsNow();
     }
 }
 
@@ -984,6 +1032,13 @@ pub fn postStream(
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+/// Helper: set the global interrupt flag after a delay (Ctrl+C simulation).
+fn interruptAfterMs(ms: i64) void {
+    var ts: std.c.timespec = .{ .sec = @divTrunc(ms, 1000), .nsec = @mod(ms, 1000) * std.time.ns_per_ms };
+    _ = std.c.nanosleep(&ts, &ts);
+    signals.setInterrupted(true);
+}
 
 /// Context for test server running on separate thread: reads 1 request, writes 1 response.
 const TestServerCtx = struct {
@@ -1595,4 +1650,63 @@ test "postStream: idle watchdog aborts silent stream with partial data" {
     try testing.expectEqualStrings("data: partial\n\n", ctx.buf.items);
     // Must abort well before a full-request timeout would (30s).
     try testing.expect(elapsed < 3 * std.time.ns_per_s / std.time.ns_per_ms);
+}
+
+test "postStream: idle stream responds to interrupt within one poll slice" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Same silent stream, but with a LONG idle window: the bug would make
+    // an interrupt wait the entire idle_timeout_secs before being observed.
+    const response =
+        "HTTP/1.1 200 OK\r\n" ++
+        "content-type: text/event-stream\r\n" ++
+        "\r\n" ++
+        "data: partial\n\n";
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var bind_server = try addr.listen(io, .{ .reuse_address = true });
+    const port = bind_server.socket.address.getPort();
+    bind_server.deinit(io);
+
+    var srv = SilentServerCtx{ .io = io, .port = port, .response = response };
+    const server_thread = try std.Thread.spawn(.{}, SilentServerCtx.run, .{&srv});
+    defer server_thread.join();
+    defer srv.done.wait(io) catch {};
+    try srv.ready.wait(io);
+
+    const u = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/v1/stream", .{port});
+    defer alloc.free(u);
+
+    var ctx = StreamAccumCtx{ .buf = .empty, .chunks = 0 };
+    defer ctx.buf.deinit(alloc);
+
+    // PSEUDOCODE:
+    // 1. Clear the interrupt flag and record start.
+    // 2. Simulate Ctrl+C 300ms in (interruptAfterMs sets the flag).
+    // 3. The idle poll must observe the interrupt within ~100ms slices,
+    //    returning error.Interrupted long before the 30s idle window.
+    signals.setInterrupted(false);
+    const interrupt_thread = try std.Thread.spawn(.{}, interruptAfterMs, .{300});
+
+    var idle_aborted = false;
+    const start_ms = testMilliTimestamp();
+    const result = postStream(alloc, io, .{
+        .url = u,
+        .body = "{\"q\":1}",
+        .headers = &.{"Content-Type: application/json"},
+        .timeout_secs = 30,
+        .idle_timeout_secs = 30,
+        .out_idle_aborted = &idle_aborted,
+    }, StreamAccumCtx.onChunk, &ctx);
+    interrupt_thread.join();
+
+    const elapsed = testMilliTimestamp() - start_ms;
+    try testing.expectError(error.Interrupted, result);
+    // Partial data already received is preserved.
+    try testing.expectEqualStrings("data: partial\n\n", ctx.buf.items);
+    // Interrupt honored within one poll slice of going idle (≈300ms + 100ms),
+    // NOT the full 30s idle window.
+    try testing.expect(elapsed < 2_000);
+    signals.setInterrupted(false);
 }
