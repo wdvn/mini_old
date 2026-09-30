@@ -361,6 +361,8 @@ pub const Client = struct {
             };
             defer ctx.line_buf.deinit(self.alloc);
             defer ctx.tool_calls.deinit(self.alloc);
+            defer ctx.think_accum_cleanup(self.alloc);
+            defer ctx.text_accum_cleanup(self.alloc);
             errdefer ctx.response.deinit();
             errdefer if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
 
@@ -369,7 +371,10 @@ pub const Client = struct {
             const raw_resp = if (ctx.raw_accum_init) ctx.raw_accum.items else "";
 
             if (self.shouldRetryRequest(&active_protocol, profile, req_http_code, raw_resp, tools.len > 0)) {
-                if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
+                if (ctx.raw_accum_init) {
+                    ctx.raw_accum.deinit(self.alloc);
+                    ctx.raw_accum_init = false;
+                }
                 ctx.response.deinit();
                 continue;
             }
@@ -835,6 +840,22 @@ const StreamCtx = struct {
     terminal_event_received: bool = false,
     terminal_event_kind: TerminalEventKind = .none,
     finalization_route: FinalizationRoute = .pending,
+
+    /// Free think accumulator (idempotent; call on error/retry paths).
+    pub fn think_accum_cleanup(self: *StreamCtx, alloc: Allocator) void {
+        if (self.think_accum_init) {
+            self.think_accum.deinit(alloc);
+            self.think_accum_init = false;
+        }
+    }
+
+    /// Free text accumulator (idempotent; call on error/retry paths).
+    pub fn text_accum_cleanup(self: *StreamCtx, alloc: Allocator) void {
+        if (self.text_accum_init) {
+            self.text_accum.deinit(alloc);
+            self.text_accum_init = false;
+        }
+    }
 
     pub fn emitNormalized(self: *StreamCtx, text: []const u8, thinking: bool) !void {
         if (text.len == 0) return;
@@ -1320,8 +1341,14 @@ const StreamCtx = struct {
         if (self.tool_calls.items.len > 0 and self.terminal_event_received and self.response.stop_reason != .tool_use) {
             self.response.stop_reason = .tool_use;
         }
-        if (self.think_accum_init) self.think_accum.deinit(self.alloc);
-        if (self.text_accum_init) self.text_accum.deinit(self.alloc);
+        if (self.think_accum_init) {
+            self.think_accum.deinit(self.alloc);
+            self.think_accum_init = false;
+        }
+        if (self.text_accum_init) {
+            self.text_accum.deinit(self.alloc);
+            self.text_accum_init = false;
+        }
     }
 };
 
