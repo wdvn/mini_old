@@ -365,6 +365,16 @@ pub fn main(init: std.process.Init) !void {
 
     if (try handleCronInstallation(alloc, init.io, &args, args_raw[0])) return;
 
+    // Queue-based terminal rendering (TTY only): a single background writer
+    // thread drains every producer's writes (renderer, spinner, watchdog
+    // notices) so in-place sections cannot interleave. Non-TTY / ACP pipe
+    // mode keeps the direct synchronous stdout path. The defer guarantees the
+    // queue is drained on every exit path.
+    if (ui_terminal.isStdoutTty()) {
+        ui_terminal.startWriter();
+        defer ui_terminal.stopWriter();
+    }
+
     const session_path = try setupSession(alloc, init.io, init.environ_map, &agent, &args, &cfg);
     defer if (session_path) |p| alloc.free(p);
     defer if (session_path) |spath| agent.history.backupToFile(init.io, spath) catch |e| {

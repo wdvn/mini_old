@@ -541,8 +541,12 @@ pub const TurnRenderer = struct {
         var trunc_buf: [512]u8 = undefined;
         const safe_text = truncateAnsi(&trunc_buf, text, max_cols);
 
-        term.writeStdout("\r\x1b[2K");
-        term.writeStdout(safe_text);
+        // Single atomic section: "\r[2K" + content must not be interleaved
+        // by another producer mid-section.
+        var section: [518]u8 = undefined;
+        @memcpy(section[0..5], "\r\x1b[2K");
+        @memcpy(section[5 .. 5 + safe_text.len], safe_text);
+        term.writeStdout(section[0 .. 5 + safe_text.len]);
     }
 
     /// Clear current line in-place and return cursor to column 0.
@@ -1001,33 +1005,45 @@ pub const TurnRenderer = struct {
         return .{};
     }
 
-    fn renderCodeActPreviewLine(line: []const u8, max_cols: usize, is_last: bool) void {
+    /// Append a CodeAct preview line into `buf` starting at `off`, returning new offset.
+    fn appendCodeActPreviewLine(buf: []u8, off: usize, line: []const u8, max_cols: usize, is_last: bool) usize {
         var trunc_buf: [160]u8 = undefined;
         const safe = truncateAnsi(&trunc_buf, line, max_cols);
         var line_buf: [256]u8 = undefined;
         const style = if (is_last) "\x1b[37m" else "\x1b[2;37m";
-        const str = std.fmt.bufPrint(&line_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m {s}{s}\x1b[0m", .{ style, safe }) catch "";
-        term.writeStdout(str);
+        const str = std.fmt.bufPrint(&line_buf, "\n\r\x1b[2K  \x1b[90m│\x1b[0m {s}{s}\x1b[0m", .{ style, safe }) catch return off;
+        const to_copy = @min(str.len, buf.len - off);
+        @memcpy(buf[off .. off + to_copy], str[0..to_copy]);
+        return off + to_copy;
     }
 
-    fn clearCodeActExcessLines(rendered: usize, target: usize) void {
-        if (rendered > target) {
-            const excess = rendered - target;
-            for (0..excess) |_| {
-                term.writeStdout("\n\r\x1b[2K");
-            }
-            for (0..excess) |_| {
-                term.writeStdout("\x1b[1A");
-            }
+    /// Append a short escape sequence `times` times into `buf` starting at `off`, returning new offset.
+    fn appendCodeActSeq(buf: []u8, off: usize, seq: []const u8, times: usize) usize {
+        var o = off;
+        for (0..times) |_| {
+            const to_copy = @min(seq.len, buf.len - o);
+            @memcpy(buf[o .. o + to_copy], seq[0..to_copy]);
+            o += to_copy;
         }
+        return o;
+    }
+
+    /// Append the clear-excess-rows escape sequence (if rendered > target).
+    fn appendClearExcessLines(buf: []u8, off: usize, rendered: usize, target: usize) usize {
+        if (rendered <= target) return off;
+        const excess = rendered - target;
+        var o = off;
+        o = appendCodeActSeq(buf, o, "\n\r\x1b[2K", excess);
+        o = appendCodeActSeq(buf, o, "\x1b[1A", excess);
+        return o;
     }
 
     fn renderCodeActInPlace(self: *TurnRenderer, now: i64) void {
         // PSEUDOCODE:
         // 1. Check TTY environment.
-        // 2. Format dynamic spinner header line.
-        // 3. Move cursor up and render 1-3 preview lines.
-        // 4. Clear any excess rows.
+        // 2. Build ONE atomic section buffer: cursor-up + header + preview lines
+        //    + clear-excess rows, then flush via a single writeStdout call so
+        //    other producers (e.g. watchdog) cannot interleave mid-section.
         if (comptime builtin.is_test) return;
         if (!term.isStdoutTty()) return;
 
@@ -1043,20 +1059,23 @@ pub const TurnRenderer = struct {
 
         const preview = self.resolveCodeActPreview();
 
-        if (self.codeact_rendered_lines > 1) {
-            for (0..self.codeact_rendered_lines - 1) |_| term.writeStdout("\x1b[1A");
-        }
-
-        term.writeStdout("\r\x1b[2K");
-        term.writeStdout(header_line);
-
         const win = term.getTerminalSize();
         const max_content_cols: usize = if (win.cols > 14) win.cols - 10 else 60;
 
-        if (preview.line2) |l2| renderCodeActPreviewLine(l2, max_content_cols, preview.line3 == null);
-        if (preview.line3) |l3| renderCodeActPreviewLine(l3, max_content_cols, true);
+        var section: [1024]u8 = undefined;
+        var off: usize = 0;
+        if (self.codeact_rendered_lines > 1) {
+            off = appendCodeActSeq(&section, off, "\x1b[1A", self.codeact_rendered_lines - 1);
+        }
+        @memcpy(section[off .. off + 5], "\r\x1b[2K");
+        off += 5;
+        @memcpy(section[off ..], header_line);
+        off += header_line.len;
+        if (preview.line2) |l2| off = appendCodeActPreviewLine(&section, off, l2, max_content_cols, preview.line3 == null);
+        if (preview.line3) |l3| off = appendCodeActPreviewLine(&section, off, l3, max_content_cols, true);
+        off = appendClearExcessLines(&section, off, self.codeact_rendered_lines, preview.num_lines);
 
-        clearCodeActExcessLines(self.codeact_rendered_lines, preview.num_lines);
+        term.writeStdout(section[0..off]);
         self.codeact_rendered_lines = preview.num_lines;
     }
 
@@ -1072,23 +1091,24 @@ pub const TurnRenderer = struct {
         self.in_codeact = false;
 
         if (term.isStdoutTty() and self.codeact_rendered_lines > 0) {
-            if (self.codeact_rendered_lines > 1) {
-                for (0..self.codeact_rendered_lines - 1) |_| {
-                    term.writeStdout("\x1b[1A");
-                }
-            }
+            // PSEUDOCODE: build ONE atomic section buffer (cursor-up, clear each
+            // rendered row, final cursor-up + clear) and flush in a single
+            // writeStdout call so no other producer interleaves mid-section.
+            var section: [512]u8 = undefined;
+            var off: usize = 0;
+            off = appendCodeActSeq(&section, off, "\x1b[1A", self.codeact_rendered_lines - 1);
             for (0..self.codeact_rendered_lines) |idx| {
-                term.writeStdout("\r\x1b[2K");
+                @memcpy(section[off .. off + 5], "\r\x1b[2K");
+                off += 5;
                 if (idx + 1 < self.codeact_rendered_lines) {
-                    term.writeStdout("\n");
+                    section[off] = '\n';
+                    off += 1;
                 }
             }
-            if (self.codeact_rendered_lines > 1) {
-                for (0..self.codeact_rendered_lines - 1) |_| {
-                    term.writeStdout("\x1b[1A");
-                }
-            }
-            term.writeStdout("\r\x1b[2K");
+            off = appendCodeActSeq(&section, off, "\x1b[1A", self.codeact_rendered_lines - 1);
+            @memcpy(section[off .. off + 5], "\r\x1b[2K");
+            off += 5;
+            term.writeStdout(section[0..off]);
         }
 
         self.ui_state = .idle;

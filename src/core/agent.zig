@@ -435,7 +435,15 @@ pub const AgentLoop = struct {
     }
 
     /// Initializes and starts Watchdog background monitoring thread.
-    fn initWatchdog(alloc: Allocator, io: std.Io, coordinator: *act_queue.ActCoordinator, config: *const config_mod.Config) ?*watchdog_mod.Watchdog {
+    fn watchdogNoticeSink(io: std.Io, msg: []const u8) void {
+    // PSEUDOCODE: Route terminal notices through the terminal writer queue
+    // (term.writeStdout enqueues a single FIFO item) so watchdog lines from the
+    // watchdog thread can never interleave the renderer's in-place sections.
+    _ = io;
+    term.writeStdout(msg);
+}
+
+fn initWatchdog(alloc: Allocator, io: std.Io, coordinator: *act_queue.ActCoordinator, config: *const config_mod.Config) ?*watchdog_mod.Watchdog {
         // PSEUDOCODE: Create watchdog with signal handlers and start thread
         const watchdog = watchdog_mod.Watchdog.init(alloc, io, coordinator, .{
             .tracking_interval_s = config.watchdog_tracking_interval_s,
@@ -448,6 +456,10 @@ pub const AgentLoop = struct {
         watchdog.interrupt_fn = &watchdogInterruptHandler;
         watchdog.force_kill_fn = &watchdogForceKillHandler;
         watchdog.decision_fn = &watchdogDecisionHandler;
+        // TTY only: ACP pipe / subagent / test stdout must keep the stderr path.
+        if (term.isStdoutTty()) {
+            watchdog.notice_fn = &watchdogNoticeSink;
+        }
         watchdog.start() catch |e| {
             if (!utils.isSubagent()) main.stderrPrint("[agent] Warning: Failed to start Watchdog thread: {s}\n", .{@errorName(e)});
         };
