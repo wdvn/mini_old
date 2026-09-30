@@ -10,6 +10,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = @import("../core/json.zig");
 const main = @import("../main.zig");
+const signals_mod = @import("../core/signals.zig");
 const process_manager = @import("../runtime/process_manager.zig");
 
 /// Maximum default subagent depth allowed to prevent infinite recursion.
@@ -129,7 +130,15 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     defer stderr_buf.deinit(alloc);
 
     drainChildPipes(io, alloc, &child, &stdout_buf, &stderr_buf);
-    const term = try child.wait(io);
+    // Close the child's owned pipe fds on the owning thread BEFORE child.wait,
+    // so the stdlib's childCleanupPosix will not re-close an already-released
+    // fd (a double close trips std.Io.Threaded's use-after-free detector and
+    // panics with BADF when a cross-thread drain read the pipe to EOF).
+    process_manager.closeOwnedPipes(&child);
+    const term = child.wait(io) catch |e| {
+        if (signals_mod.isInterrupted()) return error.Interrupted;
+        return e;
+    };
     process_manager.unregisterProcessGroup(managed_pid);
     return formatSubagentResult(alloc, term, stdout_buf.items, stderr_buf.items);
 }

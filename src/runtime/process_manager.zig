@@ -203,6 +203,29 @@ pub fn abortManaged(io: std.Io, child: *std.process.Child) void {
     }
 }
 
+/// Close the child's owned pipe fds on the owning thread and null out the
+/// Child pipe fields, so that a later `child.wait` internal cleanup
+/// (childCleanupPosix) does not re-close an already-released fd. A read loop
+/// interrupted cross-thread can leave a pipe fd already released; the
+/// resulting double close trips std.Io.Threaded's use-after-free detector
+/// and panics with EBADF (recoverableOsBugDetected). Raw close() tolerates
+/// EBADF, and nulling the fields makes the stdlib cleanup a no-op.
+pub fn closeOwnedPipes(child: *std.process.Child) void {
+    // PSEUDOCODE:
+    // 1. For each owned pipe end (stdin/stdout/stderr), raw-close the fd.
+    // 2. Null out the Child field so child.wait cleanup skips it.
+    inline for (.{&child.stdin, &child.stdout, &child.stderr}) |slot| {
+        if (slot.*) |f| {
+            if (comptime builtin.os.tag != .windows) {
+                _ = std.c.close(f.handle);
+            } else {
+                _ = std.os.windows.CloseHandle(f.handle);
+            }
+            slot.* = null;
+        }
+    }
+}
+
 pub const JobStatus = struct {
     running: bool,
     exit_code: ?i32 = null,

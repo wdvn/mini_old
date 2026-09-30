@@ -179,6 +179,23 @@ pub fn build(b: *std.Build) void {
     );
     test_parent_death_step.dependOn(&run_parent_death.step);
 
+    // 5. Subagent watchdog-SIGKILL / child.wait BADF regression
+    const race_mod = b.createModule(.{
+        .root_source_file = b.path("testcases/test_subagent_wait_race.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    race_mod.addImport("mini", test_mod);
+    race_mod.addIncludePath(qjs_path);
+    race_mod.linkLibrary(qjs_lib);
+    const race_exe = b.addExecutable(.{ .name = "test-subagent-wait-race", .root_module = race_mod });
+    const run_race = b.addRunArtifact(race_exe);
+    run_race.stdio = .inherit;
+
+    const test_race_step = b.step("test-race", "Repro subagent watchdog-SIGKILL / child.wait BADF race");
+    test_race_step.dependOn(&run_race.step);
+
     // test-unit step: run unit tests and testcases only
     const test_unit_step = b.step("test-unit", "Run unit tests & testcases only (without E2E mock)");
     test_unit_step.dependOn(&run_tests.step);

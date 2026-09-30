@@ -77,6 +77,11 @@ fn runSubAgentThread(ctx: *WorkerContext) void {
     drainPipe(ctx.io, ctx.alloc, child.stdout, &stdout_buf);
     drainPipe(ctx.io, ctx.alloc, child.stderr, &stderr_buf);
 
+    // Close the child's owned pipe fds on the owning thread BEFORE child.wait,
+    // so the stdlib's childCleanupPosix will not re-close an already-released
+    // fd (a double close trips std.Io.Threaded's use-after-free detector and
+    // panics with BADF).
+    process_manager.closeOwnedPipes(&child);
     const term = child.wait(ctx.io) catch |e| {
         ctx.error_msg = std.fmt.allocPrint(ctx.alloc, "Wait error: {s}", .{@errorName(e)}) catch null;
         return;
