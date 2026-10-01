@@ -54,6 +54,7 @@ pub const graph_mod = @import("lib/graph.zig");
 pub const graph_store_mod = @import("core/memact/graph_store.zig");
 pub const tokens_mod = @import("core/memact/tokens.zig");
 pub const media_lib = @import("lib/media.zig");
+pub const media_protocol = @import("core/media_protocol.zig");
 pub const media_gen_tool = @import("tools/media_gen.zig");
 pub const file_mod = @import("tools/file.zig");
 pub const plan_mod = @import("core/plan.zig");
