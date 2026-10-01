@@ -1,150 +1,101 @@
-# RFC-027: OpenRouter-Standardized Media Protocol — Dedicated Image & Video Generation Architecture
+# RFC-027: Universal Media Protocol — Provider-Agnostic Image & Video Generation Architecture
 
 **Status**: Proposed  
 **Date**: 2026-10-01  
 **Author**: Media & Protocol Engineering  
 **Related**: RFC-011 (Media Generation & Vision Loop-Back), RFC-012 (Provider Abstraction Layer)  
-**Tags**: Multimodal, Image Generation, Video Generation, OpenRouter, Wire Protocol  
+**Tags**: Multimodal, Image Generation, Video Generation, OpenRouter, Wire Protocol, Provider-Agnostic  
 
 ---
 
 ## 1. Executive Summary
 
-This RFC establishes a unified, extensible **Media Generation Protocol** for `mini-agent`, standardizing image and video synthesis around the canonical **OpenRouter API specifications** (`/api/v1/images` and `/api/v1/videos`).
+This RFC establishes a clean, extensible, and **provider-agnostic Media Generation Protocol** for `mini-agent`. Taking inspiration from **OpenRouter's unified multimodal design patterns** (`/api/v1/images` and `/api/v1/videos`), this RFC defines a standard agent protocol representation for image and video synthesis that cleanly decouples tool execution from any specific vendor API.
 
-Currently, `mini-agent`'s media capabilities (introduced in RFC-011 via `src/tools/media_gen.zig`) rely on fragmented, hardcoded endpoints across legacy OpenAI routes (`/v1/images/generations`, `/v1/videos`) and ad-hoc vendor quirks (e.g., Agnes AI's `/agnesapi?video_id=...`). There is no normalized protocol layer, no capability discovery, and no mechanism for per-call or provider-level customization through CodeAct or tool execution.
-
-This proposal introduces:
-1. **Normalized Media Protocol (`src/core/media_protocol.zig`)**: Strongly-typed request/response data structures, aspect ratio, resolution, and async job lifecycle primitives modeled after OpenRouter.
-2. **OpenRouter Canonical Provider Engine**: Native support for OpenRouter's synchronous `/api/v1/images` and asynchronous `/api/v1/videos` (Submit $\to$ Poll $\to$ Download) pipelines as the primary standard.
-3. **Pluggable Media Provider Profiles**: Decoupled provider definitions enabling transparent routing between OpenRouter, OpenAI, and custom proxies (Agnes, Fal.ai, etc.) without altering tool logic.
-4. **Enhanced CodeAct & Tool Interfaces**: Upgraded `mini.media(kind, prompt, opts)` and native tools (`generate_image`, `generate_video`) accepting modern multimodal parameters (`aspect_ratio`, `resolution`, `duration`, `input_reference`, `provider`).
-5. **Full Backward Compatibility**: Seamless translation of legacy OpenAI parameters (`size="1024x1024"`, `seconds=4`) into canonical protocol structures.
-
----
-
-## 2. Current State & Pain Points (RFC-011 Evidence)
-
-### 2.1 Current Architecture & Deficiencies
-
-| Component | Current Implementation (`src/tools/media_gen.zig`) | Architectural Limitation |
-|---|---|---|
-| **Image Generation** | Hardcoded POST to `<base_url>/images/generations` | OpenAI-only legacy schema; fails against modern multi-provider gateways like OpenRouter which use `/api/v1/images` with typed resolutions and aspect ratios. |
-| **Video Generation** | Ad-hoc branching: standard Sora POST to `/videos` vs hardcoded Agnes polling to `/agnesapi?video_id={id}&model_name={model}` | Tight coupling in application code; cannot support new video providers without modifying Zig core files. |
-| **Parameter Expressivity** | Only accepts `size` string (e.g. `"1024x1024"`) and `seconds` integer | Incompatible with modern models that expect aspect ratios (`"16:9"`, `"9:16"`, `"1:1"`), resolutions (`"720p"`, `"1080p"`, `"1K"`, `"2K"`), audio toggles, and image-to-image/reference inputs. |
-| **Provider Selection** | Global env variables only (`MINI_IMAGE_GEN_PROVIDER`, `MINI_VIDEO_GEN_PROVIDER`) | CodeAct scripts (`mini.media`) cannot dynamically select a provider or model per execution turn. |
-| **Async Polling** | Tight loop with basic JSON sniffing in `pollVideoJob` | Lacks exponential backoff, standardized job status normalization, and typed error code extraction. |
+### Core Objectives
+1. **Design as Protocol Reference (Not Vendor Lock-In)**:
+   Use modern industry patterns (typed aspect ratios, resolutions, normalized duration, and async job lifecycle) as the canonical design contract. Any provider—whether OpenAI, OpenRouter, Agnes AI, or a custom local proxy—plugs into this unified interface.
+2. **Normalized Data Structures (`src/core/media_protocol.zig`)**:
+   Establish strongly-typed enums (`AspectRatio`, `Resolution`, `JobState`) and request descriptors (`ImageGenRequest`, `VideoGenRequest`) without hardcoding vendor-specific requirements into the agent core.
+3. **Pluggable & Non-Invasive Provider Translation**:
+   The protocol automatically translates normalized requests into vendor-specific wire formats:
+   - **OpenAI**: Translates `(resolution, aspect_ratio)` into legacy `size` strings (e.g., `1024x1024`), duration into seconds, dispatching to standard `/v1/images/generations` and `/v1/videos`.
+   - **OpenRouter & Modern Gateways**: Passes typed `resolution`, `aspect_ratio`, and `duration` directly to `/api/v1/images` and `/api/v1/videos`.
+   - **Agnes AI & Custom Proxies**: Respects existing base URLs, custom headers, and polling endpoints seamlessly.
+4. **Preserve Existing Defaults & Backward Compatibility**:
+   Existing configurations, default models (`gpt-image-1`, `sora-2`), and environment variables remain 100% untouched. No vendor is enforced as a mandatory default.
 
 ---
 
-## 3. OpenRouter Canonical Specification Reference
+## 2. Motivation & Architectural Background
 
-OpenRouter provides dedicated generation endpoints designed specifically to normalize heterogeneous upstream models (Google Veo, Bytedance Seedream, Black Forest Labs Flux, Runway Gen-3, OpenAI Sora, etc.):
+In RFC-011 (`src/tools/media_gen.zig`), image and video generation were tightly bound to legacy OpenAI API paths (`/images/generations`) with ad-hoc conditionals for vendor proxies (such as Agnes AI's `/agnesapi?video_id=...`).
 
-### 3.1 Image Generation (`POST /api/v1/images`)
+### The Missing Layer: A Normalized Protocol
+When an LLM agent wants to generate media, it needs standard parameters:
+- **Image**: Prompt, Model, Aspect Ratio (`16:9`, `1:1`, `9:16`), Resolution (`1K`, `2K`, `1080p`).
+- **Video**: Prompt, Model, Duration, Resolution, Aspect Ratio.
 
-**Request Payload:**
-```json
-{
-  "model": "bytedance-seed/seedream-4.5",
-  "prompt": "Cyberpunk terminal running in neon rain, 8k render",
-  "resolution": "2K",
-  "aspect_ratio": "16:9",
-  "n": 1,
-  "input_references": ["data:image/png;base64,..."]
-}
-```
+Without a normalized protocol layer, tools had to:
+- Accept arbitrary, loosely-typed strings.
+- Force hardcoded parameter transformations in every tool handler.
+- Restrict CodeAct scripts from expressing modern multimodal parameters.
 
-**Response Payload:**
-```json
-{
-  "created": 1748372400,
-  "data": [
-    {
-      "b64_json": "<base64-encoded-image>",
-      "media_type": "image/png",
-      "url": "https://..."
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 0,
-    "completion_tokens": 0,
-    "total_tokens": 0
-  }
-}
-```
-
-### 3.2 Video Generation (`POST /api/v1/videos` & Polling Workflow)
-
-**Step 1: Submit Job (`POST /api/v1/videos`)**
-```json
-{
-  "model": "google/veo-3.1",
-  "prompt": "Camera sweeping over futuristic cityscape at sunrise",
-  "duration": 6,
-  "resolution": "1080p",
-  "aspect_ratio": "16:9",
-  "generate_audio": true
-}
-```
-
-**Submission Response:**
-```json
-{
-  "id": "gen_job_8f2940af1c",
-  "status": "queued",
-  "polling_url": "https://openrouter.ai/api/v1/videos/gen_job_8f2940af1c"
-}
-```
-
-**Step 2: Status Polling (`GET /api/v1/videos/{job_id}` or `polling_url`)**
-```json
-{
-  "id": "gen_job_8f2940af1c",
-  "status": "completed",
-  "metadata": {
-    "url": "https://openrouter.ai/artifacts/videos/gen_job_8f2940af1c.mp4",
-    "duration": 6,
-    "format": "mp4"
-  }
-}
-```
-*Possible Status Values:* `"queued"` $\to$ `"processing"` $\to$ `"completed"` | `"failed"`.
+By modeling our protocol around the clean design pattern established by OpenRouter, we decouple **what the agent requests** from **how a specific provider fulfills it**.
 
 ---
 
-## 4. Architectural Design
+## 3. Protocol Design Pattern (Inspired by OpenRouter)
+
+OpenRouter's API demonstrates how to normalize multimodal generation across 30+ heterogeneous upstream providers (Flux, Stable Diffusion, DALL-E, Sora, Veo, Runway, Luma):
+
+### 3.1 Normalized Request Schema
+- **Image**:
+  - `prompt`: Text description.
+  - `model`: Optional target model identifier.
+  - `resolution`: Standard enum (`720p`, `1080p`, `1K`, `2K`, `4K`).
+  - `aspect_ratio`: Standard enum (`1:1`, `16:9`, `9:16`, `4:3`, `3:4`, `21:9`).
+  - `n`: Number of outputs.
+  - `input_references`: Optional reference image URLs or base64 data for image-to-image.
+- **Video (Async Job Lifecycle)**:
+  - `prompt`: Motion/scene description.
+  - `model`: Target video model identifier.
+  - `duration`: Target duration in seconds.
+  - `resolution` & `aspect_ratio`: Output format.
+  - Standard Job States: `queued` $\to$ `processing` $\to$ `completed` | `failed`.
+
+---
+
+## 4. Architecture & Component Layout
 
 ```
-                     ┌────────────────────────────────────────────────────────┐
-                     │          CodeAct (mini.media) / Native Tools           │
-                     └──────────────────────────┬─────────────────────────────┘
-                                                │
-                                                ▼
-                     ┌────────────────────────────────────────────────────────┐
-                     │         src/core/media_protocol.zig (RFC-027)          │
-                     │  • Typed Requests (Image/Video)                        │
-                     │  • Enums: Resolution, AspectRatio, JobState            │
-                     │  • Normalization & Legacy Parameter Mapping            │
-                     └──────────────────────────┬─────────────────────────────┘
-                                                │
-                                                ▼
-                     ┌────────────────────────────────────────────────────────┐
-                     │            Media Provider Abstraction Layer            │
-                     │  • OpenRouter Provider (Canonical Default)             │
-                     │  • OpenAI Legacy Provider                              │
-                     │  • Agnes / Custom Proxy Provider                       │
-                     └──────────────────────────┬─────────────────────────────┘
-                                                │
-                       ┌────────────────────────┴────────────────────────┐
-                       ▼                                                 ▼
-        [POST /api/v1/images]                             [POST /api/v1/videos]
-        • Direct HTTP POST                                • Async Job Submit
-        • Sniff b64_json or URL                           • Non-blocking Backoff Polling
-        • Local File & Hook Dispatch                      • Download, Verify & Hook Dispatch
+                  ┌────────────────────────────────────────────────────────┐
+                  │          CodeAct (mini.media) / Native Tools           │
+                  └──────────────────────────┬─────────────────────────────┘
+                                             │
+                                             ▼
+                  ┌────────────────────────────────────────────────────────┐
+                  │         src/core/media_protocol.zig (RFC-027)          │
+                  │  • Normalized Requests (ImageGenRequest, VideoGenReq)  │
+                  │  • Standard Enums: AspectRatio, Resolution, JobState   │
+                  │  • Legacy Coercion Helpers                             │
+                  └──────────────────────────┬─────────────────────────────┘
+                                             │
+                                             ▼
+                  ┌────────────────────────────────────────────────────────┐
+                  │                 Media Dispatch Engine                  │
+                  │              (src/tools/media_gen.zig)                 │
+                  └──────────────────────────┬─────────────────────────────┘
+                                             │
+             ┌───────────────────────────────┼───────────────────────────────┐
+             ▼                               ▼                               ▼
+    [OpenAI Provider]              [OpenRouter Provider]            [Agnes / Custom Proxy]
+    • Maps to `size` string        • Maps to native schema          • Maps to compat schema
+    • /images/generations          • /api/v1/images                 • OPENAI_COMPAT_URL
+    • /videos                      • /api/v1/videos (async job)     • Polling adapters
 ```
 
-### 4.1 Normalized Protocol Layer (`src/core/media_protocol.zig`)
+### 4.1 Normalized Protocol Definitions (`src/core/media_protocol.zig`)
 
 ```zig
 pub const AspectRatio = enum {
@@ -171,7 +122,7 @@ pub const AspectRatio = enum {
         if (std.mem.eql(u8, s, "16:9") or std.mem.eql(u8, s, "landscape")) return .ar_16_9;
         if (std.mem.eql(u8, s, "9:16") or std.mem.eql(u8, s, "portrait")) return .ar_9_16;
         if (std.mem.eql(u8, s, "4:3")) return .ar_4_3;
-        if (std.mem.eql(u8, s, "3_4")) return .ar_3_4;
+        if (std.mem.eql(u8, s, "3:4")) return .ar_3_4;
         if (std.mem.eql(u8, s, "21:9")) return .ar_21_9;
         return null;
     }
@@ -198,7 +149,7 @@ pub const Resolution = enum {
         if (std.ascii.eqlIgnoreCase(s, "720p")) return .res_720p;
         if (std.ascii.eqlIgnoreCase(s, "1080p")) return .res_1080p;
         if (std.ascii.eqlIgnoreCase(s, "1k") or std.mem.eql(u8, s, "1024x1024")) return .res_1k;
-        if (std.ascii.eqlIgnoreCase(s, "2k") or std.mem.eql(u8, s, "1536x1024")) return .res_2k;
+        if (std.ascii.eqlIgnoreCase(s, "2k") or std.mem.eql(u8, s, "1536x1024") or std.mem.eql(u8, s, "1024x1536")) return .res_2k;
         if (std.ascii.eqlIgnoreCase(s, "4k")) return .res_4k;
         return null;
     }
@@ -210,6 +161,16 @@ pub const JobState = enum {
     completed,
     failed,
     timeout,
+
+    pub fn asString(self: JobState) []const u8 {
+        return switch (self) {
+            .queued => "queued",
+            .processing => "processing",
+            .completed => "completed",
+            .failed => "failed",
+            .timeout => "timeout",
+        };
+    }
 };
 
 pub const ImageGenRequest = struct {
@@ -235,167 +196,87 @@ pub const VideoGenRequest = struct {
 };
 ```
 
-### 4.2 Media Provider Registry & Abstraction
+### 4.2 Flexible Provider Adapters
 
-To avoid scattered branching across `media_gen.zig`, each provider is represented by a `MediaProviderProfile`:
+The dispatcher dynamically detects provider wire format based on the configured or requested provider:
 
-```zig
-pub const MediaProviderType = enum {
-    openrouter,
-    openai,
-    agnes,
-    custom_compat,
-};
+1. **OpenAI Mode**:
+   - Maps `resolution` + `aspect_ratio` into OpenAI's legacy `size` parameter (`"1024x1024"`, `"1536x1024"`, etc.).
+   - Dispatches to `<base_url>/images/generations` and `<base_url>/videos`.
+2. **OpenRouter Mode**:
+   - Emits canonical `resolution` and `aspect_ratio` properties in payload.
+   - Dispatches to `<base_url>/images` and `<base_url>/videos`.
+   - Reads job `polling_url` directly from submission response when available.
+3. **Agnes & Custom Compat Mode**:
+   - Uses configured `OPENAI_COMPAT_URL` with automatic endpoint resolution.
+   - Preserves custom video polling logic (`/agnesapi?video_id=...`).
 
-pub const MediaProviderProfile = struct {
-    provider_type: MediaProviderType,
-    name: []const u8,
-    default_base_url: []const u8,
-    image_endpoint_path: []const u8,       // e.g. "api/v1/images" vs "v1/images/generations"
-    video_endpoint_path: []const u8,       // e.g. "api/v1/videos" vs "v1/videos"
-    supports_aspect_ratio_param: bool,     // true for OpenRouter; false for legacy OpenAI size string
-    auth_header_format: enum { bearer, custom },
-};
-```
+### 4.3 CodeAct JS VM Options (`mini.media`)
 
-#### Provider Profile Configurations:
-1. **`openrouter` (Default)**:
-   - Base URL: `https://openrouter.ai/api/v1`
-   - Image Endpoint: `images`
-   - Video Endpoint: `videos`
-   - Polling URL: Reads `polling_url` directly from submission response; falls back to `api/v1/videos/{id}`.
-   - Format: Direct `resolution` and `aspect_ratio` properties.
-2. **`openai` (Legacy)**:
-   - Base URL: `https://api.openai.com/v1`
-   - Image Endpoint: `images/generations`
-   - Video Endpoint: `videos`
-   - Format: Maps `(resolution, aspect_ratio)` into standard `size` string (e.g. `1024x1024`).
-3. **`agnes` / `openai_compat`**:
-   - Configurable base URL via `OPENAI_COMPAT_URL`.
-   - Preserves compatibility with proxy endpoints while supporting OpenRouter-style parameters.
-
-### 4.3 Asynchronous Video Polling with Adaptive Backoff
-
-Video generation typically requires 15 seconds to 4 minutes. The polling engine is updated with adaptive backoff to reduce network overhead and respect rate limits:
-
-```
-[Job Submitted] ──> Initial delay: 3s
-                         │
-                         ▼
-                    [Poll Status] 
-                         │
-        ┌────────────────┼────────────────┐
-        ▼                ▼                ▼
-   "completed"      "processing"       "failed"
-        │                │                │
-        │           Backoff:              │
-        │           min(prev * 1.5, 10s)  ▼
-        │                │           [Return Error]
-        │                ▼
-        │          Sleep duration
-        │                │
-        │                └───> (Repeat until timeout)
-        ▼
-   [Download Artifact via GET]
-        │
-        ▼
-   [Sanitize & Write to Disk]
-        │
-        ▼
-   [Dispatch `media_saved` Hook]
-```
-
-### 4.4 Upgraded CodeAct JS VM Binding (`mini.media`)
-
-The QuickJS `mini.media` binding in `src/runtime/js_bindings.zig` is updated to parse the full OpenRouter option matrix:
+The QuickJS interface is updated to allow optional modern parameters without breaking existing calls:
 
 ```javascript
-// Example 1: High-resolution cinematic image via OpenRouter
-const img = mini.media("image", "Neon cyber-monk meditating on mountain peak", {
-    model: "bytedance-seed/seedream-4.5",
+// Standard Call (works across all providers)
+mini.media("image", "A tranquil mountain temple at dawn", {
     aspect_ratio: "16:9",
     resolution: "2K",
-    filename: "cyber_monk"
+    filename: "temple"
 });
 
-// Example 2: Video generation with custom duration and aspect ratio
-const vid = mini.media("video", "Drone flying through rainy futuristic market", {
-    model: "google/veo-3.1",
+// Legacy Call (automatically coerced)
+mini.media("image", "Logo design", {
+    size: "1024x1024",
+    model: "dall-e-3"
+});
+
+// Video with custom duration
+mini.media("video", "Waves crashing on rocky shore", {
     duration: 6,
-    aspect_ratio: "16:9",
-    resolution: "1080p",
-    filename: "neon_market"
-});
-
-// Example 3: Explicit provider override
-const quickImg = mini.media("image", "Minimalist logo", {
-    provider: "openai",
-    model: "dall-e-3",
-    size: "1024x1024"
+    aspect_ratio: "16:9"
 });
 ```
 
 ---
 
-## 5. Configuration & Environment Variables
+## 5. Non-Breaking Configuration Strategy
 
-| Variable | Type | Default | Description |
-|---|---|---|---|
-| `MINI_MEDIA_PROVIDER` | string | `"openrouter"` | Canonical media provider: `"openrouter"`, `"openai"`, `"agnes"`, `"openai_compat"`. |
-| `OPENROUTER_API_KEY` | string | `null` | Primary API key for OpenRouter endpoints. |
-| `MINI_IMAGE_GEN_MODEL` | string | `"bytedance-seed/seedream-4.5"` | Default model for image generation when unstated. |
-| `MINI_IMAGE_GEN_RESOLUTION` | string | `"1K"` | Default resolution (`"720p"`, `"1080p"`, `"1K"`, `"2K"`, `"4K"`). |
-| `MINI_IMAGE_GEN_ASPECT_RATIO` | string | `"1:1"` | Default aspect ratio (`"1:1"`, `"16:9"`, `"9:16"`, `"4:3"`). |
-| `MINI_VIDEO_GEN_MODEL` | string | `"google/veo-3.1"` | Default model for video generation when unstated. |
-| `MINI_VIDEO_GEN_DURATION` | int | `4` | Default video duration in seconds. |
-| `MINI_MEDIA_OUTPUT_DIR` | string | `"media"` | Destination directory for saved media files. |
-| `MINI_VIDEO_POLL_TIMEOUT_SECS` | int | `600` | Max duration to poll video generation jobs (10 minutes). |
+All existing defaults remain unchanged:
+- `image_gen_provider`: defaults to `"openai"`.
+- `video_gen_provider`: defaults to `"openai"`.
+- `image_gen_model`: defaults to `"gpt-image-1"`.
+- `video_gen_model`: defaults to `"sora-2"`.
 
-*Fallback Hierarchy:* If `OPENROUTER_API_KEY` is absent, the provider automatically checks `OPENAI_COMPAT_API_KEY` or `OPENAI_API_KEY`.
+Users or agents can configure any provider via standard environment variables:
+```bash
+# Optional: Set OpenRouter or any custom provider
+MINI_IMAGE_GEN_PROVIDER="openrouter" # or "openai", "agnes", "openai_compat"
+MINI_VIDEO_GEN_PROVIDER="openrouter"
 
----
-
-## 6. Security, Resource Controls & Safety Bounds
-
-1. **Path Traversal Protection**: All user/model-supplied filenames pass through `sanitizeFilename()`, stripping `..`, slashes, non-alphanumeric characters (preserving `_` and `-`), capped at 64 characters.
-2. **Download Size Quotas**:
-   - Images: Max 25 MB payload limit.
-   - Videos: Max 250 MB download stream limit.
-3. **Polling Circuit Breaker**: Hard timeout at `video_poll_timeout_secs` (default 600s). In-progress jobs that stall or return 5xx errors $> 5$ consecutive times abort with a descriptive diagnostic error.
-4. **Credential Isolation**: Bearer tokens are kept in core memory and never exposed to the JS VM global environment or recorded into session logs.
+# Optional: Dedicated or fallback API keys
+OPENROUTER_API_KEY="sk-or-..."      # Used if provider is openrouter
+OPENAI_COMPAT_API_KEY="sk-..."       # Used as fallback or compat key
+OPENAI_API_KEY="sk-..."              # Standard OpenAI key
+```
 
 ---
 
-## 7. Migration & Backward Compatibility
+## 6. Backward Compatibility & Non-Dogmatic Coercion
 
-- **Existing RFC-011 Tests**: Existing calls to `generateImageDirect` and `generateVideoDirect` will be retained as adapters forwarding to the new protocol layer.
-- **Legacy Parameter Coercion**:
-  - `opts.size = "1024x1024"` $\implies$ `resolution = .res_1k, aspect_ratio = .ar_1_1`.
-  - `opts.size = "1536x1024"` $\implies$ `resolution = .res_2k, aspect_ratio = .ar_16_9`.
-  - `opts.seconds = 6` $\implies$ `duration = 6`.
-- **Existing Env Variables**: `MINI_IMAGE_GEN_PROVIDER` and `MINI_VIDEO_GEN_PROVIDER` continue to function as granular overrides over `MINI_MEDIA_PROVIDER`.
+1. **Legacy `size` String Coercion**:
+   - `"1024x1024"` $\implies$ `Resolution.res_1k, AspectRatio.ar_1_1`
+   - `"1536x1024"` $\implies$ `Resolution.res_2k, AspectRatio.ar_16_9`
+   - `"1024x1536"` $\implies$ `Resolution.res_2k, AspectRatio.ar_9_16`
+   - Any unknown string gracefully falls back to `Resolution.res_1k, AspectRatio.ar_1_1` without error.
+2. **Legacy `seconds` Coercion**:
+   - `seconds` maps directly to `duration`. Values $\le 0$ default to 4; values $> 60$ clamp safely to 60.
+3. **Existing Tool Signatures**:
+   - `generateImageDirect` and `generateVideoDirect` remain fully available and act as thin wrappers around the protocol request structs.
 
 ---
 
-## 8. Implementation Plan & Verifiable Milestones
+## 7. Summary of Deliverables
 
-### Phase 1: Protocol Data Structures & Normalization
-- Create `src/core/media_protocol.zig`.
-- Implement `AspectRatio`, `Resolution`, `JobState` parsers and stringifiers.
-- Implement legacy size string conversion functions.
-- Unit test suite: `testcases/test_media_protocol.zig`.
-
-### Phase 2: OpenRouter Provider Implementation
-- Implement OpenRouter image dispatch (`POST /api/v1/images`).
-- Implement OpenRouter video dispatch (`POST /api/v1/videos`) with adaptive polling loop.
-- Support `b64_json` and direct binary download URLs.
-- Update `src/tools/media_gen.zig` to use the unified provider engine.
-
-### Phase 3: CodeAct JS VM Binding & Tool Registry Updates
-- Update `MediaJsOptions` in `src/runtime/js_bindings.zig` to parse `aspect_ratio`, `resolution`, `duration`, and `provider`.
-- Update native tool definitions (`generate_image`, `generate_video`) in `src/tooling/registry.zig`.
-- Verify turn loop-back attachment integration (`image_attach`).
-
-### Phase 4: Mock Server Integration & E2E Validation
-- Update `scripts/mock_llm_server.js` to simulate OpenRouter `/api/v1/images` and `/api/v1/videos` polling with `polling_url`.
-- Run full pre-commit verification: `zig build test --summary all` (all test steps must pass).
+- `src/core/media_protocol.zig`: Generic, provider-agnostic data types, enums, and coercion functions.
+- `src/tools/media_gen.zig`: Protocol-aware request execution that adapts to OpenAI, OpenRouter, and Agnes seamlessly.
+- `src/runtime/js_bindings.zig`: Enhanced `mini.media` options parsing with zero breaking changes.
+- `testcases/test_media_protocol.zig`: Comprehensive unit tests for protocol parsing, coercion, and validation.
