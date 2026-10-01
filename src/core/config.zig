@@ -236,9 +236,7 @@ pub const Config = struct {
     /// Media output directory. Null = "<workspace>/media".
     media_output_dir: ?[]const u8 = null,
     /// Video poll timeout in seconds.
-    video_poll_timeout_secs: u32 = 600,
-    /// OpenRouter API Key.
-    openrouter_key: ?[]const u8 = null,
+    video_poll_timeout_secs: u32 = 300,
 
     // RFC-019: Structured Planning System
     /// Enable structured planning system. Default: true.
@@ -485,10 +483,11 @@ pub const Config = struct {
             break :blk null;
         };
         const is_agnes = std.mem.indexOf(u8, provider_key, "agnes") != null;
-        const default_media_prov = if (is_agnes) "agnes" else "openrouter";
+        const default_media_prov = if (is_agnes) "agnes" else "openai";
         const media_prov_env = env_map.get("MINI_MEDIA_PROVIDER");
-        const img_prov = if (env_map.get("MINI_IMAGE_GEN_PROVIDER")) |p| (if (p.len > 0) p else if (media_prov_env) |mp| mp else default_media_prov) else (if (media_prov_env) |mp| mp else default_media_prov);
-        const vid_prov = if (env_map.get("MINI_VIDEO_GEN_PROVIDER")) |p| (if (p.len > 0) p else if (media_prov_env) |mp| mp else default_media_prov) else (if (media_prov_env) |mp| mp else default_media_prov);
+        const fallback_prov = if (media_prov_env) |mp| (if (mp.len > 0) mp else default_media_prov) else default_media_prov;
+        const img_prov = if (env_map.get("MINI_IMAGE_GEN_PROVIDER")) |p| (if (p.len > 0) p else fallback_prov) else fallback_prov;
+        const vid_prov = if (env_map.get("MINI_VIDEO_GEN_PROVIDER")) |p| (if (p.len > 0) p else fallback_prov) else fallback_prov;
 
         return .{
             .reasoning_effort = reasoning_effort,
@@ -501,14 +500,13 @@ pub const Config = struct {
             .image_input_max_bytes = if (env_map.get("MINI_IMAGE_INPUT_MAX_BYTES")) |s| std.fmt.parseInt(usize, s, 10) catch 10 * 1024 * 1024 else 10 * 1024 * 1024,
             .image_gen_enabled = if (env_map.get("MINI_IMAGE_GEN_ENABLED")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false,
             .image_gen_provider = img_prov,
-            .image_gen_model = env_map.get("MINI_IMAGE_GEN_MODEL") orelse "bytedance-seed/seedream-4.5",
+            .image_gen_model = env_map.get("MINI_IMAGE_GEN_MODEL") orelse "gpt-image-1",
             .image_gen_size = env_map.get("MINI_IMAGE_GEN_SIZE") orelse "1024x1024",
             .video_gen_enabled = if (env_map.get("MINI_VIDEO_GEN_ENABLED")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false,
-            .video_gen_model = env_map.get("MINI_VIDEO_GEN_MODEL") orelse "google/veo-3.1",
+            .video_gen_model = env_map.get("MINI_VIDEO_GEN_MODEL") orelse "sora-2",
             .video_gen_provider = vid_prov,
             .media_output_dir = env_map.get("MINI_MEDIA_OUTPUT_DIR"),
-            .video_poll_timeout_secs = if (env_map.get("MINI_VIDEO_POLL_TIMEOUT_SECS")) |s| std.fmt.parseInt(u32, s, 10) catch 600 else 600,
-            .openrouter_key = env_map.get("OPENROUTER_API_KEY"),
+            .video_poll_timeout_secs = if (env_map.get("MINI_VIDEO_POLL_TIMEOUT_SECS")) |s| std.fmt.parseInt(u32, s, 10) catch 300 else 300,
         };
     }
 
@@ -667,7 +665,6 @@ pub const Config = struct {
         cfg.video_gen_provider = r.video_gen_provider;
         cfg.media_output_dir = r.media_output_dir;
         cfg.video_poll_timeout_secs = r.video_poll_timeout_secs;
-        cfg.openrouter_key = r.openrouter_key;
         cfg.act_timeout_secs = p.act_timeout_secs;
         cfg.watchdog_tracking_interval_s = p.watchdog_tracking_s;
         cfg.watchdog_recap_interval = p.watchdog_recap_interval;
