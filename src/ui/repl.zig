@@ -494,9 +494,41 @@ fn printConfig(agent: *agent_mod.AgentLoop) void {
     const dynamic_thinking_str: []const u8 = if (agent.dynamic_thinking) "enabled (Cognitive Governor)" else "disabled";
     const memact_str: []const u8 = if (agent.config.memact_enabled) "enabled" else "disabled";
     const pg_str: []const u8 = if (agent.config.memact_pg_enabled) "enabled" else "disabled";
-    const planning_str: []const u8 = if (agent.plan.enable_structured_planning) "enabled" else "disabled";
-    const image_gen_str: []const u8 = if (agent.config.image_gen_enabled) agent.config.image_gen_model else "disabled";
-    const video_gen_str: []const u8 = if (agent.config.video_gen_enabled) agent.config.video_gen_model else "disabled";
+    var plan_buf: [128]u8 = undefined;
+    const planning_str: []const u8 = if (agent.plan.enable_structured_planning)
+        std.fmt.bufPrint(
+            &plan_buf,
+            "on (gates: vfy={d} appr={d} review={d} subagent={d}, max {d} steps)",
+            .{
+                @intFromBool(agent.config.plan_verification_gate),
+                @intFromBool(agent.config.plan_approval_gate),
+                @intFromBool(agent.config.plan_review_gate),
+                @intFromBool(agent.config.plan_subagent_dispatch),
+                agent.config.plan_max_steps,
+            },
+        ) catch "on"
+    else "off";
+
+    var iin_buf: [48]u8 = undefined;
+    const image_input_str = std.fmt.bufPrint(
+        &iin_buf,
+        "{s} ({d}/turn, {d}MB)",
+        .{
+            if (agent.config.image_input_enabled) "on" else "off",
+            agent.config.image_input_max_per_turn,
+            agent.config.image_input_max_bytes / (1024 * 1024),
+        },
+    ) catch "on";
+
+    var ig_buf: [64]u8 = undefined;
+    const image_gen_str: []const u8 = if (agent.config.image_gen_enabled)
+        std.fmt.bufPrint(&ig_buf, "{s} via {s}", .{ agent.config.image_gen_model, agent.config.image_gen_provider }) catch "on"
+    else "off";
+
+    var vg_buf: [96]u8 = undefined;
+    const video_gen_str: []const u8 = if (agent.config.video_gen_enabled)
+        std.fmt.bufPrint(&vg_buf, "{s} via {s} (poll {d}s)", .{ agent.config.video_gen_model, agent.config.video_gen_provider, agent.config.video_poll_timeout_secs }) catch "on"
+    else "off";
 
     var ctx_buf: [64]u8 = undefined;
     const ctx_str = std.fmt.bufPrint(
@@ -561,6 +593,7 @@ fn printConfig(agent: *agent_mod.AgentLoop) void {
             "  \x1b[1mImage Input:\x1b[0m        {s}\n" ++
             "  \x1b[1mImage Gen:\x1b[0m          {s}\n" ++
             "  \x1b[1mVideo Gen:\x1b[0m          {s}\n" ++
+            "  \x1b[1mMedia Output:\x1b[0m     {s}\n" ++
             "  \x1b[1mTools:\x1b[0m             {s}\n" ++
             "  \x1b[1mHooks:\x1b[0m             {s}\n" ++
             "  \x1b[1mSession:\x1b[0m           {s}\n" ++
@@ -582,9 +615,10 @@ fn printConfig(agent: *agent_mod.AgentLoop) void {
             memact_str,
             pg_str,
             planning_str,
-            if (agent.config.image_input_enabled) "enabled" else "disabled",
+            image_input_str,
             image_gen_str,
             video_gen_str,
+            agent.config.media_output_dir orelse "media/",
             tools_str,
             if (agent.config.hooks_config_path) |p| p else "none",
             session_str,
@@ -631,6 +665,15 @@ fn printBasicConfigHelp(io: std.Io) void {
         \\  MINI_EXECUTION_MODE   Agent execution mode: codeact|tools|auto (default: auto)
         \\  MINI_LOOP_CONSECUTIVE_CAP  Max consecutive identical tool calls (default: 3)
         \\  MINI_LOOP_WINDOW_CAP    Max identical tool calls in sliding window (default: 4)
+        \\  MINI_LOOP_MACRO_CYCLE_CAP Max alternating macro-cycle before breaker trips (default: 2)
+        \\  MINI_LOOP_ORBIT_CAP     Max 3D orbit repetition before breaker trips (default: 2)
+        \\  MINI_LOOP_READONLY_WARN Warn after N consecutive read-only actions (default: 5)
+        \\  MINI_LOOP_READONLY_TRIP Trip after N consecutive read-only actions (default: 10)
+        \\  MINI_ACTION_LOOP_DISPLAY Show action-loop detection messages ("0" to suppress)
+        \\  MINI_ACT_TIMEOUT_SECS   Per-act LLM timeout in seconds (default: 120)
+        \\  MINI_WATCHDOG_TRACKING_S Watchdog tracking interval in seconds (default: 10)
+        \\  MINI_WATCHDOG_RECAP_INTERVAL Watchdog recap interval in seconds (default: 10)
+        \\  MINI_WATCHDOG_INTERVAL_MS Watchdog poll interval in ms (default: 200)
         \\
     ) catch {};
 }
@@ -653,6 +696,8 @@ fn printAdvancedConfigHelp(io: std.Io) void {
         \\  MINI_MEMACT_PG_H             Neighborhood hop distance (default: 2)
         \\  MINI_MEMACT_PG_W             Recent trajectory window size (default: 3)
         \\  MINI_MEMACT_PG_AUTO_POPULATE Auto-learn frequent tool transitions (default: on)
+        \\  MINI_MEMACT_PG_ADVISORY      Show procedural advisory messages ("0" to hide)
+        \\  MINI_MEMACT_EXPANSION        LLM query expansion for dual-path retrieval ("0" to disable)
         \\
         \\### Tools & Media I/O (RFC-011)
         \\  MINI_TOOL_ALLOWLIST           Comma-separated list of allowed tools (null = allow all)
@@ -665,9 +710,22 @@ fn printAdvancedConfigHelp(io: std.Io) void {
         \\  MINI_IMAGE_GEN_MODEL          Image generation model (default: gpt-image-1)
         \\  MINI_IMAGE_GEN_SIZE           Default image size (default: 1024x1024)
         \\  MINI_VIDEO_GEN_ENABLED        Enable generate_video tool ("1" to enable)
+        \\  MINI_VIDEO_GEN_PROVIDER       Video gen provider: openai|openai_compat|agnes
         \\  MINI_VIDEO_GEN_MODEL          Video generation model (default: sora-2)
         \\  MINI_MEDIA_OUTPUT_DIR         Media output directory
         \\  MINI_VIDEO_POLL_TIMEOUT_SECS  Video job polling timeout in seconds (default: 600)
+        \\
+        \\### Structured Planning (RFC-019/024)
+        \\  MINI_ENABLE_STRUCTURED_PLANNING Enable LLM-driven planning ("0" to disable, default: on)
+        \\  MINI_PLAN_DRIFT_DETECTION        Detect plan drift ("0" to disable, default: on)
+        \\  MINI_PLAN_MAX_STEPS              Max plan steps per task (default: 20)
+        \\  MINI_PLANS_DIR                    Plan persistence directory
+        \\  MINI_PROMPT_ENFORCEMENT_ENABLED  Inject plan/trajectory enforcement prompts ("1" to enable)
+        \\  MINI_PLAN_VERIFICATION_GATE      Require verification before step completion ("1" to enable)
+        \\  MINI_PLAN_APPROVAL_GATE          Require user approval before executing plan ("1" to enable)
+        \\  MINI_PLAN_REVIEW_GATE            Two-stage review after subagent-executed steps ("1" to enable)
+        \\  MINI_PLAN_SUBAGENT_DISPATCH      Dispatch plan steps to subagents ("1" to enable)
+        \\  MINI_POST_COMPACT_REINJECT       Re-inject plan context after MemAct compaction ("0" to disable)
         \\
         \\### MCP, Hooks & Sessions
         \\  MINI_MCP_CONFIG       Path to mcp.json server configuration

@@ -564,6 +564,17 @@ fn printHelp() void {
         \\  MINI_TOOL_ALLOWLIST    Allow only these tools (comma-separated)
         \\  MINI_TOOL_BLOCKLIST    Block these tools (comma-separated)
         \\  MINI_MCP_CONFIG        Path to mcp.json (default: <MINI_HOME>/mcp.json)
+        \\  MINI_ACTION_LOOP_DISPLAY  Show action-loop messages ("0" to suppress)
+        \\  MINI_ACT_TIMEOUT_SECS  Per-act LLM timeout in seconds (default: 120)
+        \\  MINI_WATCHDOG_INTERVAL_MS Watchdog poll interval in ms (default: 200)
+        \\  MINI_ENABLE_STRUCTURED_PLANNING  LLM-driven planning ("0" to disable)
+        \\  MINI_PLAN_MAX_STEPS    Max plan steps per task (default: 20)
+        \\  MINI_IMAGE_GEN_ENABLED Enable generate_image tool ("1" to enable)
+        \\  MINI_IMAGE_GEN_MODEL   Image generation model
+        \\  MINI_VIDEO_GEN_ENABLED Enable generate_video tool ("1" to enable)
+        \\  MINI_VIDEO_GEN_MODEL   Video generation model
+        \\  MINI_VIDEO_GEN_PROVIDER  Video gen provider: openai|openai_compat|agnes
+        \\  MINI_MEDIA_OUTPUT_DIR  Media output directory
         \\
     ) catch {};
 }
