@@ -1,10 +1,10 @@
 # RFC-027: Universal Media Protocol — Flexible & Provider-Agnostic Synthesis Architecture
 
 **Status**: Proposed  
-**Date**: 2026-10-01  
+**Date**: 2026-10-01 (Updated: 2026-10-02)  
 **Author**: Media & Protocol Engineering  
 **Related**: RFC-011 (Media Generation & Vision Loop-Back), RFC-012 (Provider Abstraction Layer)  
-**Tags**: Multimodal, Image Generation, Video Generation, Wire Protocol, Provider-Agnostic, Flexible Adapter, Zero-Lock-In  
+**Tags**: Multimodal, Image Generation, Video Generation, Wire Protocol, Provider-Agnostic, Flexible Adapter, Zero-Lock-In, Decoupled Providers  
 
 ---
 
@@ -16,19 +16,25 @@ This RFC establishes a flexible, extensible, and **completely provider-agnostic 
 We draw inspiration from modern multimodal gateway designs (such as **OpenRouter's clean separation of concerns** across heterogeneous image and video backends) purely as an **architectural mental model**. The protocol defines clean, canonical representations for media synthesis (aspect ratio, resolution, duration, and async job lifecycle) without tying `mini-agent` to any single vendor, gateway, or closed schema.
 
 ### Core Principles
-1. **Design Reference (Zero Vendor Lock-In & Zero Strictness)**:
+1. **Decoupled Modality Planes (Chat != Image != Video)**:
+   Image and video generation can—and frequently should—use completely different providers, endpoints, and credentials from the conversational chat model:
+   - **Chat Plane**: Anthropic Claude, DeepSeek, Ollama, or OpenAI (`gpt-4o`).
+   - **Image Plane**: OpenRouter (FLUX.1), Fal.ai, OpenAI (DALL-E), Agnes AI, or a local Stable Diffusion / ComfyUI server.
+   - **Video Plane**: OpenAI (Sora), OpenRouter, Agnes AI, or Runway/Luma gateways.
+   Neither the chat backend wire protocol nor its authentication leaks into or restricts media synthesis.
+2. **Design Reference (Zero Vendor Lock-In & Zero Strictness)**:
    Modern multimodal APIs demonstrate the elegance of expressing generation requests via clean dimensions: prompt, aspect ratio, resolution, and lifecycle states. Any provider—whether standard OpenAI, OpenRouter, Agnes AI, Fal.ai, Replicate, or a local proxy—plugs cleanly into this protocol.
-2. **Postel's Law (Liberal Acceptance, Robust Forwarding)**:
+3. **Postel's Law (Liberal Acceptance, Robust Forwarding)**:
    The protocol is **completely permissive**:
    - Provides standard presets (`1:1`, `16:9`, `9:16`, `1080p`, `2K`, etc.) as ergonomic conveniences.
    - **Never rejects custom values**: arbitrary aspect ratios (e.g., `"3:2"`, `"2:3"`, `"4:5"`), custom resolutions (e.g., `"512x512"`, `"1920x1080"`, `"480p"`, `"8k"`), or novel provider parameters pass through verbatim via optional raw fields (`raw_aspect_ratio`, `raw_resolution`) without lossy coercion or validation errors.
-3. **Pluggable & Extensible Provider Adapters**:
+4. **Pluggable & Extensible Provider Adapters**:
    The protocol layer adapts normalized parameters to any target provider:
    - **OpenAI**: Maps standard presets to legacy `size` strings (e.g., `"1024x1024"`), passes raw dimension strings if supplied, and forwards to standard `/v1/images/generations` and `/v1/videos`.
    - **OpenRouter & Modern Gateways**: Emits clean `aspect_ratio`, `resolution`, and `duration` fields to `/api/v1/images` and `/api/v1/videos`.
    - **Agnes AI & Custom Proxies**: Seamlessly respects custom endpoints (`OPENAI_COMPAT_URL`) and async polling mechanisms.
    - **Local & Future Providers**: Any HTTP endpoint can be wired with zero changes to core agent logic.
-4. **Preserve All Existing Defaults & 100% Backward Compatibility**:
+5. **Preserve All Existing Defaults & 100% Backward Compatibility**:
    - Default provider remains `openai` (`MINI_IMAGE_GEN_PROVIDER="openai"`, `MINI_VIDEO_GEN_PROVIDER="openai"`).
    - Default models remain `gpt-image-1` and `sora-2`.
    - Legacy tool parameters (`size="1024x1024"`, `seconds=4`) and direct tool signatures remain fully functional.
@@ -39,7 +45,15 @@ We draw inspiration from modern multimodal gateway designs (such as **OpenRouter
 
 In RFC-011 (`src/tools/media_gen.zig`), media synthesis was coupled directly to legacy OpenAI API paths (`/images/generations`) with ad-hoc conditionals for custom proxy endpoints.
 
-### Decoupling Intent from Vendor Wire Format
+### 2.1 The Modality Mismatch Problem (Chat != Media)
+Modern AI agent architectures rarely use the same model provider across all modalities:
+- A user may configure `mini-agent` with `PROVIDER=claude` (Anthropic Claude 3.7 Sonnet) for coding reasoning. Because Claude does not have native image or video generation endpoints, forcing media generation to inherit the chat provider causes failures or requires fragile monkey-patching.
+- Similarly, a user using local `PROVIDER=ollama` for privacy might still want high-quality cloud rendering for graphics via OpenRouter FLUX or OpenAI Sora.
+- Or, a team might use an Agnes AI proxy for chat completions, but route images directly to a private Fal.ai or ComfyUI instance.
+
+Therefore, **image and video synthesis must be treated as independent service planes**, each with its own provider type, base URL, credentials, and model defaults.
+
+### 2.2 Decoupling Intent from Vendor Wire Format
 When an agent or user requests media, the intent is conceptual:
 - **Image**: Prompt, Model, Aspect Ratio, Resolution.
 - **Video**: Prompt, Model, Duration, Aspect Ratio, Resolution.
@@ -68,7 +82,7 @@ Drawing from the clean decomposition pattern seen in modern multimodal gateways:
   - `resolution`: Recognized preset enum (`720p`, `1080p`, `1K`, `2K`, `4K`) **OR** arbitrary custom dimension string (`raw_resolution`, e.g., `"512x512"`).
   - `n`: Number of outputs (default: 1).
   - `filename`: Optional output destination filename.
-  - `provider`: Optional per-request provider override (e.g., `"openrouter"`, `"openai"`, `"agnes"`).
+  - `provider`: Optional per-request provider override (e.g., `"openrouter"`, `"openai"`, `"agnes"`, `"fal"`).
   - `input_references`: Optional reference image URLs or file paths for image-to-image synthesis.
 - **Video Synthesis (Async Lifecycle)**:
   - `prompt`: Motion/scene description.
@@ -85,31 +99,38 @@ Drawing from the clean decomposition pattern seen in modern multimodal gateways:
 ## 4. Architecture & Component Layout
 
 ```
-                  ┌────────────────────────────────────────────────────────┐
-                  │          CodeAct (mini.media) / Native Tools           │
-                  └──────────────────────────┬─────────────────────────────┘
-                                             │
-                                             ▼
-                  ┌────────────────────────────────────────────────────────┐
-                  │         src/core/media_protocol.zig (RFC-027)          │
-                  │  • Normalized Requests (ImageGenRequest, VideoGenReq)  │
-                  │  • Standard Preset Enums (AspectRatio, Resolution)     │
-                  │  • Raw Passthrough (raw_aspect_ratio, raw_resolution)  │
-                  │  • Tolerant Coercion & String Extraction Helpers       │
-                  └──────────────────────────┬─────────────────────────────┘
-                                             │
-                                             ▼
-                  ┌────────────────────────────────────────────────────────┐
-                  │                 Media Dispatch Engine                  │
-                  │              (src/tools/media_gen.zig)                 │
-                  └──────────────────────────┬─────────────────────────────┘
-                                             │
-             ┌───────────────────────────────┼───────────────────────────────┐
-             ▼                               ▼                               ▼
-    [OpenAI Provider]              [OpenRouter Provider]            [Agnes / Custom Proxy]
-    • Maps presets to `size`       • Sends native schema            • Respects custom paths
-    • /images/generations          • /api/v1/images                 • OPENAI_COMPAT_URL
-    • /videos                      • /api/v1/videos (async job)     • Custom polling logic
+                                  ┌──────────────────────────┐
+                                  │   User / Task Request    │
+                                  └─────────────┬────────────┘
+                                                │
+                                                ▼
+                         ┌──────────────────────────────────────────────┐
+                         │            Agent Core (src/core/)            │
+                         └──────┬────────────────────────────────┬──────┘
+                                │                                │
+                                ▼                                ▼
+               ┌─────────────────────────────────┐   ┌─────────────────────────────────────┐
+               │           Chat Plane            │   │             Media Plane             │
+               │        (src/backends/)          │   │      (src/core/media_protocol.zig)  │
+               ├─────────────────────────────────┤   ├──────────────────┬──────────────────┤
+               │ • Claude (Anthropic API)        │   │   Image Plane    │   Video Plane    │
+               │ • DeepSeek (OpenAI Compat)      │   │ • OpenRouter     │ • OpenAI Sora    │
+               │ • Ollama (Local Ollama HTTP)    │   │ • Fal.ai / SD    │ • Agnes Video    │
+               │ • OpenAI (Responses / Chat API) │   │ • OpenAI DALL-E  │ • Luma / Runway  │
+               └─────────────────────────────────┘   └──────────────────┴──────────────────┘
+                                                                │
+                                                                ▼
+                                             ┌─────────────────────────────────────┐
+                                             │        Media Dispatch Engine        │
+                                             │      (src/tools/media_gen.zig)      │
+                                             └──────────────────┬──────────────────┘
+                                                                │
+                 ┌──────────────────────────────────────────────┼──────────────────────────────────────────────┐
+                 ▼                                              ▼                                              ▼
+        [OpenAI Provider]                             [OpenRouter Provider]                         [Agnes / Custom Proxy]
+        • Maps presets to `size`                      • Sends native schema                         • Respects custom paths
+        • /images/generations                         • /api/v1/images                              • OPENAI_COMPAT_URL
+        • /videos                                     • /api/v1/videos (async job)                  • Custom polling logic
 ```
 
 ### 4.1 Permissive Protocol Definitions (`src/core/media_protocol.zig`)
@@ -260,66 +281,87 @@ The dispatcher resolves parameters dynamically without forcing any provider as m
    - Dispatches `aspect_ratio` and `resolution` strings directly to `/api/v1/images` and `/api/v1/videos`.
    - Supports both standard presets and arbitrary custom aspect ratios.
 3. **Agnes AI & Custom Compat Adapter**:
-   - Routes to configured `OPENAI_COMPAT_URL`.
+   - Routes to configured `OPENAI_COMPAT_URL` or dedicated media endpoint.
    - Preserves custom polling logic (e.g., `/agnesapi?video_id=...`).
 4. **Extensibility**:
    - New backends (e.g., local Diffusers, Fal.ai) can be registered without modifying the caller interface.
 
-### 4.3 CodeAct JS VM Usage (`mini.media`)
+### 4.3 CodeAct JS VM Usage (`mini.media`) — Heterogeneous Modality Example
 
-QuickJS options support both standard presets and custom values seamlessly:
+An agent running with **Claude 3.7** as its main reasoning engine can seamlessly invoke different media providers in the same turn:
 
 ```javascript
-// Preset style (clean and portable across providers)
-mini.media("image", "A serene Japanese zen garden in autumn", {
+// Chat LLM is Claude 3.7.
+// 1. Generate an architectural diagram using OpenRouter Flux Pro:
+const blueprint = mini.media("image", "Modern architectural floorplan blueprint with blue ambient grid", {
+    provider: "openrouter",
+    model: "black-forest-labs/flux-1.1-pro",
     aspect_ratio: "16:9",
     resolution: "2K",
-    filename: "garden"
+    filename: "blueprint_v1"
 });
 
-// Custom aspect ratio & resolution (never rejected or dropped)
-mini.media("image", "Panoramic mountain ridge", {
-    aspect_ratio: "3:2",
-    resolution: "1920x1080"
+// 2. Generate a product hero video using OpenAI Sora:
+const teaser = mini.media("video", "Smooth 3D camera pan across futuristic metallic watch", {
+    provider: "openai",
+    model: "sora-2",
+    duration: 5,
+    aspect_ratio: "16:9",
+    filename: "teaser_v1"
 });
 
-// Legacy style (100% backward compatible)
-mini.media("image", "Company mascot icon", {
-    size: "1024x1024",
-    model: "gpt-image-1"
-});
-
-// Video generation with flexible duration
-mini.media("video", "Drone flying over ocean waves", {
-    duration: 6,
-    aspect_ratio: "16:9"
+// 3. Fallback to default configured media provider:
+const icon = mini.media("image", "Minimalist gear icon", {
+    size: "1024x1024"
 });
 ```
 
 ---
 
-## 5. Non-Breaking Configuration Strategy
+## 5. Decoupled Provider Configuration Hierarchy
 
-All existing defaults and behaviors remain completely intact:
-- `image_gen_provider`: defaults to `"openai"`.
-- `video_gen_provider`: defaults to `"openai"`.
-- `image_gen_model`: defaults to `"gpt-image-1"`.
-- `video_gen_model`: defaults to `"sora-2"`.
+Media synthesis providers are configured **independently from the chat model**.
 
-Users or agents can configure any provider via environment variables:
+### 5.1 Resolution Cascade for Image Generation
+1. **Per-request parameter**: `mini.media("image", prompt, { provider: "...", ... })`.
+2. **Environment Provider**: `MINI_IMAGE_GEN_PROVIDER` (defaults to `"openai"`).
+3. **Dedicated Base URL**: `MINI_IMAGE_GEN_URL` $\to$ falls back to provider default (e.g., `https://openrouter.ai/api/v1` for openrouter, `https://api.openai.com/v1` for openai, or `OPENAI_COMPAT_URL`).
+4. **Dedicated API Key**: `MINI_IMAGE_GEN_API_KEY` $\to$ falls back to `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, or `OPENAI_COMPAT_KEY`.
+
+### 5.2 Resolution Cascade for Video Generation
+1. **Per-request parameter**: `mini.media("video", prompt, { provider: "...", ... })`.
+2. **Environment Provider**: `MINI_VIDEO_GEN_PROVIDER` (defaults to `"openai"`).
+3. **Dedicated Base URL**: `MINI_VIDEO_GEN_URL` $\to$ falls back to provider default.
+4. **Dedicated API Key**: `MINI_VIDEO_GEN_API_KEY` $\to$ falls back to `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, or `OPENAI_COMPAT_KEY`.
+
+### 5.3 Configuration Matrix Example
 ```bash
-# Default remains standard OpenAI:
-# MINI_IMAGE_GEN_PROVIDER="openai" (default)
-# MINI_VIDEO_GEN_PROVIDER="openai" (default)
+# ========================================================
+# 1. Chat Reasoning Engine (Anthropic Claude 3.7 Sonnet)
+# ========================================================
+PROVIDER="claude"
+ANTHROPIC_API_KEY="sk-ant-..."
+ANTHROPIC_MODEL="claude-3-7-sonnet-20250219"
 
-# Optional: Switch to OpenRouter, Agnes AI, or custom endpoint
-MINI_IMAGE_GEN_PROVIDER="openrouter" # or "openai_compat", "agnes"
-MINI_VIDEO_GEN_PROVIDER="openrouter"
+# ========================================================
+# 2. Image Generation (OpenRouter / FLUX.1 Pro)
+# ========================================================
+MINI_IMAGE_GEN_ENABLED="1"
+MINI_IMAGE_GEN_PROVIDER="openrouter"
+MINI_IMAGE_GEN_MODEL="black-forest-labs/flux-1.1-pro"
+OPENROUTER_API_KEY="sk-or-v1-..."
+# Optional dedicated URL override:
+# MINI_IMAGE_GEN_URL="https://openrouter.ai/api/v1"
 
-# Optional: Provider-specific or fallback API keys
-OPENAI_API_KEY="sk-..."              # Standard OpenAI key
-OPENROUTER_API_KEY="sk-or-..."      # Used when provider is openrouter
-OPENAI_COMPAT_API_KEY="sk-..."       # Used for compat or custom gateways
+# ========================================================
+# 3. Video Generation (OpenAI / Sora 2)
+# ========================================================
+MINI_VIDEO_GEN_ENABLED="1"
+MINI_VIDEO_GEN_PROVIDER="openai"
+MINI_VIDEO_GEN_MODEL="sora-2"
+OPENAI_API_KEY="sk-..."
+
+# Default models and providers remain neutral and untouched if unspecified.
 ```
 
 ---
@@ -338,7 +380,8 @@ OPENAI_COMPAT_API_KEY="sk-..."       # Used for compat or custom gateways
 
 ## 7. Deliverables & Verification
 
-- `src/core/media_protocol.zig`: Permissive, unopinionated data structures with preset enums and raw string passthrough.
-- `src/tools/media_gen.zig`: Adaptive dispatch engine supporting OpenAI, OpenRouter, and Agnes AI.
-- `src/runtime/js_bindings.zig`: Enhanced `mini.media` options parsing supporting presets, raw strings, and legacy options.
+- `src/core/media_protocol.zig`: Permissive, unopinionated data structures with preset enums, raw string passthrough, and per-request `provider` fields.
+- `src/core/config.zig`: Independent image and video provider configuration support.
+- `src/tools/media_gen.zig`: Adaptive dispatch engine supporting independent OpenAI, OpenRouter, and Agnes AI routing decoupled from the chat backend.
+- `src/runtime/js_bindings.zig`: Enhanced `mini.media` options parsing supporting presets, raw strings, legacy options, and per-call `provider` selection.
 - `testcases/test_media_protocol.zig`: Unit tests verifying parsing, raw string preservation, and legacy coercion.
