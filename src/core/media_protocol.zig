@@ -1,7 +1,8 @@
-//! core/media_protocol.zig — OpenRouter-Standardized Media Protocol (RFC-027).
+//! core/media_protocol.zig — Universal Multimodal Media Protocol (RFC-027).
 //!
-//! Provides normalized types, enums, and request/response structures for
-//! multimodal image and video synthesis compatible with OpenRouter and OpenAI.
+//! Provides normalized types, enums, raw string passthrough, and request/response
+//! structures for multimodal image and video synthesis compatible across OpenAI,
+//! OpenRouter, Agnes AI, and custom proxies without vendor lock-in.
 
 const std = @import("std");
 
@@ -90,19 +91,20 @@ pub const JobState = enum {
 pub const LegacyCoercedSize = struct {
     res: Resolution,
     aspect: AspectRatio,
+    raw: ?[]const u8 = null,
 };
 
 pub fn coerceLegacySize(size_str: []const u8) LegacyCoercedSize {
     if (std.mem.eql(u8, size_str, "1024x1024") or std.mem.eql(u8, size_str, "512x512") or std.mem.eql(u8, size_str, "256x256")) {
-        return .{ .res = .res_1k, .aspect = .ar_1_1 };
+        return .{ .res = .res_1k, .aspect = .ar_1_1, .raw = size_str };
     }
     if (std.mem.eql(u8, size_str, "1536x1024") or std.mem.eql(u8, size_str, "1792x1024") or std.mem.eql(u8, size_str, "1280x720")) {
-        return .{ .res = .res_2k, .aspect = .ar_16_9 };
+        return .{ .res = .res_2k, .aspect = .ar_16_9, .raw = size_str };
     }
     if (std.mem.eql(u8, size_str, "1024x1536") or std.mem.eql(u8, size_str, "1024x1792") or std.mem.eql(u8, size_str, "720x1280")) {
-        return .{ .res = .res_2k, .aspect = .ar_9_16 };
+        return .{ .res = .res_2k, .aspect = .ar_9_16, .raw = size_str };
     }
-    return .{ .res = .res_1k, .aspect = .ar_1_1 };
+    return .{ .res = .res_1k, .aspect = .ar_1_1, .raw = size_str };
 }
 
 pub fn coerceLegacySeconds(seconds: u32) u32 {
@@ -115,11 +117,25 @@ pub const ImageGenRequest = struct {
     prompt: []const u8,
     model: ?[]const u8 = null,
     resolution: ?Resolution = null,
+    raw_resolution: ?[]const u8 = null,
     aspect_ratio: ?AspectRatio = null,
+    raw_aspect_ratio: ?[]const u8 = null,
     n: u8 = 1,
     filename: ?[]const u8 = null,
     provider: ?[]const u8 = null,
     input_references: []const []const u8 = &.{},
+
+    pub fn getAspectRatioString(self: ImageGenRequest) ?[]const u8 {
+        if (self.raw_aspect_ratio) |raw| return raw;
+        if (self.aspect_ratio) |ar| return ar.asString();
+        return null;
+    }
+
+    pub fn getResolutionString(self: ImageGenRequest) ?[]const u8 {
+        if (self.raw_resolution) |raw| return raw;
+        if (self.resolution) |res| return res.asString();
+        return null;
+    }
 };
 
 pub const VideoGenRequest = struct {
@@ -127,8 +143,22 @@ pub const VideoGenRequest = struct {
     model: ?[]const u8 = null,
     duration: u32 = 4,
     resolution: ?Resolution = null,
+    raw_resolution: ?[]const u8 = null,
     aspect_ratio: ?AspectRatio = null,
+    raw_aspect_ratio: ?[]const u8 = null,
     generate_audio: bool = false,
     filename: ?[]const u8 = null,
     provider: ?[]const u8 = null,
+
+    pub fn getAspectRatioString(self: VideoGenRequest) ?[]const u8 {
+        if (self.raw_aspect_ratio) |raw| return raw;
+        if (self.aspect_ratio) |ar| return ar.asString();
+        return null;
+    }
+
+    pub fn getResolutionString(self: VideoGenRequest) ?[]const u8 {
+        if (self.raw_resolution) |raw| return raw;
+        if (self.resolution) |res| return res.asString();
+        return null;
+    }
 };
