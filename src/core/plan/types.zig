@@ -1,4 +1,4 @@
-//! plan.zig — Structured Planning System (RFC-019)
+//! core/plan/types.zig — Structured Planning System (RFC-019 / RFC-024)
 //!
 //! Provides plan data model with step tracking, dependency management,
 //! serialization, and validation for multi-step task execution.
@@ -11,8 +11,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const json = @import("json.zig");
-const utils = @import("utils.zig");
+const json = @import("../json.zig");
+const utils = @import("../utils.zig");
 
 // ---------------------------------------------------------------------------
 // Step Status

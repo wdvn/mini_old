@@ -1,16 +1,16 @@
-//! plan_store.zig — Persistent plan storage (RFC-019)
+//! core/plan/store.zig — Persistent plan storage (RFC-019)
 //!
 //! Stores and restores plans using Content-Addressed Storage (CAS).
 //! Enables cross-turn and cross-session plan persistence.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const cas_mod = @import("cas.zig");
+const cas_mod = @import("../cas.zig");
 const CAS = cas_mod.CAS;
-const plan_mod = @import("plan.zig");
+const plan_mod = @import("types.zig");
 const Plan = plan_mod.Plan;
-const json_mod = @import("json.zig");
-const utils = @import("utils.zig");
+const json_mod = @import("../json.zig");
+const utils = @import("../utils.zig");
 
 // ---------------------------------------------------------------------------
 // Plan Metadata

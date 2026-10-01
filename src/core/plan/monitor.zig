@@ -1,4 +1,4 @@
-//! plan_monitor.zig — Plan execution monitoring and drift detection (RFC-019)
+//! core/plan/monitor.zig — Plan execution monitoring and drift detection (RFC-019)
 //!
 //! Detects when actual execution deviates from planned trajectory
 //! and generates corrective guidance.
@@ -10,14 +10,14 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const plan_mod = @import("plan.zig");
+const plan_mod = @import("types.zig");
 const Plan = plan_mod.Plan;
 const PlanStep = plan_mod.PlanStep;
 const PlanDrift = plan_mod.PlanDrift;
 const StepStatus = plan_mod.StepStatus;
-const plan_executor = @import("plan_executor.zig");
-const utils = @import("utils.zig");
-const prompts_mod = @import("prompts.zig");
+const plan_executor = @import("executor.zig");
+const utils = @import("../utils.zig");
+const prompts_mod = @import("../prompts.zig");
 
 // ---------------------------------------------------------------------------
 // Drift Detection
@@ -153,7 +153,7 @@ pub fn generateDriftCorrection(
 
     const current_step = plan_executor.findStepById(plan, drift.step_id);
 
-    try bw.writeAll("[Plan Drift Detected]\n");
+    try bw.writeAll(prompts_mod.plan_drift_header);
     if (current_step) |cs| {
         try bw.print("Step: {s}\n", .{cs.description});
     }
@@ -162,7 +162,7 @@ pub fn generateDriftCorrection(
     try bw.print("Actual tool: {s}\n", .{drift.actual_tool});
 
     if (drift.drift_score > 0.7) {
-        try bw.writeAll("\n⚠️ Significant deviation detected.\n");
+        try bw.writeAll(prompts_mod.plan_drift_significant);
         if (drift.expected_tool) |et| {
             try bw.print(prompts_mod.plan_drift_significant_tool_fmt, .{et});
         }

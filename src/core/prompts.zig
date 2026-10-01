@@ -409,3 +409,186 @@ pub const pg_orbit_must_list =
     "4. If you already have enough information, skip further exploration and answer the user's question directly.\n";
 
 // ---------------------------------------------------------------------------
+// MemAct query expansion & memory extraction prompts
+// ---------------------------------------------------------------------------
+
+/// System prompt for MemAct query expansion.
+pub const memact_expansion_system_prompt =
+    \\You are the MemAct query expander. Expand the retrieval query into related keywords,
+    \\synonyms, identifiers, and error codes likely to appear in project memory records.
+    \\Output keywords only — one per line, max 12 lines, no numbering, no prose.
+    \\
+;
+
+/// System prompt for MemAct end-of-turn memory extraction.
+pub const memact_extraction_system_prompt =
+    \\You are the MemAct memory extractor. Extract durable, reusable knowledge
+    \\(project facts, state, verified lessons, error causes) from a completed agent task.
+    \\Output JSON only.
+    \\
+;
+
+/// User prompt prefix for MemAct memory extraction.
+pub const memact_extraction_user_prompt_head =
+    "Extract at most 5 durable facts or lessons from this completed task that would help future sessions. " ++
+    "Output a JSON array only, each item: {\"content\": \"<informative sentence, min 20 chars>\", " ++
+    "\"keywords\": [\"k1\",\"k2\"], \"type\": \"semantic\"|\"project_state\", " ++
+    "\"confidence\": 0.0-1.0 (1.0 = confirmed by a successful test/build, lower = inferred), " ++
+    "\"related_tool\": \"<tool name if a tool caused/verified it else null>\"}. " ++
+    "No prose outside the JSON.\n\nUser request:\n";
+
+// ---------------------------------------------------------------------------
+// Watchdog timeout supervisor consultation prompts
+// ---------------------------------------------------------------------------
+
+/// System prompt for Watchdog timeout supervisor evaluation.
+pub const watchdog_supervisor_system_prompt =
+    \\You are the Watchdog Supervisor for mini-agent.
+    \\An action is taking longer than the configured timeout limit.
+    \\Your job is to analyze the action and output to decide if it is legitimately working (e.g. compiling, downloading, running a long test suite) or hung/frozen/waiting for input.
+;
+
+/// Decision prompt template for Watchdog timeout supervisor.
+/// Format args: {d} = act id, {s} = action description, {d} = elapsed seconds, {d} = timeout seconds, {d} = log tail len, {s} = log tail.
+pub const watchdog_supervisor_decision_prompt_fmt =
+    \\Act {d} has been running action '{s}' for {d}s (timeout limit is {d}s).
+    \\
+    \\Recent execution output tail ({d} bytes):
+    \\```
+    \\{s}
+    \\```
+    \\
+    \\Determine whether this action is making legitimate forward progress that needs more time, OR is stuck, deadlocked, idling, or waiting on user input.
+    \\
+    \\Respond on the first line strictly with:
+    \\DECISION: WAIT <seconds> (e.g., DECISION: WAIT 60)
+    \\or
+    \\DECISION: KILL
+    \\
+    \\On the second line, provide a short 1-sentence reason:
+    \\REASON: <explanation>
+;
+
+// ---------------------------------------------------------------------------
+// Context compaction prompts (MemAct & legacy)
+// ---------------------------------------------------------------------------
+
+/// System prompt for MemAct JSON context compaction.
+pub const memact_compaction_prompt =
+    "SYSTEM: You are the MemAct memory engine. Concisely summarize the preceding conversation into JSON, strictly adhering to this stencil:\n" ++
+    "{\n  \"type\": \"context_summary\",\n  \"iteration_range\": [1, 99],\n  \"task_state\": \"progress description\",\n  \"decisions\": [\"decision 1\"],\n  \"open_questions\": [],\n  \"learned_errors\": [],\n  \"files_touched\": [],\n  \"next_step\": \"next step\"\n}\n" ++
+    "If the input conversation already contains a \"[MemAct Context Summary]\" block, merge the previous summary into the new summary, retaining critical details while preserving the JSON stencil above.\nOutput JSON only, with no additional markdown text.";
+
+/// Legacy summary prompt when MemAct is disabled.
+pub const legacy_compaction_prompt =
+    "SYSTEM: History is full. Please summarize the current task state (what has been done, results, next steps). Do not call tools, return summary text only.";
+
+/// Header for post-compact plan context reinjection.
+pub const post_compact_plan_header = "[Post-Compact Plan Context]\n";
+
+/// Prefix for post-compact read skills reinjection.
+pub const post_compact_skills_prefix = "\n[Skills already read this session] ";
+
+// ---------------------------------------------------------------------------
+// CodeAct execution & feedback prompts
+// ---------------------------------------------------------------------------
+
+/// CodeAct system intervention message when action loop persists after replanning.
+pub const codeact_system_intervention =
+    "[CodeAct System Intervention]: Action loop persisted after multiple replanning attempts. Halting execution. Synthesize your findings and answer the user now.";
+
+/// Header for CodeAct JavaScript error report.
+pub const codeact_js_error_header = "[CodeAct JavaScript Error]\n";
+
+/// Notice injected when 3 consecutive JavaScript errors occur.
+pub const codeact_js_consecutive_errors_notice =
+    "Notice: 3 consecutive JavaScript execution errors occurred. You may fall back to standard tool calling or simplify your code.\n";
+
+/// Prompt instructing the model to retry after JavaScript error.
+pub const codeact_js_retry_prompt =
+    "Please analyze the error and retry by outputting corrected JavaScript code inside ```js ... ``` block.\n";
+
+/// Template for duplicate CodeAct script serving cached result.
+/// Format args: {s} = cached output.
+pub const codeact_cached_result_fmt =
+    "[duplicate: identical CodeAct script already executed this turn — cached output below]\n{s}";
+
+// ---------------------------------------------------------------------------
+// Response recovery & continuation prompts
+// ---------------------------------------------------------------------------
+
+/// Format args: {s} = trimmed thinking tail.
+pub const thinking_tail_hint_fmt =
+    "[System] The previous response's reasoning was truncated at the max_tokens limit. You stopped here:\n\n{s}\n\nResume from that point with MINIMAL reasoning (keep thinking to a few sentences, or call mini.setThinking(\"low\")), then emit the next tool call. Do not re-derive completed analysis.";
+
+pub const recovery_advisory_thinking_only =
+    "The model response contained internal reasoning/thinking only, without any actionable output or tool invocation. Please provide the necessary tool calls or final response to proceed.";
+
+pub const recovery_advisory_empty_response =
+    "The model response was empty or contained only whitespace. Please provide the necessary tool calls or final response to proceed.";
+
+pub const recovery_advisory_missing_terminal =
+    "The model response stream terminated unexpectedly without a terminal event. Please resume and provide the complete tool call or response.";
+
+pub const recovery_advisory_stream_aborted =
+    "The model response stream was interrupted or aborted due to idle timeout. Please resume from where execution stopped.";
+
+pub const recovery_advisory_malformed_tool_call =
+    "Your previous tool call was malformed (invalid JSON arguments or an empty tool name) and could not be executed. Re-emit exactly ONE well-formed tool call (one ```js block with valid `mini.*` calls and JSON-object arguments). Do not include the malformed block.";
+
+pub const recovery_advisory_truncated_tool_call =
+    "Your previous tool call was truncated (the arguments JSON was cut off before it completed) and could not be executed. Re-emit the SAME tool call with COMPLETE, well-formed JSON-object arguments. Do not include the truncated block.";
+
+/// Continuation prompt on max_tokens stop.
+/// Format args: {d} = continue attempt count.
+pub const max_tokens_continuation_fmt =
+    "[System] The previous response was truncated due to reaching the max_tokens limit (attempt {d}). Please continue EXACTLY from where it stopped — do not repeat already written content, do not re-introduce. If a ```js ... ``` block or tool call was in progress, complete the remainder.";
+
+/// Continuation prompt on idle stream timeout stop.
+pub const idle_stream_continuation =
+    "[System] The previous response was interrupted because the model stream went silent (idle watchdog). Continue EXACTLY from where it stopped — do not repeat already written content.";
+
+/// Continuation prompt on controlled stop sequence boundary.
+pub const stop_sequence_continuation =
+    "[System] The response stopped at a controlled sequence boundary. Continue from that boundary without repeating prior output.";
+
+/// Continuation prompt on explicit stop boundary.
+pub const explicit_stop_continuation =
+    "[System] The response ended at an explicit stop boundary. Continue from that boundary without repeating prior output.";
+
+// ---------------------------------------------------------------------------
+// Plan execution & watchdog directives (RFC-019 / RFC-024)
+// ---------------------------------------------------------------------------
+
+/// Directive injected by Plan Watchdog when model returns text only during active plan.
+/// Format args: {s} = plan summary.
+pub const plan_watchdog_directive_fmt =
+    "[Plan Watchdog Directive]: You formulated an active implementation plan ('{s}') but ended your turn with descriptive text only without executing any tools. You MUST now proceed directly to executing Step 1 using tools (e.g. file_edit, bash, etc.). Do not return monologue or explanation without tool actions.";
+
+/// Header for plan drift report.
+pub const plan_drift_header = "[Plan Drift Detected]\n";
+
+/// Prompt template for single-step review in plan dispatch.
+/// Format args: {s} = step description, {s} = verification description, {s} = output, {d} = critical, {d} = important, {d} = minor.
+pub const plan_dispatch_review_step_fmt =
+    \\Review the following plan-step output against the step specification.
+    \\Step: "{s}"
+    \\Verification requirement: {s}
+    \\
+    \\Reviewer output:
+    \\{s}
+    \\
+    \\End with a verdict block:
+    \\SEVERITIES: critical={d} important={d} minor={d}
+;
+
+/// Intro text for batch plan dispatch review.
+pub const plan_dispatch_review_batch_intro =
+    "Review the following batch of parallel plan-step outputs. " ++
+    "Each step was executed independently; check spec-compliance and code quality.\n\n";
+
+/// Verdict block ending for batch plan dispatch review.
+pub const plan_dispatch_review_verdict_block =
+    "\n\nEnd with a verdict block:\n" ++
+    "SEVERITIES: critical=0 important=0 minor=0";
+

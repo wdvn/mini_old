@@ -1,4 +1,4 @@
-//! plan_executor.zig — Execute plan steps with dependency resolution (RFC-019)
+//! core/plan/executor.zig — Execute plan steps with dependency resolution (RFC-019)
 //!
 //! Manages step execution lifecycle:
 //! - Dependency resolution before step activation
@@ -8,11 +8,11 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const plan_mod = @import("plan.zig");
+const plan_mod = @import("types.zig");
 const Plan = plan_mod.Plan;
 const PlanStep = plan_mod.PlanStep;
 const StepStatus = plan_mod.StepStatus;
-const utils = @import("utils.zig");
+const utils = @import("../utils.zig");
 
 // ---------------------------------------------------------------------------
 // Execution Context
@@ -191,7 +191,7 @@ pub const VerificationRunner = *const fn (
     value: []const u8,
 ) plan_mod.VerificationStatus;
 
-const process_manager = @import("../runtime/process_manager.zig");
+const process_manager = @import("../../runtime/process_manager.zig");
 
 /// Default runner: file_exists / file_contains use the local filesystem; shell
 /// runs the command (parent-death-guarded) and reports .passed on exit 0.

@@ -32,7 +32,7 @@ const proto = @import("protocol.zig");
 const config_mod = @import("config.zig");
 const history_mod = @import("history.zig");
 const tools_mod = @import("../tooling/registry.zig");
-const plan_dispatch = @import("plan_dispatch.zig");
+const plan_dispatch = @import("plan/dispatch.zig");
 const media_gen_tool = @import("../tools/media_gen.zig");
 const json_mod = @import("json.zig");
 const openai_mod = @import("../backends/openai.zig");
@@ -51,12 +51,12 @@ const bm25_mod = @import("memact/bm25.zig");
 const snapshot_mod = @import("snapshot.zig");
 const cas_mod = @import("cas.zig");
 const prompts_mod = @import("prompts.zig");
-const plan_parser = @import("plan_parser.zig");
-const plan_executor = @import("plan_executor.zig");
-const plan_monitor = @import("plan_monitor.zig");
+const plan_parser = @import("plan/parser.zig");
+const plan_executor = @import("plan/executor.zig");
+const plan_monitor = @import("plan/monitor.zig");
 const plan_mod = @import("plan.zig");
-const plan_store_mod = @import("plan_store.zig");
-const plan_integration = @import("plan_integration.zig");
+const plan_store_mod = @import("plan/store.zig");
+const plan_integration = @import("plan/integration.zig");
 pub const journal_mod = @import("journal.zig");
 pub const act_logger_mod = @import("act_logger.zig");
 pub const signals = @import("signals.zig");
@@ -1257,12 +1257,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
             }
         }
 
-        const expansion_system_prompt =
-            \\You are the MemAct query expander. Expand the retrieval query into related keywords,
-            \\synonyms, identifiers, and error codes likely to appear in project memory records.
-            \\Output keywords only — one per line, max 12 lines, no numbering, no prose.
-            \\
-        ;
+        const expansion_system_prompt = prompts_mod.memact_expansion_system_prompt;
 
         var msg_blocks = try alloc.alloc(proto.ContentBlock, 1);
         errdefer {
@@ -1338,7 +1333,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
 
         var prompt = ArrayList(u8).empty;
         defer prompt.deinit(self.alloc);
-        try prompt.appendSlice(self.alloc, "Extract at most 5 durable facts or lessons from this completed task that would help future sessions. Output a JSON array only, each item: {\"content\": \"<informative sentence, min 20 chars>\", \"keywords\": [\"k1\",\"k2\"], \"type\": \"semantic\"|\"project_state\", \"confidence\": 0.0-1.0 (1.0 = confirmed by a successful test/build, lower = inferred), \"related_tool\": \"<tool name if a tool caused/verified it else null>\"}. No prose outside the JSON.\n\nUser request:\n");
+        try prompt.appendSlice(self.alloc, prompts_mod.memact_extraction_user_prompt_head);
         if (self.current_user_request) |req| try prompt.appendSlice(self.alloc, req);
         try prompt.appendSlice(self.alloc, "\n\nTools executed:\n");
         for (self.recent_tools.items) |t| {
@@ -1353,12 +1348,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         }
         const request_text = prompt.toOwnedSlice(self.alloc) catch return;
 
-        const extraction_system_prompt =
-            \\You are the MemAct memory extractor. Extract durable, reusable knowledge
-            \\(project facts, state, verified lessons, error causes) from a completed agent task.
-            \\Output JSON only.
-            \\
-        ;
+        const extraction_system_prompt = prompts_mod.memact_extraction_system_prompt;
 
         var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
         errdefer {
@@ -1650,24 +1640,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         // 1. Format action description, elapsed time, and output log tail
         // 2. Return formatted prompt string
         var prompt_buf = utils.BufWriter.init(alloc);
-        try prompt_buf.print(
-            \\Act {d} has been running action '{s}' for {d}s (timeout limit is {d}s).
-            \\
-            \\Recent execution output tail ({d} bytes):
-            \\```
-            \\{s}
-            \\```
-            \\
-            \\Determine whether this action is making legitimate forward progress that needs more time, OR is stuck, deadlocked, idling, or waiting on user input.
-            \\
-            \\Respond on the first line strictly with:
-            \\DECISION: WAIT <seconds> (e.g., DECISION: WAIT 60)
-            \\or
-            \\DECISION: KILL
-            \\
-            \\On the second line, provide a short 1-sentence reason:
-            \\REASON: <explanation>
-        , .{
+        try prompt_buf.print(prompts_mod.watchdog_supervisor_decision_prompt_fmt, .{
             ctx.act_id,
             ctx.action_desc,
             ctx.elapsed_s,
@@ -1689,11 +1662,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         defer arena.deinit();
         const alloc = arena.allocator();
 
-        const system_prompt =
-            \\You are the Watchdog Supervisor for mini-agent.
-            \\An action is taking longer than the configured timeout limit.
-            \\Your job is to analyze the action and output to decide if it is legitimately working (e.g. compiling, downloading, running a long test suite) or hung/frozen/waiting for input.
-        ;
+        const system_prompt = prompts_mod.watchdog_supervisor_system_prompt;
         const prompt_text = buildTimeoutSupervisorPrompt(alloc, ctx) catch {
             return .{ .should_kill = false, .extend_seconds = 60 };
         };
@@ -1757,10 +1726,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         main.stderrPrint("\x1b[33m[agent] Summarizing context (MemAct compaction)...\x1b[0m\n", .{});
 
         if (self.config.memact_enabled) {
-            const memact_prompt =
-                "SYSTEM: You are the MemAct memory engine. Concisely summarize the preceding conversation into JSON, strictly adhering to this stencil:\n" ++
-                "{\n  \"type\": \"context_summary\",\n  \"iteration_range\": [1, 99],\n  \"task_state\": \"progress description\",\n  \"decisions\": [\"decision 1\"],\n  \"open_questions\": [],\n  \"learned_errors\": [],\n  \"files_touched\": [],\n  \"next_step\": \"next step\"\n}\n" ++
-                "If the input conversation already contains a \"[MemAct Context Summary]\" block, merge the previous summary into the new summary, retaining critical details while preserving the JSON stencil above.\nOutput JSON only, with no additional markdown text.";
+            const memact_prompt = prompts_mod.memact_compaction_prompt;
             if (try self.requestContextSummary(act_id, memact_prompt)) |summary| {
                 defer self.alloc.free(summary);
                 try self.history.compactMemAct(act_id, summary);
@@ -1770,7 +1736,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
             }
         } else {
             main.stderrPrint("\n\x1b[33m[agent] History too long (MemAct disabled), compacting using legacy method...\x1b[0m\n", .{});
-            const legacy_prompt = "SYSTEM: History is full. Please summarize the current task state (what has been done, results, next steps). Do not call tools, return summary text only.";
+            const legacy_prompt = prompts_mod.legacy_compaction_prompt;
             if (try self.requestContextSummary(act_id, legacy_prompt)) |summary| {
                 defer self.alloc.free(summary);
                 try self.history.compactWithSummary(summary);
@@ -1808,7 +1774,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
             if (plan_executor.generateProgressSummary(plan, &self.plan.plan_ctx, self.alloc) catch null) |summary| {
                 defer self.alloc.free(summary);
                 if (summary.len > 0) {
-                    bw.writeAll("[Post-Compact Plan Context]\n") catch return;
+                    bw.writeAll(prompts_mod.post_compact_plan_header) catch return;
                     bw.writeAll(summary) catch return;
                     has_content = true;
                 }
@@ -1817,7 +1783,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
 
         // (b) read-skill names (restated because their content was dropped)
         if (self.read_skills.items.len > 0) {
-            bw.writeAll("\n[Skills already read this session] ") catch return;
+            bw.writeAll(prompts_mod.post_compact_skills_prefix) catch return;
             var first = true;
             for (self.read_skills.items) |name| {
                 if (!first) bw.writeAll(", ") catch return;

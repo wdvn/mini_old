@@ -227,7 +227,7 @@ fn handleCodeActLoopTrip(loop: *AgentLoop, act_id: usize) !StepResult {
             "\n\x1b[33m[agent] ⚠️ Action loop persisted after replanning attempts: identical CodeAct script repeated. Halting loop.\x1b[0m\n",
             .{},
         );
-        const trip_msg = "[CodeAct System Intervention]: Action loop persisted after multiple replanning attempts. Halting execution. Synthesize your findings and answer the user now.";
+        const trip_msg = prompts_mod.codeact_system_intervention;
         try loop.history.addUser(trip_msg);
         loop.action_loop_tripped = true;
         loop.last_step_outcome = .protocol_failure;
@@ -317,7 +317,7 @@ fn handleCodeActScriptError(loop: *AgentLoop, res: ExecutionResult, dur_ms: u64)
     var err_buf = utils.BufWriter.init(loop.alloc);
     defer err_buf.deinit();
 
-    try err_buf.writeAll("[CodeAct JavaScript Error]\n");
+    try err_buf.writeAll(prompts_mod.codeact_js_error_header);
     if (res.error_message) |m| {
         try err_buf.print("Error: {s}\n", .{m});
     }
@@ -328,9 +328,9 @@ fn handleCodeActScriptError(loop: *AgentLoop, res: ExecutionResult, dur_ms: u64)
         try err_buf.print("stdout before error:\n{s}\n", .{res.stdout});
     }
     if (loop.js_retry_count >= 3) {
-        try err_buf.writeAll("Notice: 3 consecutive JavaScript execution errors occurred. You may fall back to standard tool calling or simplify your code.\n");
+        try err_buf.writeAll(prompts_mod.codeact_js_consecutive_errors_notice);
     } else {
-        try err_buf.writeAll("Please analyze the error and retry by outputting corrected JavaScript code inside ```js ... ``` block.\n");
+        try err_buf.writeAll(prompts_mod.codeact_js_retry_prompt);
     }
 
     try loop.history.addUser(err_buf.list.items);
@@ -387,7 +387,7 @@ pub fn executeCodeActBlock(
             }
             const note = try std.fmt.allocPrint(
                 loop.alloc,
-                "[duplicate: identical CodeAct script already executed this turn — cached output below]\n{s}",
+                prompts_mod.codeact_cached_result_fmt,
                 .{cached},
             );
             defer loop.alloc.free(note);
@@ -603,7 +603,7 @@ fn buildThinkingTailHint(alloc: std.mem.Allocator, response: *const proto.Respon
     // Single contiguous allocation; caller owns and frees it.
     return std.fmt.allocPrint(
         alloc,
-        "[System] The previous response's reasoning was truncated at the max_tokens limit. You stopped here:\n\n{s}\n\nResume from that point with MINIMAL reasoning (keep thinking to a few sentences, or call mini.setThinking(\"low\")), then emit the next tool call. Do not re-derive completed analysis.",
+        prompts_mod.thinking_tail_hint_fmt,
         .{tail_trimmed},
     ) catch return null;
 }
@@ -640,12 +640,12 @@ fn handleResponseRecovery(
         loop.last_step_outcome = .transient_retry;
 
         const advisory = switch (recovery_class) {
-            .thinking_only => "The model response contained internal reasoning/thinking only, without any actionable output or tool invocation. Please provide the necessary tool calls or final response to proceed.",
-            .empty_response => "The model response was empty or contained only whitespace. Please provide the necessary tool calls or final response to proceed.",
-            .missing_terminal => "The model response stream terminated unexpectedly without a terminal event. Please resume and provide the complete tool call or response.",
-            .stream_aborted => "The model response stream was interrupted or aborted due to idle timeout. Please resume from where execution stopped.",
-            .malformed_tool_call => "Your previous tool call was malformed (invalid JSON arguments or an empty tool name) and could not be executed. Re-emit exactly ONE well-formed tool call (one ```js block with valid `mini.*` calls and JSON-object arguments). Do not include the malformed block.",
-            .truncated_tool_call => "Your previous tool call was truncated (the arguments JSON was cut off before it completed) and could not be executed. Re-emit the SAME tool call with COMPLETE, well-formed JSON-object arguments. Do not include the truncated block.",
+            .thinking_only => prompts_mod.recovery_advisory_thinking_only,
+            .empty_response => prompts_mod.recovery_advisory_empty_response,
+            .missing_terminal => prompts_mod.recovery_advisory_missing_terminal,
+            .stream_aborted => prompts_mod.recovery_advisory_stream_aborted,
+            .malformed_tool_call => prompts_mod.recovery_advisory_malformed_tool_call,
+            .truncated_tool_call => prompts_mod.recovery_advisory_truncated_tool_call,
         };
         try loop.history.addUser(advisory);
 
@@ -764,7 +764,7 @@ fn handleMaxTokensStop(
     var buf = utils.BufWriter.init(loop.alloc);
     defer buf.deinit();
     try buf.print(
-        "[System] The previous response was truncated due to reaching the max_tokens limit (attempt {d}). Please continue EXACTLY from where it stopped — do not repeat already written content, do not re-introduce. If a ```js ... ``` block or tool call was in progress, complete the remainder.",
+        prompts_mod.max_tokens_continuation_fmt,
         .{loop.max_tokens_continues},
     );
     try loop.history.addUser(buf.list.items);
@@ -839,7 +839,7 @@ fn handleStreamAbortedStop(
     loop.last_act_failed = true;
     main.stderrPrint("\n\x1b[33m[agent] ⚠️ Stream stalled mid-response, requesting continuation...\x1b[0m\n", .{});
     try loop.closeOrphanedToolUses(response);
-    const note = "[System] The previous response was interrupted because the model stream went silent (idle watchdog). Continue EXACTLY from where it stopped — do not repeat already written content.";
+    const note = prompts_mod.idle_stream_continuation;
     try loop.history.addUser(note);
     return .continue_loop;
 }
@@ -1193,7 +1193,7 @@ pub fn executeStep(
                 // PSEUDOCODE:
                 // 1. Keep partial text in history for a safe resume boundary.
                 // 2. Bound controlled continuations and stall on repeated boundaries.
-                try self.history.addUser("[System] The response stopped at a controlled sequence boundary. Continue from that boundary without repeating prior output.");
+                try self.history.addUser(prompts_mod.stop_sequence_continuation);
                 const transition = stopSequenceContinuation(&self.stop_sequence_continues);
                 if (transition == .stall) {
                     self.last_step_outcome = .continuation_requested;
@@ -1201,7 +1201,7 @@ pub fn executeStep(
                 }
                 return transition;
             }
-            try self.history.addUser("[System] The response ended at an explicit stop boundary. Continue from that boundary without repeating prior output.");
+            try self.history.addUser(prompts_mod.explicit_stop_continuation);
             return proto.ActTransition{ .next_act = {} };
         },
         .deliver_final_answer => {
