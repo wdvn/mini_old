@@ -63,19 +63,15 @@ pub fn writeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
 pub fn editTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     const path = (try json.findStringOwned(alloc, input_json, "path")) orelse
         return std.fmt.allocPrint(alloc, "Error: missing 'path' parameter", .{});
+    defer alloc.free(path);
     const old_str = (try json.findStringOwned(alloc, input_json, "old_string")) orelse
         return std.fmt.allocPrint(alloc, "Error: missing 'old_string' parameter", .{});
+    defer alloc.free(old_str);
     const new_str = (try json.findStringOwned(alloc, input_json, "new_string")) orelse
         return std.fmt.allocPrint(alloc, "Error: missing 'new_string' parameter", .{});
-    errdefer alloc.free(path);
-    errdefer alloc.free(old_str);
-    errdefer alloc.free(new_str);
+    defer alloc.free(new_str);
 
-    const result = try editFile(alloc, io, path, old_str, new_str);
-    alloc.free(path);
-    alloc.free(old_str);
-    alloc.free(new_str);
-    return result;
+    return try editFile(alloc, io, path, old_str, new_str);
 }
 
 // ---------------------------------------------------------------------------

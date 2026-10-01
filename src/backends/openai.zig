@@ -300,7 +300,10 @@ pub const Client = struct {
                 ctx.response.raw_debug_info = ctx.alloc.dupe(u8, ctx.raw_accum.items) catch null;
             }
         }
-        if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
+        if (ctx.raw_accum_init) {
+            ctx.raw_accum.deinit(self.alloc);
+            ctx.raw_accum_init = false;
+        }
         return ctx.response;
     }
 
@@ -359,17 +362,14 @@ pub const Client = struct {
                 .line_buf = .empty,
                 .tool_calls = .empty,
             };
-            defer ctx.line_buf.deinit(self.alloc);
-            defer ctx.tool_calls.deinit(self.alloc);
+            defer ctx.deinit();
             errdefer ctx.response.deinit();
-            errdefer if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
 
             var idle_aborted = false;
             const req_http_code = try self.executeAttempt(active_protocol, body, &ctx, &idle_aborted);
             const raw_resp = if (ctx.raw_accum_init) ctx.raw_accum.items else "";
 
             if (self.shouldRetryRequest(&active_protocol, profile, req_http_code, raw_resp, tools.len > 0)) {
-                if (ctx.raw_accum_init) ctx.raw_accum.deinit(self.alloc);
                 ctx.response.deinit();
                 continue;
             }
@@ -767,8 +767,11 @@ const PartialToolCall = struct {
     }
     fn deinit(self: *PartialToolCall, alloc: std.mem.Allocator) void {
         self.id.deinit(alloc);
+        self.id = .empty;
         self.name.deinit(alloc);
+        self.name = .empty;
         self.args.deinit(alloc);
+        self.args = .empty;
     }
 };
 
@@ -835,6 +838,44 @@ const StreamCtx = struct {
     terminal_event_received: bool = false,
     terminal_event_kind: TerminalEventKind = .none,
     finalization_route: FinalizationRoute = .pending,
+
+    /// Free think accumulator (idempotent; call on error/retry paths).
+    pub fn think_accum_cleanup(self: *StreamCtx, alloc: Allocator) void {
+        if (self.think_accum_init) {
+            self.think_accum.deinit(alloc);
+            self.think_accum_init = false;
+        }
+    }
+
+    /// Free text accumulator (idempotent; call on error/retry paths).
+    pub fn text_accum_cleanup(self: *StreamCtx, alloc: Allocator) void {
+        if (self.text_accum_init) {
+            self.text_accum.deinit(alloc);
+            self.text_accum_init = false;
+        }
+    }
+
+    /// Free tool calls list and all PartialToolCall items (idempotent).
+    pub fn tool_calls_cleanup(self: *StreamCtx, alloc: Allocator) void {
+        for (self.tool_calls.items) |*tc| {
+            tc.deinit(alloc);
+        }
+        self.tool_calls.deinit(alloc);
+        self.tool_calls = .empty;
+    }
+
+    /// Free all intermediate stream buffers (idempotent; safe for defer on both success and error).
+    pub fn deinit(self: *StreamCtx) void {
+        self.line_buf.deinit(self.alloc);
+        self.line_buf = .empty;
+        self.tool_calls_cleanup(self.alloc);
+        self.think_accum_cleanup(self.alloc);
+        self.text_accum_cleanup(self.alloc);
+        if (self.raw_accum_init) {
+            self.raw_accum.deinit(self.alloc);
+            self.raw_accum_init = false;
+        }
+    }
 
     pub fn emitNormalized(self: *StreamCtx, text: []const u8, thinking: bool) !void {
         if (text.len == 0) return;
@@ -1200,6 +1241,7 @@ const StreamCtx = struct {
         // No slot yet → create new item
         if (slot == null) {
             var tc = PartialToolCall.init();
+            errdefer tc.deinit(self.alloc);
             if (id) |tcid| try tc.id.appendSlice(self.alloc, tcid);
             try self.tool_calls.append(self.alloc, tc);
             slot = self.tool_calls.items.len - 1;
@@ -1243,6 +1285,7 @@ const StreamCtx = struct {
 
         if (slot == null) {
             var tc = PartialToolCall.init();
+            errdefer tc.deinit(self.alloc);
             if (id) |tcid| try tc.id.appendSlice(self.alloc, tcid);
             if (name) |n| try tc.name.appendSlice(self.alloc, n);
             if (args) |a| try tc.args.appendSlice(self.alloc, a);
@@ -1290,7 +1333,6 @@ const StreamCtx = struct {
 
         if (self.terminal_event_received) {
             for (self.tool_calls.items, 0..) |*tc, ti| {
-                defer tc.deinit(self.alloc);
                 if (tc.name.items.len == 0) continue;
                 const clean_name = sanitizeToolName(tc.name.items) orelse continue;
                 // Provider did not send id (some compat/proxies) → generate fallback id
@@ -1299,7 +1341,9 @@ const StreamCtx = struct {
                     try self.alloc.dupe(u8, tc.id.items)
                 else
                     try std.fmt.allocPrint(self.alloc, "call_{d}", .{ti});
+                errdefer self.alloc.free(id);
                 const name = try self.alloc.dupe(u8, clean_name);
+                errdefer self.alloc.free(name);
                 // PSEUDOCODE:
                 // 1. Preserve missing arguments as incomplete.
                 // 2. Let RFC-023 response validation reject the tool call.
@@ -1308,20 +1352,20 @@ const StreamCtx = struct {
                     try self.alloc.dupe(u8, tc.args.items)
                 else
                     "";
+                errdefer if (args.len > 0) self.alloc.free(args);
                 try self.response.content.append(self.alloc, .{ .tool_use = .{
                     .id = id,
                     .name = name,
                     .input_json = args,
                 } });
             }
-        } else {
-            for (self.tool_calls.items) |*tc| tc.deinit(self.alloc);
         }
         if (self.tool_calls.items.len > 0 and self.terminal_event_received and self.response.stop_reason != .tool_use) {
             self.response.stop_reason = .tool_use;
         }
-        if (self.think_accum_init) self.think_accum.deinit(self.alloc);
-        if (self.text_accum_init) self.text_accum.deinit(self.alloc);
+        self.tool_calls_cleanup(self.alloc);
+        self.think_accum_cleanup(self.alloc);
+        self.text_accum_cleanup(self.alloc);
     }
 };
 
@@ -2060,3 +2104,34 @@ test "openai sanitizeToolName: strips DSML tags and rejects invalid tool names" 
     try testing.expect(sanitizeToolName("   ") == null);
     try testing.expect(sanitizeToolName("invalid tool with spaces") == null);
 }
+
+test "openai stream: interrupted/cancelled stream cleans up tool_calls, thinking, and text accumulators without leak" {
+    // PSEUDOCODE:
+    // 1. Initialize StreamCtx with testing.allocator
+    // 2. Feed lines containing partial reasoning, text, and tool call
+    // 3. Deinit StreamCtx directly without calling finalizeToolCalls (simulating Ctrl+C / stream interrupt)
+    // 4. Verification: testing allocator must report 0 leaks
+    const alloc = testing.allocator;
+    var ctx = StreamCtx{
+        .alloc = alloc,
+        .response = proto.Response.init(alloc),
+        .line_buf = .empty,
+        .tool_calls = .empty,
+    };
+    defer ctx.response.deinit();
+    defer ctx.deinit();
+
+    try feedLines(&ctx, &.{
+        \\data: {"choices":[{"delta":{"reasoning_content":"Thinking about tool call..."}}]}
+        ,
+        \\data: {"choices":[{"delta":{"content":"Let me check."}}]}
+        ,
+        \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_test_1","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}
+        ,
+    });
+
+    try testing.expect(ctx.think_accum_init);
+    try testing.expect(ctx.text_accum_init);
+    try testing.expectEqual(@as(usize, 1), ctx.tool_calls.items.len);
+}
+

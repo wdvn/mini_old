@@ -105,6 +105,10 @@ pub const AcpServer = struct {
     current_session_id: ?[]u8 = null,
     is_cancelled: bool = false,
     session_counter: usize = 0,
+    pending_msg_buf: [4]u8 = undefined,
+    pending_msg_len: usize = 0,
+    pending_thought_buf: [4]u8 = undefined,
+    pending_thought_len: usize = 0,
 
     pub fn init(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, config: *const config_mod.Config) AcpServer {
         return .{
@@ -115,6 +119,10 @@ pub const AcpServer = struct {
             .current_session_id = null,
             .is_cancelled = false,
             .session_counter = 0,
+            .pending_msg_buf = undefined,
+            .pending_msg_len = 0,
+            .pending_thought_buf = undefined,
+            .pending_thought_len = 0,
         };
     }
 
@@ -291,6 +299,7 @@ pub const AcpServer = struct {
 
     fn executeAgentPrompt(self: *AcpServer, expanded_prompt: []const u8) []const u8 {
         var result = self.agent.processInput(expanded_prompt, acpTextCallback, acpThinkCallback) catch |e| {
+            self.flushPendingStreams() catch {};
             main.stderrPrint("[acp] Agent error during prompt: {s}\n", .{@errorName(e)});
             return switch (e) {
                 error.LLMRateLimitExceeded => "rate_limited",
@@ -299,6 +308,7 @@ pub const AcpServer = struct {
             };
         };
         defer result.deinit(self.agent.alloc);
+        self.flushPendingStreams() catch {};
         if (self.is_cancelled) return "cancelled";
         return acpStopReason(result.outcome, result.failure_reason);
     }
@@ -371,7 +381,56 @@ pub const AcpServer = struct {
     // Streaming Notifications
     // -----------------------------------------------------------------------
 
+    fn splitIncompleteUtf8(slice: []const u8) struct { valid: []const u8, incomplete: []const u8 } {
+        if (slice.len == 0) return .{ .valid = slice, .incomplete = &.{} };
+        var i: usize = slice.len;
+        while (i > 0 and slice.len - i < 4) {
+            i -= 1;
+            const b = slice[i];
+            if ((b & 0xC0) != 0x80) {
+                if (b < 0x80) {
+                    return .{ .valid = slice, .incomplete = &.{} };
+                }
+                const needed = std.unicode.utf8ByteSequenceLength(b) catch 1;
+                const avail = slice.len - i;
+                if (avail < needed) {
+                    return .{ .valid = slice[0..i], .incomplete = slice[i..] };
+                } else {
+                    return .{ .valid = slice, .incomplete = &.{} };
+                }
+            }
+        }
+        return .{ .valid = slice, .incomplete = &.{} };
+    }
+
     pub fn sendAgentMessageChunk(self: *AcpServer, text: []const u8) !void {
+        if (text.len == 0 and self.pending_msg_len == 0) return;
+
+        var full_text: []const u8 = undefined;
+        var allocated = false;
+        if (self.pending_msg_len > 0) {
+            const buf = try self.alloc.alloc(u8, self.pending_msg_len + text.len);
+            @memcpy(buf[0..self.pending_msg_len], self.pending_msg_buf[0..self.pending_msg_len]);
+            @memcpy(buf[self.pending_msg_len..], text);
+            self.pending_msg_len = 0;
+            full_text = buf;
+            allocated = true;
+        } else {
+            full_text = text;
+        }
+        defer if (allocated) self.alloc.free(full_text);
+
+        const split = splitIncompleteUtf8(full_text);
+        if (split.incomplete.len > 0) {
+            @memcpy(self.pending_msg_buf[0..split.incomplete.len], split.incomplete);
+            self.pending_msg_len = split.incomplete.len;
+        }
+        if (split.valid.len == 0) return;
+
+        try self.sendAgentMessageChunkRaw(split.valid);
+    }
+
+    fn sendAgentMessageChunkRaw(self: *AcpServer, text: []const u8) !void {
         if (text.len == 0) return;
         const sid = self.current_session_id orelse "default";
 
@@ -392,8 +451,34 @@ pub const AcpServer = struct {
 
         try self.writeStdoutLine(msg.list.items);
     }
-
     pub fn sendAgentThoughtChunk(self: *AcpServer, text: []const u8) !void {
+        if (text.len == 0 and self.pending_thought_len == 0) return;
+
+        var full_text: []const u8 = undefined;
+        var allocated = false;
+        if (self.pending_thought_len > 0) {
+            const buf = try self.alloc.alloc(u8, self.pending_thought_len + text.len);
+            @memcpy(buf[0..self.pending_thought_len], self.pending_thought_buf[0..self.pending_thought_len]);
+            @memcpy(buf[self.pending_thought_len..], text);
+            self.pending_thought_len = 0;
+            full_text = buf;
+            allocated = true;
+        } else {
+            full_text = text;
+        }
+        defer if (allocated) self.alloc.free(full_text);
+
+        const split = splitIncompleteUtf8(full_text);
+        if (split.incomplete.len > 0) {
+            @memcpy(self.pending_thought_buf[0..split.incomplete.len], split.incomplete);
+            self.pending_thought_len = split.incomplete.len;
+        }
+        if (split.valid.len == 0) return;
+
+        try self.sendAgentThoughtChunkRaw(split.valid);
+    }
+
+    fn sendAgentThoughtChunkRaw(self: *AcpServer, text: []const u8) !void {
         if (text.len == 0) return;
         const sid = self.current_session_id orelse "default";
 
@@ -413,6 +498,18 @@ pub const AcpServer = struct {
         try msg.writeAll("\"}}}}");
 
         try self.writeStdoutLine(msg.list.items);
+    }
+    pub fn flushPendingStreams(self: *AcpServer) !void {
+        if (self.pending_msg_len > 0) {
+            const leftover = self.pending_msg_buf[0..self.pending_msg_len];
+            self.pending_msg_len = 0;
+            try self.sendAgentMessageChunkRaw(leftover);
+        }
+        if (self.pending_thought_len > 0) {
+            const leftover = self.pending_thought_buf[0..self.pending_thought_len];
+            self.pending_thought_len = 0;
+            try self.sendAgentThoughtChunkRaw(leftover);
+        }
     }
 
     pub fn sendToolCall(self: *AcpServer, tool_id: []const u8, tool_name: []const u8, input_json: []const u8) !void {

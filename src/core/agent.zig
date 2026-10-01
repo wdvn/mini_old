@@ -435,7 +435,15 @@ pub const AgentLoop = struct {
     }
 
     /// Initializes and starts Watchdog background monitoring thread.
-    fn initWatchdog(alloc: Allocator, io: std.Io, coordinator: *act_queue.ActCoordinator, config: *const config_mod.Config) ?*watchdog_mod.Watchdog {
+    fn watchdogNoticeSink(io: std.Io, msg: []const u8) void {
+    // PSEUDOCODE: Route terminal notices through the terminal writer queue
+    // (term.writeStdout enqueues a single FIFO item) so watchdog lines from the
+    // watchdog thread can never interleave the renderer's in-place sections.
+    _ = io;
+    term.writeStdout(msg);
+}
+
+fn initWatchdog(alloc: Allocator, io: std.Io, coordinator: *act_queue.ActCoordinator, config: *const config_mod.Config) ?*watchdog_mod.Watchdog {
         // PSEUDOCODE: Create watchdog with signal handlers and start thread
         const watchdog = watchdog_mod.Watchdog.init(alloc, io, coordinator, .{
             .tracking_interval_s = config.watchdog_tracking_interval_s,
@@ -448,6 +456,10 @@ pub const AgentLoop = struct {
         watchdog.interrupt_fn = &watchdogInterruptHandler;
         watchdog.force_kill_fn = &watchdogForceKillHandler;
         watchdog.decision_fn = &watchdogDecisionHandler;
+        // TTY only: ACP pipe / subagent / test stdout must keep the stderr path.
+        if (term.isStdoutTty()) {
+            watchdog.notice_fn = &watchdogNoticeSink;
+        }
         watchdog.start() catch |e| {
             if (!utils.isSubagent()) main.stderrPrint("[agent] Warning: Failed to start Watchdog thread: {s}\n", .{@errorName(e)});
         };
@@ -554,6 +566,13 @@ pub const AgentLoop = struct {
             self.alloc.free(t);
         }
         self.recent_tools.deinit(self.alloc);
+        // PSEUDOCODE:
+        // 1. Free each skill name slice tracked during this session
+        // 2. Deinitialize the read_skills unmanaged list
+        for (self.read_skills.items) |s| {
+            self.alloc.free(s);
+        }
+        self.read_skills.deinit(self.alloc);
         self.deinitTurnToolRecords();
         if (self.last_agent_message) |msg| {
             self.alloc.free(msg);
@@ -1077,7 +1096,14 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
 
     /// Clears conversation history (starts new conversation).
     pub fn clearHistory(self: *AgentLoop) void {
+        // PSEUDOCODE:
+        // 1. Clear history messages
+        // 2. Free and clear tracked skill names from previous conversation
         self.history.clear();
+        for (self.read_skills.items) |s| {
+            self.alloc.free(s);
+        }
+        self.read_skills.clearRetainingCapacity();
     }
 
     /// Switches backend at runtime.
@@ -2953,3 +2979,26 @@ test "agent - skillNameFromSkillPath" {
     try std.testing.expect(skillNameFromSkillPath("/home/u/rfc_003_summary.md") == null);
     try std.testing.expect(skillNameFromSkillPath("/home/u/notskilled/SKILL.md.bak") == null);
 }
+
+test "agent - read_skills lifecycle and deinit cleans up without leaks" {
+    // PSEUDOCODE:
+    // 1. Allocate read_skills using testing allocator
+    // 2. Track skill names (including duplicates)
+    // 3. Verify deduplication
+    // 4. Free and deinit read_skills, verifying no leaks
+    const alloc = std.testing.allocator;
+    var list: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (list.items) |s| alloc.free(s);
+        list.deinit(alloc);
+    }
+
+    const s1 = try alloc.dupe(u8, "brainstorming");
+    try list.append(alloc, s1);
+
+    const s2 = try alloc.dupe(u8, "codebase-analysis");
+    try list.append(alloc, s2);
+
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+}
+

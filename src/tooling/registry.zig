@@ -691,54 +691,44 @@ pub fn forceKillActiveBash() void {
 }
 
 /// Interrupt active MCP server (called on Watchdog timeout or SIGINT).
+///
+/// Thread-safety: this may run on the watchdog/SIGINT thread while the agent
+/// worker thread is blocked in readStreaming on the child's pipe fds.
+/// Therefore we only signal the child process here; the pipe fds and
+/// child.stdin/stdout are NOT touched cross-thread. The worker's read loop
+/// bails via signals.isInterrupted() and the pipes are closed exactly once,
+/// under the per-server mutex, from shutdown on the owning thread.
 pub fn interruptActiveMcp() void {
     signals.setInterrupted(true);
     while (!g_registry_mutex.tryLock()) {}
     const mgr = g_mcp;
     g_registry_mutex.unlock();
     if (mgr) |m| {
-        for (m.servers.items) |*srv| {
-            if (srv.child_pid > 0) {
-                if (comptime builtin.os.tag != .windows) {
-                    _ = std.posix.kill(-srv.child_pid, std.posix.SIG.TERM) catch {
-                        _ = std.posix.kill(srv.child_pid, std.posix.SIG.TERM) catch {};
-                    };
-                }
-                // Null child pipes BEFORE closing so child.wait cleanup
-                // doesn't try to re-close already-closed fds (BADF panic).
-                srv.child.stdin = null;
-                srv.child.stdout = null;
-                // Use raw fd close (ignore BADF) to avoid panic if kernel
-                // already closed the pipe ends when the child process died.
-                _ = std.c.close(srv.stdin_file.handle);
-                _ = std.c.close(srv.stdout_file.handle);
+        for (m.servers.items) |srv| {
+            if (srv.child_pid > 0 and comptime builtin.os.tag != .windows) {
+                _ = std.posix.kill(-srv.child_pid, std.posix.SIG.TERM) catch {
+                    _ = std.posix.kill(srv.child_pid, std.posix.SIG.TERM) catch {};
+                };
             }
         }
     }
 }
 
 /// Force kill active MCP server process group with SIGKILL (called on Watchdog escalation).
+///
+/// Thread-safety: same as interruptActiveMcp — only signal the child from
+/// this thread; never touch the pipe fds or child.stdin/stdout cross-thread.
 pub fn forceKillActiveMcp() void {
     signals.setInterrupted(true);
     while (!g_registry_mutex.tryLock()) {}
     const mgr = g_mcp;
     g_registry_mutex.unlock();
     if (mgr) |m| {
-        for (m.servers.items) |*srv| {
-            if (srv.child_pid > 0) {
-                if (comptime builtin.os.tag != .windows) {
-                    _ = std.posix.kill(-srv.child_pid, std.posix.SIG.KILL) catch {
-                        _ = std.posix.kill(srv.child_pid, std.posix.SIG.KILL) catch {};
-                    };
-                }
-                // Null child pipes BEFORE closing so child.wait cleanup
-                // doesn't try to re-close already-closed fds (BADF panic).
-                srv.child.stdin = null;
-                srv.child.stdout = null;
-                // Use raw fd close (ignore BADF) to avoid panic if kernel
-                // already closed the pipe ends when the child process died.
-                _ = std.c.close(srv.stdin_file.handle);
-                _ = std.c.close(srv.stdout_file.handle);
+        for (m.servers.items) |srv| {
+            if (srv.child_pid > 0 and comptime builtin.os.tag != .windows) {
+                _ = std.posix.kill(-srv.child_pid, std.posix.SIG.KILL) catch {
+                    _ = std.posix.kill(srv.child_pid, std.posix.SIG.KILL) catch {};
+                };
             }
         }
     }

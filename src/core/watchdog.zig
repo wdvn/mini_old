@@ -22,6 +22,21 @@ fn printStderr(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     w.flush() catch {};
 }
 
+/// Terminal-safe notice sink: watchdog notifications are routed through this
+/// hook so the REPL/ACP front-end can serialize them with its in-place renderer
+/// (terminal writer queue) instead of racing a direct stderr write.
+pub const NoticeFn = *const fn (io: std.Io, msg: []const u8) void;
+
+fn emitNotice(self: *const Watchdog, io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    if (self.notice_fn) |sink| {
+        var buf: [1024]u8 = undefined;
+        const out = std.fmt.bufPrint(&buf, fmt, args) catch "";
+        sink(io, out);
+        return;
+    }
+    printStderr(io, fmt, args);
+}
+
 pub const WatchdogConfig = struct {
     /// Seconds between act progress tracking notifications (default: 10s).
     tracking_interval_s: u32 = 10,
@@ -32,7 +47,7 @@ pub const WatchdogConfig = struct {
     /// Watchdog polling interval in milliseconds (default: 200ms).
     poll_interval_ms: u32 = 200,
     /// If true, print notifications to stderr (default: true).
-    verbose_stderr: bool = true,
+    verbose_stderr: bool = false,
     /// If true, inject trajectory recap advisories into the next act.
     prompt_enforcement_enabled: bool = false,
     /// Cooldown in seconds between force-kill escalations to prevent log spam (default: 10s).
@@ -77,6 +92,9 @@ pub const Watchdog = struct {
 
     /// Optional external force kill hook (e.g. SIGKILL active processes).
     force_kill_fn: ?*const fn () void = null,
+
+    /// Optional terminal-safe notice sink (see NoticeFn). Defaults to stderr.
+    notice_fn: ?NoticeFn = null,
 
     /// Optional 1-call LLM timeout decision handler.
     decision_fn: ?DecisionFn = null,
@@ -146,7 +164,7 @@ pub const Watchdog = struct {
 
         self.coordinator.updateLastReported10s(bucket);
         if (self.config.verbose_stderr) {
-            printStderr(
+            emitNotice(self, 
                 self.io,
                 "\x1b[36m[watchdog]\x1b[0m Act {d} in progress ({d}s): {s}\n",
                 .{ state.act_id, bucket * self.config.tracking_interval_s, state.getActionDesc() },
@@ -162,7 +180,7 @@ pub const Watchdog = struct {
             defer self.is_consulting_decision = false;
 
             if (self.config.verbose_stderr) {
-                printStderr(
+                emitNotice(self, 
                     self.io,
                     "\n\x1b[33m[watchdog] ⚠️ Act {d} elapsed {d}s (limit {d}s, action: {s}). Consulting LLM for decision...\x1b[0m\n",
                     .{ state.act_id, elapsed_s, effective_timeout, state.getActionDesc() },
@@ -184,7 +202,7 @@ pub const Watchdog = struct {
             const ext = if (decision.extend_seconds > 0) decision.extend_seconds else 60;
             self.current_act_timeout_s = elapsed_s + ext;
             if (self.config.verbose_stderr) {
-                printStderr(self.io, "\x1b[36m[watchdog]\x1b[0m ⏳ LLM decided to WAIT (+{d}s, new limit: {d}s): {s}\n", .{ ext, self.current_act_timeout_s, decision.reason() });
+                emitNotice(self, self.io, "\x1b[36m[watchdog]\x1b[0m ⏳ LLM decided to WAIT (+{d}s, new limit: {d}s): {s}\n", .{ ext, self.current_act_timeout_s, decision.reason() });
             }
             return;
         }
@@ -195,7 +213,7 @@ pub const Watchdog = struct {
         self.coordinator.setPendingTimeoutContext(reason_str) catch {};
         if (self.interrupt_fn) |int_fn| int_fn();
         if (self.config.verbose_stderr) {
-            printStderr(self.io, "\n\x1b[31m[watchdog] 🛑 LLM decided to KILL Act {d} action: {s}. Triggering interrupt.\x1b[0m\n", .{ state.act_id, reason_str });
+            emitNotice(self, self.io, "\n\x1b[31m[watchdog] 🛑 LLM decided to KILL Act {d} action: {s}. Triggering interrupt.\x1b[0m\n", .{ state.act_id, reason_str });
         }
     }
 
@@ -215,7 +233,7 @@ pub const Watchdog = struct {
             int_fn();
         }
         if (self.config.verbose_stderr) {
-            printStderr(
+            emitNotice(self, 
                 self.io,
                 "\x1b[31m[watchdog] 🛑 Act {d} still running past timeout ({d}s). Escalating to force kill (SIGKILL).\x1b[0m\n",
                 .{ act_id, elapsed_s },
@@ -352,7 +370,7 @@ pub const Watchdog = struct {
 
         try self.coordinator.setPendingRecapAdvisory(full_message);
         if (self.config.verbose_stderr) {
-            printStderr(self.io, "\n\x1b[33m[watchdog] 📍 Checkpoint & Recap (Act {d}): Trajectory: {s} | {s}\x1b[0m\n", .{ completed_acts, display_traj, diag.diagnosis });
+            emitNotice(self, self.io, "\n\x1b[33m[watchdog] 📍 Checkpoint & Recap (Act {d}): Trajectory: {s} | {s}\x1b[0m\n", .{ completed_acts, display_traj, diag.diagnosis });
         }
     }
 };
