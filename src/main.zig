@@ -596,6 +596,10 @@ test {
     _ = @import("core/protocol.zig");
     _ = @import("core/json.zig");
     _ = @import("core/config.zig");
+    _ = @import("core/config/types.zig");
+    _ = @import("core/config/workspace.zig");
+    _ = @import("core/config/dotenv.zig");
+    _ = @import("core/config/resolvers.zig");
     _ = @import("core/memact/tokens.zig");
     _ = @import("core/memact/store.zig");
     _ = @import("core/memact/graph_store.zig");
