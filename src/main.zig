@@ -591,6 +591,11 @@ test {
     _ = @import("core/agent/backend.zig");
     _ = @import("core/agent/folder.zig");
     _ = @import("core/history.zig");
+    _ = @import("core/history/types.zig");
+    _ = @import("core/history/append.zig");
+    _ = @import("core/history/compact.zig");
+    _ = @import("core/history/compat.zig");
+    _ = @import("core/history/backup.zig");
     _ = @import("backends/openai.zig");
     _ = @import("core/journal.zig");
     _ = @import("core/protocol.zig");
