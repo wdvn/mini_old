@@ -45,7 +45,7 @@ const main = @import("../main.zig");
 const registry = @import("../tooling/registry.zig");
 const hooks = @import("../core/hooks.zig");
 const snapshot_mod = @import("../core/snapshot.zig");
-const agent_loop_monitor = @import("../core/agent_loop_monitor.zig");
+const agent_loop_monitor = @import("../core/agent/loop_monitor.zig");
 
 // ---------------------------------------------------------------------------
 // Security & auditing guard (ISSUE-CODEACT-001 M2/M3/M4)

@@ -119,7 +119,7 @@ pub fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
 // Entry point
 // ---------------------------------------------------------------------------
 
-const agent_folder_mod = @import("core/agent_folder.zig");
+const agent_folder_mod = @import("core/agent/folder.zig");
 
 fn handleHelpOrVersion(args: *const Args) bool {
     if (args.show_help) {
@@ -582,7 +582,14 @@ fn printHelp() void {
 test {
     _ = @import("core/artifacts.zig");
     _ = @import("core/agent.zig");
-    _ = @import("core/agent_step.zig");
+    _ = @import("core/agent/step.zig");
+    _ = @import("core/agent/turn.zig");
+    _ = @import("core/agent/execution.zig");
+    _ = @import("core/agent/subagent.zig");
+    _ = @import("core/agent/loop_monitor.zig");
+    _ = @import("core/agent/parsing.zig");
+    _ = @import("core/agent/backend.zig");
+    _ = @import("core/agent/folder.zig");
     _ = @import("core/history.zig");
     _ = @import("backends/openai.zig");
     _ = @import("core/journal.zig");
