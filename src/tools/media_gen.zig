@@ -19,19 +19,63 @@ const main = @import("../main.zig");
 // Configuration & State
 // ---------------------------------------------------------------------------
 
+
+// RFC-028: Per-plane configuration structs
+pub const ImagePlaneConfig = struct {
+    enabled: bool = false,
+    provider: []const u8 = "openai",
+    model: []const u8 = "gpt-image-1",
+    url: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    api_header: []const u8 = "Authorization",
+    endpoint: []const u8 = "images/generations",
+    resolution: ?[]const u8 = null,
+    aspect_ratio: ?[]const u8 = null,
+    size: []const u8 = "1024x1024",
+    n: u8 = 1,
+    quality: ?[]const u8 = null,
+    output_format: ?[]const u8 = null,
+    background: ?[]const u8 = null,
+    output_compression: ?u8 = null,
+    stream: bool = false,
+    seed: ?i64 = null,
+    provider_only: ?[]const []const u8 = null,
+    provider_order: ?[]const []const u8 = null,
+    provider_ignore: ?[]const []const u8 = null,
+    provider_sort: ?[]const u8 = null,
+    provider_allow_fallbacks: ?bool = null,
+    provider_options: ?[]const u8 = null,
+};
+
+pub const VideoPlaneConfig = struct {
+    enabled: bool = false,
+    provider: []const u8 = "openai",
+    model: []const u8 = "sora-2",
+    url: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    api_header: []const u8 = "Authorization",
+    endpoint: []const u8 = "videos",
+    resolution: ?[]const u8 = null,
+    aspect_ratio: ?[]const u8 = null,
+    size: ?[]const u8 = null,
+    duration: u32 = 4,
+    generate_audio: bool = false,
+    seed: ?i64 = null,
+    callback_url: ?[]const u8 = null,
+    provider_only: ?[]const []const u8 = null,
+    provider_order: ?[]const []const u8 = null,
+    provider_ignore: ?[]const []const u8 = null,
+    provider_sort: ?[]const u8 = null,
+    provider_allow_fallbacks: ?bool = null,
+    provider_options: ?[]const u8 = null,
+    poll_interval_secs: u32 = 5,
+    poll_timeout_secs: u32 = 300,
+};
+
 pub const MediaGenConfig = struct {
-    image_gen_enabled: bool = false,
-    image_gen_provider: []const u8 = "openai",
-    image_gen_model: []const u8 = "gpt-image-1",
-    image_gen_size: []const u8 = "1024x1024",
-    video_gen_enabled: bool = false,
-    /// Video gen provider: "openai" (Sora-compatible) | "openai_compat" (Agnes/etc).
-    video_gen_provider: []const u8 = "openai",
-    video_gen_model: []const u8 = "sora-2",
+    image: ImagePlaneConfig = .{},
+    video: VideoPlaneConfig = .{},
     media_output_dir: ?[]const u8 = null,
-    video_poll_timeout_secs: u32 = 600,
-    openai_compat_url: ?[]const u8 = null,
-    openai_compat_key: ?[]const u8 = null,
     image_input_max_bytes: usize = 10 * 1024 * 1024,
     image_input_max_per_turn: u8 = 5,
 };
@@ -114,11 +158,14 @@ fn ensureOutputDir(alloc: Allocator, io: std.Io, dir_path: []const u8) !void {
     cwd.createDirPath(io, dir_path) catch {};
 }
 
-fn buildAuthHeaders(alloc: Allocator, key: ?[]const u8) ![]const u8 {
+pub const UnknownProvider = error{UnknownProvider};
+
+pub fn buildAuthHeaders(alloc: Allocator, header_name: []const u8, key: ?[]const u8) ![]const u8 {
     if (key) |k| {
-        if (k.len > 0) {
+        if (std.mem.eql(u8, header_name, "Authorization")) {
             return std.fmt.allocPrint(alloc, "{{\"Authorization\":\"Bearer {s}\",\"Content-Type\":\"application/json\"}}", .{k});
         }
+        return std.fmt.allocPrint(alloc, "{{\"{s}\":\"{s}\",\"Content-Type\":\"application/json\"}}", .{header_name, k});
     }
     return std.fmt.allocPrint(alloc, "{{\"Content-Type\":\"application/json\"}}", .{});
 }
@@ -205,16 +252,20 @@ fn makeFailedMediaResultFmt(alloc: Allocator, comptime fmt: []const u8, args: an
     };
 }
 
-fn resolveBaseUrl(provider: []const u8, compat_url: ?[]const u8) []const u8 {
-    const is_compat = isCompatOrAgnes(provider);
-    if (is_compat and std.mem.indexOf(u8, provider, "agnes") != null) {
-        if (compat_url) |u| return cleanBaseUrl(u);
-        return "https://apihub.agnes.ai/v1";
+pub fn resolveBaseUrl(alloc: Allocator, provider: []const u8, dedicated_url: ?[]const u8) ![]const u8 {
+    if (dedicated_url) |u| {
+        return try alloc.dupe(u8, u);
     }
-    if (is_compat) {
-        if (compat_url) |u| return cleanBaseUrl(u);
+    if (std.mem.eql(u8, provider, "openai")) {
+        return try alloc.dupe(u8, "https://api.openai.com/v1");
     }
-    return "https://api.openai.com/v1";
+    if (std.mem.eql(u8, provider, "openai_compat")) {
+        return try alloc.dupe(u8, "https://api.openai.com/v1");
+    }
+    if (std.mem.indexOf(u8, provider, "agnes") != null) {
+        return try alloc.dupe(u8, "https://apihub.agnes.ai/v1");
+    }
+    return error.UnknownProvider;
 }
 
 fn resolveEndpointUrl(alloc: Allocator, base_url: []const u8, suffix: []const u8) ![]u8 {
@@ -224,7 +275,15 @@ fn resolveEndpointUrl(alloc: Allocator, base_url: []const u8, suffix: []const u8
     return std.fmt.allocPrint(alloc, "{s}/v1/{s}", .{ base_url, suffix });
 }
 
-fn extractImageData(alloc: Allocator, io: std.Io, body: []const u8) !?[]u8 {
+pub fn resolveApiUrl(alloc: Allocator, base_url: []const u8, endpoint: []const u8, _provider_override: ?[]const u8) ![]u8 {
+    _ = _provider_override;
+    if (std.mem.endsWith(u8, base_url, "/v1")) {
+        return std.fmt.allocPrint(alloc, "{s}/{s}", .{ base_url, endpoint });
+    }
+    return std.fmt.allocPrint(alloc, "{s}/v1/{s}", .{ base_url, endpoint });
+}
+
+fn extractImageData(alloc: Allocator, io: std.Io, body: []const u8) anyerror!?[]u8 {
     if (json.findString(body, "b64_json")) |b64_str| {
         const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_str);
         const bin_buf = try alloc.alloc(u8, decoded_len);
@@ -320,13 +379,18 @@ pub fn generateImageDirect(
         return makeFailedMediaResult(alloc, "Prompt must be between 1 and 4000 characters");
     }
 
-    const model = model_opt orelse g_config.image_gen_model;
-    const size = size_opt orelse g_config.image_gen_size;
-    const base_url = resolveBaseUrl(g_config.image_gen_provider, g_config.openai_compat_url);
+    const model = model_opt orelse g_config.image.model;
+    const size = size_opt orelse g_config.image.size;
+    const base_url = resolveBaseUrl(alloc, g_config.image.provider, g_config.image.url) catch |err| {
+        return if (err == error.UnknownProvider)
+            makeFailedMediaResultFmt(alloc, "Unknown image provider '{s}'. Set MINI_IMAGE_GEN_URL (and MINI_IMAGE_GEN_KEY) to configure it, or use one of: openai, openai_compat, agnes", .{g_config.image.provider})
+        else err;
+    };
+    defer alloc.free(base_url);
     const api_url = try resolveEndpointUrl(alloc, base_url, "images/generations");
     defer alloc.free(api_url);
 
-    const headers_json = try buildAuthHeaders(alloc, g_config.openai_compat_key);
+    const headers_json = try buildAuthHeaders(alloc, g_config.image.api_header, g_config.image.key);
     defer alloc.free(headers_json);
     const req_body = try buildImageGenRequestBody(alloc, model, prompt, size);
     defer alloc.free(req_body);
@@ -513,7 +577,7 @@ fn resolveVideoDownloadUrl(
     job_id: []const u8,
     is_compat: bool,
     last_body: ?[]const u8,
-) !?[]u8 {
+) anyerror!?[]u8 {
     if (is_compat and last_body != null) {
         const vid_url = json.findString(last_body.?, "url") orelse
             json.findString(last_body.?, "video_url") orelse
@@ -567,7 +631,7 @@ fn pollAndDownloadVideo(
     const poll_url = try buildVideoPollUrl(alloc, base_url, ids.job_id, ids.video_id, model, is_compat);
     defer alloc.free(poll_url);
 
-    var poll_res = try pollVideoJob(alloc, io, poll_url, headers_json, g_config.video_poll_timeout_secs);
+    var poll_res = try pollVideoJob(alloc, io, poll_url, headers_json, g_config.video.poll_timeout_secs);
     defer poll_res.deinit(alloc);
     if (!poll_res.completed) {
         return makeFailedMediaResult(alloc, poll_res.error_msg orelse "Video job polling timed out");
@@ -592,13 +656,18 @@ pub fn generateVideoDirect(
         return makeFailedMediaResult(alloc, "Prompt cannot be empty");
     }
 
-    const model = model_opt orelse g_config.video_gen_model;
-    const is_compat = isCompatOrAgnes(g_config.video_gen_provider);
-    const base_url = resolveBaseUrl(g_config.video_gen_provider, g_config.openai_compat_url);
+    const model = model_opt orelse g_config.video.model;
+    const is_compat = isCompatOrAgnes(g_config.video.provider);
+    const base_url = resolveBaseUrl(alloc, g_config.video.provider, g_config.video.url) catch |err| {
+        return if (err == error.UnknownProvider)
+            makeFailedMediaResultFmt(alloc, "Unknown video provider '{s}'. Set MINI_VIDEO_GEN_URL (and MINI_VIDEO_GEN_KEY) to configure it, or use one of: openai, openai_compat, agnes", .{g_config.video.provider})
+        else err;
+    };
+    defer alloc.free(base_url);
     const create_url = try resolveEndpointUrl(alloc, base_url, "videos");
     defer alloc.free(create_url);
 
-    const headers_json = try buildAuthHeaders(alloc, g_config.openai_compat_key);
+    const headers_json = try buildAuthHeaders(alloc, g_config.video.api_header, g_config.video.key);
     defer alloc.free(headers_json);
     const req_body = try buildVideoGenRequestBody(alloc, model, prompt, seconds, is_compat);
     defer alloc.free(req_body);
@@ -621,6 +690,109 @@ pub fn generateVideoDirect(
 
     return pollAndDownloadVideo(alloc, io, base_url, ids, model, is_compat, headers_json, filename_opt);
 }
+
+// RFC-028: Provider options routing object assembly
+pub const InvalidProviderOptions = error{InvalidProviderOptions};
+
+pub fn resolveProviderOptionsJson(
+    alloc: Allocator,
+    provider_only: ?[]const []const u8,
+    provider_order: ?[]const []const u8,
+    provider_ignore: ?[]const []const u8,
+    provider_sort: ?[]const u8,
+    allow_fallbacks: ?bool,
+    raw_options: ?[]const u8,
+) anyerror!?[]u8 {
+    const has_routing = provider_only != null or
+        provider_order != null or
+        provider_ignore != null or
+        provider_sort != null or
+        allow_fallbacks != null;
+    if (!has_routing and raw_options == null) {
+        return null;
+    }
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(alloc);
+    try buf.append(alloc, '{');
+
+    var first = true;
+    if (provider_only) |po| {
+        if (!first) try buf.append(alloc, ',');
+        first = false;
+        try buf.appendSlice(alloc, "\"only\":");
+        try writeStringSlice(alloc, &buf, po);
+    }
+    if (provider_order) |po| {
+        if (!first) try buf.append(alloc, ',');
+        first = false;
+        try buf.appendSlice(alloc, "\"order\":");
+        try writeStringSlice(alloc, &buf, po);
+    }
+    if (provider_ignore) |pi| {
+        if (!first) try buf.append(alloc, ',');
+        first = false;
+        try buf.appendSlice(alloc, "\"ignore\":");
+        try writeStringSlice(alloc, &buf, pi);
+    }
+    if (provider_sort) |ps| {
+        if (!first) try buf.append(alloc, ',');
+        first = false;
+        try buf.appendSlice(alloc, "\"sort\":");
+        try jsonEscapeString(alloc, &buf, ps);
+    }
+    if (allow_fallbacks) |af| {
+        if (!first) try buf.append(alloc, ',');
+        first = false;
+        try buf.appendSlice(alloc, "\"allow_fallbacks\":");
+        try buf.appendSlice(alloc, if (af) "true" else "false");
+    }
+
+    if (raw_options) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \\t\\n\\r");
+        if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') {
+            return error.InvalidProviderOptions;
+        }
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{}) catch {
+            return error.InvalidProviderOptions;
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) {
+            return error.InvalidProviderOptions;
+        }
+        if (!first) try buf.append(alloc, ',');
+        first = false;
+        try buf.appendSlice(alloc, trimmed[1 .. trimmed.len - 1]);
+    }
+
+    try buf.append(alloc, '}');
+    return try buf.toOwnedSlice(alloc);
+}
+
+fn writeStringSlice(alloc: Allocator, buf: *std.ArrayList(u8), items: []const []const u8) !void {
+    try buf.append(alloc, '[');
+    for (items, 0..) |item, i| {
+        if (i > 0) try buf.append(alloc, ',');
+        try jsonEscapeString(alloc, buf, item);
+    }
+    try buf.append(alloc, ']');
+}
+
+fn jsonEscapeString(alloc: Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
+    try buf.append(alloc, '"');
+    for (s) |c| {
+        switch (c) {
+            '\\' => try buf.appendSlice(alloc, "\\\\"),
+            '"' => try buf.appendSlice(alloc, "\""),
+            '\n' => try buf.appendSlice(alloc, "\\n"),
+            '\r' => try buf.appendSlice(alloc, "\\r"),
+            '\t' => try buf.appendSlice(alloc, "\\t"),
+            else => |c2| try buf.append(alloc, c2),
+        }
+    }
+    try buf.append(alloc, '"');
+}
+
 
 // ---------------------------------------------------------------------------
 // image_attach Tool (RFC-011 §3.5 Loop-Back Vision)

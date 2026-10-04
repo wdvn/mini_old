@@ -359,17 +359,24 @@ pub const AgentLoop = struct {
         tools_mod.setPolicy(config.tool_allowlist, config.tool_blocklist);
         tools_mod.setMediaConfig(config.image_gen_enabled, config.video_gen_enabled, config.image_input_enabled);
         media_gen_tool.setConfig(.{
-            .image_gen_enabled = config.image_gen_enabled,
-            .image_gen_provider = config.image_gen_provider,
-            .image_gen_model = config.image_gen_model,
-            .image_gen_size = config.image_gen_size,
-            .video_gen_enabled = config.video_gen_enabled,
-            .video_gen_model = config.video_gen_model,
-            .video_gen_provider = config.video_gen_provider,
+            .image = .{
+                .enabled = config.image_gen_enabled,
+                .provider = config.image_gen_provider,
+                .model = config.image_gen_model,
+                .size = config.image_gen_size,
+                .url = config.image_gen_url,
+                .key = config.image_gen_key,
+                .api_header = config.image_gen_api_header,
+            },
+            .video = .{
+                .enabled = config.video_gen_enabled,
+                .provider = config.video_gen_provider,
+                .model = config.video_gen_model,
+                .url = config.video_gen_url,
+                .key = config.video_gen_key,
+                .api_header = config.video_gen_api_header,
+            },
             .media_output_dir = config.media_output_dir,
-            .video_poll_timeout_secs = config.video_poll_timeout_secs,
-            .openai_compat_url = config.openai_compat_url,
-            .openai_compat_key = config.openai_compat_key,
             .image_input_max_bytes = config.image_input_max_bytes,
             .image_input_max_per_turn = config.image_input_max_per_turn,
         });

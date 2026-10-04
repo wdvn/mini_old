@@ -279,3 +279,236 @@ test "media_gen: config falls back to agnes when OPENAI_COMPAT_PROVIDER is agnes
     try testing.expectEqualStrings("agnes", cfg.image_gen_provider);
 }
 
+// ---------------------------------------------------------------------------
+// RFC-028 Task A: strict base URL resolution, plane configs, auth header
+// ---------------------------------------------------------------------------
+
+// PSEUDOCODE:
+// 1. Unknown provider with no dedicated URL must NOT silently route to OpenAI.
+// 2. generateImageDirect must return ok=false with a message naming the
+//    provider and MINI_IMAGE_GEN_URL (fail-fast contract, RFC-028 §3.2).
+test "media_gen: unknown image provider fails fast with actionable error" {
+    const alloc = testing.allocator;
+
+    media_gen_tool.setConfig(.{
+        .image = .{
+            .enabled = true,
+            .provider = "openrouter",
+            .model = "gpt-image-1",
+            .size = "1024x1024",
+            .url = null,
+            .key = null,
+        },
+    });
+
+    const res = try media_gen_tool.generateImageDirect(alloc, testing.io, "a scenic view", null, null, null);
+    defer {
+        alloc.free(res.path);
+        alloc.free(res.media_type);
+        if (res.message.len > 0) alloc.free(res.message);
+    }
+
+    try testing.expect(!res.ok);
+    try testing.expect(std.mem.indexOf(u8, res.message, "openrouter") != null);
+    try testing.expect(std.mem.indexOf(u8, res.message, "MINI_IMAGE_GEN_URL") != null);
+}
+
+// PSEUDOCODE:
+// 1. Video plane mirrors the image plane: unknown provider fails fast.
+// 2. Error message must name MINI_VIDEO_GEN_URL.
+test "media_gen: unknown video provider fails fast with actionable error" {
+    const alloc = testing.allocator;
+
+    media_gen_tool.setConfig(.{
+        .video = .{
+            .enabled = true,
+            .provider = "fal",
+            .model = "sora-2",
+            .url = null,
+            .key = null,
+        },
+    });
+
+    const res = try media_gen_tool.generateVideoDirect(alloc, testing.io, "waves crashing", 4, null, null);
+    defer {
+        alloc.free(res.path);
+        alloc.free(res.media_type);
+        if (res.message.len > 0) alloc.free(res.message);
+    }
+
+    try testing.expect(!res.ok);
+    try testing.expect(std.mem.indexOf(u8, res.message, "fal") != null);
+    try testing.expect(std.mem.indexOf(u8, res.message, "MINI_VIDEO_GEN_URL") != null);
+}
+
+// PSEUDOCODE:
+// 1. A dedicated MINI_IMAGE_GEN_URL is used verbatim (no cleanBaseUrl
+//    truncation, RFC-028 §3.3) and the endpoint is appended directly.
+// 2. Since resolveBaseUrl needs the env at call time, drive it through the
+//    process env via Config-independent pure helper if exposed; otherwise
+//    verify via resolveBaseUrl-equivalent behavior in the direct path.
+test "media_gen: dedicated image gen URL is used verbatim with endpoint appended" {
+    // The verbatim-URL behavior lives in resolveBaseUrlUrl/resolveApiUrl in
+    // media_gen.zig; verify the pure composition function directly.
+    const alloc = testing.allocator;
+
+    const api_url = try media_gen_tool.resolveApiUrl(
+        alloc,
+        "http://localhost:7860/sdapi/v1",
+        "txt2img",
+        null,
+    );
+    defer alloc.free(api_url);
+    try testing.expectEqualStrings("http://localhost:7860/sdapi/v1/txt2img", api_url);
+}
+
+// PSEUDOCODE:
+// 1. buildAuthHeaders is parameterized by header name (RFC-028 §3.4).
+// 2. Authorization keeps the Bearer prefix; custom headers do not.
+// 3. null key yields only the Content-Type header.
+test "media_gen: buildAuthHeaders supports custom header names without Bearer" {
+    const alloc = testing.allocator;
+
+    // Authorization keeps Bearer prefix (existing contract)
+    const h1 = try media_gen_tool.buildAuthHeaders(alloc, "Authorization", "sk-test-123");
+    defer alloc.free(h1);
+    try testing.expectEqualStrings(
+        "{\"Authorization\":\"Bearer sk-test-123\",\"Content-Type\":\"application/json\"}",
+        h1,
+    );
+
+    // Custom header: no Bearer prefix
+    const h2 = try media_gen_tool.buildAuthHeaders(alloc, "X-API-Key", "k");
+    defer alloc.free(h2);
+    try testing.expectEqualStrings(
+        "{\"X-API-Key\":\"k\",\"Content-Type\":\"application/json\"}",
+        h2,
+    );
+
+    // null key: Content-Type only
+    const h3 = try media_gen_tool.buildAuthHeaders(alloc, "Authorization", null);
+    defer alloc.free(h3);
+    try testing.expectEqualStrings("{\"Content-Type\":\"application/json\"}", h3);
+}
+
+// PSEUDOCODE:
+// 1. resolveProviderOptionsJson returns null when no routing field is set.
+// 2. With routing fields set it emits the OpenRouter provider object JSON.
+// 3. Raw provider_options must be a JSON object (array/scalar/malformed →
+//    error); valid object merges under the routing keys.
+test "media_gen: resolveProviderOptionsJson routing object assembly" {
+    const alloc = testing.allocator;
+
+    // No routing fields → null
+    const none = try media_gen_tool.resolveProviderOptionsJson(alloc, null, null, null, null, null, null);
+    try testing.expect(none == null);
+
+    // Routing fields set → provider object
+    const only = [_][]const u8{"openai/gpt-image-1"};
+    const opts = try media_gen_tool.resolveProviderOptionsJson(
+        alloc,
+        &only,
+        null,
+        null,
+        "price",
+        false,
+        null,
+    );
+    defer if (opts) |o| alloc.free(o);
+    try testing.expect(opts != null);
+    const got = opts.?;
+    try testing.expect(std.mem.indexOf(u8, got, "\"only\"") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\"sort\":\"price\"") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\"allow_fallbacks\":false") != null);
+
+    // Raw JSON object merges under routing keys
+    const raw = "{\"data\":{\"plan\":\"free\"}}";
+    const merged = try media_gen_tool.resolveProviderOptionsJson(alloc, &only, null, null, null, null, raw);
+    defer if (merged) |m| alloc.free(m);
+    try testing.expect(merged != null);
+    try testing.expect(std.mem.indexOf(u8, merged.?, "\"data\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged.?, "\"only\"") != null);
+
+    // Raw JSON array → error
+    try testing.expectError(error.InvalidProviderOptions, media_gen_tool.resolveProviderOptionsJson(
+        alloc, null, null, null, null, null, "[1,2]",
+    ));
+    // Malformed text → error
+    try testing.expectError(error.InvalidProviderOptions, media_gen_tool.resolveProviderOptionsJson(
+        alloc, null, null, null, null, null, "{not json",
+    ));
+}
+
+// PSEUDOCODE:
+// 1. The plane structs must exist with the RFC-028 §2.1 field surface.
+// 2. Nested MediaGenConfig carries no chat-plane fields (§3.1 decision b).
+test "media_gen: plane config structs expose the RFC-028 field surface" {
+    // Compile-time surface check: all fields from RFC-028 §2.1 are addressable.
+    const img = media_gen_tool.ImagePlaneConfig{
+        .enabled = true,
+        .provider = "openrouter",
+        .model = "gpt-image-1",
+        .url = "https://example.test/api/v1",
+        .key = "sk-or",
+        .api_header = "Authorization",
+        .endpoint = "images/generations",
+        .resolution = "1K",
+        .aspect_ratio = "16:9",
+        .size = "1024x1024",
+        .n = 2,
+        .quality = "high",
+        .output_format = "webp",
+        .background = "opaque",
+        .output_compression = 80,
+        .stream = false,
+        .seed = 42,
+        .provider_only = null,
+        .provider_order = null,
+        .provider_ignore = null,
+        .provider_sort = null,
+        .provider_allow_fallbacks = null,
+        .provider_options = null,
+    };
+    try testing.expect(img.n == 2);
+    try testing.expectEqualStrings("openrouter", img.provider);
+
+    const vid = media_gen_tool.VideoPlaneConfig{
+        .enabled = true,
+        .provider = "openrouter",
+        .model = "sora-2",
+        .url = "https://example.test/api/v1",
+        .key = "sk-or",
+        .api_header = "Authorization",
+        .endpoint = "videos",
+        .resolution = "720p",
+        .aspect_ratio = "16:9",
+        .size = "1280x720",
+        .duration = 4,
+        .generate_audio = false,
+        .seed = 7,
+        .callback_url = "https://hooks.example.test/cb",
+        .poll_interval_secs = 5,
+        .poll_timeout_secs = 300,
+        .provider_only = null,
+        .provider_order = null,
+        .provider_ignore = null,
+        .provider_sort = null,
+        .provider_allow_fallbacks = null,
+        .provider_options = null,
+    };
+    try testing.expect(vid.duration == 4);
+    try testing.expectEqualStrings("sora-2", vid.model);
+
+    // MediaGenConfig is nested and carries no chat-plane fields.
+    const cfg = media_gen_tool.MediaGenConfig{
+        .image = img,
+        .video = vid,
+        .media_output_dir = "media",
+        .image_input_max_bytes = 10 * 1024 * 1024,
+        .image_input_max_per_turn = 5,
+    };
+    try testing.expect(cfg.image.enabled);
+    try testing.expect(cfg.video.enabled);
+    try testing.expectEqualStrings("media", cfg.media_output_dir.?);
+}
+
