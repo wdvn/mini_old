@@ -573,8 +573,6 @@ fn executeSingleActAttempt(
     self.current_act_attempt = nextActAttempt(self.current_act_attempt);
     if (self.journal) |*j| j.recordEvent(self.io, act_id, .act_started, "Act started") catch {};
 
-    const history_len = self.history.len();
-
     const transition = self.executeStep(act_id, tool_defs, text_cb, think_cb) catch |e| {
         const resolution = try handleActError(
             self,
@@ -583,7 +581,7 @@ fn executeSingleActAttempt(
             try_count,
             max_retries,
             rate_limit_retries,
-            history_len,
+            self.act_history_checkpoint,
         );
         return actErrorTransition(resolution);
     };
@@ -614,7 +612,16 @@ fn runActRetryLoop(
     rate_limit_retries: *usize,
     max_retries: usize,
 ) !proto.ActTransition {
+    // PSEUDOCODE:
+    // 1. Drain pending recap advisory at the start of the Act before establishing checkpoint.
+    // 2. Record act_history_checkpoint as the pristine baseline before any retry attempts.
     self.current_act_attempt = 0;
+    if (self.coordinator.popPendingRecapAdvisory()) |advisory| {
+        defer self.alloc.free(advisory);
+        try self.history.addUser(advisory);
+    }
+    self.act_history_checkpoint = self.history.len();
+
     var try_count: usize = 0;
     while (try_count <= max_retries) : (try_count += 1) {
         const transition = try executeSingleActAttempt(
@@ -629,10 +636,15 @@ fn runActRetryLoop(
         );
         switch (transition) {
             .retry_same_act => continue,
-            .next_act, .complete, .stall, .fail, .cancel => return transition,
+            .next_act, .complete => return transition,
+            .stall, .fail, .cancel => {
+                self.history.truncate(self.act_history_checkpoint);
+                return transition;
+            },
         }
     } else {
         main.stderrPrint("\n\x1b[31m[agent] ⛔ Act {d} failed after {d} unrecoverable attempts. Terminating task.\x1b[0m\n", .{ act_id, max_retries + 1 });
+        self.history.truncate(self.act_history_checkpoint);
         self.coordinator.finishAct(act_id, false);
         return proto.ActTransition{ .fail = .provider_error };
     }

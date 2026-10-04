@@ -260,6 +260,8 @@ pub const AgentLoop = struct {
     last_agent_message: ?[]const u8 = null,
     last_turn_outcome: proto.TurnOutcome = .completed,
     current_act_attempt: usize = 1,
+    /// History length at the start of the active Act (before any retry attempt).
+    act_history_checkpoint: usize = 0,
     last_recovery_class: ?proto.RecoveryClass = null,
     last_failure_reason: ?proto.FailureReason = null,
 
