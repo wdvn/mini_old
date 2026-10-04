@@ -139,6 +139,8 @@ pub const JsProviderAdapter = struct {
     fn_extract_reasoning: ?c.JSValue = null,
     fn_extract_content: ?c.JSValue = null,
     fn_transform_request: ?c.JSValue = null,
+    fn_generate_image: ?c.JSValue = null,
+    fn_generate_video: ?c.JSValue = null,
     profile: ProviderProfile,
     name_owned: ?[]const u8 = null,
     deadline_ms: i64 = 0,
@@ -498,6 +500,20 @@ pub const JsProviderAdapter = struct {
         } else {
             c.JS_FreeValue(ctx, fn_tr);
         }
+
+        const fn_gi = c.JS_GetPropertyStr(ctx, obj, "generateImage");
+        if (isFunction(ctx, fn_gi)) {
+            self.fn_generate_image = fn_gi;
+        } else {
+            c.JS_FreeValue(ctx, fn_gi);
+        }
+
+        const fn_gv = c.JS_GetPropertyStr(ctx, obj, "generateVideo");
+        if (isFunction(ctx, fn_gv)) {
+            self.fn_generate_video = fn_gv;
+        } else {
+            c.JS_FreeValue(ctx, fn_gv);
+        }
     }
 
     fn parseExportedObject(self: *JsProviderAdapter) !void {
@@ -639,11 +655,81 @@ pub const JsProviderAdapter = struct {
         return error.JsRequestTransformFailed;
     }
 
+    /// Generate image via JS provider hook.
+    /// Returns: JSON string with {path, media_type, bytes, width, height, ok, message}
+    pub fn generateImage(self: *JsProviderAdapter, alloc: Allocator, input_json: []const u8) ![]const u8 {
+        self.beginCall();
+        const fn_hook = self.fn_generate_image orelse return error.NoGenerateImageHook;
+        if (input_json.len == 0) return error.EmptyInput;
+
+        const input_val = parseJsonZeroTerminated(self.ctx, alloc, input_json, "<image_input>") orelse return error.InvalidInputJson;
+        defer c.JS_FreeValue(self.ctx, input_val);
+
+        var args = [_]c.JSValue{input_val};
+        const ret_val = c.JS_Call(self.ctx, fn_hook, self.export_obj, 1, &args);
+        defer c.JS_FreeValue(self.ctx, ret_val);
+
+        if (isException(ret_val)) {
+            logJsException(self.ctx, "generateImage hook execution failed");
+            return error.JsGenerateImageFailed;
+        }
+
+        if (isObject(ret_val)) {
+            const str_val = c.JS_JSONStringify(self.ctx, ret_val, JS_UNDEFINED, JS_UNDEFINED);
+            defer c.JS_FreeValue(self.ctx, str_val);
+            if (isString(str_val)) {
+                const cstr = c.JS_ToCString(self.ctx, str_val);
+                if (cstr != null) {
+                    defer c.JS_FreeCString(self.ctx, cstr);
+                    return try alloc.dupe(u8, std.mem.span(cstr));
+                }
+            }
+        }
+
+        return error.JsGenerateImageFailed;
+    }
+
+    /// Generate video via JS provider hook.
+    /// Returns: JSON string with {path, media_type, bytes, ok, message}
+    pub fn generateVideo(self: *JsProviderAdapter, alloc: Allocator, input_json: []const u8) ![]const u8 {
+        self.beginCall();
+        const fn_hook = self.fn_generate_video orelse return error.NoGenerateVideoHook;
+        if (input_json.len == 0) return error.EmptyInput;
+
+        const input_val = parseJsonZeroTerminated(self.ctx, alloc, input_json, "<video_input>") orelse return error.InvalidInputJson;
+        defer c.JS_FreeValue(self.ctx, input_val);
+
+        var args = [_]c.JSValue{input_val};
+        const ret_val = c.JS_Call(self.ctx, fn_hook, self.export_obj, 1, &args);
+        defer c.JS_FreeValue(self.ctx, ret_val);
+
+        if (isException(ret_val)) {
+            logJsException(self.ctx, "generateVideo hook execution failed");
+            return error.JsGenerateVideoFailed;
+        }
+
+        if (isObject(ret_val)) {
+            const str_val = c.JS_JSONStringify(self.ctx, ret_val, JS_UNDEFINED, JS_UNDEFINED);
+            defer c.JS_FreeValue(self.ctx, str_val);
+            if (isString(str_val)) {
+                const cstr = c.JS_ToCString(self.ctx, str_val);
+                if (cstr != null) {
+                    defer c.JS_FreeCString(self.ctx, cstr);
+                    return try alloc.dupe(u8, std.mem.span(cstr));
+                }
+            }
+        }
+
+        return error.JsGenerateVideoFailed;
+    }
+
     pub fn deinit(self: *JsProviderAdapter) void {
         const ctx = self.ctx;
         if (self.fn_extract_reasoning) |f| c.JS_FreeValue(ctx, f);
         if (self.fn_extract_content) |f| c.JS_FreeValue(ctx, f);
         if (self.fn_transform_request) |f| c.JS_FreeValue(ctx, f);
+        if (self.fn_generate_image) |f| c.JS_FreeValue(ctx, f);
+        if (self.fn_generate_video) |f| c.JS_FreeValue(ctx, f);
         c.JS_FreeValue(ctx, self.export_obj);
 
         c.JS_FreeContext(ctx);
