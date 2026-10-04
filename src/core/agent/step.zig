@@ -118,7 +118,84 @@ test "thinking budget capped at 85% of max_tokens" {
     try std.testing.expectEqual(@as(?u32, 20400), capThinkingBudget(24000, 20400));
 }
 
-/// Dynamically modulates reasoning effort and thinking budget tokens based on overrides, error state, and stickiness.
+/// Input snapshot for reasoning effort selection (pure, testable without AgentLoop).
+pub const EffortSelection = struct {
+    config_effort: ?[]const u8 = null,
+    config_budget: ?u32 = null,
+    last_effort: ?[]const u8 = null,
+    last_budget: ?u32 = null,
+    last_act_failed: bool = false,
+    js_retry_count: usize = 0,
+    act_id: usize = 1,
+    /// RFC-019: true when a structured plan is approved/executing its items.
+    plan_executing_items: bool = false,
+};
+
+/// PSEUDOCODE: Pure effort selection with fixed priority:
+/// 1. Error recovery safety net — escalate to high (failed act or JS retry)
+/// 2. Plan execution (RFC-019) — downgrade to medium so mechanical step
+///    execution stays fast; an explicit config effort of "low" is respected
+/// 3. Act 1: no model choice yet — start from config/default
+/// 4. Sticky effort — sustain previous level across routine follow-ups
+pub fn selectReasoningEffort(s: EffortSelection) struct {
+    effort: ?[]const u8,
+    budget: ?u32,
+} {
+    if (s.last_act_failed or s.js_retry_count > 0)
+        return .{ .effort = "high", .budget = 4096 };
+    if (s.plan_executing_items) {
+        if (std.mem.eql(u8, s.config_effort orelse "", "low"))
+            return .{ .effort = "low", .budget = s.config_budget orelse 1024 };
+        return .{ .effort = "medium", .budget = 4096 };
+    }
+    if (s.act_id == 1)
+        return .{ .effort = s.config_effort orelse "high", .budget = s.config_budget orelse 4096 };
+    return .{ .effort = s.last_effort, .budget = s.last_budget };
+}
+
+test "reasoning effort selection priorities" {
+    var base = EffortSelection{};
+
+    // Error recovery always escalates to high, even during plan execution.
+    base = .{ .plan_executing_items = true, .last_act_failed = true, .act_id = 3, .last_effort = "medium" };
+    try std.testing.expectEqualStrings("high", selectReasoningEffort(base).effort.?);
+
+    base = .{ .plan_executing_items = true, .js_retry_count = 1, .act_id = 3 };
+    try std.testing.expectEqualStrings("high", selectReasoningEffort(base).effort.?);
+
+    // Plan execution downgrades sticky high to medium.
+    base = .{ .plan_executing_items = true, .act_id = 2, .last_effort = "high", .last_budget = 8192 };
+    var d = selectReasoningEffort(base);
+    try std.testing.expectEqualStrings("medium", d.effort.?);
+    try std.testing.expectEqual(@as(?u32, 4096), d.budget);
+
+    // Explicit config effort "low" is respected during plan execution.
+    base = .{ .plan_executing_items = true, .act_id = 2, .config_effort = "low" };
+    d = selectReasoningEffort(base);
+    try std.testing.expectEqualStrings("low", d.effort.?);
+    try std.testing.expectEqual(@as(?u32, 1024), d.budget);
+    base.config_budget = 512;
+    try std.testing.expectEqual(@as(?u32, 512), selectReasoningEffort(base).budget);
+
+    // No plan: act 1 starts from config/default.
+    base = .{ .act_id = 1 };
+    d = selectReasoningEffort(base);
+    try std.testing.expectEqualStrings("high", d.effort.?);
+    try std.testing.expectEqual(@as(?u32, 4096), d.budget);
+    base.config_effort = "low";
+    base.config_budget = 777;
+    d = selectReasoningEffort(base);
+    try std.testing.expectEqualStrings("low", d.effort.?);
+    try std.testing.expectEqual(@as(?u32, 777), d.budget);
+
+    // No plan: sticky effort is sustained.
+    base = .{ .act_id = 4, .last_effort = "medium", .last_budget = 2048 };
+    d = selectReasoningEffort(base);
+    try std.testing.expectEqualStrings("medium", d.effort.?);
+    try std.testing.expectEqual(@as(?u32, 2048), d.budget);
+}
+
+/// Dynamically modulates reasoning effort and thinking budget tokens based on overrides, error state, plan execution, and stickiness.
 pub fn modulateReasoningEffort(loop: *AgentLoop, act_id: usize) void {
     if (loop.config.reasoning_effort_disabled) return;
 
@@ -130,19 +207,24 @@ pub fn modulateReasoningEffort(loop: *AgentLoop, act_id: usize) void {
         if (override.effort) |eff| effective_effort = eff;
         if (override.budget_tokens) |bud| effective_budget = bud;
     } else if (loop.dynamic_thinking) {
-        if (act_id == 1) {
-            // Act 1: no model choice yet — start from config/default
-            effective_effort = loop.config.reasoning_effort orelse "high";
-            effective_budget = loop.config.thinking_budget_tokens orelse 4096;
-        } else if (loop.last_act_failed or loop.js_retry_count > 0) {
-            // Priority 3a: Error recovery safety net — escalate to high
-            effective_effort = "high";
-            effective_budget = 4096;
-        } else {
-            // Priority 3b: Sticky effort — sustain previous level across routine follow-ups
-            effective_effort = loop.last_effort;
-            effective_budget = loop.last_budget;
-        }
+        // RFC-019: downshift while executing structured plan items.
+        const plan_items_executing = if (loop.plan.current_plan) |plan|
+            plan.phase == .approved or plan.phase == .executing
+        else
+            false;
+
+        const decision = selectReasoningEffort(EffortSelection{
+            .config_effort = loop.config.reasoning_effort,
+            .config_budget = loop.config.thinking_budget_tokens,
+            .last_effort = loop.last_effort,
+            .last_budget = loop.last_budget,
+            .last_act_failed = loop.last_act_failed,
+            .js_retry_count = loop.js_retry_count,
+            .act_id = act_id,
+            .plan_executing_items = plan_items_executing,
+        });
+        effective_effort = decision.effort;
+        effective_budget = decision.budget;
     }
 
     // PSEUDOCODE: Clamp thinking budget to 85% of max_tokens so the response
