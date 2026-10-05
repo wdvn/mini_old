@@ -106,22 +106,51 @@ fn resolveTurnToolDefinitions(
     turn_alloc: std.mem.Allocator,
     user_text: []const u8,
 ) []const proto.ToolDefinition {
+    return resolveTurnToolDefinitionsInner(self, turn_alloc, user_text, tools_mod.isDeferredToolsEnabled());
+}
+
+/// RFC-029: resolve the tool list sent to the model for this act.
+///
+/// PSEUDOCODE:
+/// 1. In `.codeact` mode the native tool list stays empty (mini.* API is static).
+/// 2. In deferred mode send essential tools + `tool_search` + promoted tools only
+///    (`.tools` still drops `codeact`; `.auto` keeps it), so the sent list is
+///    cache-stable and independent of MCP tool count.
+/// 3. In legacy mode fall back to the eager keyword-filtered list.
+/// 4. Under a plan, promote the hinted tool instead of dropping the rest
+///    (deferred mode) or keep the legacy drop-filter (legacy mode).
+pub fn resolveTurnToolDefinitionsInner(
+    self: *AgentLoop,
+    turn_alloc: std.mem.Allocator,
+    user_text: []const u8,
+    deferred: bool,
+) []const proto.ToolDefinition {
     const raw_tool_defs = switch (self.config.execution_mode) {
         .codeact => &[_]proto.ToolDefinition{},
         .tools => blk: {
-            const all_defs = tools_mod.getRelevantDefinitions(turn_alloc, user_text);
+            const src: []const proto.ToolDefinition = if (deferred)
+                tools_mod.resolveDeferredTools(turn_alloc)
+            else
+                tools_mod.getRelevantDefinitions(turn_alloc, user_text);
             var list = std.ArrayListUnmanaged(proto.ToolDefinition).empty;
-            for (all_defs) |td| {
+            for (src) |td| {
                 if (!std.mem.eql(u8, td.name, "codeact")) {
                     list.append(turn_alloc, td) catch {};
                 }
             }
             break :blk list.items;
         },
-        .auto => tools_mod.getRelevantDefinitions(turn_alloc, user_text),
+        .auto => if (deferred)
+            tools_mod.resolveDeferredTools(turn_alloc)
+        else
+            tools_mod.getRelevantDefinitions(turn_alloc, user_text),
     };
 
     if (self.plan.getToolHint()) |hint| {
+        if (deferred) {
+            tools_mod.promoteTool(hint);
+            return resolveTurnToolDefinitionsInner(self, turn_alloc, user_text, true);
+        }
         return tools_mod.filterDefinitionsForPlan(turn_alloc, raw_tool_defs, hint);
     }
     return raw_tool_defs;
@@ -692,6 +721,13 @@ pub fn executeTurnWorker(
 
     const tool_defs = try prepareTurnState(self, turn_alloc, user_text, images);
 
+    // RFC-029: in deferred mode the tool list is re-resolved at the start of
+    // every act, so tools promoted by earlier acts (tool_search hits, actual
+    // invocations, plan hints) become visible. The list only ever grows, so
+    // the provider prompt-cache prefix stays valid.
+    const deferred_mode = tools_mod.isDeferredToolsEnabled();
+    var current_tool_defs = tool_defs;
+
     var act_id: usize = 1;
     var rate_limit_retries: usize = 0;
     const max_retries = 3;
@@ -700,8 +736,11 @@ pub fn executeTurnWorker(
 
     while (true) : (act_id += 1) {
         self.last_turn_acts = act_id;
+        if (deferred_mode) {
+            current_tool_defs = resolveTurnToolDefinitionsInner(self, turn_alloc, user_text, true);
+        }
         main.beginAct(act_id);
-        const transition = try runActRetryLoop(self, act_id, tool_defs, text_cb, think_cb, &rate_limit_retries, max_retries);
+        const transition = try runActRetryLoop(self, act_id, current_tool_defs, text_cb, think_cb, &rate_limit_retries, max_retries);
         switch (transition) {
             .next_act => continue,
             .retry_same_act => continue,

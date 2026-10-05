@@ -73,6 +73,8 @@ pub const Config = struct {
     tool_allowlist: ?[]const u8,
     /// Comma-separated blocklist. Null = block none.
     tool_blocklist: ?[]const u8,
+    /// RFC-029: deferred tool loading with tool_search meta-tool. Default true.
+    deferred_tool_loading: bool = true,
 
     // Reasoning & Thinking (RFC-009)
     /// Reasoning effort for OpenAI-compatible models: "minimal" | "low" | "medium" | "high" | "none" | null.
@@ -285,6 +287,8 @@ pub const JsonConfig = struct {
     // Tools
     tool_allowlist: ?[]const u8 = null,
     tool_blocklist: ?[]const u8 = null,
+    /// RFC-029: deferred tool loading. Null = keep default (on).
+    deferred_tool_loading: ?bool = null,
     // Reasoning & Thinking (RFC-009)
     reasoning_effort: ?[]const u8 = null,
     reasoning_effort_disabled: ?bool = null,

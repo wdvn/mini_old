@@ -360,6 +360,7 @@ pub const AgentLoop = struct {
         // PSEUDOCODE: Set tool policies and media generation options
         tools_mod.setPolicy(config.tool_allowlist, config.tool_blocklist);
         tools_mod.setMediaConfig(config.image_gen_enabled, config.video_gen_enabled, config.image_input_enabled);
+        tools_mod.setDeferredToolsEnabled(config.deferred_tool_loading);
         media_gen_tool.setConfig(.{
             .image = .{
                 .enabled = config.image_gen_enabled,

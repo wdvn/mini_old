@@ -339,6 +339,11 @@ pub fn applyBackendAndMemActToConfig(
     cfg.system_prompt_buf = sp.buf;
     cfg.tool_allowlist = env_map.get("MINI_TOOL_ALLOWLIST");
     cfg.tool_blocklist = env_map.get("MINI_TOOL_BLOCKLIST");
+    // RFC-029: safety valve — MINI_DEFERRED_TOOLS=0 restores legacy eager tool lists.
+    cfg.deferred_tool_loading = blk: {
+        const v = env_map.get("MINI_DEFERRED_TOOLS") orelse break :blk true;
+        break :blk !((std.mem.eql(u8, v, "0")) or std.mem.eql(u8, v, "false"));
+    };
     cfg.memact_enabled = m.enabled;
     cfg.context_window = m.context_window;
     cfg.ctx_safety_margin = m.ctx_safety_margin;

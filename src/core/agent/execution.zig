@@ -410,6 +410,10 @@ pub fn executeSingleTool(
     }
 
     var is_err = false;
+    // RFC-029: promoting the invoked tool keeps its schema visible for the
+    // following acts even when the model calls a deferred tool directly
+    // (no tool_search round-trip). Grow-only, so the cache prefix is safe.
+    if (tools_mod.isDeferredToolsEnabled()) tools_mod.promoteTool(tu.name);
     const result = tools_mod.executeTool(self.alloc, self.io, tu.name, tu.input_json) catch |e| blk: {
         if (e == error.Interrupted or signals.isInterrupted()) return error.Interrupted;
         is_err = true;

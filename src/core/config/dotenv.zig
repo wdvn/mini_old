@@ -188,6 +188,7 @@ pub fn applyGeneralAndModelJsonConfig(cfg: *const JsonConfig, env_map: *std.proc
     if (cfg.max_tokens) |val| count += setEnvInt(u32, env_map, "MINI_MAX_TOKENS", val);
     if (cfg.tool_allowlist) |val| count += setEnvDefault(env_map, "MINI_TOOL_ALLOWLIST", val);
     if (cfg.tool_blocklist) |val| count += setEnvDefault(env_map, "MINI_TOOL_BLOCKLIST", val);
+    if (cfg.deferred_tool_loading) |val| count += setEnvBool(env_map, "MINI_DEFERRED_TOOLS", val);
     return count;
 }
 
