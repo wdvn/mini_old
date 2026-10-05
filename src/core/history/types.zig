@@ -10,7 +10,7 @@ const compact_mod = @import("compact.zig");
 const compat = @import("compat.zig");
 
 /// Maximum messages before auto-compaction.
-pub const DEFAULT_MAX_MESSAGES = 40;
+pub const DEFAULT_MAX_MESSAGES = 100;
 
 /// Conversation history for a session.
 pub const History = struct {

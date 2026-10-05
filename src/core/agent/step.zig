@@ -21,6 +21,7 @@ const agent_parsing = @import("parsing.zig");
 const loop_mod = @import("loop.zig");
 const AgentLoop = loop_mod.AgentLoop;
 const prompts_mod = @import("../prompts.zig");
+const history_mod = @import("../history.zig");
 const agent_loop_monitor = @import("loop_monitor.zig");
 
 pub const StepResult = proto.ActTransition;
@@ -117,7 +118,84 @@ test "thinking budget capped at 85% of max_tokens" {
     try std.testing.expectEqual(@as(?u32, 20400), capThinkingBudget(24000, 20400));
 }
 
-/// Dynamically modulates reasoning effort and thinking budget tokens based on overrides, error state, and stickiness.
+/// Input snapshot for reasoning effort selection (pure, testable without AgentLoop).
+pub const EffortSelection = struct {
+    config_effort: ?[]const u8 = null,
+    config_budget: ?u32 = null,
+    last_effort: ?[]const u8 = null,
+    last_budget: ?u32 = null,
+    last_act_failed: bool = false,
+    js_retry_count: usize = 0,
+    act_id: usize = 1,
+    /// RFC-019: true when a structured plan is approved/executing its items.
+    plan_executing_items: bool = false,
+};
+
+/// PSEUDOCODE: Pure effort selection with fixed priority:
+/// 1. Error recovery safety net — escalate to high (failed act or JS retry)
+/// 2. Plan execution (RFC-019) — downgrade to medium so mechanical step
+///    execution stays fast; an explicit config effort of "low" is respected
+/// 3. Act 1: no model choice yet — start from config/default
+/// 4. Sticky effort — sustain previous level across routine follow-ups
+pub fn selectReasoningEffort(s: EffortSelection) struct {
+    effort: ?[]const u8,
+    budget: ?u32,
+} {
+    if (s.last_act_failed or s.js_retry_count > 0)
+        return .{ .effort = "high", .budget = 4096 };
+    if (s.plan_executing_items) {
+        if (std.mem.eql(u8, s.config_effort orelse "", "low"))
+            return .{ .effort = "low", .budget = s.config_budget orelse 1024 };
+        return .{ .effort = "medium", .budget = 4096 };
+    }
+    if (s.act_id == 1)
+        return .{ .effort = s.config_effort orelse "high", .budget = s.config_budget orelse 4096 };
+    return .{ .effort = s.last_effort, .budget = s.last_budget };
+}
+
+test "reasoning effort selection priorities" {
+    var base = EffortSelection{};
+
+    // Error recovery always escalates to high, even during plan execution.
+    base = .{ .plan_executing_items = true, .last_act_failed = true, .act_id = 3, .last_effort = "medium" };
+    try std.testing.expectEqualStrings("high", selectReasoningEffort(base).effort.?);
+
+    base = .{ .plan_executing_items = true, .js_retry_count = 1, .act_id = 3 };
+    try std.testing.expectEqualStrings("high", selectReasoningEffort(base).effort.?);
+
+    // Plan execution downgrades sticky high to medium.
+    base = .{ .plan_executing_items = true, .act_id = 2, .last_effort = "high", .last_budget = 8192 };
+    var d = selectReasoningEffort(base);
+    try std.testing.expectEqualStrings("medium", d.effort.?);
+    try std.testing.expectEqual(@as(?u32, 4096), d.budget);
+
+    // Explicit config effort "low" is respected during plan execution.
+    base = .{ .plan_executing_items = true, .act_id = 2, .config_effort = "low" };
+    d = selectReasoningEffort(base);
+    try std.testing.expectEqualStrings("low", d.effort.?);
+    try std.testing.expectEqual(@as(?u32, 1024), d.budget);
+    base.config_budget = 512;
+    try std.testing.expectEqual(@as(?u32, 512), selectReasoningEffort(base).budget);
+
+    // No plan: act 1 starts from config/default.
+    base = .{ .act_id = 1 };
+    d = selectReasoningEffort(base);
+    try std.testing.expectEqualStrings("high", d.effort.?);
+    try std.testing.expectEqual(@as(?u32, 4096), d.budget);
+    base.config_effort = "low";
+    base.config_budget = 777;
+    d = selectReasoningEffort(base);
+    try std.testing.expectEqualStrings("low", d.effort.?);
+    try std.testing.expectEqual(@as(?u32, 777), d.budget);
+
+    // No plan: sticky effort is sustained.
+    base = .{ .act_id = 4, .last_effort = "medium", .last_budget = 2048 };
+    d = selectReasoningEffort(base);
+    try std.testing.expectEqualStrings("medium", d.effort.?);
+    try std.testing.expectEqual(@as(?u32, 2048), d.budget);
+}
+
+/// Dynamically modulates reasoning effort and thinking budget tokens based on overrides, error state, plan execution, and stickiness.
 pub fn modulateReasoningEffort(loop: *AgentLoop, act_id: usize) void {
     if (loop.config.reasoning_effort_disabled) return;
 
@@ -129,19 +207,24 @@ pub fn modulateReasoningEffort(loop: *AgentLoop, act_id: usize) void {
         if (override.effort) |eff| effective_effort = eff;
         if (override.budget_tokens) |bud| effective_budget = bud;
     } else if (loop.dynamic_thinking) {
-        if (act_id == 1) {
-            // Act 1: no model choice yet — start from config/default
-            effective_effort = loop.config.reasoning_effort orelse "high";
-            effective_budget = loop.config.thinking_budget_tokens orelse 4096;
-        } else if (loop.last_act_failed or loop.js_retry_count > 0) {
-            // Priority 3a: Error recovery safety net — escalate to high
-            effective_effort = "high";
-            effective_budget = 4096;
-        } else {
-            // Priority 3b: Sticky effort — sustain previous level across routine follow-ups
-            effective_effort = loop.last_effort;
-            effective_budget = loop.last_budget;
-        }
+        // RFC-019: downshift while executing structured plan items.
+        const plan_items_executing = if (loop.plan.current_plan) |plan|
+            plan.phase == .approved or plan.phase == .executing
+        else
+            false;
+
+        const decision = selectReasoningEffort(EffortSelection{
+            .config_effort = loop.config.reasoning_effort,
+            .config_budget = loop.config.thinking_budget_tokens,
+            .last_effort = loop.last_effort,
+            .last_budget = loop.last_budget,
+            .last_act_failed = loop.last_act_failed,
+            .js_retry_count = loop.js_retry_count,
+            .act_id = act_id,
+            .plan_executing_items = plan_items_executing,
+        });
+        effective_effort = decision.effort;
+        effective_budget = decision.budget;
     }
 
     // PSEUDOCODE: Clamp thinking budget to 85% of max_tokens so the response
@@ -619,6 +702,7 @@ fn handleResponseRecovery(
     history_checkpoint: usize,
 ) !StepResult {
     const recovery_class: proto.RecoveryClass = proto.responseRecoveryClass(validity, gen_stop) orelse {
+        loop.history.truncate(history_checkpoint);
         loop.last_step_outcome = .protocol_failure;
         loop.last_turn_outcome = .failed;
         return proto.ActTransition{ .fail = .protocol_error };
@@ -631,6 +715,10 @@ fn handleResponseRecovery(
         .error_message = @tagName(validity),
     });
 
+    // PSEUDOCODE:
+    // 1. Roll back any previous retry attempt's advisory back to act_history_checkpoint.
+    // 2. Consume budget: if retrying same act, append exactly one advisory.
+    // 3. If failing or stalling, ensure history remains cleanly truncated at act checkpoint.
     loop.history.truncate(history_checkpoint);
 
     const transition = (try nextResponseRecoveryTransition(validity, gen_stop, &loop.response_recovery_budget)).?;
@@ -670,11 +758,13 @@ fn handleResponseRecovery(
     }
 
     if (transition == .fail) {
+        loop.history.truncate(history_checkpoint);
         loop.last_step_outcome = .provider_failure;
         loop.last_turn_outcome = .failed;
         return transition;
     }
 
+    loop.history.truncate(history_checkpoint);
     loop.last_agent_decision = .fail_stalled;
     markRecoveryExhausted(loop);
     return transition;
@@ -945,12 +1035,12 @@ pub fn dispatchStopReason(
                 loop.last_response_validity == .whitespace_only or
                 loop.last_response_validity == .empty)
             {
-                return handleResponseRecovery(loop, act_id, input_msgs_count, tool_defs, response, loop.last_response_validity);
+                return handleResponseRecovery(loop, act_id, input_msgs_count, tool_defs, response, loop.last_response_validity, loop.last_generation_stop, loop.act_history_checkpoint);
             }
             return handleEndTurnStop(loop, act_id, input_msgs_count, tool_defs, response);
         },
-        .missing_terminal_event => return handleResponseRecovery(loop, act_id, input_msgs_count, tool_defs, response, loop.last_response_validity),
-        .stop_sequence => return handleResponseRecovery(loop, act_id, input_msgs_count, tool_defs, response, .partial_text),
+        .missing_terminal_event => return handleResponseRecovery(loop, act_id, input_msgs_count, tool_defs, response, loop.last_response_validity, loop.last_generation_stop, loop.act_history_checkpoint),
+        .stop_sequence => return handleResponseRecovery(loop, act_id, input_msgs_count, tool_defs, response, .partial_text, loop.last_generation_stop, loop.act_history_checkpoint),
         .max_tokens => return handleMaxTokensStop(loop, act_id, input_msgs_count, tool_defs, response),
         .tool_use => return handleToolUseStop(loop, act_id, input_msgs_count, tool_defs, response, has_tool_use_blocks),
         .stream_aborted => return handleStreamAbortedStop(loop, act_id, input_msgs_count, tool_defs, response),
@@ -960,11 +1050,6 @@ pub fn dispatchStopReason(
 
 fn renderStepHeader(self: *AgentLoop, act_id: usize) !void {
     if (signals.isInterrupted() or self.coordinator.isTimedOut()) return error.Interrupted;
-
-    if (self.coordinator.popPendingRecapAdvisory()) |advisory| {
-        defer self.alloc.free(advisory);
-        try self.history.addUser(advisory);
-    }
 
     self.coordinator.updateStatus(act_id, .calling_llm, "Calling LLM backend");
 
@@ -1047,7 +1132,7 @@ pub fn executeStep(
 ) !StepResult {
     try renderStepHeader(self, act_id);
 
-    const history_checkpoint = self.history.len();
+    const history_checkpoint = self.act_history_checkpoint;
 
     var input_msgs_count: usize = 0;
     var temp_input_msgs = std.ArrayListUnmanaged(proto.Message).empty;
@@ -1317,4 +1402,41 @@ test "P0-B: whitespace-only thinking yields no tail hint" {
     var response = makeThinkingResponse(alloc, "   \n\t  ", "");
     defer response.deinit();
     try std.testing.expectEqual(@as(?[]const u8, null), buildThinkingTailHint(alloc, &response, 512));
+}
+
+test "RFC-023: history rollback cleans retry advisories across multiple attempts" {
+    // PSEUDOCODE:
+    // 1. Establish baseline history with 1 user prompt.
+    // 2. Attempt 1: transition is retry_same_act, adds 1 recovery advisory (len = baseline + 1).
+    // 3. Attempt 2: truncates to baseline checkpoint, transition is retry_same_act, adds advisory (len = baseline + 1).
+    // 4. Attempt 3: budget exhausted -> transition is fail, history stays cleanly truncated at baseline.
+    const alloc = std.testing.allocator;
+    var history = history_mod.History.init(alloc);
+    defer history.deinit();
+
+    try history.addUser("initial user prompt");
+    const baseline_len = history.len();
+    try std.testing.expectEqual(@as(usize, 1), baseline_len);
+
+    var budget = proto.ResponseRecoveryBudget{ .missing_terminal = 2 };
+
+    // Attempt 1: retry_same_act -> add advisory
+    const t1 = (try nextResponseRecoveryTransition(.empty, .missing_terminal_event, &budget)).?;
+    try std.testing.expect(t1 == .retry_same_act);
+    try history.addUser(prompts_mod.recovery_advisory_missing_terminal);
+    try std.testing.expectEqual(baseline_len + 1, history.len());
+
+    // Attempt 2: rollback previous advisory, retry_same_act -> add advisory
+    history.truncate(baseline_len);
+    try std.testing.expectEqual(baseline_len, history.len());
+    const t2 = (try nextResponseRecoveryTransition(.empty, .missing_terminal_event, &budget)).?;
+    try std.testing.expect(t2 == .retry_same_act);
+    try history.addUser(prompts_mod.recovery_advisory_missing_terminal);
+    try std.testing.expectEqual(baseline_len + 1, history.len());
+
+    // Attempt 3: rollback advisory, budget exhausted -> fail, history remains baseline
+    history.truncate(baseline_len);
+    const t3 = (try nextResponseRecoveryTransition(.empty, .missing_terminal_event, &budget)).?;
+    try std.testing.expectEqual(proto.FailureReason.provider_unavailable, t3.fail);
+    try std.testing.expectEqual(baseline_len, history.len());
 }

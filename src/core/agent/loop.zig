@@ -260,6 +260,8 @@ pub const AgentLoop = struct {
     last_agent_message: ?[]const u8 = null,
     last_turn_outcome: proto.TurnOutcome = .completed,
     current_act_attempt: usize = 1,
+    /// History length at the start of the active Act (before any retry attempt).
+    act_history_checkpoint: usize = 0,
     last_recovery_class: ?proto.RecoveryClass = null,
     last_failure_reason: ?proto.FailureReason = null,
 
@@ -359,17 +361,24 @@ pub const AgentLoop = struct {
         tools_mod.setPolicy(config.tool_allowlist, config.tool_blocklist);
         tools_mod.setMediaConfig(config.image_gen_enabled, config.video_gen_enabled, config.image_input_enabled);
         media_gen_tool.setConfig(.{
-            .image_gen_enabled = config.image_gen_enabled,
-            .image_gen_provider = config.image_gen_provider,
-            .image_gen_model = config.image_gen_model,
-            .image_gen_size = config.image_gen_size,
-            .video_gen_enabled = config.video_gen_enabled,
-            .video_gen_model = config.video_gen_model,
-            .video_gen_provider = config.video_gen_provider,
+            .image = .{
+                .enabled = config.image_gen_enabled,
+                .provider = config.image_gen_provider,
+                .model = config.image_gen_model,
+                .size = config.image_gen_size,
+                .url = config.image_gen_url,
+                .key = config.image_gen_key,
+                .api_header = config.image_gen_api_header,
+            },
+            .video = .{
+                .enabled = config.video_gen_enabled,
+                .provider = config.video_gen_provider,
+                .model = config.video_gen_model,
+                .url = config.video_gen_url,
+                .key = config.video_gen_key,
+                .api_header = config.video_gen_api_header,
+            },
             .media_output_dir = config.media_output_dir,
-            .video_poll_timeout_secs = config.video_poll_timeout_secs,
-            .openai_compat_url = config.openai_compat_url,
-            .openai_compat_key = config.openai_compat_key,
             .image_input_max_bytes = config.image_input_max_bytes,
             .image_input_max_per_turn = config.image_input_max_per_turn,
         });
@@ -1166,14 +1175,21 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         const extraction_system_prompt = prompts_mod.memact_extraction_system_prompt;
 
         var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
-        errdefer {
-            self.alloc.free(msg_blocks[0].text);
-            self.alloc.free(msg_blocks);
-        }
         msg_blocks[0] = .{ .text = request_text };
         const user_msg = proto.Message{ .role = .user, .content = msg_blocks };
 
-        var resp = self.backend.send(extraction_system_prompt, &.{ user_msg }, &[_]proto.ToolDefinition{}, null, null) catch return;
+        // PSEUDOCODE:
+        // 1. Attempt backend send; on error, free both prompt buffers and
+        //    gracefully bail out (extraction must never break the turn).
+        //    NOTE: `catch return` swallows the error, so an errdefer would
+        //    not fire here — the failure path must free manually.
+        // 2. On success, free the buffers explicitly after resp is owned
+        //    by `defer resp.deinit()`.
+        var resp = self.backend.send(extraction_system_prompt, &.{ user_msg }, &[_]proto.ToolDefinition{}, null, null) catch {
+            self.alloc.free(msg_blocks[0].text);
+            self.alloc.free(msg_blocks);
+            return;
+        };
         defer resp.deinit();
         self.alloc.free(msg_blocks);
         self.alloc.free(request_text);

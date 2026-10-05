@@ -69,7 +69,7 @@ possible:
 | Auto completion detection | `src/core/agent.zig:1455-1478` | after each tool act: if executed tool == `tool_hint` of active step → `completeStep()`; when `is_complete` → `plan_store.save()` + `clearPlan()` |
 | Prompt-side planning modes | `src/core/prompts.zig` | "ReAct Mode (Default)" vs "Proactive Planning Mode (RFC-019)" with JSON plan template; `plan_replan_suggestion_fmt`, `plan_drift_significant`, `plan_step_enforcement_head` |
 | REPL control | `src/ui/repl.zig:249, 335-346` | `/plan on\|off\|status` toggles `enable_structured_planning` |
-| Config | `src/core/config.zig:240-253, 506-519` | Struct field default for `enable_structured_planning` is **true**, but the env-resolved loader default (the *actual runtime value*) is **false** (`config.zig:512` — no `MINI_ENABLE_STRUCTURED_PLANNING` env var → false). Also: `plan_drift_detection`, `plan_max_steps` (20), `plans_dir`, `enhanced_progress_checkpoint` (parsed but unused outside config — gates nothing), `prompt_enforcement_enabled` (default **false**; gates the progress block) |
+| Config | `src/core/config.zig:240-253, 506-519` | Struct field default for `enable_structured_planning` is **true**, and the env-resolved loader default (the *actual runtime value*) is now also **true** (`resolvers.zig:271` — absent `MINI_ENABLE_STRUCTURED_PLANNING` → true; set `0`/`false` to opt out). Also: `plan_drift_detection`, `plan_max_steps` (20), `plans_dir`, `enhanced_progress_checkpoint` (parsed but unused outside config — gates nothing), `prompt_enforcement_enabled` (default **false**; gates the progress block) |
 
 ### 2.2 Skills system (subset of Superpowers, prompt-based)
 
@@ -159,8 +159,11 @@ steps and subagent dispatch, and no review gate after a subagent returns.
 Design principle: **Superpowers semantics, mini's enforcement style.** Where Superpowers
 uses prompt pressure ("you MUST invoke the skill"), mini hard-enforces in Zig (parser,
 gates, journal events) and keeps prompt pressure only where the LLM's judgment is the
-signal. All phases opt-in behind new config flags; default behavior for existing users is
-unchanged except flag (5) telemetry, which is inert.
+signal. All RFC-024 phase gates remain opt-in behind new config flags (flag (5)
+telemetry inert). Note: the *core* `enable_structured_planning` flag is now ON by
+default (resolver default `true`, opt-out via `MINI_ENABLE_STRUCTURED_PLANNING=0` /
+`config.json` / `/plan off`), so out-of-the-box sessions run in State B/C until a
+plan is emitted; RFC-024-specific gates stay off unless explicitly enabled.
 
 ### 3.1 Phase 1 — Verification-gated plan steps
 
@@ -324,9 +327,11 @@ New `ActEventType`s in `journal.zig`: `plan_phase_changed`, `plan_step_verified`
 
 The RFC must state precisely what happens when planning is *not* active. Note on the
 baseline: the struct-field default for `enable_structured_planning` is `true`
-(`config.zig:241`), but the **actual runtime value** comes from the env-resolved
-loader (`config.zig:512`), which defaults to **false** when the env var is absent —
-so, out of the box, the feature is OFF and State A describes default behavior.
+(`types.zig:199`), and the **actual runtime value** comes from the env-resolved
+loader (`resolvers.zig:271`), which also defaults to **true** when
+`MINI_ENABLE_STRUCTURED_PLANNING` is absent — so, out of the box, the feature is ON
+and State B/C describes default behavior; State A is reached by explicitly opting
+out (`MINI_ENABLE_STRUCTURED_PLANNING=0`, `config.json`, or `/plan off`).
 The flag only *enables* the parser/monitor; whether a plan actually exists depends
 on the LLM emitting a parseable plan in a response. There are four distinct
 states, each with defined behavior under this RFC.
@@ -504,11 +509,12 @@ RFC-024 nhắm đúng các thiếu hụt về xác minh step, duyệt kế hoạ
 
 ## Các điểm cần sửa trước — ưu tiên cao
 
-### 1. Mâu thuẫn về mặc định của structured planning
+### 1. Mâu thuẫn về mặc định của structured planning — ĐÃ GIẢI QUYẾT
 
-RFC nói enable_structured_planning mặc định bật (§2.1, §3.6). Struct Config có giá trị khởi tạo true, nhưng config loader lấy từ resolvePlanningAndWatchdogSettings() với giá trị môi trường mặc định **false** (src/core/config.zig:239-253, 506-519). Cần thống nhất RFC mô tả **giá trị mặc định thực tế khi chạy**, không chỉ giá trị mặc định của struct.
+RFC nói enable_structured_planning mặc định bật (§2.1, §3.6). Struct Config có giá trị khởi tạo true; trước đây config loader lấy từ resolvePlanningAndWatchdogSettings() với giá trị môi trường mặc định **false** (src/core/config.zig:239-253, 506-519).
+→ Đã đồng bộ: resolver hiện default **true** khi thiếu `MINI_ENABLE_STRUCTURED_PLANNING` (src/core/config/resolvers.zig:271, opt-out bằng `0`/`false`), khớp struct default và mô tả RFC (§2.1, §3.6 baseline).
 
-Mâu thuẫn này tác động trực tiếp đến fallback semantics, test no-op và các tuyên bố tương thích ngược.
+Ghi chú (liên quan trước khi fix): mâu thuẫn này từng tác động trực tiếp đến fallback semantics, test no-op và các tuyên bố tương thích ngược.
 
 ### 2. Approval gate hiện chỉ là advisory, không phải user sign-off
 

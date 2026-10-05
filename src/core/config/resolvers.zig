@@ -268,7 +268,7 @@ pub fn resolvePlanningAndWatchdogSettings(env_map: *const std.process.Environ.Ma
         break :blk std.fmt.parseInt(u32, s, 10) catch 120;
     };
     return .{
-        .enable_structured_planning = if (env_map.get("MINI_ENABLE_STRUCTURED_PLANNING")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false,
+        .enable_structured_planning = if (env_map.get("MINI_ENABLE_STRUCTURED_PLANNING")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else true,
         .plan_drift_detection = if (env_map.get("MINI_PLAN_DRIFT_DETECTION")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else true,
         .plan_max_steps = if (env_map.get("MINI_PLAN_MAX_STEPS")) |s| std.fmt.parseInt(usize, s, 10) catch 20 else 20,
         .plans_dir = env_map.get("MINI_PLANS_DIR"),

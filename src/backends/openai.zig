@@ -295,7 +295,7 @@ pub const Client = struct {
         if (req_http_code == 200 and self.protocol_mode == .auto) {
             self.cached_protocol = active_protocol;
         }
-        if ((ctx.response.stop_reason == .unknown or req_http_code >= 400) and ctx.raw_accum_init) {
+        if ((ctx.response.stop_reason == .unknown or ctx.response.stop_reason == .missing_terminal_event or req_http_code >= 400) and ctx.raw_accum_init) {
             if (ctx.response.raw_debug_info == null) {
                 ctx.response.raw_debug_info = ctx.alloc.dupe(u8, ctx.raw_accum.items) catch null;
             }

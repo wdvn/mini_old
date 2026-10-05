@@ -165,18 +165,30 @@ pub const Config = struct {
     image_input_max_bytes: usize = 10 * 1024 * 1024,
     /// Enable generate_image tool. Default: false.
     image_gen_enabled: bool = false,
-    /// Image gen provider: "openai" | "openai_compat".
+    /// Image gen provider: "openai" | "openai_compat" | "openrouter" | etc.
     image_gen_provider: []const u8 = "openai",
     /// Image gen model: "gpt-image-1", "dall-e-3", etc.
     image_gen_model: []const u8 = "gpt-image-1",
     /// Default image size: "1024x1024" | "1536x1024" | "1024x1536" | "auto".
     image_gen_size: []const u8 = "1024x1024",
+    /// Image gen base URL (MINI_IMAGE_GEN_URL).
+    image_gen_url: ?[]const u8 = null,
+    /// Image gen API key (MINI_IMAGE_GEN_KEY).
+    image_gen_key: ?[]const u8 = null,
+    /// Image gen auth header name.
+    image_gen_api_header: []const u8 = "Authorization",
     /// Enable generate_video tool. Default: false.
     video_gen_enabled: bool = false,
     /// Video gen model: "sora-2", "sora-2-pro", etc.
     video_gen_model: []const u8 = "sora-2",
-    /// Video gen provider: "openai" | "openai_compat".
+    /// Video gen provider: "openai" | "openai_compat" | "openrouter" | etc.
     video_gen_provider: []const u8 = "openai",
+    /// Video gen base URL (MINI_VIDEO_GEN_URL).
+    video_gen_url: ?[]const u8 = null,
+    /// Video gen API key (MINI_VIDEO_GEN_KEY).
+    video_gen_key: ?[]const u8 = null,
+    /// Video gen auth header name.
+    video_gen_api_header: []const u8 = "Authorization",
     /// Media output directory. Null = "<workspace>/media".
     media_output_dir: ?[]const u8 = null,
     /// Video poll timeout in seconds.
