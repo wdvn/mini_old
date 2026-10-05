@@ -1175,14 +1175,21 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         const extraction_system_prompt = prompts_mod.memact_extraction_system_prompt;
 
         var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
-        errdefer {
-            self.alloc.free(msg_blocks[0].text);
-            self.alloc.free(msg_blocks);
-        }
         msg_blocks[0] = .{ .text = request_text };
         const user_msg = proto.Message{ .role = .user, .content = msg_blocks };
 
-        var resp = self.backend.send(extraction_system_prompt, &.{ user_msg }, &[_]proto.ToolDefinition{}, null, null) catch return;
+        // PSEUDOCODE:
+        // 1. Attempt backend send; on error, free both prompt buffers and
+        //    gracefully bail out (extraction must never break the turn).
+        //    NOTE: `catch return` swallows the error, so an errdefer would
+        //    not fire here — the failure path must free manually.
+        // 2. On success, free the buffers explicitly after resp is owned
+        //    by `defer resp.deinit()`.
+        var resp = self.backend.send(extraction_system_prompt, &.{ user_msg }, &[_]proto.ToolDefinition{}, null, null) catch {
+            self.alloc.free(msg_blocks[0].text);
+            self.alloc.free(msg_blocks);
+            return;
+        };
         defer resp.deinit();
         self.alloc.free(msg_blocks);
         self.alloc.free(request_text);
