@@ -1,4 +1,4 @@
-//! deepseek.zig — DeepSeek provider profile and URL matcher (RFC-012).
+//! deepseek.zig — DeepSeek provider profile and URL matcher.
 
 const std = @import("std");
 const base = @import("../provider.zig");

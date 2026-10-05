@@ -1,4 +1,4 @@
-//! terminal.zig — ANSI Escape Codes, Colors, Box Drawing & Terminal Primitives for mini-agent (RFC-007).
+//! terminal.zig — ANSI Escape Codes, Colors, Box Drawing & Terminal Primitives for mini-agent.
 //!
 //! Provides constants and utilities for terminal control, syntax coloring,
 //! box drawing, and cursor management according to ANSI standards.

@@ -1,4 +1,4 @@
-//! qwen.zig — Qwen / DashScope (Alibaba Cloud) provider profile and URL matcher (RFC-012).
+//! qwen.zig — Qwen / DashScope (Alibaba Cloud) provider profile and URL matcher.
 
 const std = @import("std");
 const base = @import("../provider.zig");

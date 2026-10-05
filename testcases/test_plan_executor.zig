@@ -1,4 +1,4 @@
-//! test_plan_executor.zig — Unit tests for RFC-019 Plan Executor.
+//! test_plan_executor.zig — Unit tests for Plan Executor.
 //!
 //! Validates:
 //! 1. Step activation and dependency checking (DependenciesNotSatisfied error)

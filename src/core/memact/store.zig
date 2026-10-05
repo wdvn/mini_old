@@ -1,4 +1,4 @@
-//! store.zig — MemoryStore for MemAct (RFC-003, M3 §4.4)
+//! store.zig — MemoryStore for MemAct
 //! Long-term memory as an append-only event log JSONL at
 //! `~/.mini/memory/<project_hash>/memory.jsonl`.
 //!
@@ -48,7 +48,7 @@ pub const MemoryEntry = struct {
     confidence: f32,
     /// ID of the entry that this entry supersedes (null if none).
     supersedes: ?[]u8,
-    /// RFC-025 Phase 3: reference into the procedural graph (Node ID).
+    /// Reference into the procedural graph (Node ID).
     /// Nullable; legacy lines parse as null.
     node_ref: ?u32 = null,
     access_count: u32,
@@ -232,7 +232,7 @@ pub const MemoryStore = struct {
         alloc.free(entries);
     }
 
-    /// Write entry as 1 JSON object on 1 line (RFC-003 §4.4 schema).
+    /// Write entry as 1 JSON object on 1 line.
     fn stringifyEntry(writer: *std.Io.Writer, entry: *const MemoryEntry) !void {
         try writer.writeAll("{\"id\":");
         try std.json.Stringify.value(entry.id, .{}, writer);

@@ -1,6 +1,6 @@
 //! lib/graph/types.zig — Fundamental data types for the Graph Engine.
 //!
-//! Defines Node/Edge identifiers, Procedural Graph relation types (RFC-010),
+//! Defines Node/Edge identifiers, Procedural Graph relation types,
 //! node types, and attribute payload structures.
 
 const std = @import("std");
@@ -10,7 +10,7 @@ pub const EdgeId = u32;
 pub const INVALID_NODE: NodeId = std.math.maxInt(u32);
 pub const INVALID_EDGE: EdgeId = std.math.maxInt(u32);
 
-/// Relation types defined by RFC-010 Procedural Graph (and extensible for code graphs).
+/// Relation types defined by Procedural Graph (and extensible for code graphs).
 pub const RelationType = enum(u8) {
     leads_to = 0,
     triggers = 1,
@@ -69,7 +69,7 @@ pub const NodeType = enum(u8) {
     }
 };
 
-/// Attributed edge properties (Φ in RFC-010).
+/// Attributed edge properties (Φ in).
 pub const EdgeAttributes = struct {
     condition: ?[]const u8 = null,
     guidance: ?[]const u8 = null,

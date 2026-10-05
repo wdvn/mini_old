@@ -1,5 +1,5 @@
 //! agent_folder.zig — Manage the `.agent/` directory in the workspace.
-//! Implements RFC-005.
+//! Implements
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

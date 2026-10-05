@@ -94,7 +94,7 @@ test "JsonConfig parsing" {
     try std.testing.expectEqual(true, parsed.value.memact_pg_enabled.?);
 }
 
-test "JsonConfig parsing RFC-019 planning fields" {
+test "JsonConfig parsing planning fields" {
     const alloc = std.testing.allocator;
     const json_str =
         \\{

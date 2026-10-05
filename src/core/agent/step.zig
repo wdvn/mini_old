@@ -1,7 +1,7 @@
 //! Step execution logic for AgentLoop.
 //!
 //! Decomposes single-step execution (executeStep) into focused, testable lifecycle phases:
-//! - GuidanceProgressContext: injects Procedural Graph (RFC-010) & Plan progress (RFC-019)
+//! - GuidanceProgressContext: injects Procedural Graph & Plan progress
 //! - modulateReasoningEffort: dynamic thinking / reasoning effort selection
 //! - scanResponseContent: analyzes tokens, meaningful text, tool blocks, and plan detection
 //! - executeCodeActBlock: handles QuickJS evaluation, action loop trips, and output formatting
@@ -52,7 +52,7 @@ pub const GuidanceProgressContext = struct {
         act_id: usize,
         temp_input_msgs: *std.ArrayListUnmanaged(proto.Message),
     ) !void {
-        // Procedural Graph (RFC-010): Prepare ephemeral situational guidance block
+        // Procedural Graph: Prepare ephemeral situational guidance block
         if (loop.config.prompt_enforcement_enabled) {
             if (loop.pg_store) |pg| {
                 if (loop.config.memact_pg_advisory) {
@@ -127,13 +127,13 @@ pub const EffortSelection = struct {
     last_act_failed: bool = false,
     js_retry_count: usize = 0,
     act_id: usize = 1,
-    /// RFC-019: true when a structured plan is approved/executing its items.
+    /// True when a structured plan is approved/executing its items.
     plan_executing_items: bool = false,
 };
 
 /// PSEUDOCODE: Pure effort selection with fixed priority:
 /// 1. Error recovery safety net — escalate to high (failed act or JS retry)
-/// 2. Plan execution (RFC-019) — downgrade to medium so mechanical step
+/// 2. Plan execution — downgrade to medium so mechanical step
 ///    execution stays fast; an explicit config effort of "low" is respected
 /// 3. Act 1: no model choice yet — start from config/default
 /// 4. Sticky effort — sustain previous level across routine follow-ups
@@ -207,7 +207,7 @@ pub fn modulateReasoningEffort(loop: *AgentLoop, act_id: usize) void {
         if (override.effort) |eff| effective_effort = eff;
         if (override.budget_tokens) |bud| effective_budget = bud;
     } else if (loop.dynamic_thinking) {
-        // RFC-019: downshift while executing structured plan items.
+        // Downshift while executing structured plan items.
         const plan_items_executing = if (loop.plan.current_plan) |plan|
             plan.phase == .approved or plan.phase == .executing
         else
@@ -551,7 +551,7 @@ fn nextResponseRecoveryTransition(
     return proto.ActTransition{ .stall = .recovery_budget_exhausted };
 }
 
-test "RFC-023: Act 52 provider failure recovers twice then stalls" {
+test "Act 52 provider failure recovers twice then stalls" {
     var budget = proto.ResponseRecoveryBudget{};
 
     // Act 52, attempt 1: HTTP 500 is a provider failure.
@@ -569,14 +569,14 @@ test "RFC-023: Act 52 provider failure recovers twice then stalls" {
     try std.testing.expectEqual(proto.StallReason.recovery_budget_exhausted, stalled.stall);
 }
 
-test "RFC-023: recovery exhaustion records transient retry while stalling" {
+test "recovery exhaustion records transient retry while stalling" {
     var loop: AgentLoop = undefined;
     markRecoveryExhausted(&loop);
     try std.testing.expectEqual(proto.StepOutcome.transient_retry, loop.last_step_outcome);
     try std.testing.expectEqual(proto.TurnOutcome.stalled, loop.last_turn_outcome);
 }
 
-test "RFC-023: missing-terminal recovery uses capped exponential retry backoff" {
+test "missing-terminal recovery uses capped exponential retry backoff" {
     try std.testing.expectEqual(@as(u64, 0), responseRecoveryBackoffSeconds(.missing_terminal, 0));
     try std.testing.expectEqual(@as(u64, 1), responseRecoveryBackoffSeconds(.missing_terminal, 1));
     try std.testing.expectEqual(@as(u64, 2), responseRecoveryBackoffSeconds(.missing_terminal, 2));
@@ -585,7 +585,7 @@ test "RFC-023: missing-terminal recovery uses capped exponential retry backoff" 
     try std.testing.expectEqual(@as(u64, 0), responseRecoveryBackoffSeconds(.empty_response, 1));
 }
 
-test "RFC-023: repeated empty missing-terminal response fails as provider unavailable" {
+test "repeated empty missing-terminal response fails as provider unavailable" {
     // PSEUDOCODE:
     // 1. Configure a three-retry missing-terminal budget for this focused boundary test.
     // 2. Verify the first three responses retry the same Act.
@@ -609,14 +609,14 @@ test "RFC-023: repeated empty missing-terminal response fails as provider unavai
     try std.testing.expectEqual(proto.FailureReason.provider_unavailable, transition.fail);
 }
 
-test "RFC-023: valid action resets max-token continuation budget" {
+test "valid action resets max-token continuation budget" {
     var loop: AgentLoop = undefined;
     loop.max_tokens_continues = 5;
     markValidActionProgress(&loop);
     try std.testing.expectEqual(@as(usize, 0), loop.max_tokens_continues);
 }
 
-test "RFC-023: stop-sequence continuation is bounded and eventually stalls" {
+test "stop-sequence continuation is bounded and eventually stalls" {
     var count: usize = 0;
     for (0..5) |_| try std.testing.expect(stopSequenceContinuation(&count) == .next_act);
     try std.testing.expectEqual(proto.StallReason.recovery_budget_exhausted, stopSequenceContinuation(&count).stall);
@@ -782,7 +782,7 @@ fn finalAnswerWatchdogTransition(watchdog_action: anytype) proto.ActTransition {
     };
 }
 
-test "RFC-023: watchdog maps exhaustion to stall and no-action to completion" {
+test "watchdog maps exhaustion to stall and no-action to completion" {
     try std.testing.expect(finalAnswerWatchdogTransition(.continue_loop) == .next_act);
     try std.testing.expectEqual(
         proto.StallReason.plan_stalled,
@@ -1141,7 +1141,7 @@ pub fn executeStep(
     var guidance_ctx = try prepareStepInputMessages(self, act_id, &temp_input_msgs, &input_msgs_count);
     defer guidance_ctx.deinit(self.alloc);
 
-    // RFC-024 §3.4: step-scoped subagent dispatch + two-stage review gate.
+    // Step-scoped subagent dispatch + two-stage review gate.
     // When the active step requests subagent/parallel executor mode and the
     // feature is enabled, dispatch it (and optionally review it) ahead of the
     // LLM step, then surface the outcome to the model as a user message.
@@ -1404,7 +1404,7 @@ test "P0-B: whitespace-only thinking yields no tail hint" {
     try std.testing.expectEqual(@as(?[]const u8, null), buildThinkingTailHint(alloc, &response, 512));
 }
 
-test "RFC-023: history rollback cleans retry advisories across multiple attempts" {
+test "history rollback cleans retry advisories across multiple attempts" {
     // PSEUDOCODE:
     // 1. Establish baseline history with 1 user prompt.
     // 2. Attempt 1: transition is retry_same_act, adds 1 recovery advisory (len = baseline + 1).

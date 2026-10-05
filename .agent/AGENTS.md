@@ -13,7 +13,7 @@ This document complements the sections above, focusing on **analysis, root cause
    - Carefully review HTTP error codes, Zig's `error_name`, and backend server `raw_snippet` to prevent speculative assumptions.
 
 3. **Align with RFCs & Design Docs**:
-   - Before classifying a behavior as a "bug" or "feature", cross-reference the corresponding proposals in `docs/` (`rfc_001` through `rfc_009`).
+   - Before classifying a behavior as a "bug" or "feature", cross-reference the corresponding proposals in `docs/`.
    - Ensure proposed solutions conform to the project's Code-Centric (CodeAct VM) and Event Sourcing architectural direction.
 
 4. **Multi-tier Verification**:
@@ -59,7 +59,7 @@ This document complements the sections above, focusing on **analysis, root cause
 - **Memory & History**: `src/core/history.zig`, `src/core/memact/`.
 - **Tools & Registry**: `src/tooling/registry.zig` (15 built-in tools + MCP dispatcher), `src/tools/session_diagnostics.zig`, `src/core/skills.zig`.
 
-## 4. ReAct Mode & Structured Planning Guidelines (RFC-019)
+## 4. ReAct Mode & Structured Planning Guidelines
 
 1. **Dual Execution Modes**:
    - **ReAct Mode (Reactive Execution — Default)**: For simple queries, exploratory searches, single-step commands, or quick inspections. Directly follow the ReAct loop:
@@ -68,7 +68,7 @@ This document complements the sections above, focusing on **analysis, root cause
      - `Observation`: Real data returned by QuickJS (`[CodeAct Execution Output]`). Never fabricate observations.
      - `Final Answer`: When done, output the final answer directly without code blocks.
      - *Zero planning overhead*: Do not emit multi-step plans for simple, single-action tasks.
-   - **Proactive Planning Mode (RFC-019)**: For complex or multi-step tasks (>= 2 steps, architectural refactors, multi-file edits). Formulate a structured JSON DAG plan or numbered checklist on turn 1, then execute each step sequentially via the ReAct cycle with progress tracking.
+   - **Proactive Planning Mode**: For complex or multi-step tasks (>= 2 steps, architectural refactors, multi-file edits). Formulate a structured JSON DAG plan or numbered checklist on turn 1, then execute each step sequentially via the ReAct cycle with progress tracking.
 2. **Grounding in Active Code**:
    - Always verify facts against the active codebase using `mini.read`, `mini.grep`, or `mini.glob`.
    - Never guess file contents, function signatures, types, or configuration keys.

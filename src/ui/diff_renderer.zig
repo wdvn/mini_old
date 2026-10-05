@@ -1,4 +1,4 @@
-//! diff_renderer.zig — Unified Diff Visualizer & Patch Styler for mini-agent (RFC-007).
+//! diff_renderer.zig — Unified Diff Visualizer & Patch Styler for mini-agent.
 //!
 //! Renders colored Diff blocks (Red/Green/Cyan) with elegant box frames,
 //! allowing users to visually inspect code changes performed by the Agent.

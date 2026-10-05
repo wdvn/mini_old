@@ -20,7 +20,7 @@
 //!
 //! ## Fallback
 //! There is no cross-provider fallback at this layer: protocol/vendor
-//! fallback is handled inside the provider abstraction (RFC-012), and the
+//! fallback is handled inside the provider abstraction, and the
 //! act retry loop in `processInput` re-runs the same backend on transient
 //! transport errors. A blind extra Ollama attempt was removed because it
 //! usually pointed at a non-running local server and masked the real error.
@@ -71,7 +71,7 @@ pub var g_agent_mutex = std.atomic.Mutex.unlocked;
 
 var g_active_agent: ?*AgentLoop = null;
 
-/// RFC-024 §3.3: extract a skill name from a `.../skills/<name>/SKILL.md`
+/// Extract a skill name from a `.../skills/<name>/SKILL.md`
 /// path, or null if the path does not look like a skill file.
 pub fn skillNameFromSkillPath(path: []const u8) ?[]const u8 {
     if (!std.mem.endsWith(u8, path, "SKILL.md")) return null;
@@ -194,13 +194,13 @@ pub const AgentLoop = struct {
     stop_sequence_continues: usize = 0,
     /// Token estimator (MemAct).
     token_estimator: tokens_mod.TokenEstimator,
-    /// Content-Addressed Storage (RFC-002).
+    /// Content-Addressed Storage.
     cas: cas_mod.CAS,
-    /// Act Journal (RFC-002). Null if processInput has not run.
+    /// Act Journal. Null if processInput has not run.
     journal: ?journal_mod.ActJournal = null,
     /// Act Logger (Session Replay & Diagnostics).
     act_logger: ?act_logger_mod.ActLogger = null,
-    /// Snapshot tracker (RFC-002/ISSUE-CODEACT-001 M4) — tracks mini.write/patch/sh.
+    /// Snapshot tracker — tracks mini.write/patch/sh.
     snapshot_tracker: ?snapshot_mod.SnapshotTracker = null,
     /// HTTP code of latest backend error (for journal ErrorDetail).
     last_backend_http_code: u32 = 0,
@@ -218,18 +218,18 @@ pub const AgentLoop = struct {
     last_budget: ?u32 = null,
     /// Dynamic thinking governor runtime state (enabled by default).
     dynamic_thinking: bool = true,
-    /// Procedural Graph Store (RFC-010).
+    /// Procedural Graph Store.
     pg_store: ?*graph_store_mod.PGraphStore = null,
-    /// Semantic/Episodic Memory Store (RFC-003).
+    /// Semantic/Episodic Memory Store.
     memory_store: ?*store_mod.MemoryStore = null,
-    /// RFC-025 Phase 2: cached LLM query expansion per distinct user request.
+    /// Cached LLM query expansion per distinct user request.
     memact_expansion_cache: ?[]u8 = null,
     memact_expansion_cache_key: ?[]u8 = null,
-    /// Last executed tool name (RFC-010 active node anchor).
+    /// Last executed tool name.
     last_executed_tool: ?[]u8 = null,
     /// Recent tool execution sequence (w acts window).
     recent_tools: std.ArrayListUnmanaged([]u8) = .empty,
-    /// RFC-024 §3.3: skill names read into the conversation this session
+    /// Skill names read into the conversation this session
     /// (for post-compaction re-injection; name only, deduplicated).
     read_skills: std.ArrayListUnmanaged([]u8) = .empty,
     /// Action Loop Guard: tool signatures executed in current turn.
@@ -250,7 +250,7 @@ pub const AgentLoop = struct {
     /// Stop reason from the most recent LLM response (for journal debugging).
     last_stop_reason: ?[]const u8 = null,
     /// Track whether the most recent LLM response had no meaningful content (empty/whitespace only).
-    /// RFC-023 response state for the current turn.
+    /// Response state for the current turn.
     last_generation_stop: proto.GenerationStop = .missing_terminal_event,
     last_response_validity: proto.ResponseValidity = .empty,
     last_agent_decision: proto.AgentDecision = .request_continuation,
@@ -267,10 +267,10 @@ pub const AgentLoop = struct {
 
     current_user_request: ?[]const u8 = null,
 
-    /// Consolidated plan state (RFC-019 + legacy watchdog). See plan_integration.zig.
+    /// Consolidated plan state. See plan_integration.zig.
     plan: plan_integration.PlanState,
 
-    /// 3-Thread Coordinator & State Monitor (RFC-015)
+    /// 3-Thread Coordinator & State Monitor
     coordinator: *act_queue.ActCoordinator,
     /// Thread 2 Watchdog Monitor
     watchdog: ?*watchdog_mod.Watchdog = null,
@@ -413,7 +413,7 @@ pub const AgentLoop = struct {
         }
     }
 
-    /// Initializes semantic/episodic memory store for the active project (RFC-003).
+    /// Initializes semantic/episodic memory store for the active project.
     fn initMemoryStore(alloc: Allocator, io: std.Io, config: *const config_mod.Config, home_dir: []const u8) ?*store_mod.MemoryStore {
         // PSEUDOCODE: Hash cwd, resolve memory path, allocate and initialize MemoryStore
         if (!config.memact_enabled) return null;
@@ -764,7 +764,7 @@ fn initWatchdog(alloc: Allocator, io: std.Io, coordinator: *act_queue.ActCoordin
         }) catch {};
     }
 
-    /// RFC-024 §3.5: approve the current plan and journal the phase change
+    /// Approve the current plan and journal the phase change
     /// (REPL `/plan approve` path).
     pub fn approvePlan(self: *AgentLoop) bool {
         const ok = self.plan.approve();
@@ -776,7 +776,7 @@ fn initWatchdog(alloc: Allocator, io: std.Io, coordinator: *act_queue.ActCoordin
         return ok;
     }
 
-    /// RFC-024 §3.5: reject the current plan and journal the phase change
+    /// Reject the current plan and journal the phase change
     /// (REPL `/plan reject` path).
     pub fn rejectPlan(self: *AgentLoop) bool {
         const ok = self.plan.reject();
@@ -792,7 +792,7 @@ fn initWatchdog(alloc: Allocator, io: std.Io, coordinator: *act_queue.ActCoordin
     pub const maybeBatchPlanStep = agent_subagent.maybeBatchPlanStep;
     pub const maybeDispatchPlanStep = agent_subagent.maybeDispatchPlanStep;
 
-/// RFC-024 §3.3: record that a skill's content was read this session so the
+/// Record that a skill's content was read this session so the
 /// post-compaction reinject block can restate it. `skills` (operation=detail)
 /// and `file_read` of a SKILL.md path are the two signals.
 fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]const u8) void {
@@ -818,7 +818,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         if (self.alloc.dupe(u8, name)) |owned| {
             self.read_skills.append(self.alloc, owned) catch self.alloc.free(owned);
         } else |_| {}
-        // RFC-024 §3.5: telemetry — a skill was read into the conversation.
+        // Telemetry — a skill was read into the conversation.
         if (self.journal) |*j| {
             j.recordEvent(self.io, 0, .skill_loaded, name) catch {};
         }
@@ -889,7 +889,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         );
     }
 
-    /// Process user input with optional attached image blocks (RFC-011 Media Ingestion, RFC-015 3-Thread Architecture).
+    /// Process user input with optional attached image blocks.
     pub fn processInputWithImages(
         self: *AgentLoop,
         user_text: []const u8,
@@ -1065,7 +1065,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         return e;
     }
 
-    /// RFC-025 Phase 2: LLM query expansion (Path B). Stateless keyword
+    /// LLM query expansion (Path B). Stateless keyword
     /// expansion of the retrieval query; returns null when expansion fails or
     /// yields nothing (graceful degrade — Path A stands alone). Results are
     /// cached per user request in `memact_expansion_cache`.
@@ -1109,7 +1109,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
             if (block == .text) try response_text.appendSlice(alloc, block.text);
         }
 
-        // Keep at most 12 keyword lines (latency/cost cap, RFC-025 §4).
+        // Keep at most 12 keyword lines (latency/cost cap).
         var keyword_buf = ArrayList(u8).empty;
         defer keyword_buf.deinit(alloc);
         var line_count: u32 = 0;
@@ -1138,7 +1138,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         return keywords_text;
     }
 
-    /// RFC-025 Phase 3: end-of-turn LLM extraction of durable facts/lessons
+    /// End-of-turn LLM extraction of durable facts/lessons
     /// into the declarative store (`semantic` / `project_state` records with
     /// meaningful self-reported confidence, optional `related_tool` mapped to
     /// a procedural-graph `node_ref`). Wired from `executeTurnWorker` when
@@ -1222,11 +1222,11 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
                 .string => |s| s,
                 else => continue,
             };
-            // Injection filter (RFC-025 §3.2 rule 3): reject tool-name-only rows.
+            // Injection filter: reject tool-name-only rows.
             if (content.len < 20) continue;
 
             // Confidence: model self-report, clamped; banned constants are
-            // replaced by the extraction prompt (RFC-025 §3.2 rule 2).
+            // replaced by the extraction prompt.
             const confidence: f32 = switch (obj.get("confidence") orelse .null) {
                 .float => |f| @min(1.0, @max(0.0, @as(f32, @floatCast(f)))),
                 .integer => |i| @min(1.0, @max(0.0, @as(f32, @floatFromInt(i)))),
@@ -1303,7 +1303,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         }
     }
 
-    /// Injects top-k semantic memories into system prompt based on keyword matching (RFC-003).
+    /// Injects top-k semantic memories into system prompt based on keyword matching.
     fn injectSemanticMemory(self: *AgentLoop, alloc: Allocator, current_prompt: []const u8) ![]u8 {
         // PSEUDOCODE:
         // 1. Load memory entries from store
@@ -1316,7 +1316,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         const entries = self.memory_store.?.loadIndex(self.io) catch return alloc.dupe(u8, current_prompt);
         defer store_mod.MemoryStore.freeEntries(alloc, entries);
 
-        // RFC-025 Phase 1: dual-path retrieval, Path A = BM25 on the original
+        // Dual-path retrieval, Path A = BM25 on the original
         // query (user request; falls back to the prompt). Guarantees exact
         // lexical recall of private entities (error codes, identifiers).
         const query: []const u8 = self.current_user_request orelse current_prompt;
@@ -1331,7 +1331,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         }
 
         for (entries) |*entry| {
-            // RFC-025 Phase 0: reject tool-name-only rows defensively
+            // Reject tool-name-only rows defensively
             // (legacy episodic entries may still exist on disk).
             if (entry.content.len < 20) continue;
 
@@ -1352,7 +1352,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         defer index.deinit(alloc);
 
         // Path A: BM25 on the original query (guarantees exact lexical recall
-        // of private entities — RFC-025 §3.1).
+        // of private entities).
         const ranked_a_opt = index.rank(alloc, query, doc_texts.items.len) catch null;
         defer if (ranked_a_opt) |r| alloc.free(r);
         const ranked_a: []const bm25_mod.Ranked = ranked_a_opt orelse &.{};
@@ -1402,7 +1402,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
 
             try mem_buf.print("- [{s}] {s}\n", .{ entry.type, entry_text });
 
-            // RFC-025 Phase 3: graph enrichment. A record carrying `node_ref`
+            // Graph enrichment. A record carrying `node_ref`
             // is enriched with its 2-hop procedural context (causes/effects +
             // guidance/pitfalls). Dangling refs degrade to the plain record.
             if (entry.node_ref) |node_ref| {
@@ -1577,10 +1577,10 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
             }
         }
 
-        // RFC-024 §3.3: after a successful compaction, re-inject the active plan
+        // After a successful compaction, re-inject the active plan
         // progress, read-skill names, and the task reminder so the model keeps
         // its bearings. §3.6 State A: when structured planning is fully off,
-        // ALL RFC-024 behavior must be a no-op — so the reinject is additionally
+        // ALL behavior must be a no-op — so the reinject is additionally
         // gated on enable_structured_planning (it only re-emits plan/skill
         // context that would not exist in State A anyway).
         if (self.config.post_compact_reinject and self.config.enable_structured_planning) {
@@ -1588,7 +1588,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
         }
     }
 
-    /// RFC-024 §3.3: build and append a `.summarized`-tier user message at the
+    /// Build and append a `.summarized`-tier user message at the
     /// next history index containing (a) the active plan progress summary,
     /// (b) skill names read this session, and (c) the task reminder. Skips
     /// silently when there is nothing to reinject (no plan, no skills, no task).

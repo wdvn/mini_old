@@ -1,4 +1,4 @@
-//! media.zig — Media I/O helper library for mini-agent (RFC-011).
+//! media.zig — Media I/O helper library for mini-agent.
 //!
 //! Provides:
 //!   - Strict MIME sniffing via magic bytes (PNG, JPEG, WEBP, GIF, MP4)
@@ -27,7 +27,7 @@ pub const ReadImageResult = struct {
     }
 };
 
-/// Sniff MIME strictly by magic bytes (RFC-011 §3.0.2).
+/// Sniff MIME strictly by magic bytes.
 /// Does NOT rely on file extensions to avoid polyglot security issues.
 pub fn sniffMimeFromMagic(data: []const u8) ?[]const u8 {
     if (data.len >= 8 and std.mem.eql(u8, data[0..8], "\x89PNG\r\n\x1a\n")) {

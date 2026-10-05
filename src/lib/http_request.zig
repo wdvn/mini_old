@@ -450,7 +450,7 @@ fn resolveConnectTarget(
     return target;
 }
 
-/// Interruptible IPv4 pre-connect (RFC-009 follow-up: Ctrl+C must not stall).
+/// Interruptible IPv4 pre-connect.
 ///
 /// Zig 0.16.0 offers no bounded connect: `ConnectTcpOptions.timeout` is declared
 /// but never read, and the POSIX backend `@panic`s if one is passed
@@ -750,7 +750,7 @@ fn readErrorMessage(alloc: Allocator, r: anytype) !?[]const u8 {
     return if (n > 0) try alloc.dupe(u8, err_buf[0..n]) else null;
 }
 
-/// Download an HTTP resource directly into a file on disk in chunks (RFC-011 §3.3).
+/// Download an HTTP resource directly into a file on disk in chunks.
 /// Avoids loading large bodies (e.g. 200MB video) into memory buffers.
 pub fn downloadToFile(
     alloc: Allocator,
@@ -822,7 +822,7 @@ pub const StreamOptions = struct {
     /// Total timeout (seconds). Default: 120.
     timeout_secs: u32 = 120,
     /// Idle (stall) watchdog: abort recv if no bytes arrive for this many
-    /// seconds (RFC-009 Phase 5). Kernel-level SO_RCVTIMEO; 0 = disabled.
+    /// seconds. Kernel-level SO_RCVTIMEO; 0 = disabled.
     idle_timeout_secs: u32 = 0,
     /// Out flag: set true when the stream was aborted by the idle watchdog
     /// after partial data was already received (partial content preserved).
@@ -1568,7 +1568,7 @@ fn testMilliTimestamp() i64 {
 }
 
 /// Server that sends a partial response then holds the connection open and
-/// silent, for testing the stream stall watchdog (RFC-009 Phase 5).
+/// silent, for testing the stream stall watchdog.
 const SilentServerCtx = struct {
     io: std.Io,
     port: u16,

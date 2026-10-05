@@ -11,7 +11,7 @@ const PORT = parseInt(process.argv[2] || '8399', 10);
 let rfc023Act52Attempts = 0;
 
 const CASES = {
-  // RFC-023 Act 52 regression: provider failure, then repeated thinking-only responses.
+  // Act 52 regression: provider failure, then repeated thinking-only responses.
   rfc023_act52: {
     match: (b) => Array.isArray(b.messages) && b.messages.some(m => typeof m.content === 'string' && m.content.includes('RFC023-ACT52-REGRESSION')),
     sse: (reqBody) => ({

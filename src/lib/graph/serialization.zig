@@ -3,7 +3,7 @@
 //! Provides:
 //! - ByteWriter / ByteReader memory streams
 //! - Compact binary snapshot (.pgbin) format for instant loading of 100k+ nodes
-//! - RFC-010 JSONL event stream ingestion (add_node, add_edge, delete_edge, supersedes)
+//! - JSONL event stream ingestion (add_node, add_edge, delete_edge, supersedes)
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -291,7 +291,7 @@ fn applyAddEdgeEvent(graph: *Graph, root: std.json.ObjectMap) !void {
     }, str_id);
 }
 
-/// Apply a single RFC-010 JSON event line.
+/// Apply a single JSON event line.
 /// Format examples:
 /// - {"ev":"add_node","id":"pgn_1","node":{"name":"edit_code","type":"tool_action","desc":"Edit code"}}
 /// - {"ev":"add_edge","id":"pge_1","edge":{"src":"edit_code","rel":"LEADS_TO","dst":"run_test_suite","condition":"...","guidance":"...","pitfalls":"..."}}

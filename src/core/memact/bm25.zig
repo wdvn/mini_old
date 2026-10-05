@@ -1,5 +1,5 @@
 //! bm25.zig — In-tree BM25 ranking + Reciprocal Rank Fusion (RRF) for
-//! Dual-Path Semantic Memory retrieval (RFC-025 Phases 1-2).
+//! Dual-Path Semantic Memory retrieval.
 //! Std-only, embedding-free.
 //!
 //! ## Responsibilities
@@ -9,7 +9,7 @@
 //! - `rrfFuse`: fuse two ranked lists (Path A original query + Path B
 //!   LLM-expanded query) with Reciprocal Rank Fusion, k=60.
 //!
-//! Design principle (RFC-025 §3.1): semantic understanding at the query
+//! Design principle: semantic understanding at the query
 //! layer (stateless), lexical exact-match at the storage layer.
 //! Graceful degrade: when Path B is empty/failed, fused scores reduce to
 //! `1/(k+rank_A)` — ranking is preserved, absolute scores scale down.
@@ -21,7 +21,7 @@ const Allocator = std.mem.Allocator;
 pub const BM25_K1: f32 = 1.5;
 pub const BM25_B: f32 = 0.75;
 
-/// RRF constant (standard value, k=60 per RFC-025 §3.1).
+/// RRF constant (standard value, k=60).
 pub const RRF_K: u32 = 60;
 
 /// One ranked document. `doc_index` is the position in the source docs list;

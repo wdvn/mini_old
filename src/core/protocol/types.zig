@@ -47,7 +47,7 @@ pub const ToolResultBlock = struct {
     is_error: bool,
 };
 
-/// Image block attached in a message (RFC-010 Vision).
+/// Image block attached in a message.
 pub const ImageBlock = struct {
     /// Base64 data (WITHOUT prefix "data:...;base64,").
     data: []const u8,
@@ -67,7 +67,7 @@ pub const ThinkingBlock = struct {
 pub const ContentBlock = union(enum) {
     /// Regular text.
     text: []const u8,
-    /// Image block attached in a message (RFC-010 Vision).
+    /// Image block attached in a message.
     image: ImageBlock,
     /// Thinking stream of the AI.
     thinking: ThinkingBlock,
@@ -77,7 +77,7 @@ pub const ContentBlock = union(enum) {
     tool_result: ToolResultBlock,
 };
 
-/// Context tier (MemAct RFC-003).
+/// Context tier (MemAct).
 pub const Tier = enum {
     pinned,
     recent,
@@ -96,7 +96,7 @@ pub const Message = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Usage (RFC-006)
+// Usage
 // ---------------------------------------------------------------------------
 
 /// Token usage statistics returned by backend (OpenAI usage object format).

@@ -1,4 +1,4 @@
-//! watchdog.zig — Thread 2 Watchdog Supervisor (RFC-015).
+//! watchdog.zig — Thread 2 Watchdog Supervisor.
 //!
 //! Dedicated supervisor thread monitoring the active act on Thread 3:
 //! 1. Act Observation: inspects what the active act is doing in real-time.

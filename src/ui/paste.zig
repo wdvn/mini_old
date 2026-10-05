@@ -1,6 +1,6 @@
 //! paste.zig — Incremental parser for bracketed paste mode (xterm `?2004`).
 //!
-//! Issue with the old end-of-pointer byte read approach (RFC-000 follow-up):
+//! Issue with the old end-of-pointer byte read approach:
 //!   - Pasted content containing escape sequences (e.g. ANSI color `\x1b[31m`) can
 //!     share prefixes with end-marker `\x1b[201~` → bytes wrongly inserted, real marker
 //!     swallowed → editor permanently trapped in paste mode (Enter/Ctrl+C swallowed).
@@ -63,7 +63,7 @@ pub fn sanitizeReset() void {
 /// Observed CR state awaiting LF for multiline mode (independent variable, untouched by single-line).
 var multi_pending_cr: bool = false;
 
-/// Sanitize + append 1 byte according to MULTILINE rules (RFC-008 §5A):
+/// Sanitize + append 1 byte according to MULTILINE rules:
 /// - '\r\n' / '\r' / '\n' → exactly 1 '\n' (preserves line structure).
 /// - TAB preserved; other control characters dropped; UTF-8 preserved.
 /// Returns true if byte was appended.

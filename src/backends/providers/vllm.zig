@@ -1,4 +1,4 @@
-//! vllm.zig — vLLM provider profile and URL matcher (RFC-012).
+//! vllm.zig — vLLM provider profile and URL matcher.
 
 const std = @import("std");
 const base = @import("../provider.zig");

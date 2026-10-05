@@ -1,11 +1,11 @@
-//! act_queue.zig — 3-Thread Act Coordinator & State Monitor (RFC-015).
+//! act_queue.zig — 3-Thread Act Coordinator & State Monitor.
 //!
 //! Provides thread-safe coordination and state observation between:
 //! - Thread 1: REPL Chat (Main Thread)
 //! - Thread 2: Watchdog Monitor (Timeout Guardian & 3-Act Trajectory Recap)
 //! - Thread 3: Act Executor (Worker Thread)
 //!
-//! Replaces legacy multi-worker/priority queue bloat from RFC-013 with a lean,
+//! Replaces legacy multi-worker/priority queue bloat with a lean,
 //! thread-safe coordinator tailored for single-turn code-centric execution.
 
 const std = @import("std");

@@ -138,9 +138,9 @@ mini-agent reads configuration from environment variables. `.env` files are auto
 | `MINI_SESSION` | Session ID (stored at `<MINI_HOME>/sessions/<id>.json`) | — |
 | `MINI_SESSION_FILE` | Direct path to session JSON file | — |
 | `MINI_ENV_FILE` | Explicit `.env` path | — |
-| `MINI_BUDGET_MAX_TOKENS` | Maximum token consumption budget for a task (RFC-002) | `0` (unlimited) |
+| `MINI_BUDGET_MAX_TOKENS` | Maximum token consumption budget for a task | `0` (unlimited) |
 
-### MemAct & Context Management (RFC-003)
+### MemAct & Context Management
 
 | Variable | Description | Default |
 |---|---|---|
@@ -459,7 +459,7 @@ Directly executes JavaScript within the embedded QuickJS-ng engine. Standard out
 
 ## Agent Workspace Folder (`.agent/`)
 
-Per **RFC-005**, each project can contain an `.agent/` folder at its workspace root to manage local agent knowledge and behavior without polluting global configs:
+Each project can contain an `.agent/` folder at its workspace root to manage local agent knowledge and behavior without polluting global configs:
 
 ```
 .agent/

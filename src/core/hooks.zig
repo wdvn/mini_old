@@ -50,7 +50,7 @@ pub fn getHookListener() ?HookListener {
     return g_hook_listener;
 }
 
-/// Callback type for tool lifecycle listener (RFC-010 Procedural Graph).
+/// Callback type for tool lifecycle listener.
 pub const ToolListener = *const fn (tool_name: []const u8, input_json: ?[]const u8, is_error: bool) void;
 var g_tool_listener: ?ToolListener = null;
 
@@ -118,7 +118,7 @@ pub const HookPayload = struct {
     artifact_path: ?[]const u8 = null,
     artifact_type: ?[]const u8 = null,
     artifact_title: ?[]const u8 = null,
-    // Fields for hook events RFC-003 §4.6 (session/memory context)
+    // Fields for hook events (session/memory context)
     ctx_budget: ?u64 = null,
     ctx_used: ?u64 = null,
     session_file: ?[]const u8 = null,

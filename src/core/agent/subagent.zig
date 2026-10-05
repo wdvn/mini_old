@@ -1,7 +1,7 @@
 //! subagent.zig — Subagent runner and plan dispatch orchestration for AgentLoop.
 //!
 //! Provides child-process subagent invocation via `invoke_subagent` and parallel
-//! batch dispatch via `batch_invoke_subagents` according to RFC-024.
+//! batch dispatch via `batch_invoke_subagents` according to
 
 const std = @import("std");
 const proto = @import("../protocol.zig");
@@ -15,7 +15,7 @@ const main = @import("../../main.zig");
 const loop_mod = @import("loop.zig");
 const AgentLoop = loop_mod.AgentLoop;
 
-/// RFC-024 §3.4: real subagent runner — wraps the `invoke_subagent` tool so
+/// Real subagent runner — wraps the `invoke_subagent` tool so
 /// plan steps can be dispatched to a child mini process. Module-level so it
 /// can be passed as a `plan_dispatch.SubagentRunner`.
 pub fn subagentRunner(io: std.Io, alloc: std.mem.Allocator, task: []const u8) anyerror![]u8 {
@@ -26,7 +26,7 @@ pub fn subagentRunner(io: std.Io, alloc: std.mem.Allocator, task: []const u8) an
     return tools_mod.executeTool(alloc, io, "invoke_subagent", input);
 }
 
-/// RFC-024 §3.4: batch subagent runner — wraps `batch_invoke_subagents` so
+/// Batch subagent runner — wraps `batch_invoke_subagents` so
 /// multiple independent plan steps are executed in one parallel dispatch.
 /// Builds `{"tasks":[t1,t2,...]}` JSON, escaped.
 pub fn batchSubagentRunner(
@@ -52,7 +52,7 @@ pub fn batchSubagentRunner(
     return tools_mod.executeTool(alloc, io, "batch_invoke_subagents", input);
 }
 
-/// RFC-024 §3.4: dispatch a set of independent parallel plan steps in one
+/// Dispatch a set of independent parallel plan steps in one
 /// `batch_invoke_subagents` call. On success (or unblocked review) every
 /// batched step is completed via `completeStepByIndex` and `ctx` advances
 /// to the next ready step; a blocked review yields a re-run advisory
@@ -108,7 +108,7 @@ pub fn maybeBatchPlanStep(
         ctx.is_complete = true;
     }
 
-    // Persist the running plan (RFC-024 §3.2 persistence trigger).
+    // Persist the running plan.
     if (self.plan.plan_store) |ps| {
         ps.save(plan) catch |e| main.stderrPrint("[agent] Warning: Failed to persist running plan: {s}\n", .{@errorName(e)});
     }
@@ -139,7 +139,7 @@ pub fn maybeBatchPlanStep(
     });
 }
 
-/// RFC-024 §3.4: when subagent dispatch is enabled and the current step
+/// When subagent dispatch is enabled and the current step
 /// requests a `subagent` / `parallel` executor mode, dispatch the step to
 /// a child process and optionally run the two-stage review gate. The step
 /// is only completed on a passing verification (or unblocked review).
@@ -155,7 +155,7 @@ pub fn maybeDispatchPlanStep(self: *AgentLoop, act_id: usize) !?[]u8 {
     const mode = step.executor_mode orelse return null;
     if (!std.mem.startsWith(u8, mode, "subagent") and !plan_dispatch.isParallelMode(mode)) return null;
 
-    // RFC-024 §3.4 auto-batching: when the current step requests a
+    // auto-batching: when the current step requests a
     // parallel mode and >= 2 mutually-independent parallel steps are
     // ready, dispatch them ALL in one `batch_invoke_subagents` call
     // instead of one-per-step. A single ready step falls through to

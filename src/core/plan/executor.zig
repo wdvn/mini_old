@@ -1,4 +1,4 @@
-//! core/plan/executor.zig — Execute plan steps with dependency resolution (RFC-019)
+//! core/plan/executor.zig — Execute plan steps with dependency resolution
 //!
 //! Manages step execution lifecycle:
 //! - Dependency resolution before step activation
@@ -107,7 +107,7 @@ pub fn findStepIndexById(plan: *const Plan, step_id: u64) ?usize {
     return null;
 }
 
-/// RFC-024 §3.4: idempotently complete the step at index `idx` (no-op when
+/// Idempotently complete the step at index `idx` (no-op when
 /// already completed/skipped). Used by the parallel batch path, which
 /// completes several independent steps in one act. Returns true when a
 /// transition happened.
@@ -179,7 +179,7 @@ pub fn getUnsatisfiedDependencies(plan: *const Plan, step_idx: usize, alloc: All
 }
 
 // ---------------------------------------------------------------------------
-// Verification (RFC-024 §3.1)
+// Verification
 // ---------------------------------------------------------------------------
 
 /// Pluggable verification runner. Given a check kind + value, returns a
@@ -263,14 +263,14 @@ pub fn verifyStep(
     return status;
 }
 
-/// RFC-024: count acts consumed toward the active step so `actual_acts`
+/// Count acts consumed toward the active step so `actual_acts`
 /// accounting is maintained (was unwired; the counters were only ever reset).
 pub fn bumpActCounters(ctx: *ExecutionContext) void {
     ctx.current_step_acts += 1;
     ctx.total_acts += 1;
 }
 
-/// RFC-024: execute the next ready step by dependency-aware ready-set, instead
+/// Execute the next ready step by dependency-aware ready-set, instead
 /// of the sequential findActiveStepIndex scan. Falls back to .complete when no
 /// ready step exists.
 pub fn executeReadyStep(plan: *Plan, ctx: *ExecutionContext) !void {
@@ -513,7 +513,7 @@ test "getProgressPercent" {
     completeStep(&plan, &ctx);
     try std.testing.expectApproxEqAbs(0.2, getProgressPercent(&plan, &ctx), 0.01);
 
-    // RFC-024: completeStep is idempotent — repeating it on an already-
+    // CompleteStep is idempotent — repeating it on an already-
     // completed step is a no-op, so the runtime advances to the next step
     // before calling complete again.
     ctx.current_step_idx += 1;

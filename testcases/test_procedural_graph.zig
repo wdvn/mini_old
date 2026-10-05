@@ -1,7 +1,7 @@
-//! test_procedural_graph.zig — Validation suite for src/lib/graph.zig (RFC-010).
+//! test_procedural_graph.zig — Validation suite for src/lib/graph.zig.
 //!
 //! Validates the graph engine against the exact scenarios the MemAct update
-//! (RFC-010 PG-1/PG-2/PG-3) will rely on:
+//! will rely on:
 //!   1. JSONL event replay semantics (store.zig pattern: append-only + supersedes)
 //!   2. Tolerance to corrupted / unknown event lines (skip-not-fail at caller)
 //!   3. Candidate edit pipeline: add edges -> cycle repair -> terminal reachability
@@ -94,7 +94,7 @@ test "pg: replay tolerates corrupted / unknown lines without aborting the stream
     try testing.expectEqual(@as(usize, 2), g.active_node_count);
     try testing.expectEqual(@as(usize, 0), g.active_edge_count);
 
-    // Unknown relation -> edge silently dropped (RFC-010 4-relation vocabulary).
+    // Unknown relation -> edge silently dropped.
     try applyEventJson(&g,
         \\{"ev":"add_edge","id":"pge_x","edge":{"src":"tool_bash","rel":"MAGICAL_LINK","dst":"tool_read"}}
     );
@@ -317,7 +317,7 @@ test "pg: binary snapshot round-trip keeps superseded edges inactive for CAS-sty
 }
 
 // ---------------------------------------------------------------------------
-// 6. PGraphStore (RFC-010 PG-1, PG-2, PG-3)
+// 6. PGraphStore
 // ---------------------------------------------------------------------------
 
 const PGraphStore = mini.graph_store_mod.PGraphStore;

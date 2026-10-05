@@ -1,6 +1,6 @@
 //! snapshot.zig — SnapshotTracker: CAS snapshot before/after file modifications.
 //!
-//! Extends coverage of RFC-002: all file-write pathways (tool file_write/file_edit,
+//! Extends coverage: all file-write pathways (tool file_write/file_edit,
 //! mini.write/mini.patch in CodeAct, bash command with redirects, subagents)
 //! save old contents to CAS (~/.mini/cas) and record FileSnapshot to the journal.
 //!
@@ -23,7 +23,7 @@ pub fn getTracker() ?*SnapshotTracker {
     return g_tracker;
 }
 
-/// RFC-023 response telemetry attached to every Act completion event.
+/// Response telemetry attached to every Act completion event.
 pub const ActTelemetry = struct {
     stop_reason: ?[]const u8 = null,
     generation_stop: []const u8 = "missing_terminal_event",
@@ -130,7 +130,7 @@ pub const SnapshotTracker = struct {
     /// Flush all tracked snapshots to journal (1 secondary act_completed event).
     pub fn flush(self: *SnapshotTracker, act_id: usize, telemetry: ActTelemetry) void {
         // PSEUDOCODE:
-        // 1. Record file snapshots and RFC-023 response state atomically.
+        // 1. Record file snapshots and response state atomically.
         // 2. Preserve the same Act completion contract with or without file changes.
         const j = self.journal orelse return;
         if (self.tracked.items.len == 0) return;
@@ -158,7 +158,7 @@ pub const SnapshotTracker = struct {
     }
 };
 
-test "RFC-023: snapshot act completion preserves response state fields" {
+test "snapshot act completion preserves response state fields" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     const journal_path = "/tmp/rfc023_snapshot_journal.jsonl";

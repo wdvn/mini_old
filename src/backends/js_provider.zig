@@ -1,4 +1,4 @@
-//! js_provider.zig — Dynamic JavaScript Provider Adapter (RFC-012 Extension).
+//! js_provider.zig — Dynamic JavaScript Provider Adapter.
 //!
 //! Executes a user-provided or dynamically loaded JavaScript provider script via embedded QuickJS.
 //! Allows custom providers to hook into:

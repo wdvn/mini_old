@@ -107,7 +107,7 @@ pub fn detectMacroCycle(records: []const AgentLoop.ToolCallRecord, current_name:
     return null;
 }
 
-/// RFC-022 Gate 2: true when the most recent tool call this turn was a
+/// Gate 2: true when the most recent tool call this turn was a
 /// mutating tool (file write/edit) and the act did not fail — indicating
 /// the last mutation was verified successful, so a text-only turn is a
 /// legitimate Final Answer rather than plan stalling.

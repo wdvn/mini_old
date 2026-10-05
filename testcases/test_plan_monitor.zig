@@ -1,4 +1,4 @@
-//! test_plan_monitor.zig — Unit tests for RFC-019 Plan Monitor & Drift Detection.
+//! test_plan_monitor.zig — Unit tests for Plan Monitor & Drift Detection.
 //!
 //! Validates:
 //! 1. Drift score calculation by tool category (identical, same category, different category)

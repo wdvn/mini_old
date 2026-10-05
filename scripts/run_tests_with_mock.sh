@@ -126,12 +126,12 @@ run_act52_regression() {
        grep -F -q '"attempt":2' "$journal" &&
        grep -F -q '"attempt":3' "$journal" &&
        grep -F -q '"attempt":4' "$journal"; then
-      echo "  [PASS] RFC-023 Act 52 recovery regression"
+      echo "  [PASS] Act 52 recovery regression"
       PASS=$((PASS+1))
       return
     fi
   fi
-  echo "  [FAIL] RFC-023 Act 52 recovery regression (rc=$rc, journal=$journal, act_started=$act_started_count)"
+  echo "  [FAIL] Act 52 recovery regression (rc=$rc, journal=$journal, act_started=$act_started_count)"
   FAIL=$((FAIL+1))
   echo "$out" | head -15 | sed 's/^/         | /'
   [[ -n "$journal" ]] && tail -n 12 "$journal" | sed 's/^/         | /'

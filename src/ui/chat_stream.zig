@@ -1,4 +1,4 @@
-//! chat_stream.zig — Turn Renderer & Unified Stream Event Lifecycle for mini-agent (RFC-007).
+//! chat_stream.zig — Turn Renderer & Unified Stream Event Lifecycle for mini-agent.
 //!
 //! Stream Event Lifecycle Pipeline architecture:
 //!
@@ -154,7 +154,7 @@ fn isExactMatch(buf: []const u8, tags: []const []const u8) bool {
     return false;
 }
 
-/// RFC-012 §3.5.2: select the active open/close tag arrays according to the
+/// Select the active open/close tag arrays according to the
 /// provider profile's ThinkingTagSet. Returns null when tag parsing is disabled.
 const ActiveThinkTags = struct {
     open: []const []const u8,
@@ -185,7 +185,7 @@ pub const StreamEventParser = struct {
     fence_len: usize = 0,
     in_fence_check: bool = false,
     closing_backticks: usize = 0,
-    /// RFC-012 §3.5.2: which thinking tags this parser recognizes (provider profile gate).
+    /// Which thinking tags this parser recognizes (provider profile gate).
     thinking_tags: provider.ThinkingTagSet = .english_and_chinese,
 
     pub fn init() StreamEventParser {

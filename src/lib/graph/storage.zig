@@ -1,6 +1,6 @@
 //! lib/graph/storage.zig — Mutable Property Graph Storage.
 //!
-//! Provides dynamic node/edge insertion, O(1) attribute superseding (RFC-010),
+//! Provides dynamic node/edge insertion, O(1) attribute superseding,
 //! String-to-NodeId interning, and conversion to CSR/CSC views.
 
 const std = @import("std");
@@ -197,7 +197,7 @@ pub const Graph = struct {
         }
     }
 
-    /// Mark an edge inactive by string ID (RFC-010 `delete_edge`).
+    /// Mark an edge inactive by string ID.
     pub fn deleteEdgeByStrId(self: *Graph, str_id: []const u8) bool {
         if (self.str_id_to_edge.get(str_id)) |eid| {
             self.deleteEdge(eid);

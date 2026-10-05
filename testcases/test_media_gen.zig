@@ -1,7 +1,7 @@
-//! testcases/test_media_gen.zig — Integration tests for RFC-011 Media Generation & Vision Loop-Back.
+//! testcases/test_media_gen.zig — Integration tests for Media Generation & Vision Loop-Back.
 //!
 //! Validates:
-//!   1. Filename sanitization & path traversal mitigation (RFC-011 §3.2)
+//!   1. Filename sanitization & path traversal mitigation
 //!   2. Tool capability gates (opt-in via image_gen_enabled / video_gen_enabled)
 //!   3. image_attach loop-back vision tool
 //!   4. mini.media JS bindings in QuickJS CodeAct VM
@@ -280,13 +280,13 @@ test "media_gen: config falls back to agnes when OPENAI_COMPAT_PROVIDER is agnes
 }
 
 // ---------------------------------------------------------------------------
-// RFC-028 Task A: strict base URL resolution, plane configs, auth header
+// Task A: strict base URL resolution, plane configs, auth header
 // ---------------------------------------------------------------------------
 
 // PSEUDOCODE:
 // 1. Unknown provider with no dedicated URL must NOT silently route to OpenAI.
 // 2. generateImageDirect must return ok=false with a message naming the
-//    provider and MINI_IMAGE_GEN_URL (fail-fast contract, RFC-028 §3.2).
+// provider and MINI_IMAGE_GEN_URL (fail-fast contract).
 test "media_gen: unknown image provider fails fast with actionable error" {
     const alloc = testing.allocator;
 
@@ -343,7 +343,7 @@ test "media_gen: unknown video provider fails fast with actionable error" {
 
 // PSEUDOCODE:
 // 1. A dedicated MINI_IMAGE_GEN_URL is used verbatim (no cleanBaseUrl
-//    truncation, RFC-028 §3.3) and the endpoint is appended directly.
+// truncation,) and the endpoint is appended directly.
 // 2. Since resolveBaseUrl needs the env at call time, drive it through the
 //    process env via Config-independent pure helper if exposed; otherwise
 //    verify via resolveBaseUrl-equivalent behavior in the direct path.
@@ -363,7 +363,7 @@ test "media_gen: dedicated image gen URL is used verbatim with endpoint appended
 }
 
 // PSEUDOCODE:
-// 1. buildAuthHeaders is parameterized by header name (RFC-028 §3.4).
+// 1. buildAuthHeaders is parameterized by header name.
 // 2. Authorization keeps the Bearer prefix; custom headers do not.
 // 3. null key yields only the Content-Type header.
 test "media_gen: buildAuthHeaders supports custom header names without Bearer" {
@@ -440,10 +440,10 @@ test "media_gen: resolveProviderOptionsJson routing object assembly" {
 }
 
 // PSEUDOCODE:
-// 1. The plane structs must exist with the RFC-028 §2.1 field surface.
+// 1. The plane structs must exist with the field surface.
 // 2. Nested MediaGenConfig carries no chat-plane fields (§3.1 decision b).
-test "media_gen: plane config structs expose the RFC-028 field surface" {
-    // Compile-time surface check: all fields from RFC-028 §2.1 are addressable.
+test "media_gen: plane config structs expose the field surface" {
+    // Compile-time surface check: all fields from are addressable.
     const img = media_gen_tool.ImagePlaneConfig{
         .enabled = true,
         .provider = "openrouter",

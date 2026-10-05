@@ -1,6 +1,6 @@
 //! tools/media_gen.zig — Media generation (Image & Video) and Vision Loop-Back tools.
 //!
-//! Implements RFC-011:
+//! Implements:
 //!   - generate_image: synchronous image generation via OpenAI Images API / compat
 //!   - generate_video: asynchronous video generation with polling loop via Sora / compat
 //!   - image_attach: loop-back vision attachment for multi-turn inspection
@@ -20,7 +20,7 @@ const main = @import("../main.zig");
 // ---------------------------------------------------------------------------
 
 
-// RFC-028: Per-plane configuration structs
+// Per-plane configuration structs
 pub const ImagePlaneConfig = struct {
     enabled: bool = false,
     provider: []const u8 = "openai",
@@ -115,7 +115,7 @@ pub const MediaResult = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Path & Filename Sanitization (RFC-011 §3.2)
+// Path & Filename Sanitization
 // ---------------------------------------------------------------------------
 
 pub fn sanitizeFilename(alloc: Allocator, name: []const u8) ![]u8 {
@@ -171,7 +171,7 @@ pub fn buildAuthHeaders(alloc: Allocator, header_name: []const u8, key: ?[]const
 }
 
 // ---------------------------------------------------------------------------
-// generate_image Tool (RFC-011 §3.2)
+// generate_image Tool
 // ---------------------------------------------------------------------------
 
 pub fn generateImageTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
@@ -418,7 +418,7 @@ pub fn generateImageDirect(
 }
 
 // ---------------------------------------------------------------------------
-// generate_video Tool (RFC-011 §3.3)
+// generate_video Tool
 // ---------------------------------------------------------------------------
 
 pub fn generateVideoTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
@@ -691,7 +691,7 @@ pub fn generateVideoDirect(
     return pollAndDownloadVideo(alloc, io, base_url, ids, model, is_compat, headers_json, filename_opt);
 }
 
-// RFC-028: Provider options routing object assembly
+// Provider options routing object assembly
 pub const InvalidProviderOptions = error{InvalidProviderOptions};
 
 pub fn resolveProviderOptionsJson(
@@ -795,7 +795,7 @@ fn jsonEscapeString(alloc: Allocator, buf: *std.ArrayList(u8), s: []const u8) !v
 
 
 // ---------------------------------------------------------------------------
-// image_attach Tool (RFC-011 §3.5 Loop-Back Vision)
+// image_attach Tool
 // ---------------------------------------------------------------------------
 
 pub fn attachImageTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {

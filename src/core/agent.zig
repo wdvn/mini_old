@@ -3,13 +3,13 @@
 //! Refactored into modular sub-package under `core/agent/`:
 //!   - `agent/loop.zig`         — AgentLoop main loop, state, lifecycle, and listeners
 //!   - `agent/backend.zig`      — Backend initialization and protocol negotiation
-//!   - `agent/folder.zig`       — Manage the `.agent/` directory in the workspace (RFC-005)
-//!   - `agent/loop_monitor.zig` — Loop monitoring, orbit detection, tool cache (RFC-022)
+//!   - `agent/folder.zig`       — Manage the `.agent/` directory in the workspace
+//!   - `agent/loop_monitor.zig` — Loop monitoring, orbit detection, tool cache
 //!   - `agent/parsing.zig`      — Response/text parsing utilities (CodeAct JS, XML tool tags, timeout decisions)
 //!   - `agent/step.zig`         — Single-step execution logic (executeStep)
 //!   - `agent/turn.zig`         — Turn execution logic (executeTurnWorker)
 //!   - `agent/execution.zig`    — Tool execution pipeline, dedupe caching, and plan tracking
-//!   - `agent/subagent.zig`     — Subagent runner and plan dispatch orchestration (RFC-024)
+//!   - `agent/subagent.zig`     — Subagent runner and plan dispatch orchestration
 //!
 //! This file maintains 100% backward compatibility for all existing imports.
 

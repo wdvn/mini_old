@@ -3,7 +3,7 @@
 //! Submodules:
 //!   - `loop`: AgentLoop main loop, state, and lifecycle.
 //!   - `backend`: Backend initialization and protocol negotiation for AgentLoop.
-//!   - `folder`: Manage the `.agent/` directory in the workspace (RFC-005).
+//!   - `folder`: Manage the `.agent/` directory in the workspace.
 //!   - `loop_monitor`: Loop monitoring and orbit detection for AgentLoop.
 //!   - `parsing`: Response/text parsing utilities (CodeAct JS, XML tool tags, timeout decisions).
 //!   - `step`: Single-step execution logic (executeStep).

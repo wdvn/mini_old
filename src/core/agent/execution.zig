@@ -226,8 +226,8 @@ pub fn renderToolInvocationFinish(self: *AgentLoop, tu: proto.ToolUse, result: [
 pub fn trackPlanToolExecution(self: *AgentLoop, act_id: usize, tu: proto.ToolUse) !?[]u8 {
     // PSEUDOCODE:
     // 1. Guard: structured planning off or no plan -> null
-    // 2. RFC-024: bump act counters so actual_acts accounting is maintained
-    // 3. RFC-024: approval gate — a proposed plan is not actionable; emit advisory
+    // 2. Bump act counters so actual_acts accounting is maintained
+    // 3. Approval gate — a proposed plan is not actionable; emit advisory
     // 4. Check drift (existing)
     // 5. On tool_hint match: run verification gate when enabled, then complete/advance
     // 6. Persist at phase transitions (step complete, plan complete), not only at the end
@@ -237,7 +237,7 @@ pub fn trackPlanToolExecution(self: *AgentLoop, act_id: usize, tu: proto.ToolUse
 
     plan_executor.bumpActCounters(&self.plan.plan_ctx);
 
-    // RFC-024 §3.2: approval gate (advisory). A plan that is still `proposed`
+    // Approval gate (advisory). A plan that is still `proposed`
     // is not actionable — steps do not advance and the model gets a standing
     // advisory instead of silent execution.
     if (self.config.plan_approval_gate and plan.phase == .proposed) {
@@ -269,7 +269,7 @@ pub fn trackPlanToolExecution(self: *AgentLoop, act_id: usize, tu: proto.ToolUse
         const current_step = &plan.steps.items[self.plan.plan_ctx.current_step_idx];
         if (current_step.tool_hint) |hint| {
             if (std.mem.eql(u8, tu.name, hint)) {
-                // RFC-024 §3.1: verification gate. When enabled and the step
+                // Verification gate. When enabled and the step
                 // carries a verification, the hint match is necessary-not-
                 // sufficient: run the check and only complete on .passed.
                 if (self.config.plan_verification_gate and current_step.verification != null) {
@@ -298,7 +298,7 @@ pub fn trackPlanToolExecution(self: *AgentLoop, act_id: usize, tu: proto.ToolUse
                     if (!utils.isSubagent()) main.stderrPrint("[agent] Plan step completed: {s}\n", .{current_step.description});
                 }
 
-                // RFC-024 §3.2: persistence trigger — a step transition is a
+                // Persistence trigger — a step transition is a
                 // phase transition; save the running plan so a crash revives it.
                 if (self.plan.plan_store) |ps| {
                     ps.save(plan) catch |e| main.stderrPrint("[agent] Warning: Failed to persist running plan: {s}\n", .{@errorName(e)});
@@ -318,7 +318,7 @@ pub fn trackPlanToolExecution(self: *AgentLoop, act_id: usize, tu: proto.ToolUse
         }
         self.plan.clearPlan();
     } else {
-        // RFC-024: advance via the dependency-aware ready-set selector instead
+        // Advance via the dependency-aware ready-set selector instead
         // of a sequential index scan, so independent steps can go ready the
         // moment their dependencies complete (runtime DAG wiring, §3.4).
         if (plan.findReadyStepIndex()) |next_idx| {
@@ -410,7 +410,7 @@ pub fn executeSingleTool(
     }
 
     var is_err = false;
-    // RFC-029: promoting the invoked tool keeps its schema visible for the
+    // Promoting the invoked tool keeps its schema visible for the
     // following acts even when the model calls a deferred tool directly
     // (no tool_search round-trip). Grow-only, so the cache prefix is safe.
     if (tools_mod.isDeferredToolsEnabled()) tools_mod.promoteTool(tu.name);

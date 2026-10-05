@@ -1,4 +1,4 @@
-//! plan.zig — Structured Planning System (RFC-019 / RFC-024)
+//! plan.zig — Structured Planning System
 //!
 //! Refactored into modular sub-package under `core/plan/`:
 //!   - `plan/types.zig`       — StepStatus, PlanPhase, StepVerification, PlanStep, Plan, PlanDrift

@@ -60,7 +60,7 @@ var g_allowlist: ?[]const u8 = null;
 /// Blocklist comma-separated. Null = nothing blocked.
 var g_blocklist: ?[]const u8 = null;
 
-/// RFC-011: Media generation & vision capability gates
+/// Media generation & vision capability gates
 var g_image_gen_enabled: bool = false;
 var g_video_gen_enabled: bool = false;
 var g_image_input_enabled: bool = true;
@@ -333,7 +333,7 @@ pub const definitions = [_]proto.ToolDefinition{
         \\{"type":"object","properties":{"path":{"type":"string","description":"Path to local image file to attach"}},"required":["path"]}
         ,
     },
-    // RFC-029: meta-tool that materializes deferred tool schemas on demand.
+    // Meta-tool that materializes deferred tool schemas on demand.
     .{
         .name = "tool_search",
         .description = "Search currently hidden tool schemas by name or keyword. Returns full definitions (name, description, input_schema) of matching deferred tools, which stay visible for the rest of the session. Use this to discover MCP tools, subagent/media/artifact tools before calling them.",
@@ -355,20 +355,20 @@ const core_tools = [_][]const u8{
     "generate_video", "image_attach",
 };
 
-/// RFC-029: tools always sent in deferred mode (never hidden behind tool_search).
+/// Tools always sent in deferred mode (never hidden behind tool_search).
 const essential_tools = [_][]const u8{
     "bash",       "file_write", "file_edit",
     "http_request", "skills",   "tool_search",
 };
 
-/// RFC-029: built-in tools that are hidden until promoted.
+/// Built-in tools that are hidden until promoted.
 const deferred_tools = [_][]const u8{
     "invoke_subagent", "batch_invoke_subagents", "session_diagnostics",
     "artifact_write",  "artifact_read",          "artifact_list",
     "generate_image",  "generate_video",         "image_attach",
 };
 
-/// RFC-029: grow-only session promotion set, stored in a static buffer.
+/// Grow-only session promotion set, stored in a static buffer.
 /// Names are copied inline so the set has no allocator ownership and never
 /// outlives the process (callers pass per-turn arenas, which are freed).
 const MAX_PROMOTED_TOOLS = 64;
@@ -377,17 +377,17 @@ var promoted_tools: [MAX_PROMOTED_TOOLS][MAX_PROMOTED_NAME_LEN]u8 = undefined;
 var promoted_tools_len: [MAX_PROMOTED_TOOLS]usize = undefined;
 var promoted_count: usize = 0;
 
-/// RFC-029: deferred tool loading enabled by default (MINI_DEFERRED_TOOLS=0 opts out).
+/// Deferred tool loading enabled by default (MINI_DEFERRED_TOOLS=0 opts out).
 var g_deferred_enabled: bool = true;
 
-/// RFC-029: enable/disable deferred tool loading for this process.
+/// Enable/disable deferred tool loading for this process.
 pub fn setDeferredToolsEnabled(enabled: bool) void {
     while (!g_registry_mutex.tryLock()) {}
     g_deferred_enabled = enabled;
     g_registry_mutex.unlock();
 }
 
-/// RFC-029: current deferred tool loading state.
+/// Current deferred tool loading state.
 pub fn isDeferredToolsEnabled() bool {
     while (!g_registry_mutex.tryLock()) {}
     const v = g_deferred_enabled;
@@ -395,14 +395,14 @@ pub fn isDeferredToolsEnabled() bool {
     return v;
 }
 
-/// RFC-029: reset the promotion set (tests / fresh session).
+/// Reset the promotion set (tests / fresh session).
 pub fn resetPromotedTools() void {
     while (!g_registry_mutex.tryLock()) {}
     promoted_count = 0;
     g_registry_mutex.unlock();
 }
 
-/// RFC-029: number of promoted tools (diagnostics/tests).
+/// Number of promoted tools (diagnostics/tests).
 pub fn promotedCount() usize {
     while (!g_registry_mutex.tryLock()) {}
     const n = promoted_count;
@@ -410,7 +410,7 @@ pub fn promotedCount() usize {
     return n;
 }
 
-/// RFC-029: promote a tool so its schema stays visible for later acts.
+/// Promote a tool so its schema stays visible for later acts.
 /// Grow-only: repeated or out-of-order calls never reorder or remove entries.
 pub fn promoteTool(name: []const u8) void {
     if (name.len == 0 or name.len >= MAX_PROMOTED_NAME_LEN) return;
@@ -430,7 +430,7 @@ pub fn promoteTool(name: []const u8) void {
     promoted_count += 1;
 }
 
-/// RFC-029: true when the tool was already promoted this session.
+/// True when the tool was already promoted this session.
 pub fn isToolPromoted(name: []const u8) bool {
     const norm = normalizeToolName(name);
     while (!g_registry_mutex.tryLock()) {}
@@ -441,7 +441,7 @@ pub fn isToolPromoted(name: []const u8) bool {
     return false;
 }
 
-/// RFC-029: tool definitions sent to the model in deferred mode.
+/// Tool definitions sent to the model in deferred mode.
 /// Essential core first, then promoted tools in first-promotion order (stable prefix).
 /// Caller owns the returned slice.
 pub fn resolveDeferredTools(alloc: Allocator) []proto.ToolDefinition {
@@ -493,7 +493,7 @@ pub fn resolveDeferredTools(alloc: Allocator) []proto.ToolDefinition {
     return list.toOwnedSlice(alloc) catch &.{};
 }
 
-/// RFC-029: true when a tool belongs to the always-sent tier.
+/// True when a tool belongs to the always-sent tier.
 pub fn isEssentialTool(name: []const u8) bool {
     for (essential_tools) |et| {
         if (std.mem.eql(u8, name, et)) return true;
@@ -501,7 +501,7 @@ pub fn isEssentialTool(name: []const u8) bool {
     return false;
 }
 
-/// RFC-029: true when a built-in tool is hidden behind tool_search.
+/// True when a built-in tool is hidden behind tool_search.
 pub fn isDeferredTool(name: []const u8) bool {
     for (deferred_tools) |dt| {
         if (std.mem.eql(u8, name, dt)) return true;
@@ -509,7 +509,7 @@ pub fn isDeferredTool(name: []const u8) bool {
     return false;
 }
 
-/// RFC-029: search hidden tool schemas (built-in deferred + MCP tools).
+/// Search hidden tool schemas (built-in deferred + MCP tools).
 /// Returns a JSON array of full definitions; matched tools are promoted.
 fn executeToolSearch(alloc: Allocator, input_json: []const u8) ![]u8 {
     // PSEUDOCODE:
@@ -571,7 +571,7 @@ fn executeToolSearch(alloc: Allocator, input_json: []const u8) ![]u8 {
     return alloc.dupe(u8, out.list.items);
 }
 
-/// RFC-029: case-insensitive substring match against tool name or description.
+/// Case-insensitive substring match against tool name or description.
 fn toolMatchesQuery(td: proto.ToolDefinition, query: []const u8) bool {
     if (query.len == 0) return true;
     return containsCI(td.name, query) or containsCI(td.description, query);
@@ -660,7 +660,7 @@ pub fn isCoreTool(name: []const u8) bool {
 // 2. Return true if tool is in exploration tool set (file_read, read, grep, glob, skills)
 // 3. Otherwise return false
 
-/// Check if a tool is an exploration tool that should always remain available (RFC-019).
+/// Check if a tool is an exploration tool that should always remain available.
 pub fn isExplorationTool(name: []const u8) bool {
     const norm = normalizeToolName(name);
     return std.mem.eql(u8, norm, "file_read") or
@@ -675,7 +675,7 @@ pub fn isExplorationTool(name: []const u8) bool {
 // 3. Keep exploration tools and tool matching normalized tool_hint
 // 4. Return filtered list (or all_defs if empty)
 
-/// Filter relevant definitions for plan-aware tool selection (RFC-019).
+/// Filter relevant definitions for plan-aware tool selection.
 /// Exploration tools always remain available. If tool_hint is provided, preferred tool is kept.
 pub fn filterDefinitionsForPlan(
     alloc: Allocator,
@@ -742,7 +742,7 @@ pub fn isPermitted(name: []const u8) bool {
         if (cur_depth >= max_depth) return false;
     }
 
-    // RFC-011: Capability gates for media tools
+    // Capability gates for media tools
     if (std.mem.eql(u8, name, "generate_image")) {
         if (!g_image_gen_enabled) return false;
     }

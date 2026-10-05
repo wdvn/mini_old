@@ -1,6 +1,6 @@
-//! test_plan_rfc024_bench.zig — Benchmark sweep evaluating RFC-024 plan-framework features.
+//! test_plan_rfc024_bench.zig — Benchmark sweep evaluating plan-framework features.
 //!
-//! A *sweep* over plan sizes (50 -> 1000 steps) and over each RFC-024 phase:
+//! A *sweep* over plan sizes (50 -> 1000 steps) and over each phase:
 //!   - P1 verification: verifyStep with the default runner (real file stat, no spawn)
 //!   - P2 approval:     plan phase JSON round-trip scaling
 //!   - P3 reinject:     skillNameFromSkillPath + generateProgressSummary scaling
@@ -263,7 +263,7 @@ test "bench P5 plan JSON parse scaling sweep" {
 }
 
 test "bench P5 journal plan-methodology event tally" {
-    // Simulated journal content with a mix of RFC-024 events, using the exact
+    // Simulated journal content with a mix of events, using the exact
     // same substring-matching strategy as session_diagnostics.scanJournalLines.
     const journal =
         \\{"act_id":1,"event_type":"plan_phase_changed","timestamp":1,"description":"approved"}
@@ -286,5 +286,5 @@ test "bench P5 journal plan-methodology event tally" {
     }
     const t1 = nowNs();
     if (total != iters * 5) @panic("tally mismatch — scan strategy changed?");
-    report("P5 journal event tally (5 RFC-024 events/line)", iters, t0, t1);
+    report("P5 journal event tally (5 events/line)", iters, t0, t1);
 }

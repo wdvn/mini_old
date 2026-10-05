@@ -1,4 +1,4 @@
-//! testcases/test_media_ingest.zig — Integration tests for RFC-011 Media Ingestion (Phase 0).
+//! testcases/test_media_ingest.zig — Integration tests for Media Ingestion (Phase 0).
 //!
 //! Validates:
 //!   1. Magic bytes sniffing (blocking polyglot files)

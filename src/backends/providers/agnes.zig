@@ -1,4 +1,4 @@
-//! agnes.zig — Agnes AI provider profile and URL matcher (RFC-012).
+//! agnes.zig — Agnes AI provider profile and URL matcher.
 //!
 //! Agnes AI is an OpenAI-compatible LLM provider with custom reasoning
 //! field handling (delta.detail.reasoning_content).

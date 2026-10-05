@@ -299,7 +299,7 @@ const StreamCtx = struct {
 
 const testing = std.testing;
 
-test "RFC-023: Ollama idle abort overrides earlier terminal state" {
+test "Ollama idle abort overrides earlier terminal state" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
         .alloc = alloc,
@@ -320,7 +320,7 @@ test "RFC-023: Ollama idle abort overrides earlier terminal state" {
     try testing.expectEqual(proto.GenerationStop.stream_aborted, response.getGenerationStop());
 }
 
-test "RFC-023: Ollama done populates generation stop" {
+test "Ollama done populates generation stop" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
         .alloc = alloc,

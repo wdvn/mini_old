@@ -1,7 +1,7 @@
-//! graph_store.zig — Event-Sourced Procedural Graph Storage for MemAct (RFC-010).
+//! graph_store.zig — Event-Sourced Procedural Graph Storage for MemAct.
 //!
 //! Manages persistent Procedural Graph storage at `~/.mini/memory/<project_hash>/pgraph.jsonl`.
-//! Replays JSONL event stream into `lib.graph.Graph` (RFC-010 PG-1), tracks tool transitions
+//! Replays JSONL event stream into `lib.graph.Graph`, tracks tool transitions
 //! (PG-2 population pipeline), and generates localized h-hop situational guidance (PG-3).
 
 const std = @import("std");
@@ -252,11 +252,11 @@ pub const PGraphStore = struct {
         try self.seedDefaultEdges(io);
     }
 
-    /// RFC-025 Phase 3: render a compact 2-hop causal chain for a node by
+    /// Render a compact 2-hop causal chain for a node by
     /// its Node ID (from a memory entry's `node_ref`). Returns the node name,
     /// up to `max` cause/effect neighbors with LEADS_TO guidance. `null` when
     /// the id is dangling (node missing or no active edges) — the record then
-    /// renders without graph context (RFC-025 §7).
+    /// renders without graph context.
     pub fn enrichNode(
         self: *PGraphStore,
         alloc: Allocator,
@@ -504,7 +504,7 @@ pub const PGraphStore = struct {
             std.mem.eql(u8, name, "session_diagnostics");
     }
 
-    /// Extract h-hop neighborhood subgraph guidance formatted as markdown (RFC-010 PG-3).
+    /// Extract h-hop neighborhood subgraph guidance formatted as markdown.
     /// If an orbit is detected in 3D procedural space, produces a
     /// Checkpoint & Recap block instead of cyclic forward step suggestions.
     /// `user_request` is the original task prompt — injected to keep the model anchored
@@ -620,7 +620,7 @@ pub const PGraphStore = struct {
         return try bw.toOwnedSlice();
     }
 
-    /// Extract h-hop neighborhood subgraph guidance formatted as markdown (RFC-010 PG-3).
+    /// Extract h-hop neighborhood subgraph guidance formatted as markdown.
     /// If an orbit is detected in 3D procedural space, produces a
     /// Checkpoint & Recap block instead of cyclic forward step suggestions.
     /// `user_request` is the original task prompt — injected to keep the model anchored
@@ -682,7 +682,7 @@ pub const PGraphStore = struct {
         _ = repairCycles(&self.graph, self.alloc) catch 0;
     }
 
-    /// Record a transition between two tool actions (RFC-010 PG-2 population frequency gate).
+    /// Record a transition between two tool actions.
     /// If transition frequency reaches threshold N=3, automatically persists candidate edge.
     pub fn recordTransition(self: *PGraphStore, io: std.Io, src_action: []const u8, dst_action: []const u8) !void {
         // PSEUDOCODE:

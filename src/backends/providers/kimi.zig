@@ -1,4 +1,4 @@
-//! kimi.zig — Kimi / Moonshot provider profile and URL matcher (RFC-012).
+//! kimi.zig — Kimi / Moonshot provider profile and URL matcher.
 
 const std = @import("std");
 const base = @import("../provider.zig");

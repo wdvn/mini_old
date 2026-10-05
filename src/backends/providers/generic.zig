@@ -1,4 +1,4 @@
-//! generic.zig — Generic OpenAI-compatible fallback provider profile (RFC-012).
+//! generic.zig — Generic OpenAI-compatible fallback provider profile.
 
 const base = @import("../provider.zig");
 const ProviderProfile = base.ProviderProfile;

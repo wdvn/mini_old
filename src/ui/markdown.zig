@@ -1,4 +1,4 @@
-//! markdown.zig — Streaming Markdown & Syntax Highlighter for terminal mini-agent (RFC-007).
+//! markdown.zig — Streaming Markdown & Syntax Highlighter for terminal mini-agent.
 //!
 //! Parses and colors Markdown text in real time as the AI streams:
 //! - Headers (#, ##, ###)

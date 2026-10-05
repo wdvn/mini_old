@@ -56,7 +56,7 @@ pub const Client = struct {
         self.active_thinking_budget = budget;
     }
 
-    /// Idle watchdog timeout scaled by active thinking budget (RFC-009 Phase 5).
+    /// Idle watchdog timeout scaled by active thinking budget.
     fn effectiveIdleTimeout(self: *const Client) u32 {
         // Disabled? Return 0 to skip idle polling entirely.
         if (utils.getEnvSlice("MINI_WATCHDOG_ENABLED")) |s| {
@@ -529,7 +529,7 @@ test "claude buildRequestBody contains cache_control" {
     try testing.expect(std.mem.indexOf(u8, body, "\"name\":\"tool2\",\"description\":\"desc2\",\"input_schema\":{},\"cache_control\":{\"type\":\"ephemeral\"}") != null);
 }
 
-test "RFC-023: Claude message stop populates generation stop" {
+test "Claude message stop populates generation stop" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
         .alloc = alloc,
@@ -554,7 +554,7 @@ test "RFC-023: Claude message stop populates generation stop" {
     try testing.expectEqual(proto.GenerationStop.natural_end, ctx.response.generation_stop);
 }
 
-test "RFC-023: Claude message delta terminal reason survives EOF" {
+test "Claude message delta terminal reason survives EOF" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
         .alloc = alloc,
@@ -581,7 +581,7 @@ test "RFC-023: Claude message delta terminal reason survives EOF" {
     try testing.expectEqual(proto.GenerationStop.natural_end, response.getGenerationStop());
 }
 
-test "RFC-023: Claude idle abort overrides earlier terminal state" {
+test "Claude idle abort overrides earlier terminal state" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
         .alloc = alloc,

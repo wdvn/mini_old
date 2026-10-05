@@ -1,4 +1,4 @@
-//! test_three_threads_watchdog.zig — Integration tests for RFC-015 3-thread runtime and watchdog.
+//! test_three_threads_watchdog.zig — Integration tests for -thread runtime and watchdog.
 //!
 //! Validates:
 //!   1. ActCoordinator state tracking and thread-safe monitor state snapshots.

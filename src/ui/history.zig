@@ -1,8 +1,8 @@
-//! history.zig — Persistent prompt input history (RFC-000 group 5).
+//! history.zig — Persistent prompt input history.
 //!
 //! Ring in-memory (max 500 items) + JSONL storage at <MINI_HOME>/history.jsonl
 //! (default ~/.mini/history.jsonl). This is **prompt input history** — what
-//! the user types into the composer, not conversation history (RFC-003).
+//! the user types into the composer, not conversation history.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

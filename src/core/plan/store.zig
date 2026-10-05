@@ -1,4 +1,4 @@
-//! core/plan/store.zig — Persistent plan storage (RFC-019)
+//! core/plan/store.zig — Persistent plan storage
 //!
 //! Stores and restores plans using Content-Addressed Storage (CAS).
 //! Enables cross-turn and cross-session plan persistence.
@@ -34,7 +34,7 @@ pub const PlanMetadata = struct {
     is_complete: bool,
     /// Number of steps completed.
     steps_completed: usize,
-    /// Plan lifecycle phase (RFC-024 §3.2).
+    /// Plan lifecycle phase.
     phase: []const u8,
 };
 
@@ -134,7 +134,7 @@ pub const PlanStore = struct {
         return null;
     }
 
-    /// RFC-024 §3.2: restore the newest *running* (non-complete) plan for a
+    /// Restore the newest *running* (non-complete) plan for a
     /// request, so a mid-plan crash revives the in-progress plan rather than a
     /// finished one. Returns null if none.
     pub fn restoreRunning(self: *PlanStore, request_hash: u64) !?Plan {
@@ -302,7 +302,7 @@ const PlanMetadataJson = struct {
     content_hash: []const u8,
     is_complete: bool,
     steps_completed: usize,
-    /// RFC-024 §3.2. Old files without this key parse to the default.
+    /// Old files without this key parse to the default.
     phase: []const u8 = "proposed",
 };
 

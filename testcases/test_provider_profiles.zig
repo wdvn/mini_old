@@ -1,4 +1,4 @@
-//! test_provider_profiles.zig — Integration tests for RFC-012 Provider Abstraction Layer.
+//! test_provider_profiles.zig — Integration tests for Provider Abstraction Layer.
 //!
 //! Validates:
 //!   1. ProviderProfile lookup and fallback to generic.
@@ -105,7 +105,7 @@ test "provider: resolveProfile prioritizes explicit key over URL" {
     const p1 = provider.resolveProfile("deepseek", "https://api.openai.com/v1");
     try testing.expectEqualStrings("DeepSeek", p1.name);
 
-    // Explicit "generic" is also a non-empty key -> wins over URL detection (RFC-012 §3.3)
+    // Explicit "generic" is also a non-empty key -> wins over URL detection
     const p2 = provider.resolveProfile("generic", "https://api.deepseek.com/v1");
     try testing.expectEqualStrings("Generic OpenAI-compat", p2.name);
 

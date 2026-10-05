@@ -1,4 +1,4 @@
-//! core/media_protocol.zig — Universal Multimodal Media Protocol (RFC-027).
+//! core/media_protocol.zig — Universal Multimodal Media Protocol.
 //!
 //! Provides normalized types, enums, raw string passthrough, and request/response
 //! structures for multimodal image and video synthesis compatible across OpenAI,

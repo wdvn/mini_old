@@ -198,7 +198,7 @@ AI tool_use → Registry
 Support mọi endpoint compatible OpenAI Chat Completions:
 - OpenAI, Ollama, LM Studio, vLLM, OpenRouter, custom endpoints
 
-**Dual-protocol auto-negotiation** (RFC-012):
+**Dual-protocol auto-negotiation**:
 - Chat Completions API (`/v1/chat/completions`)
 - Responses API (`/v1/responses`)
 - Tự động switch và nhớ protocol đã chọn
@@ -220,7 +220,7 @@ Normalizes wire protocol differences:
 
 ---
 
-## Procedural Graph (RFC-010)
+## Procedural Graph
 
 Event-sourced directed graph trong `~/.mini/memory/<project_hash>/pgraph.jsonl`:
 
@@ -238,7 +238,7 @@ PGraphStore
 
 ---
 
-## MemAct Memory (RFC-003)
+## MemAct Memory
 
 Long-term memory system:
 
@@ -263,7 +263,7 @@ MemoryStore (~/.mini/memory/<project_hash>/memory.jsonl)
 
 ---
 
-## Structured Planning (RFC-019)
+## Structured Planning
 
 LLM-driven planning system với DAG dependency resolution:
 

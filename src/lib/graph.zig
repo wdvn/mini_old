@@ -1,6 +1,6 @@
 //! lib/graph.zig — High-Performance Native Graph Engine for mini-agent.
 //!
-//! Designed for RFC-010 (Procedural Graph) and MemAct long-term memory.
+//! Designed for the Procedural Graph and MemAct long-term memory.
 //! Capable of scaling from small localized graphs (10-50 nodes) up to
 //! massive knowledge and code graphs (100k+ nodes, 500k+ edges) with
 //! sub-millisecond query latency and minimal memory footprint (< 10MB).

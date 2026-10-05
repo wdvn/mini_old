@@ -3,7 +3,7 @@
 //! Decomposes turn execution (executeTurnWorker) into distinct lifecycle phases:
 //! - prepareTurnState: initial metrics reset, user message injection, plan restore, tool definition filtering
 //! - handleActError: classified error handling (interrupted/timeout, auth, rate limit/503 backoff, context window compaction)
-//! - flushActProgress: delta file snapshot flushing and RFC-019 plan progress tracking
+//! - flushActProgress: delta file snapshot flushing and plan progress tracking
 //! - executeTurnWorker: resilient act loop coordinating steps and recovery
 
 const std = @import("std");
@@ -95,7 +95,7 @@ fn resetTurnMetrics(self: *AgentLoop, user_text: []const u8) void {
     self.plan.tryRestoreFromStore(user_text);
 }
 
-test "RFC-023: same-Act attempt identity increments monotonically" {
+test "same-Act attempt identity increments monotonically" {
     try std.testing.expectEqual(@as(usize, 1), nextActAttempt(0));
     try std.testing.expectEqual(@as(usize, 2), nextActAttempt(1));
     try std.testing.expectEqual(@as(usize, 3), nextActAttempt(2));
@@ -109,7 +109,7 @@ fn resolveTurnToolDefinitions(
     return resolveTurnToolDefinitionsInner(self, turn_alloc, user_text, tools_mod.isDeferredToolsEnabled());
 }
 
-/// RFC-029: resolve the tool list sent to the model for this act.
+/// Resolve the tool list sent to the model for this act.
 ///
 /// PSEUDOCODE:
 /// 1. In `.codeact` mode the native tool list stays empty (mini.* API is static).
@@ -561,13 +561,13 @@ pub fn actErrorTransition(resolution: ActErrorResolution) proto.ActTransition {
     };
 }
 
-test "RFC-023: terminal Act errors become failed turns" {
+test "terminal Act errors become failed turns" {
     try std.testing.expect(actErrorTransition(.fail_turn) == .fail);
     try std.testing.expectEqual(proto.FailureReason.provider_error, actErrorTransition(.fail_turn).fail);
     try std.testing.expect(actErrorTransition(.stop_turn) == .cancel);
 }
 
-test "RFC-023: exhausted backend error keeps rate-limit versus provider cause" {
+test "exhausted backend error keeps rate-limit versus provider cause" {
     try std.testing.expectEqual(
         ActErrorResolution.fail_rate_limited,
         exhaustedActErrorResolution(error.LLMRateLimitExceeded),
@@ -578,7 +578,7 @@ test "RFC-023: exhausted backend error keeps rate-limit versus provider cause" {
     );
 }
 
-test "RFC-023: terminal Act errors preserve ACP exhaustion reason" {
+test "terminal Act errors preserve ACP exhaustion reason" {
     try std.testing.expectEqual(
         proto.FailureReason.rate_limit_exhausted,
         actErrorTransition(.fail_rate_limited).fail,
@@ -691,7 +691,7 @@ fn terminalTaskEvent(outcome: proto.TurnOutcome) journal_mod.ActEventType {
     };
 }
 
-test "RFC-023: terminal outcomes map to one truthful task event" {
+test "terminal outcomes map to one truthful task event" {
     try std.testing.expectEqual(journal_mod.ActEventType.task_completed, terminalTaskEvent(.completed));
     try std.testing.expectEqual(journal_mod.ActEventType.task_stalled, terminalTaskEvent(.stalled));
     try std.testing.expectEqual(journal_mod.ActEventType.task_stalled, terminalTaskEvent(.blocked));
@@ -721,7 +721,7 @@ pub fn executeTurnWorker(
 
     const tool_defs = try prepareTurnState(self, turn_alloc, user_text, images);
 
-    // RFC-029: in deferred mode the tool list is re-resolved at the start of
+    // In deferred mode the tool list is re-resolved at the start of
     // every act, so tools promoted by earlier acts (tool_search hits, actual
     // invocations, plan hints) become visible. The list only ever grows, so
     // the provider prompt-cache prefix stays valid.
@@ -783,7 +783,7 @@ pub fn executeTurnWorker(
     self.coordinator.finishAct(act_id, outcome == .completed);
     self.coordinator.notifyTurnComplete();
 
-    // RFC-025 Phase 3: background LLM extraction of durable memories
+    // Background LLM extraction of durable memories
     // (sync end-of-turn dispatch; no-op when memact_extract == "off").
     // Extraction must never alter the turn outcome.
     self.maybeExtractMemories() catch {};

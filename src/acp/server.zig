@@ -807,7 +807,7 @@ pub fn acpStopReason(outcome: proto.TurnOutcome, failure_reason: ?proto.FailureR
     };
 }
 
-test "ACP maps every RFC-023 turn outcome" {
+test "ACP maps every turn outcome" {
     try std.testing.expectEqualStrings("end_turn", acpStopReason(.completed, null));
     try std.testing.expectEqualStrings("stalled", acpStopReason(.stalled, null));
     try std.testing.expectEqualStrings("error", acpStopReason(.failed, null));

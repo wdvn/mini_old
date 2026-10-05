@@ -32,20 +32,20 @@ pub const ActEventType = enum {
     task_stalled,
     task_failed,
     task_interrupted,
-    /// RFC-003 §4.6: MemAct compaction completed (observable & reversible via Act model).
+    /// MemAct compaction completed (observable & reversible via Act model).
     memact_compacted,
     /// Progress Checkpoint & Recap created upon orbit/loop detection or act limit.
     checkpoint_created,
-    /// RFC-024: plan lifecycle phase transition (proposed → approved → executing → complete/rejected).
+    /// Plan lifecycle phase transition (proposed → approved → executing → complete/rejected).
     plan_phase_changed,
-    /// RFC-024: step verification check outcome (passed/failed/timed_out/error).
+    /// Step verification check outcome (passed/failed/timed_out/error).
     plan_step_verified,
-    /// RFC-024: two-stage review gate verdict (Critical/Important/Minor) on a
+    /// Two-stage review gate verdict (Critical/Important/Minor) on a
     /// subagent-executed plan step.
     plan_review_outcome,
-    /// RFC-024: a skill was read into the conversation (tracked for post-compaction reinjection).
+    /// A skill was read into the conversation (tracked for post-compaction reinjection).
     skill_loaded,
-    /// RFC-024: plan/skill/task context re-injected after MemAct compaction.
+    /// Plan/skill/task context re-injected after MemAct compaction.
     post_compact_reinject,
 };
 
@@ -55,7 +55,7 @@ pub const FileSnapshot = struct {
     previous_content_hash: ?[]const u8,
 };
 
-/// Backend error details (RFC-002): sufficient context for future debugging from journal —
+/// Backend error details: sufficient context for future debugging from journal —
 /// which backend/model, error details, HTTP code, attempt number, raw body (if any).
 pub const ErrorDetail = struct {
     /// Backend name ("openai-compat" / "claude" / "ollama").
@@ -104,7 +104,7 @@ pub const ActEvent = struct {
 pub const ActJournal = struct {
     alloc: Allocator,
     file_path: []const u8,
-    /// RFC-002 extension (subagent merge): parent agent journal path read from
+    /// Extension (subagent merge): parent agent journal path read from
     /// MINI_PARENT_JOURNAL env at init. Null if not set / empty / identical to file_path.
     /// Events are mirrored 1-level (direct write, non-recursive appendEvent).
     parent_path: ?[]u8 = null,
@@ -330,7 +330,7 @@ pub const ActJournal = struct {
         // Write to main journal
         try writeLineTo(self.alloc, io, self.file_path, out_buf.items);
 
-        // RFC-002 extension: 1-tier mirror to parent agent's journal (subagent merge).
+        // Extension: 1-tier mirror to parent agent's journal (subagent merge).
         // Write the same JSON line directly — do NOT recursively call appendEvent to prevent
         // loops when parent also has MINI_PARENT_JOURNAL set.
         if (self.parent_path) |pp| {
@@ -340,7 +340,7 @@ pub const ActJournal = struct {
 };
 
 test "ActEventType stringify contains memact_compacted" {
-    // Default enum stringify in Zig uses snake_case field names — RFC-003 §4.6
+    // Default enum stringify in Zig uses snake_case field names —
     try std.testing.expectEqualStrings("memact_compacted", @tagName(ActEventType.memact_compacted));
     // Enum JSON stringify also uses tag name
     var buf: [64]u8 = undefined;

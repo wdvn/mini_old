@@ -1,4 +1,4 @@
-//! core/plan/monitor.zig — Plan execution monitoring and drift detection (RFC-019)
+//! core/plan/monitor.zig — Plan execution monitoring and drift detection
 //!
 //! Detects when actual execution deviates from planned trajectory
 //! and generates corrective guidance.

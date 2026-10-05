@@ -2,7 +2,7 @@
 //!
 //! High-performance implementations of:
 //! - h-hop neighborhood subgraph extraction (BFS with dynamic bitset)
-//! - 3-color cycle detection and automated cycle repair (for RFC-010 validator)
+//! - 3-color cycle detection and automated cycle repair (for validator)
 //! - Terminal reachability verification (reverse BFS from out-degree = 0 nodes)
 //! - Shortest path finding
 

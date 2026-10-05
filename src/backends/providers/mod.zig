@@ -1,4 +1,4 @@
-//! mod.zig — Provider profile modules registry (RFC-012).
+//! mod.zig — Provider profile modules registry.
 
 pub const openai = @import("openai.zig");
 pub const deepseek = @import("deepseek.zig");

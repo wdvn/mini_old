@@ -1,4 +1,4 @@
-//! xai.zig — xAI (Grok) provider profile and URL matcher (RFC-012).
+//! xai.zig — xAI (Grok) provider profile and URL matcher.
 
 const std = @import("std");
 const base = @import("../provider.zig");

@@ -60,7 +60,7 @@ pub const SessionSummary = struct {
     last_error_msg_buf: [256]u8 = [_]u8{0} ** 256,
     last_error_msg_len: usize = 0,
 
-    // RFC-024 §3.5: plan-methodology event counts (scanned from journal lines).
+    // Plan-methodology event counts (scanned from journal lines).
     plan_phase_changed: usize = 0,
     plan_step_verified: usize = 0,
     plan_review_outcome: usize = 0,
@@ -185,7 +185,7 @@ fn evaluateExitedState(summary: *SessionSummary, last_ev: []const u8) void {
 
 fn scanJournalLines(summary: *SessionSummary, content: []const u8) struct { last_line: ?[]const u8, err_line: ?[]const u8 } {
     // PSEUDOCODE: Scan lines to count events, errors, and extract last lines.
-    // Also count RFC-024 plan-methodology events by matching "event_type":"<name>".
+    // Also count plan-methodology events by matching "event_type":"<name>".
     var line_it = std.mem.splitScalar(u8, content, '\n');
     var last_non_empty: ?[]const u8 = null;
     var last_err: ?[]const u8 = null;
@@ -201,7 +201,7 @@ fn scanJournalLines(summary: *SessionSummary, content: []const u8) struct { last
             last_err = trimmed;
         }
 
-        // RFC-024 §3.5: tally plan-methodology events for the diagnostics section.
+        // Tally plan-methodology events for the diagnostics section.
         if (std.mem.indexOf(u8, trimmed, "\"event_type\":\"plan_phase_changed\"") != null) summary.plan_phase_changed += 1;
         if (std.mem.indexOf(u8, trimmed, "\"event_type\":\"plan_step_verified\"") != null) summary.plan_step_verified += 1;
         if (std.mem.indexOf(u8, trimmed, "\"event_type\":\"plan_review_outcome\"") != null) summary.plan_review_outcome += 1;
@@ -444,8 +444,7 @@ pub fn detailSession(alloc: Allocator, io: std.Io, pid: i32) ![]u8 {
     }
     try w.print("- **Journal path**: `{s}`\n\n", .{full_path});
 
-    // RFC-024 §3.5: plan-methodology telemetry section (the plan-path half of
-    // RFC-020's telemetry requirement). Only shown when the session has any
+    // Plan-methodology telemetry section. Only shown when the session has any
     // plan/skill/reinject activity, so legacy sessions stay unchanged.
     const has_plan_activity = summary.plan_phase_changed > 0 or
         summary.plan_step_verified > 0 or
@@ -453,7 +452,7 @@ pub fn detailSession(alloc: Allocator, io: std.Io, pid: i32) ![]u8 {
         summary.skill_loaded > 0 or
         summary.post_compact_reinject > 0;
     if (has_plan_activity) {
-        try w.writeAll("## Plan Methodology (RFC-024)\n");
+        try w.writeAll("## Plan Methodology\n");
         try w.print("- **Plan phase changes**: {d}\n", .{summary.plan_phase_changed});
         try w.print("- **Step verifications**: {d}\n", .{summary.plan_step_verified});
         try w.print("- **Review outcomes**: {d}\n", .{summary.plan_review_outcome});

@@ -1,4 +1,4 @@
-//! core/plan/dispatch.zig — Step-scoped subagent orchestration (RFC-024 §3.4)
+//! core/plan/dispatch.zig — Step-scoped subagent orchestration
 //!
 //! Deterministic core for dispatching plan steps to subagents and running the
 //! two-stage review gate. This module is dependency-free (no subagent/spawn
@@ -37,7 +37,7 @@ pub const SubagentRunner = *const fn (
 // Task rendering
 // ---------------------------------------------------------------------------
 
-/// Render a self-contained task string for a single plan step (RFC-024 §3.4):
+/// Render a self-contained task string for a single plan step:
 /// step description, dependencies' descriptions, verification requirement,
 /// and executor mode hint. The subagent receives no other context, so the
 /// task must be self-sufficient.
@@ -184,7 +184,7 @@ fn runner2SingleStep(
     const one = [1][]const u8{ review_task };
     return runner(io, alloc, &one);
 }
-/// RFC-024 §3.4: collect the IDs of the pending, mutually-independent steps
+/// Collect the IDs of the pending, mutually-independent steps
 /// that are eligible for `executor_mode: "parallel"`. A step is eligible when
 /// it is pending, all of its dependencies are satisfied, and its executor_mode
 /// is a parallel mode. Two eligible steps are mutually independent when
@@ -242,7 +242,7 @@ pub fn isParallelMode(mode: ?[]const u8) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Review verdict (two-stage, RFC-024 §3.4)
+// Review verdict (two-stage)
 // ---------------------------------------------------------------------------
 
 /// Machine-readable outcome of the two-stage review gate.

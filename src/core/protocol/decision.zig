@@ -1,4 +1,4 @@
-//! core/protocol/decision.zig — RFC-023 Agent Decision, Turn Outcome, and Recovery logic.
+//! core/protocol/decision.zig — Agent Decision, Turn Outcome, and Recovery logic.
 //!
 //! Provides StepOutcome, TurnOutcome, TurnResult, AgentDecision, RecoveryClass,
 //! ResponseRecoveryBudget, classifyResponse, decideAgentAction, and related helpers.
@@ -17,10 +17,10 @@ const ResponseValidity = response_mod.ResponseValidity;
 const toGenerationStop = response_mod.toGenerationStop;
 
 // ---------------------------------------------------------------------------
-// RFC-023 Outcomes & Decisions
+// Outcomes & Decisions
 // ---------------------------------------------------------------------------
 
-/// RFC-023: StepOutcome describing the immediate action taken for a step.
+/// StepOutcome describing the immediate action taken for a step.
 pub const StepOutcome = enum {
     actions_executed,
     final_answer,
@@ -31,7 +31,7 @@ pub const StepOutcome = enum {
     cancelled,
 };
 
-/// RFC-023: Terminal outcome of a complete user turn.
+/// Terminal outcome of a complete user turn.
 pub const TurnOutcome = enum {
     completed,
     stalled,
@@ -40,7 +40,7 @@ pub const TurnOutcome = enum {
     cancelled,
 };
 
-/// RFC-023: Public result returned after a normal terminal turn path.
+/// Public result returned after a normal terminal turn path.
 pub const TurnResult = struct {
     outcome: TurnOutcome,
     generation_stop: GenerationStop,
@@ -57,7 +57,7 @@ pub const TurnResult = struct {
     }
 };
 
-/// RFC-023: Agent-level action selected after response classification.
+/// Agent-level action selected after response classification.
 pub const AgentDecision = enum {
     execute_native_tools,
     execute_codeact,
@@ -305,7 +305,7 @@ pub fn decideAgentActionFromStopReason(
 // Tests
 // ---------------------------------------------------------------------------
 
-test "RFC-023: thinking-only natural end retries then stalls" {
+test "thinking-only natural end retries then stalls" {
     const alloc = std.testing.allocator;
     var response = Response.init(alloc);
     defer response.deinit();
@@ -324,7 +324,7 @@ test "RFC-023: thinking-only natural end retries then stalls" {
     try std.testing.expectEqual(RecoveryDecision.stalled, budget.consume(.thinking_only));
 }
 
-test "RFC-023: native tool takes precedence over final text" {
+test "native tool takes precedence over final text" {
     const alloc = std.testing.allocator;
     var response = Response.init(alloc);
     defer response.deinit();
@@ -340,7 +340,7 @@ test "RFC-023: native tool takes precedence over final text" {
     try std.testing.expectEqual(AgentDecision.execute_native_tools, decideAgentAction(.tool_call, .native_tool_calls, false));
 }
 
-test "RFC-023: explicit GenerationStop overrides legacy StopReason" {
+test "explicit GenerationStop overrides legacy StopReason" {
     const alloc = std.testing.allocator;
     var response = Response.init(alloc);
     defer response.deinit();
@@ -350,7 +350,7 @@ test "RFC-023: explicit GenerationStop overrides legacy StopReason" {
     try std.testing.expectEqual(GenerationStop.missing_terminal_event, response.getGenerationStop());
 }
 
-test "RFC-023: missing terminal event never becomes natural completion" {
+test "missing terminal event never becomes natural completion" {
     const alloc = std.testing.allocator;
     var response = Response.init(alloc);
     defer response.deinit();
@@ -362,7 +362,7 @@ test "RFC-023: missing terminal event never becomes natural completion" {
     try std.testing.expectEqual(AgentDecision.request_continuation, decideAgentAction(response.getGenerationStop(), .partial_text, false));
 }
 
-test "RFC-023: whitespace-only and empty responses never become final answers" {
+test "whitespace-only and empty responses never become final answers" {
     const alloc = std.testing.allocator;
     var response = Response.init(alloc);
     defer response.deinit();
@@ -379,7 +379,7 @@ test "RFC-023: whitespace-only and empty responses never become final answers" {
     try std.testing.expectEqual(AgentDecision.retry_transient, decideAgentAction(.natural_end, .empty, false));
 }
 
-test "RFC-023: resumable partial transport text stays outside recovery budget" {
+test "resumable partial transport text stays outside recovery budget" {
     try std.testing.expectEqual(@as(?RecoveryClass, null), responseRecoveryClass(.partial_text, .missing_terminal_event));
     try std.testing.expectEqual(@as(?RecoveryClass, null), responseRecoveryClass(.partial_text, .stream_aborted));
     try std.testing.expectEqual(@as(?RecoveryClass, null), responseRecoveryClass(.partial_text, .max_tokens));
@@ -388,7 +388,7 @@ test "RFC-023: resumable partial transport text stays outside recovery budget" {
     try std.testing.expectEqual(RecoveryClass.stream_aborted, responseRecoveryClass(.empty, .stream_aborted) orelse unreachable);
 }
 
-test "RFC-023: tool arguments must be valid JSON objects" {
+test "tool arguments must be valid JSON objects" {
     const alloc = std.testing.allocator;
     var response = Response.init(alloc);
     defer response.deinit();
@@ -413,7 +413,7 @@ test "isValidJsonObject accepts objects, rejects truncated and non-object JSON" 
     try std.testing.expect(!isValidJsonObject("not a json"));
 }
 
-test "RFC-023: malformed tool call yields malformed_tool_call and bounded retry" {
+test "malformed tool call yields malformed_tool_call and bounded retry" {
     const alloc = std.testing.allocator;
     var response = Response.init(alloc);
     defer response.deinit();
@@ -429,7 +429,7 @@ test "RFC-023: malformed tool call yields malformed_tool_call and bounded retry"
     try std.testing.expectEqual(AgentDecision.cancel, decideAgentAction(.tool_call, .malformed_tool_call, true));
 }
 
-test "RFC-023: malformed tool call maps to its own bounded recovery budget" {
+test "malformed tool call maps to its own bounded recovery budget" {
     try std.testing.expectEqual(
         RecoveryClass.malformed_tool_call,
         responseRecoveryClass(.malformed_tool_call, .tool_call) orelse unreachable,
@@ -485,7 +485,7 @@ test "text plus truncated tool call at tool_call stop classifies as partial_text
     try std.testing.expectEqual(ResponseValidity.partial_text, classifyResponse(&response, false));
 }
 
-test "RFC-023: max_tokens with thinking-only retries transiently (P0-B)" {
+test "max_tokens with thinking-only retries transiently (P0-B)" {
     try std.testing.expectEqual(AgentDecision.retry_transient, decideAgentAction(.max_tokens, .thinking_only, false));
     try std.testing.expectEqual(
         RecoveryClass.thinking_only,
@@ -494,7 +494,7 @@ test "RFC-023: max_tokens with thinking-only retries transiently (P0-B)" {
     try std.testing.expectEqual(AgentDecision.retry_transient, decideAgentAction(.max_tokens, .empty, false));
 }
 
-test "RFC-023: incomplete max-tokens tool call requests continuation" {
+test "incomplete max-tokens tool call requests continuation" {
     const alloc = std.testing.allocator;
     var response = Response.init(alloc);
     defer response.deinit();
@@ -514,7 +514,7 @@ test "RFC-023: incomplete max-tokens tool call requests continuation" {
     );
 }
 
-test "RFC-023: interrupted tool payloads are non-executable partial responses" {
+test "interrupted tool payloads are non-executable partial responses" {
     const alloc = std.testing.allocator;
     for ([_]GenerationStop{ .max_tokens, .stop_sequence, .missing_terminal_event, .stream_aborted }) |stop| {
         var response = Response.init(alloc);
@@ -530,12 +530,12 @@ test "RFC-023: interrupted tool payloads are non-executable partial responses" {
     }
 }
 
-test "RFC-023: non-resumable stop-sequence response stalls" {
+test "non-resumable stop-sequence response stalls" {
     try std.testing.expectEqual(AgentDecision.fail_stalled, decideAgentAction(.stop_sequence, .thinking_only, false));
     try std.testing.expectEqual(AgentDecision.fail_stalled, decideAgentAction(.stop_sequence, .empty, false));
 }
 
-test "RFC-023: CodeAct takes precedence over meaningful final text" {
+test "CodeAct takes precedence over meaningful final text" {
     const alloc = std.testing.allocator;
     var response = Response.init(alloc);
     defer response.deinit();
@@ -546,7 +546,7 @@ test "RFC-023: CodeAct takes precedence over meaningful final text" {
     try std.testing.expectEqual(AgentDecision.execute_codeact, decideAgentAction(.natural_end, .codeact, false));
 }
 
-test "RFC-023: tool-only responses never deliver final answers" {
+test "tool-only responses never deliver final answers" {
     try std.testing.expectEqual(
         AgentDecision.execute_native_tools,
         decideAgentAction(.tool_call, .native_tool_calls, false),
@@ -557,7 +557,7 @@ test "RFC-023: tool-only responses never deliver final answers" {
     );
 }
 
-test "RFC-023: valid actions produce next-Act transitions without a global limit" {
+test "valid actions produce next-Act transitions without a global limit" {
     const native = proto_act_next_action(.execute_native_tools);
     try std.testing.expect(native == .next_act);
     const codeact = proto_act_next_action(.execute_codeact);
@@ -578,7 +578,7 @@ fn proto_act_next_action(decision: AgentDecision) ActTransition {
     };
 }
 
-test "RFC-023: cancellation takes absolute precedence" {
+test "cancellation takes absolute precedence" {
     try std.testing.expectEqual(AgentDecision.cancel, decideAgentAction(.cancelled, .final_text, false));
     try std.testing.expectEqual(AgentDecision.cancel, decideAgentAction(.natural_end, .final_text, true));
     try std.testing.expectEqual(AgentDecision.cancel, decideAgentAction(.tool_call, .native_tool_calls, true));

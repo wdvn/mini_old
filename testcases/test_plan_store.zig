@@ -1,4 +1,4 @@
-//! test_plan_store.zig — Unit tests for RFC-019 Plan Store & CAS persistence.
+//! test_plan_store.zig — Unit tests for Plan Store & CAS persistence.
 //!
 //! Validates:
 //! 1. Plan serialization and CAS hashing

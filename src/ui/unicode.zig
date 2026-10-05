@@ -1,6 +1,6 @@
 //! unicode.zig — UTF-8 utilities for UI: display width, grapheme cluster iteration.
 //!
-//! Addresses group 1 (RFC-000): calculates display width according to East Asian Width,
+//! Addresses group 1: calculates display width according to East Asian Width,
 //! iterates by grapheme cluster (base + combining marks + ZWJ sequences + variation
 //! selectors) to prevent cursor misalignment when typing multibyte languages / emojis.
 

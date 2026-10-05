@@ -50,7 +50,7 @@ Event types (from `src/core/journal.zig` — `ActEventType`):
 | `rollback_requested` / `rollback_completed` | State rolled back (CAS file snapshots restored) |
 | `memact_compacted` | Context compacted; preserved prompt + summary inserted |
 | `checkpoint_created` | Progress checkpoint after orbit/loop detection |
-| `plan_phase_changed` / `plan_step_verified` / `plan_review_outcome` | RFC-019/024 plan lifecycle |
+| `plan_phase_changed` / `plan_step_verified` / `plan_review_outcome` | plan lifecycle |
 | `skill_loaded` / `post_compact_reinject` | Skill read into context; re-injection after compaction |
 
 ---

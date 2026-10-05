@@ -57,7 +57,7 @@ pub const codeact_execution_instructions =
     \\   - Once you have gathered sufficient information or completed the task:
     \\       * Deliver your Final Answer directly to the user (without any ```js block). If the task requires a concrete artifact (fix, patch, feature) and it has not been produced yet, do not give a final answer — keep acting until the artifact exists, or explicitly state the blocker and what remains instead.
     \\
-    \\2. Proactive Planning Mode (RFC-019 — For complex / multi-step tasks):
+    \\2. Proactive Planning Mode:
     \\   - Use when a task is non-trivial (>= 2 steps, architectural refactor, multi-file edits, migrations).
     \\   - First turn: Formulate and output a structured plan in JSON or checklist format BEFORE mutating code:
     \\     ```json
@@ -557,7 +557,7 @@ pub const explicit_stop_continuation =
     "[System] The response ended at an explicit stop boundary. Continue from that boundary without repeating prior output.";
 
 // ---------------------------------------------------------------------------
-// Plan execution & watchdog directives (RFC-019 / RFC-024)
+// Plan execution & watchdog directives
 // ---------------------------------------------------------------------------
 
 /// Directive injected by Plan Watchdog when model returns text only during active plan.

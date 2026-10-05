@@ -1,4 +1,4 @@
-//! editor.zig — Line editor for REPL (RFC-000 Phase 0).
+//! editor.zig — Line editor for REPL.
 //!
 //! Addresses editor features:
 //!   - Dynamic buffer `ArrayListUnmanaged(u8)` (input limit 64KB, reject instead of truncate)
@@ -8,14 +8,14 @@
 //!   - Undo/Redo: Ctrl+Z / Ctrl+Y (16-snapshot ring, 4KB/snapshot cap)
 //!   - Kill ring: Ctrl+W cut left word, Ctrl+K cut to end of line, Ctrl+Y yank (5-slot ring)
 //!   - Ctrl+A/E/U/L, Home/End, ↑/↓ history, bracketed paste
-//!   - Multiline insert: Shift+Enter / Ctrl+Enter / Alt+Enter, Ctrl+J (RFC-008 §5B).
+//!   - Multiline insert: Shift+Enter / Ctrl+Enter / Alt+Enter, Ctrl+J.
 //!     Modified Enter is decoded from xterm modifyOtherKeys ("ESC[27;2;13~")
 //!     or kitty keyboard protocol ("ESC[13;2u"); the editor requests
 //!     modifyOtherKeys=1 (level 1: only re-encodes keys whose legacy encoding
 //!     is ambiguous, e.g. Shift+Enter, leaving Ctrl/Alt+letter untouched)
 //!     while in raw mode.
 //!
-//! Still a single-line composer (multiline is Phase 1 — RFC-000).
+//! Still a single-line composer (multiline is Phase 1).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -280,7 +280,7 @@ pub const LineEditor = struct {
         return true;
     }
 
-    /// Insert '\n' at cursor position (manual newline, RFC-008 §5B).
+    /// Insert '\n' at cursor position (manual newline, B).
     pub fn insertNewlineAtCursor(self: *LineEditor, io: std.Io, prompt: []const u8) void {
         if (self.buf.items.len + 1 > MAX_INPUT_BYTES) {
             self.limit_msg = true;
@@ -1514,7 +1514,7 @@ test "normal paste: content between start/end marker" {
     try std.testing.expectEqualStrings("hello pasted", out);
 }
 
-test "multiline paste: preserves newlines (RFC-008 §5A)" {
+test "multiline paste: preserves newlines" {
     const alloc = std.testing.allocator;
     const out = try simulatePaste(alloc, "line1\r\nline2\nline3" ++ paste_mod.END_MARKER);
     defer alloc.free(out);

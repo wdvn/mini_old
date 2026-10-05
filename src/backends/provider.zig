@@ -1,4 +1,4 @@
-//! provider.zig — Provider Abstraction Layer (RFC-012).
+//! provider.zig — Provider Abstraction Layer.
 //!
 //! Static profiles describing provider-specific wire protocol quirks.
 //! Normalizes differences in:
@@ -117,7 +117,7 @@ pub fn detectFromUrl(url: []const u8) []const u8 {
 
 /// Resolve profile from explicit key or auto-detected URL.
 pub fn resolveProfile(explicit_key: ?[]const u8, url: ?[]const u8) ProviderProfile {
-    // RFC-012 §3.3: an explicit, non-empty provider key always wins;
+    // An explicit, non-empty provider key always wins;
     // URL auto-detection applies only when no explicit key is given.
     if (explicit_key) |k| {
         if (k.len > 0) return getProfile(k);

@@ -14,7 +14,7 @@ pub fn addUser(self: *History, text: []const u8) !void {
     try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks, .tier = .recent });
 }
 
-/// Appends user message with image attachments (RFC-011 Media Ingestion).
+/// Appends user message with image attachments.
 pub fn addUserWithImages(self: *History, text: []const u8, images: []const proto.ImageBlock) !void {
     const has_text = text.len > 0;
     const total_blocks = (if (has_text) @as(usize, 1) else 0) + images.len;
@@ -88,7 +88,7 @@ pub fn addToolResults(self: *History, results: []const proto.ToolResult) !void {
     try self.msgs.append(self.alloc, .{ .role = .user, .content = blocks, .tier = .recent });
 }
 
-/// Appends tool execution results + attached loop-back images (RFC-011 §3.5).
+/// Appends tool execution results + attached loop-back images.
 pub fn addToolResultsWithImages(self: *History, results: []const proto.ToolResult, images: []const proto.ImageBlock) !void {
     const total_blocks = results.len + images.len;
     if (total_blocks == 0) return;

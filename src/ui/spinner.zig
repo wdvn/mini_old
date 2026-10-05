@@ -1,4 +1,4 @@
-//! spinner.zig — Live Non-blocking Braille Spinner & Timer for mini-agent (RFC-007).
+//! spinner.zig — Live Non-blocking Braille Spinner & Timer for mini-agent.
 //!
 //! Provides an animated spinner with smooth rotating Braille frames and execution timer.
 

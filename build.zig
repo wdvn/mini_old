@@ -144,7 +144,7 @@ pub fn build(b: *std.Build) void {
     const ws_ctx_tests = b.addTest(.{ .root_module = ws_ctx_mod });
     const run_ws_ctx_tests = b.addRunArtifact(ws_ctx_tests);
 
-    // 3c. RFC-029 Deferred Tool Loading testcases
+    // 3c. Deferred Tool Loading testcases
     const deferred_mod = b.createModule(.{
         .root_source_file = b.path("testcases/test_deferred_tool_loading.zig"),
         .target = target,
@@ -156,7 +156,7 @@ pub fn build(b: *std.Build) void {
     deferred_mod.linkLibrary(qjs_lib);
     const deferred_tests = b.addTest(.{ .root_module = deferred_mod });
     const run_deferred_tests = b.addRunArtifact(deferred_tests);
-    const test_deferred_step = b.step("test-deferred", "Run RFC-029 deferred tool loading tests only");
+    const test_deferred_step = b.step("test-deferred", "Run deferred tool loading tests only");
     test_deferred_step.dependOn(&run_deferred_tests.step);
 
     // 3d. Connect/interrupt regression (Ctrl+C must not stall on blackholed TCP)

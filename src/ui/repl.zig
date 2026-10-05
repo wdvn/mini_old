@@ -1,4 +1,4 @@
-//! repl.zig — Interactive Terminal REPL & UI Presentation Layer for mini-agent (RFC-007).
+//! repl.zig — Interactive Terminal REPL & UI Presentation Layer for mini-agent.
 //!
 //! Fully decouples the user interface, slash command handlers (/help, /model, /artifact, /clear),
 //! and streaming markdown / thinking text from the composition root.
@@ -651,7 +651,7 @@ fn printBasicConfigHelp(io: std.Io) void {
         \\  OLLAMA_HOST             Ollama base URL (default: http://localhost:11434)
         \\  OLLAMA_MODEL            Ollama model name (default: llama3)
         \\
-        \\### Agent & Reasoning (RFC-009)
+        \\### Agent & Reasoning
         \\  MINI_MAX_TOKENS                   Max tokens per response (default: 24000)
         \\  MINI_MAX_TOKENS_CONTINUE_CAP      Max consecutive auto-continuations on truncation (default: 3)
         \\  MINI_USE_COMPLETION_TOKENS        Use max_completion_tokens instead of max_tokens ("1"/"0")
@@ -683,7 +683,7 @@ fn printAdvancedConfigHelp(io: std.Io) void {
     // 1. Output MemAct, Tools, Media I/O, MCP, Hooks, and Budget configuration variables.
     std.Io.File.stdout().writeStreamingAll(io,
         \\
-        \\### MemAct (RFC-003) & Procedural Graph (RFC-010)
+        \\### MemAct & Procedural Graph
         \\  MINI_MEMACT_ENABLED          Enable MemAct memory system ("0" to disable)
         \\  MINI_CONTEXT_WINDOW          Context window size in tokens (auto-detected if unset)
         \\  MINI_CTX_SAFETY_MARGIN       Safety margin ratio for context (default: 0.15)
@@ -699,7 +699,7 @@ fn printAdvancedConfigHelp(io: std.Io) void {
         \\  MINI_MEMACT_PG_ADVISORY      Show procedural advisory messages ("0" to hide)
         \\  MINI_MEMACT_EXPANSION        LLM query expansion for dual-path retrieval ("0" to disable)
         \\
-        \\### Tools & Media I/O (RFC-011)
+        \\### Tools & Media I/O
         \\  MINI_TOOL_ALLOWLIST           Comma-separated list of allowed tools (null = allow all)
         \\  MINI_TOOL_BLOCKLIST           Comma-separated list of blocked tools (null = block none)
         \\  MINI_IMAGE_INPUT_ENABLED      Enable @image:path parsing ("0" to disable)
@@ -715,7 +715,7 @@ fn printAdvancedConfigHelp(io: std.Io) void {
         \\  MINI_MEDIA_OUTPUT_DIR         Media output directory
         \\  MINI_VIDEO_POLL_TIMEOUT_SECS  Video job polling timeout in seconds (default: 600)
         \\
-        \\### Structured Planning (RFC-019/024)
+        \\### Structured Planning
         \\  MINI_ENABLE_STRUCTURED_PLANNING Enable LLM-driven planning ("0" to disable, default: on)
         \\  MINI_PLAN_DRIFT_DETECTION        Detect plan drift ("0" to disable, default: on)
         \\  MINI_PLAN_MAX_STEPS              Max plan steps per task (default: 20)

@@ -1,4 +1,4 @@
-//! core/plan/parser.zig — Extract structured plans from LLM output (RFC-019)
+//! core/plan/parser.zig — Extract structured plans from LLM output
 //!
 //! Parses JSON or Markdown formatted plans from LLM responses.
 //! Supports both structured JSON and fallback Markdown formats (numbered lists, task lists).
@@ -32,7 +32,7 @@ const registry = @import("../../tooling/registry.zig");
 ///      "verification": {"kind": "shell", "value": "zig build"}, "executor_mode": "subagent"}
 ///   ]
 /// }
-/// `phase` (RFC-024) is optional; defaults to "proposed". `verification` may be
+/// `phase` is optional; defaults to "proposed". `verification` may be
 /// a string shorthand ("zig build test") or an object; `executor_mode` is optional.
 fn parseJsonStep(alloc: Allocator, step_val: std.json.Value, fallback_id: u64) !?PlanStep {
     // PSEUDOCODE: Extract step fields (id, description, dependencies, tool_hint, status) from JSON object.
@@ -76,7 +76,7 @@ fn parseJsonStep(alloc: Allocator, step_val: std.json.Value, fallback_id: u64) !
         }
     }
 
-    // RFC-024 §3.1/§3.4: optional per-step verification and executor mode.
+    // Optional per-step verification and executor mode.
     if (step_obj.get("executor_mode")) |em_val| {
         if (em_val == .string and em_val.string.len > 0) {
             step.executor_mode = try alloc.dupe(u8, em_val.string);
@@ -148,7 +148,7 @@ pub fn parsePlanJson(text: []const u8, alloc: Allocator) !Plan {
     var plan = try Plan.init(alloc, task, std.hash.Fnv1a_64.hash(task));
     errdefer plan.deinit(alloc);
 
-    // RFC-024 §3.2: optional plan-level phase (defaults to .proposed).
+    // Optional plan-level phase (defaults to .proposed).
     if (obj.get("phase")) |ph_val| {
         if (ph_val == .string) plan.phase = plan_mod.parsePlanPhase(ph_val.string);
     }

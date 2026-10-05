@@ -48,7 +48,7 @@ pub const Config = struct {
     openai_compat_model: []const u8,
     /// Flag to use max_completion_tokens instead of max_tokens.
     openai_compat_use_completion_tokens: bool,
-    /// Provider profile key for OpenAI-compat backend (RFC-012).
+    /// Provider profile key for OpenAI-compat backend.
     openai_provider: []const u8 = "generic",
     openai_provider_js: ?[]const u8 = null,
     /// Anthropic API key. Null = unconfigured.
@@ -73,10 +73,10 @@ pub const Config = struct {
     tool_allowlist: ?[]const u8,
     /// Comma-separated blocklist. Null = block none.
     tool_blocklist: ?[]const u8,
-    /// RFC-029: deferred tool loading with tool_search meta-tool. Default true.
+    /// Deferred tool loading with tool_search meta-tool. Default true.
     deferred_tool_loading: bool = true,
 
-    // Reasoning & Thinking (RFC-009)
+    // Reasoning & Thinking
     /// Reasoning effort for OpenAI-compatible models: "minimal" | "low" | "medium" | "high" | "none" | null.
     reasoning_effort: ?[]const u8 = null,
     /// Soft off-switch, set to true to force omitting reasoning params.
@@ -95,18 +95,18 @@ pub const Config = struct {
     context_window: u32,
     ctx_safety_margin: f32,
     ctx_compact_threshold: f32,
-    /// Maximum memory items injected into prompt (RFC-003).
+    /// Maximum memory items injected into prompt.
     memact_top_k: u32 = 8,
-    /// Token budget for memory block (RFC-003).
+    /// Token budget for memory block.
     memact_memory_budget: u32 = 2000,
-    /// Memory extraction mode: async | sync | off (RFC-003).
+    /// Memory extraction mode: async | sync | off.
     memact_extract: []const u8 = "async",
-    /// LLM query expansion for dual-path retrieval (RFC-025 Phase 2).
+    /// LLM query expansion for dual-path retrieval.
     memact_expansion: bool = true,
     /// Memory directory. Null = caller builds ~/.mini/memory.
     memory_dir: ?[]const u8 = null,
 
-    // Procedural Graph (RFC-010)
+    // Procedural Graph
     /// Whether Procedural Graph online guidance is enabled.
     memact_pg_enabled: bool = true,
     /// Whether to emit procedural advisory/checkpoint messages to stderr.
@@ -119,7 +119,7 @@ pub const Config = struct {
     /// Automatically learn and persist frequent tool transitions (N >= 3).
     memact_pg_auto_populate: bool = true,
 
-    // Budget Limits (RFC-002)
+    // Budget Limits
     budget_max_tokens: usize,
 
     // Execution & Action Loop Limits
@@ -158,7 +158,7 @@ pub const Config = struct {
     /// Direct path to session file.
     session_file: ?[]const u8,
 
-    // RFC-011: Media I/O
+    // Media I/O
     /// Enable @image:<path> parsing in prompt (Ingestion, Phase 0). Default: true.
     image_input_enabled: bool = true,
     /// Maximum image attachments per turn.
@@ -196,7 +196,7 @@ pub const Config = struct {
     /// Video poll timeout in seconds.
     video_poll_timeout_secs: u32 = 300,
 
-    // RFC-019: Structured Planning System
+    // Structured Planning System
     /// Enable structured planning system. Default: true.
     enable_structured_planning: bool = true,
     /// Enable drift detection. Default: true.
@@ -208,7 +208,7 @@ pub const Config = struct {
     /// Inject plan, progress, action-loop, and trajectory enforcement prompts. Default: false.
     prompt_enforcement_enabled: bool = false,
 
-    // RFC-024: AI Plan Framework
+    // AI Plan Framework
     /// Gate plan step completion on explicit verification. Default: false.
     plan_verification_gate: bool = false,
     /// Require user approval before executing a parsed plan (advisory gate). Default: false.
@@ -220,7 +220,7 @@ pub const Config = struct {
     /// Two-stage review gate after subagent-executed steps. Default: false.
     plan_review_gate: bool = false,
 
-    // 3-Thread Watchdog & Act Coordinator (RFC-015)
+    // 3-Thread Watchdog & Act Coordinator
     act_timeout_secs: u32 = 120,
     watchdog_tracking_interval_s: u32 = 10,
     watchdog_recap_interval: usize = 10,
@@ -287,16 +287,16 @@ pub const JsonConfig = struct {
     // Tools
     tool_allowlist: ?[]const u8 = null,
     tool_blocklist: ?[]const u8 = null,
-    /// RFC-029: deferred tool loading. Null = keep default (on).
+    /// Deferred tool loading. Null = keep default (on).
     deferred_tool_loading: ?bool = null,
-    // Reasoning & Thinking (RFC-009)
+    // Reasoning & Thinking
     reasoning_effort: ?[]const u8 = null,
     reasoning_effort_disabled: ?bool = null,
     thinking_budget_tokens: ?u32 = null,
     thinking_temperature: ?f32 = null,
     max_tokens_continue_cap: ?usize = null,
     dynamic_thinking_enabled: ?bool = null,
-    // MemAct Config (RFC-003)
+    // MemAct Config
     memact_enabled: ?bool = null,
     context_window: ?u32 = null,
     ctx_safety_margin: ?f32 = null,
@@ -306,13 +306,13 @@ pub const JsonConfig = struct {
     memact_extract: ?[]const u8 = null,
     memact_expansion: ?bool = null,
     memory_dir: ?[]const u8 = null,
-    // Procedural Graph (RFC-010)
+    // Procedural Graph
     memact_pg_enabled: ?bool = null,
     memact_pg_advisory: ?bool = null,
     memact_pg_h: ?u32 = null,
     memact_pg_w: ?u32 = null,
     memact_pg_auto_populate: ?bool = null,
-    // Budget Limits (RFC-002)
+    // Budget Limits
     budget_max_tokens: ?usize = null,
     // Execution & Action Loop Limits
     action_loop_consecutive_cap: ?usize = null,
@@ -332,7 +332,7 @@ pub const JsonConfig = struct {
     // Session
     session_id: ?[]const u8 = null,
     session_file: ?[]const u8 = null,
-    // RFC-011: Media I/O
+    // Media I/O
     image_input_enabled: ?bool = null,
     image_input_max_per_turn: ?u8 = null,
     image_input_max_bytes: ?usize = null,
@@ -345,19 +345,19 @@ pub const JsonConfig = struct {
     video_gen_provider: ?[]const u8 = null,
     media_output_dir: ?[]const u8 = null,
     video_poll_timeout_secs: ?u32 = null,
-    // RFC-019: Structured Planning System
+    // Structured Planning System
     enable_structured_planning: ?bool = null,
     plan_drift_detection: ?bool = null,
     plan_max_steps: ?usize = null,
     plans_dir: ?[]const u8 = null,
     prompt_enforcement_enabled: ?bool = null,
-    // RFC-024: AI Plan Framework
+    // AI Plan Framework
     plan_verification_gate: ?bool = null,
     plan_approval_gate: ?bool = null,
     post_compact_reinject: ?bool = null,
     plan_subagent_dispatch: ?bool = null,
     plan_review_gate: ?bool = null,
-    // 3-Thread Watchdog & Act Coordinator (RFC-015)
+    // 3-Thread Watchdog & Act Coordinator
     act_timeout_secs: ?u32 = null,
     watchdog_tracking_interval_s: ?u32 = null,
     watchdog_recap_interval: ?usize = null,

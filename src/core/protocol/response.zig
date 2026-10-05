@@ -10,10 +10,10 @@ const ContentBlock = types.ContentBlock;
 const Usage = types.Usage;
 
 // ---------------------------------------------------------------------------
-// Response & Stop Reasons (RFC-023)
+// Response & Stop Reasons
 // ---------------------------------------------------------------------------
 
-/// RFC-023: normalized provider generation termination state.
+/// Normalized provider generation termination state.
 ///
 /// PSEUDOCODE:
 /// 1. Record the provider's terminal generation event.
@@ -47,7 +47,7 @@ pub const StopReason = enum {
     max_tokens,
     /// Stop sequence triggered.
     stop_sequence,
-    /// Stream aborted by idle stall watchdog (RFC-009 Phase 5) — partial
+    /// Stream aborted by idle stall watchdog — partial
     /// content may have been preserved; agent decides how to recover.
     stream_aborted,
     /// Provider stream ended without an explicit terminal event.
@@ -93,7 +93,7 @@ pub fn toGenerationStop(stop_reason: StopReason, http_code: u32) GenerationStop 
     };
 }
 
-/// RFC-023: Validated shape of a backend response payload.
+/// Validated shape of a backend response payload.
 pub const ResponseValidity = enum {
     final_text,
     native_tool_calls,
@@ -133,14 +133,14 @@ pub const Response = struct {
     content: ArrayList(ContentBlock),
     /// Legacy provider stop reason retained for wire/log compatibility.
     stop_reason: StopReason,
-    /// RFC-023 normalized generation termination state.
+    /// Normalized generation termination state.
     /// Null means the legacy backend adapter has not normalized a terminal event yet.
     generation_stop: ?GenerationStop = null,
     /// HTTP status code (in case of error/unknown)
     http_code: u32 = 200,
     /// Raw debug info from backend (when stop_reason == .unknown)
     raw_debug_info: ?[]const u8,
-    /// Actual token usage from backend (RFC-006). Zero if not reported.
+    /// Actual token usage from backend. Zero if not reported.
     usage: Usage = .{},
 
     /// Initialize an empty Response.
@@ -223,7 +223,7 @@ pub const Response = struct {
     }
 };
 
-test "RFC-023: provider response diagnostics are bounded" {
+test "provider response diagnostics are bounded" {
     const raw = "secret-bearing-response" ** 1000;
     try std.testing.expectEqual(MAX_RESPONSE_SNIPPET_LEN, boundedResponseSnippet(raw).len);
 }

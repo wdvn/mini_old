@@ -1,4 +1,4 @@
-//! test_plan_parser.zig — Integration tests for RFC-019 Plan Parser.
+//! test_plan_parser.zig — Integration tests for Plan Parser.
 //!
 //! Validates:
 //! 1. JSON plan parsing with markdown code block formatting

@@ -1,6 +1,6 @@
 //! test_backend_edge_cases.zig — Crash-hunt & edge-case tests for backend layers.
 //!
-//! Scope (reliability hardening, RFC-025 companion):
+//! Scope (reliability hardening, companion):
 //!   1. JSON helpers (core/json.zig): malformed / truncated / huge / invalid-UTF-8
 //!      inputs must return errors or null — never crash.
 //!   2. OOM resilience: a failing allocator must turn into error.OutOfMemory, and

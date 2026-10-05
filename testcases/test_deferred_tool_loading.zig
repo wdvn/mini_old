@@ -1,4 +1,4 @@
-//! test_deferred_tool_loading.zig — Integration tests for RFC-029 Deferred Tool Loading.
+//! test_deferred_tool_loading.zig — Integration tests for Deferred Tool Loading.
 //!
 //! Validates:
 //! 1. Deferred mode ships a small, MCP-independent essential tool list
@@ -24,7 +24,7 @@ fn resetState() void {
     pinSubagentDepth();
 }
 
-/// RFC-029: `isPermitted` hides invoke_subagent when the subagent depth limit is
+/// `isPermitted` hides invoke_subagent when the subagent depth limit is
 /// reached, and other testcases mutate MINI_SUBAGENT_DEPTH in the shared env map.
 /// Pin the depth so these tests do not depend on unrelated global state.
 fn pinSubagentDepth() void {
@@ -33,7 +33,7 @@ fn pinSubagentDepth() void {
     em.put("MINI_MAX_SUBAGENT_DEPTH", "3") catch {};
 }
 
-test "RFC-029: deferred mode sends only the essential tool list" {
+test "deferred mode sends only the essential tool list" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -58,7 +58,7 @@ test "RFC-029: deferred mode sends only the essential tool list" {
     }
 }
 
-test "RFC-029: tool_search returns full schemas and promotes matches" {
+test "tool_search returns full schemas and promotes matches" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -93,7 +93,7 @@ test "RFC-029: tool_search returns full schemas and promotes matches" {
     try std.testing.expect(found_subagent);
 }
 
-test "RFC-029: promotion list is grow-only and deterministic" {
+test "promotion list is grow-only and deterministic" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -119,7 +119,7 @@ test "RFC-029: promotion list is grow-only and deterministic" {
     }
 }
 
-test "RFC-029: MINI_DEFERRED_TOOLS=0 keeps the legacy eager tool list" {
+test "MINI_DEFERRED_TOOLS=0 keeps the legacy eager tool list" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -141,7 +141,7 @@ test "RFC-029: MINI_DEFERRED_TOOLS=0 keeps the legacy eager tool list" {
     try std.testing.expect(has_subagent);
 }
 
-test "RFC-029: tool policy still filters the deferred list" {
+test "tool policy still filters the deferred list" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();

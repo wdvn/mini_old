@@ -1,4 +1,4 @@
-//! test_plan_integration.zig — End-to-End Integration & Edge Cases for RFC-019.
+//! test_plan_integration.zig — End-to-End Integration & Edge Cases for
 //!
 //! Validates:
 //! 1. Full lifecycle: LLM plan extraction -> CAS storage -> execution -> drift monitoring -> completion

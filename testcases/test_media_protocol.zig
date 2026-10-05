@@ -1,4 +1,4 @@
-//! testcases/test_media_protocol.zig — Unit tests for RFC-027 Media Protocol.
+//! testcases/test_media_protocol.zig — Unit tests for Media Protocol.
 
 const std = @import("std");
 const testing = std.testing;

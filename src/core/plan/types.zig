@@ -1,4 +1,4 @@
-//! core/plan/types.zig — Structured Planning System (RFC-019 / RFC-024)
+//! core/plan/types.zig — Structured Planning System
 //!
 //! Provides plan data model with step tracking, dependency management,
 //! serialization, and validation for multi-step task execution.
@@ -42,11 +42,11 @@ pub fn parseStepStatus(str: []const u8) StepStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Plan Phase (RFC-024 §3.2)
+// Plan Phase
 // ---------------------------------------------------------------------------
 
 /// Plan lifecycle phase. `proposed` is the default for a freshly parsed plan;
-/// execution guidance is gated on `approved` (advisory, per RFC-020).
+/// execution guidance is gated on `approved` (advisory).
 pub const PlanPhase = enum {
     /// Parsed but not yet user-approved (default).
     proposed,
@@ -79,7 +79,7 @@ pub fn parseVerificationStatus(str: []const u8) VerificationStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Step Verification (RFC-024 §3.1)
+// Step Verification
 // ---------------------------------------------------------------------------
 
 /// Result of running a step's verification check (normative state machine).
@@ -146,11 +146,11 @@ pub const PlanStep = struct {
     created_at: i64,
     /// Timestamp when step completed (null if not done).
     completed_at: ?i64 = null,
-    /// Optional acceptance check (RFC-024 §3.1); null = legacy tool_hint completion.
+    /// Optional acceptance check; null = legacy tool_hint completion.
     verification: ?StepVerification = null,
-    /// Latest verification result state (RFC-024 §3.1).
+    /// Latest verification result state.
     verification_status: VerificationStatus = .skipped,
-    /// "inline" (default) | "subagent" | "parallel:<batch>" (RFC-024 §3.4).
+    /// "inline" (default) | "subagent" | "parallel:<batch>".
     executor_mode: ?[]const u8 = null,
 
     // PSEUDOCODE:
@@ -257,7 +257,7 @@ pub const Plan = struct {
     parent_plan_id: ?u64 = null,
     /// Hash of user request for plan matching/restore.
     request_hash: u64,
-    /// Lifecycle phase (RFC-024 §3.2); `proposed` for freshly parsed plans.
+    /// Lifecycle phase; `proposed` for freshly parsed plans.
     phase: PlanPhase = .proposed,
 
     /// Initialize a new empty plan.
@@ -376,7 +376,7 @@ pub const Plan = struct {
         return null;
     }
 
-    /// RFC-024: dependency-aware ready-set selector. Returns the index of the
+    /// Dependency-aware ready-set selector. Returns the index of the
     /// first step whose prerequisites are all satisfied (completed/skipped) and
     /// which is not yet finished — replacing the sequential `findActiveStepIndex`
     /// scan in the runtime. A step that is `.active` with unmet deps is left as-is
@@ -967,7 +967,7 @@ test "DAG validation - cycle detected" {
     try std.testing.expect(checkCycles(&cyclic_steps));
 }
 
-test "RFC-024: verification + executor_mode + phase JSON round-trip" {
+test "verification + executor_mode + phase JSON round-trip" {
     const alloc = std.testing.allocator;
 
     var plan = try Plan.init(alloc, "Plan with verification", 0xabcd);
@@ -997,7 +997,7 @@ test "RFC-024: verification + executor_mode + phase JSON round-trip" {
     try std.testing.expectEqualStrings("inline", s.executor_mode.?);
 }
 
-test "RFC-024: string-shorthand verification parses as shell" {
+test "string-shorthand verification parses as shell" {
     const alloc = std.testing.allocator;
     const json_text =
         \\{"task":"t","phase":"proposed","request_hash":1,"steps":[
@@ -1009,7 +1009,7 @@ test "RFC-024: string-shorthand verification parses as shell" {
     try std.testing.expectEqual(VerificationKind.shell, plan.steps.items[0].verification.?.kind);
 }
 
-test "RFC-024: ready-step selector honors dependencies" {
+test "ready-step selector honors dependencies" {
     const alloc = std.testing.allocator;
 
     var plan = try Plan.init(alloc, "Ready-set", 0x1);

@@ -1,4 +1,4 @@
-//! minimax.zig — MiniMax provider profile and URL matcher (RFC-012).
+//! minimax.zig — MiniMax provider profile and URL matcher.
 
 const std = @import("std");
 const base = @import("../provider.zig");

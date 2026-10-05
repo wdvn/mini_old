@@ -1,4 +1,4 @@
-//! glm.zig — GLM / ZhipuAI provider profile and URL matcher (RFC-012).
+//! glm.zig — GLM / ZhipuAI provider profile and URL matcher.
 
 const std = @import("std");
 const base = @import("../provider.zig");

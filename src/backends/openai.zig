@@ -86,7 +86,7 @@ pub const Client = struct {
     use_completion_tokens: bool,
     /// Disable reasoning_effort if API does not support it alongside tool calls.
     disable_reasoning_effort: bool,
-    /// Disable stream_options if compat API does not support it (RFC-006 §3.6).
+    /// Disable stream_options if compat API does not support it.
     disable_stream_options: bool,
     /// Protocol mode (auto, chat_completions, responses).
     protocol_mode: ProtocolMode,
@@ -94,7 +94,7 @@ pub const Client = struct {
     cached_protocol: ?ProtocolMode,
     /// Dynamic reasoning effort override for next request ("minimal" | "low" | "medium" | "high" | "none" | null).
     active_reasoning_effort: ?[]const u8,
-    /// Provider key for wire protocol quirks normalization (RFC-012).
+    /// Provider key for wire protocol quirks normalization.
     provider_key: []const u8 = "generic",
     /// Explicit trusted adapter source; never loaded from model output.
     provider_js: ?[]const u8 = null,
@@ -124,7 +124,7 @@ pub const Client = struct {
         self.active_reasoning_effort = effort;
     }
 
-    /// Idle watchdog timeout scaled by active reasoning effort (RFC-009 Phase 5).
+    /// Idle watchdog timeout scaled by active reasoning effort.
     /// low/minimal → tight window (routine acts finish fast); high → generous.
     fn effectiveIdleTimeout(self: *const Client) u32 {
         // Disabled? Return 0 to skip idle polling entirely.
@@ -146,7 +146,7 @@ pub const Client = struct {
         return initWithProvider(alloc, base_url, api_key, api_header, model, max_tokens, protocol_mode, "generic");
     }
 
-    /// Initialize client with explicit provider key and protocol mode (RFC-012).
+    /// Initialize client with explicit provider key and protocol mode.
     pub fn initWithProvider(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32, protocol_mode: ProtocolMode, provider_key: []const u8) Client {
         return .{
             .alloc = alloc,
@@ -168,7 +168,7 @@ pub const Client = struct {
     /// Send messages to API and receive streaming response.
     /// Supports 3-Tier Dual-Protocol Auto-Negotiation & Adaptive Fallback.
     fn resolveActiveProtocol(self: *const Client, profile: provider.ProviderProfile) ProtocolMode {
-        // PSEUDOCODE: RFC-012 §7 priority: explicit OPENAI_PROTOCOL > ProviderProfile.protocol > cached auto-negotiate.
+        // PSEUDOCODE: priority: explicit OPENAI_PROTOCOL > ProviderProfile.protocol > cached auto-negotiate.
         if (self.protocol_mode == .chat_completions) return .chat_completions;
         if (self.protocol_mode == .responses) return .responses;
         return switch (profile.protocol) {
@@ -673,7 +673,7 @@ fn appendChatMessage(
     try w.writeByte('}');
 }
 
-/// Build request body for OpenAI Chat Completions API with a specific ProviderProfile (RFC-012).
+/// Build request body for OpenAI Chat Completions API with a specific ProviderProfile.
 pub fn buildRequestBodyWithProfile(
     alloc: Allocator,
     profile: provider.ProviderProfile,
@@ -1346,7 +1346,7 @@ const StreamCtx = struct {
                 errdefer self.alloc.free(name);
                 // PSEUDOCODE:
                 // 1. Preserve missing arguments as incomplete.
-                // 2. Let RFC-023 response validation reject the tool call.
+                // 2. Let response validation reject the tool call.
                 // 3. Never invent an empty JSON object for a partial provider stream.
                 const args = if (tc.args.items.len > 0)
                     try self.alloc.dupe(u8, tc.args.items)
@@ -1455,7 +1455,7 @@ test "openai stream: parallel tool calls merged by index (DeepSeek style)" {
     try testing.expectEqualStrings("{\"path\":\"a.zig\"}", second.input_json);
 }
 
-test "RFC-023: OpenAI idle abort overrides earlier terminal state" {
+test "OpenAI idle abort overrides earlier terminal state" {
     const alloc = testing.allocator;
     var client = Client.init(alloc, "http://localhost/v1", "", "Authorization", "mock", 100);
     var ctx = StreamCtx{
@@ -1475,7 +1475,7 @@ test "RFC-023: OpenAI idle abort overrides earlier terminal state" {
     try testing.expectEqual(proto.GenerationStop.stream_aborted, response.getGenerationStop());
 }
 
-test "RFC-023: incomplete tool arguments are never replaced with empty object" {
+test "incomplete tool arguments are never replaced with empty object" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
         .alloc = alloc,
@@ -1587,7 +1587,7 @@ test "openai buildRequestBody coerces truncated tool-call arguments to valid JSO
     try testing.expect(std.mem.indexOf(u8, body, "\"id\":\"call_trunc\",\"function\":{\"name\":\"artifact_write\",\"arguments\":\"{}\"}") != null);
 }
 
-// --- RFC-006 Tests ---
+// --- Tests ---
 
 test "openai buildRequestBody: disable_stream_options omits stream_options" {
     const alloc = testing.allocator;
@@ -1601,7 +1601,7 @@ test "openai buildRequestBody: disable_stream_options omits stream_options" {
     try testing.expect(std.mem.indexOf(u8, body, "include_usage") == null);
 }
 
-test "openai stream: parse usage chunk (RFC-006 §3.1)" {
+test "openai stream: parse usage chunk" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
         .alloc = alloc,
@@ -1633,7 +1633,7 @@ test "openai stream: parse usage chunk (RFC-006 §3.1)" {
     try testing.expectEqual(@as(u64, 10), ctx.response.usage.reasoning_tokens);
 }
 
-test "RFC-023: terminal metadata distinguishes provider and transport completion" {
+test "terminal metadata distinguishes provider and transport completion" {
     const alloc = testing.allocator;
     var client = Client.init(alloc, "http://localhost/v1", "", "Authorization", "mock", 100);
 
@@ -1676,7 +1676,7 @@ test "RFC-023: terminal metadata distinguishes provider and transport completion
     defer aborted.deinit();
     try testing.expectEqual(FinalizationRoute.idle_abort, idle_ctx.finalization_route);
 }
-test "RFC-023: EOF with partial thinking is not natural end_turn" {
+test "EOF with partial thinking is not natural end_turn" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
         .alloc = alloc,
@@ -1697,7 +1697,7 @@ test "RFC-023: EOF with partial thinking is not natural end_turn" {
     try testing.expectEqual(@as(usize, 1), ctx.response.content.items.len);
 }
 
-test "openai stream: DeepSeek usage alias prompt_cache_hit_tokens (RFC-006 §3.1)" {
+test "openai stream: DeepSeek usage alias prompt_cache_hit_tokens" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
         .alloc = alloc,
@@ -1722,7 +1722,7 @@ test "openai stream: DeepSeek usage alias prompt_cache_hit_tokens (RFC-006 §3.1
     try testing.expectEqual(@as(u64, 60), ctx.response.usage.cached_tokens);
 }
 
-test "openai stream: delta.reasoning parsed as thinking (RFC-006 §3.3)" {
+test "openai stream: delta.reasoning parsed as thinking" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
         .alloc = alloc,
@@ -1759,7 +1759,7 @@ test "openai stream: delta.reasoning parsed as thinking (RFC-006 §3.3)" {
     try testing.expectEqualStrings("The answer is 42", text_block);
 }
 
-test "openai stream: finish_reason content_filter maps to content_filter (RFC-023)" {
+test "openai stream: finish_reason content_filter maps to content_filter" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
         .alloc = alloc,
@@ -1782,7 +1782,7 @@ test "openai stream: finish_reason content_filter maps to content_filter (RFC-02
     try testing.expectEqual(proto.StopReason.content_filter, ctx.response.stop_reason);
 }
 
-test "openai stream: finish_reason function maps to tool_use (RFC-006 §3.4)" {
+test "openai stream: finish_reason function maps to tool_use" {
     const alloc = testing.allocator;
     var ctx = StreamCtx{
         .alloc = alloc,
@@ -2081,7 +2081,7 @@ test "openai buildResponsesRequestBody: unsupported reasoning_param omits reason
     const msgs = [_]proto.Message{};
     const tools = [_]proto.ToolDefinition{};
 
-    // RFC-012: profile-pinned .unsupported reasoning_param (deepseek) must never
+    // Profile-pinned .unsupported reasoning_param (deepseek) must never
     // emit any reasoning field, even when forced onto the Responses API.
     const body = try buildResponsesRequestBody(alloc, "deepseek-chat", 4096, false, "high", "", &msgs, &tools, provider.getProfile("deepseek"));
     defer alloc.free(body);

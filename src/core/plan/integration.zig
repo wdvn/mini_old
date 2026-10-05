@@ -1,6 +1,6 @@
 //! core/plan/integration.zig — Plan state & orchestration extracted from agent.zig
 //!
-//! Encapsulates all plan-related state (legacy watchdog + RFC-019 structured planning)
+//! Encapsulates all plan-related state (legacy watchdog + structured planning)
 //! and orchestration logic that was previously inlined in AgentLoop.
 //! This module owns:
 //!   - Plan lifecycle (set, clear, detect, restore)
@@ -35,7 +35,7 @@ pub const WatchdogAction = enum {
 pub const PlanState = struct {
     alloc: Allocator,
 
-    // -- Legacy plan watchdog state (pre-RFC-019) --
+    // -- Legacy plan watchdog state --
 
     /// Whether a plan commitment has been detected in model output.
     plan_active: bool = false,
@@ -57,7 +57,7 @@ pub const PlanState = struct {
     /// and execute next step to recover from an action loop in the current turn.
     loop_plan_retries: usize = 0,
 
-    // -- RFC-019: Structured Planning System --
+    // --: Structured Planning System --
 
     /// Structured plan (replaces plan_active/plan_summary_buf when enabled).
     current_plan: ?plan_mod.Plan = null,
@@ -139,7 +139,7 @@ pub const PlanState = struct {
         self.renderPlanDisplay();
     }
 
-    /// Render the structured plan to the terminal UI (RFC-019 user visibility).
+    /// Render the structured plan to the terminal UI.
     ///
     /// Previously the plan was only reported as a one-line stderr note
     /// ("Structured plan detected: N steps") while step contents were
@@ -158,7 +158,7 @@ pub const PlanState = struct {
         errdefer buf.deinit();
 
         buf.print("📋 Plan ({d} steps):", .{plan.stepCount()}) catch return;
-        // RFC-024 §3.2: surface the lifecycle phase so the user knows whether
+        // Surface the lifecycle phase so the user knows whether
         // the plan is actionable or still awaiting approval.
         if (plan.phase != .executing and plan.phase != .complete) {
             buf.print(" \x1b[36m[{s}]\x1b[0m", .{@tagName(plan.phase)}) catch return;
@@ -190,7 +190,7 @@ pub const PlanState = struct {
         }
     }
 
-    /// RFC-024 §3.2: approve the current plan (proposed/approved → executing).
+    /// Approve the current plan (proposed/approved → executing).
     /// Idempotent for already-advancing phases. Returns false if no plan active.
     pub fn approve(self: *PlanState) bool {
         const plan = &(self.current_plan orelse return false);
@@ -204,7 +204,7 @@ pub const PlanState = struct {
         return true;
     }
 
-    /// RFC-024 §3.2: reject the current plan (proposed → rejected).
+    /// Reject the current plan (proposed → rejected).
     pub fn reject(self: *PlanState) bool {
         const plan = &(self.current_plan orelse return false);
         if (plan.phase == .rejected or plan.phase == .complete) return false;
@@ -213,7 +213,7 @@ pub const PlanState = struct {
         return true;
     }
 
-    /// RFC-024 §3.2: list stored plans (delegates to plan_store) and prints a
+    /// List stored plans (delegates to plan_store) and prints a
     /// summary. Returns true if the store was available.
     pub fn listPlans(self: *PlanState) bool {
         const store = self.plan_store orelse {
@@ -253,7 +253,7 @@ pub const PlanState = struct {
         @memcpy(self.plan_summary_buf[0..len], summary[0..len]);
         self.plan_summary_len = len;
 
-        // RFC-019: If structured planning is enabled, attempt to parse structured plan from summary
+        // If structured planning is enabled, attempt to parse structured plan from summary
         if (self.enable_structured_planning and self.current_plan == null) {
             if (plan_parser.extractStructuredPlan(summary, self.alloc) catch null) |plan| {
                 if (plan.stepCount() > 0) {
@@ -315,7 +315,7 @@ pub const PlanState = struct {
     /// Called for each text block in the response.
     pub fn tryDetectPlanInResponse(self: *PlanState, text: []const u8) void {
         if (self.enable_structured_planning) {
-            // RFC-019: Canonical structured plan parser
+            // Canonical structured plan parser
             if (self.current_plan == null) {
                 if (plan_parser.extractStructuredPlan(text, self.alloc) catch null) |plan| {
                     if (plan.stepCount() > 0) {
@@ -344,7 +344,7 @@ pub const PlanState = struct {
             if (self.current_plan != null) return;
 
             const req_hash = std.hash.Fnv1a_64.hash(user_text);
-            // RFC-024 §3.2: prefer a running (non-complete) plan so a crash
+            // Prefer a running (non-complete) plan so a crash
             // revives the in-progress plan; a completed plan is kept for
             // reference but not re-activated.
             const restored = self.plan_store.?.restoreRunning(req_hash) catch null;
@@ -421,11 +421,11 @@ pub const PlanState = struct {
 
     /// Check plan watchdog at end_turn. Returns the action the agent loop should take.
     /// If continue_loop, the caller should inject `getWatchdogDirective()` into history.
-    /// RFC-022: `last_mutation_verified` — true when the most recent act was a
+    /// `last_mutation_verified` — true when the most recent act was a
     /// successfully executed mutating tool (file write/edit), meaning a text-only
     /// turn is a legitimate Final Answer rather than plan stalling.
     pub fn handleEndTurnWatchdog(self: *PlanState, current_user_request: ?[]const u8, last_mutation_verified: bool) WatchdogAction {
-        // RFC-022 Gate 1 (provenance): only enforce plans with a verifiable origin —
+        // Gate 1 (provenance): only enforce plans with a verifiable origin —
         // a parsed structured plan, an explicit action-loop recovery request
         // (plan_execution_pending), or legacy mode (structured planning disabled).
         // A bare plan_active flag from keyword-only text detection in structured
@@ -433,7 +433,7 @@ pub const PlanState = struct {
         const enforceable = self.plan_execution_pending or
             self.current_plan != null or
             (!self.enable_structured_planning and self.plan_active);
-        // RFC-022 Gate 2 (completion): a verified mutation in the last act means
+        // Gate 2 (completion): a verified mutation in the last act means
         // the model just finished real work — allow the Final Answer through.
         if (enforceable and !last_mutation_verified and !isPlanOnlyRequest(current_user_request)) {
             self.plan_watchdog_retries += 1;
@@ -614,7 +614,7 @@ pub const PlanState = struct {
     }
 
     test "rfc022 - bare keyword plan is not enforceable in structured mode" {
-        // RFC-022 Incident 1: a final answer that merely MENTIONS an
+        // Incident 1: a final answer that merely MENTIONS an
         // implementation plan may set plan_active via keyword detection,
         // but Gate 1 (provenance) must prevent watchdog enforcement.
         // (Detection remains benign by design; see detectPlanInText case 3.)
