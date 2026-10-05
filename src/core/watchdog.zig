@@ -163,13 +163,13 @@ pub const Watchdog = struct {
         if (bucket <= state.last_reported_10s or bucket == 0) return;
 
         self.coordinator.updateLastReported10s(bucket);
-        if (self.config.verbose_stderr) {
-            emitNotice(self, 
-                self.io,
-                "\x1b[36m[watchdog]\x1b[0m Act {d} in progress ({d}s): {s}\n",
-                .{ state.act_id, bucket * self.config.tracking_interval_s, state.getActionDesc() },
-            );
-        }
+        // if (self.config.verbose_stderr) {
+        //     emitNotice(self, 
+        //         self.io,
+        //         "\x1b[36m[watchdog]\x1b[0m Act {d} in progress ({d}s): {s}\n",
+        //         .{ state.act_id, bucket * self.config.tracking_interval_s, state.getActionDesc() },
+        //     );
+        // }
     }
 
     fn consultAndApplyTimeoutDecision(self: *Watchdog, state: act_queue.ActMonitorState, elapsed_s: u32, effective_timeout: u32) void {
