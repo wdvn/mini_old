@@ -54,15 +54,16 @@ pub const graph_mod = @import("lib/graph.zig");
 pub const graph_store_mod = @import("core/memact/graph_store.zig");
 pub const tokens_mod = @import("core/memact/tokens.zig");
 pub const media_lib = @import("lib/media.zig");
+pub const media_protocol = @import("core/media_protocol.zig");
 pub const media_gen_tool = @import("tools/media_gen.zig");
 pub const file_mod = @import("tools/file.zig");
 pub const plan_mod = @import("core/plan.zig");
-pub const plan_parser_mod = @import("core/plan_parser.zig");
-pub const plan_executor_mod = @import("core/plan_executor.zig");
-pub const plan_dispatch_mod = @import("core/plan_dispatch.zig");
-pub const plan_monitor_mod = @import("core/plan_monitor.zig");
-pub const plan_store_mod = @import("core/plan_store.zig");
-pub const plan_integration_mod = @import("core/plan_integration.zig");
+pub const plan_parser_mod = @import("core/plan/parser.zig");
+pub const plan_executor_mod = @import("core/plan/executor.zig");
+pub const plan_dispatch_mod = @import("core/plan/dispatch.zig");
+pub const plan_monitor_mod = @import("core/plan/monitor.zig");
+pub const plan_store_mod = @import("core/plan/store.zig");
+pub const plan_integration_mod = @import("core/plan/integration.zig");
 pub const cas_mod = @import("core/cas.zig");
 
 pub const VERSION = "1.0.0";
@@ -118,7 +119,7 @@ pub fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
 // Entry point
 // ---------------------------------------------------------------------------
 
-const agent_folder_mod = @import("core/agent_folder.zig");
+const agent_folder_mod = @import("core/agent/folder.zig");
 
 fn handleHelpOrVersion(args: *const Args) bool {
     if (args.show_help) {
@@ -563,6 +564,17 @@ fn printHelp() void {
         \\  MINI_TOOL_ALLOWLIST    Allow only these tools (comma-separated)
         \\  MINI_TOOL_BLOCKLIST    Block these tools (comma-separated)
         \\  MINI_MCP_CONFIG        Path to mcp.json (default: <MINI_HOME>/mcp.json)
+        \\  MINI_ACTION_LOOP_DISPLAY  Show action-loop messages ("0" to suppress)
+        \\  MINI_ACT_TIMEOUT_SECS  Per-act LLM timeout in seconds (default: 120)
+        \\  MINI_WATCHDOG_INTERVAL_MS Watchdog poll interval in ms (default: 200)
+        \\  MINI_ENABLE_STRUCTURED_PLANNING  LLM-driven planning ("0" to disable)
+        \\  MINI_PLAN_MAX_STEPS    Max plan steps per task (default: 20)
+        \\  MINI_IMAGE_GEN_ENABLED Enable generate_image tool ("1" to enable)
+        \\  MINI_IMAGE_GEN_MODEL   Image generation model
+        \\  MINI_VIDEO_GEN_ENABLED Enable generate_video tool ("1" to enable)
+        \\  MINI_VIDEO_GEN_MODEL   Video generation model
+        \\  MINI_VIDEO_GEN_PROVIDER  Video gen provider: openai|openai_compat|agnes
+        \\  MINI_MEDIA_OUTPUT_DIR  Media output directory
         \\
     ) catch {};
 }
@@ -570,13 +582,29 @@ fn printHelp() void {
 test {
     _ = @import("core/artifacts.zig");
     _ = @import("core/agent.zig");
-    _ = @import("core/agent_step.zig");
+    _ = @import("core/agent/step.zig");
+    _ = @import("core/agent/turn.zig");
+    _ = @import("core/agent/execution.zig");
+    _ = @import("core/agent/subagent.zig");
+    _ = @import("core/agent/loop_monitor.zig");
+    _ = @import("core/agent/parsing.zig");
+    _ = @import("core/agent/backend.zig");
+    _ = @import("core/agent/folder.zig");
     _ = @import("core/history.zig");
+    _ = @import("core/history/types.zig");
+    _ = @import("core/history/append.zig");
+    _ = @import("core/history/compact.zig");
+    _ = @import("core/history/compat.zig");
+    _ = @import("core/history/backup.zig");
     _ = @import("backends/openai.zig");
     _ = @import("core/journal.zig");
     _ = @import("core/protocol.zig");
     _ = @import("core/json.zig");
     _ = @import("core/config.zig");
+    _ = @import("core/config/types.zig");
+    _ = @import("core/config/workspace.zig");
+    _ = @import("core/config/dotenv.zig");
+    _ = @import("core/config/resolvers.zig");
     _ = @import("core/memact/tokens.zig");
     _ = @import("core/memact/store.zig");
     _ = @import("core/memact/graph_store.zig");

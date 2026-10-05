@@ -1,4 +1,4 @@
-//! plan_integration.zig — Plan state & orchestration extracted from agent.zig
+//! core/plan/integration.zig — Plan state & orchestration extracted from agent.zig
 //!
 //! Encapsulates all plan-related state (legacy watchdog + RFC-019 structured planning)
 //! and orchestration logic that was previously inlined in AgentLoop.
@@ -11,15 +11,15 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const plan_mod = @import("plan.zig");
-const plan_parser = @import("plan_parser.zig");
-const plan_executor = @import("plan_executor.zig");
-const plan_store_mod = @import("plan_store.zig");
-const cas_mod = @import("cas.zig");
-const config_mod = @import("config.zig");
-const utils = @import("utils.zig");
-const prompts_mod = @import("prompts.zig");
-const main = @import("../main.zig");
+const plan_mod = @import("types.zig");
+const plan_parser = @import("parser.zig");
+const plan_executor = @import("executor.zig");
+const plan_store_mod = @import("store.zig");
+const cas_mod = @import("../cas.zig");
+const config_mod = @import("../config.zig");
+const utils = @import("../utils.zig");
+const prompts_mod = @import("../prompts.zig");
+const main = @import("../../main.zig");
 
 /// Result of plan watchdog check at end_turn.
 pub const WatchdogAction = enum {
@@ -462,7 +462,7 @@ pub const PlanState = struct {
     pub fn getWatchdogDirective(self: *PlanState, alloc: Allocator) ?[]u8 {
         var dir_buf = utils.BufWriter.init(alloc);
         dir_buf.print(
-            "[Plan Watchdog Directive]: You formulated an active implementation plan ('{s}') but ended your turn with descriptive text only without executing any tools. You MUST now proceed directly to executing Step 1 using tools (e.g. file_edit, bash, etc.). Do not return monologue or explanation without tool actions.",
+            prompts_mod.plan_watchdog_directive_fmt,
             .{self.getPlanSummary()},
         ) catch {
             dir_buf.deinit();

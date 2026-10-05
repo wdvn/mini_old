@@ -1,15 +1,15 @@
-//! plan_parser.zig — Extract structured plans from LLM output (RFC-019)
+//! core/plan/parser.zig — Extract structured plans from LLM output (RFC-019)
 //!
 //! Parses JSON or Markdown formatted plans from LLM responses.
 //! Supports both structured JSON and fallback Markdown formats (numbered lists, task lists).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const plan_mod = @import("plan.zig");
+const plan_mod = @import("types.zig");
 const Plan = plan_mod.Plan;
 const PlanStep = plan_mod.PlanStep;
-const utils = @import("utils.zig");
-const registry = @import("../tooling/registry.zig");
+const utils = @import("../utils.zig");
+const registry = @import("../../tooling/registry.zig");
 
 // ---------------------------------------------------------------------------
 // JSON Plan Parser

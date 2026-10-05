@@ -4,10 +4,10 @@
 //! orbit analysis via procedural graph telemetry.
 
 const std = @import("std");
-const json_mod = @import("json.zig");
-const graph_store_mod = @import("memact/graph_store.zig");
-const agent_mod = @import("agent.zig");
-const AgentLoop = agent_mod.AgentLoop;
+const json_mod = @import("../json.zig");
+const graph_store_mod = @import("../memact/graph_store.zig");
+const loop_mod = @import("loop.zig");
+const AgentLoop = loop_mod.AgentLoop;
 
 pub fn isReadOnlyTool(name: []const u8) bool {
     return std.mem.eql(u8, name, "file_read") or

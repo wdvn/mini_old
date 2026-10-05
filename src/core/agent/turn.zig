@@ -7,18 +7,18 @@
 //! - executeTurnWorker: resilient act loop coordinating steps and recovery
 
 const std = @import("std");
-const proto = @import("protocol.zig");
-const utils = @import("utils.zig");
-const signals = @import("signals.zig");
-const main = @import("../main.zig");
-const tools_mod = @import("../tooling/registry.zig");
-const snapshot_mod = @import("snapshot.zig");
-const journal_mod = @import("journal.zig");
-const prompts_mod = @import("prompts.zig");
-const media_gen_tool = @import("../tools/media_gen.zig");
-const hooks_mod = @import("hooks.zig");
-const agent_mod = @import("agent.zig");
-const AgentLoop = agent_mod.AgentLoop;
+const proto = @import("../protocol.zig");
+const utils = @import("../utils.zig");
+const signals = @import("../signals.zig");
+const main = @import("../../main.zig");
+const tools_mod = @import("../../tooling/registry.zig");
+const snapshot_mod = @import("../snapshot.zig");
+const journal_mod = @import("../journal.zig");
+const prompts_mod = @import("../prompts.zig");
+const media_gen_tool = @import("../../tools/media_gen.zig");
+const hooks_mod = @import("../hooks.zig");
+const loop_mod = @import("loop.zig");
+const AgentLoop = loop_mod.AgentLoop;
 
 pub fn nextActAttempt(current: usize) usize {
     // PSEUDOCODE:
@@ -666,8 +666,8 @@ pub fn executeTurnWorker(
     text_cb: ?*const fn ([]const u8) void,
     think_cb: ?*const fn ([]const u8) void,
 ) !proto.TurnResult {
-    agent_mod.activateTurnHooks(self);
-    defer agent_mod.deactivateTurnHooks();
+    loop_mod.activateTurnHooks(self);
+    defer loop_mod.deactivateTurnHooks();
 
     media_gen_tool.clearTurnAttachments(self.alloc);
 

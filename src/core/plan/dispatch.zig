@@ -1,4 +1,4 @@
-//! plan_dispatch.zig — Step-scoped subagent orchestration (RFC-024 §3.4)
+//! core/plan/dispatch.zig — Step-scoped subagent orchestration (RFC-024 §3.4)
 //!
 //! Deterministic core for dispatching plan steps to subagents and running the
 //! two-stage review gate. This module is dependency-free (no subagent/spawn
@@ -13,10 +13,11 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const plan_mod = @import("plan.zig");
+const plan_mod = @import("types.zig");
 const Plan = plan_mod.Plan;
 const PlanStep = plan_mod.PlanStep;
-const utils = @import("utils.zig");
+const utils = @import("../utils.zig");
+const prompts_mod = @import("../prompts.zig");
 
 // ---------------------------------------------------------------------------
 // Subagent runner injection
@@ -144,10 +145,7 @@ pub fn dispatchParallelBatch(
         // A single reviewer over the aggregate output of the whole batch.
         var review_bw = utils.BufWriter.init(alloc);
         defer review_bw.deinit();
-        try review_bw.writeAll(
-            "Review the following batch of parallel plan-step outputs. " ++
-                "Each step was executed independently; check spec-compliance and code quality.\n\n",
-        );
+        try review_bw.writeAll(prompts_mod.plan_dispatch_review_batch_intro);
         for (step_ids, 0..) |sid, i| {
             for (plan.steps.items) |step| {
                 if (step.id != sid) continue;
@@ -158,10 +156,7 @@ pub fn dispatchParallelBatch(
         }
         try review_bw.writeAll("\nAggregate subagent output:\n");
         try review_bw.writeAll(output);
-        try review_bw.writeAll(
-            "\n\nEnd with a verdict block:\n" ++
-                "SEVERITIES: critical=0 important=0 minor=0",
-        );
+        try review_bw.writeAll(prompts_mod.plan_dispatch_review_verdict_block);
         const review_task = try review_bw.toOwnedSlice();
         defer alloc.free(review_task);
 
@@ -337,17 +332,7 @@ pub fn dispatchStep(
     if (review) {
         const verif_desc = try verificationDescription(alloc, step);
         defer alloc.free(verif_desc);
-        const review_task = try std.fmt.allocPrint(alloc,
-            \\Review the following plan-step output against the step specification.
-            \\Step: "{s}"
-            \\Verification requirement: {s}
-            \\
-            \\Reviewer output:
-            \\{s}
-            \\
-            \\End with a verdict block:
-            \\SEVERITIES: critical={d} important={d} minor={d}
-        , .{
+        const review_task = try std.fmt.allocPrint(alloc, prompts_mod.plan_dispatch_review_step_fmt, .{
             step.description,
             verif_desc,
             output,

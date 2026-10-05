@@ -4,11 +4,11 @@
 //! and wire protocol auto-negotiation.
 
 const std = @import("std");
-const proto = @import("protocol.zig");
-const openai_mod = @import("../backends/openai.zig");
-const claude_mod = @import("../backends/claude.zig");
-const ollama_mod = @import("../backends/ollama.zig");
-const history_mod = @import("history.zig");
+const proto = @import("../protocol.zig");
+const openai_mod = @import("../../backends/openai.zig");
+const claude_mod = @import("../../backends/claude.zig");
+const ollama_mod = @import("../../backends/ollama.zig");
+const history_mod = @import("../history.zig");
 
 /// Active AI backend.
 pub const Backend = union(enum) {

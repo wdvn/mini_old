@@ -1069,8 +1069,11 @@ pub const TurnRenderer = struct {
         }
         @memcpy(section[off .. off + 5], "\r\x1b[2K");
         off += 5;
-        @memcpy(section[off ..], header_line);
-        off += header_line.len;
+        // @memcpy requires equal-length slices; slice the destination explicitly
+        // and clamp so a long header can never overflow `section`.
+        const hdr_copy = @min(header_line.len, section.len - off);
+        @memcpy(section[off .. off + hdr_copy], header_line[0..hdr_copy]);
+        off += hdr_copy;
         if (preview.line2) |l2| off = appendCodeActPreviewLine(&section, off, l2, max_content_cols, preview.line3 == null);
         if (preview.line3) |l3| off = appendCodeActPreviewLine(&section, off, l3, max_content_cols, true);
         off = appendClearExcessLines(&section, off, self.codeact_rendered_lines, preview.num_lines);

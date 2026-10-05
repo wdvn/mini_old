@@ -4,10 +4,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const proto = @import("protocol.zig");
-const json_mod = @import("json.zig");
-const utils = @import("utils.zig");
-const watchdog_mod = @import("watchdog.zig");
+const proto = @import("../protocol.zig");
+const json_mod = @import("../json.zig");
+const utils = @import("../utils.zig");
+const watchdog_mod = @import("../watchdog.zig");
 
 pub fn extractJsCodeBlock(alloc: Allocator, text: []const u8) ?[]const u8 {
     var search_idx: usize = 0;
