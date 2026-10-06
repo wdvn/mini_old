@@ -24,4 +24,4 @@ newspaper_*.md
 arxiv_*.md
 testcases/reports/*
 .mini/
-media
+media.worktrees/
