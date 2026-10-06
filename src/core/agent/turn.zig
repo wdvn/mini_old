@@ -783,9 +783,10 @@ pub fn executeTurnWorker(
     self.coordinator.finishAct(act_id, outcome == .completed);
     self.coordinator.notifyTurnComplete();
 
-    // Background LLM extraction of durable memories
-    // (sync end-of-turn dispatch; no-op when memact_extract == "off").
-    // Extraction must never alter the turn outcome.
+    // End-of-turn LLM extraction of durable memories.
+    // "async" (default): dispatches a detached worker and returns immediately,
+    // so the turn completes without waiting for the extraction LLM call.
+    // "sync": blocks inline; "off": no-op. Never alters the turn outcome.
     self.maybeExtractMemories() catch {};
 
     const duped_last_message = if (self.last_agent_message) |msg|

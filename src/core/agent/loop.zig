@@ -267,6 +267,10 @@ pub const AgentLoop = struct {
 
     current_user_request: ?[]const u8 = null,
 
+    /// Detached end-of-turn memory-extraction worker ("async" mode).
+    /// Joined in deinit so shutdown never races an in-flight extraction.
+    extraction_thread: ?std.Thread = null,
+
     /// Consolidated plan state. See plan_integration.zig.
     plan: plan_integration.PlanState,
 
@@ -540,6 +544,12 @@ fn initWatchdog(alloc: Allocator, io: std.Io, coordinator: *act_queue.ActCoordin
 
     /// Releases memory.
     pub fn deinit(self: *AgentLoop) void {
+        // Join any in-flight async memory extraction before tearing down
+        // shared state (backend, memory store) it may still be using.
+        if (self.extraction_thread) |t| {
+            t.join();
+            self.extraction_thread = null;
+        }
         if (self.watchdog) |wd| {
             wd.deinit();
             self.watchdog = null;
@@ -1144,13 +1154,24 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
     /// a procedural-graph `node_ref`). Wired from `executeTurnWorker` when
     /// `memact_extract != "off"`. No-op on failure (extraction must never
     /// break the turn outcome).
+    ///
+    /// Dispatch modes (config `memact_extract`):
+    /// - "off":   skip entirely.
+    /// - "sync":  run inline before the turn result is returned (blocking).
+    /// - "async": (default) build the extraction prompt inline, then run the
+    ///   backend call + store append on a detached background thread so the
+    ///   turn completes immediately after the final answer. The thread is
+    ///   joined in `deinit` so shutdown never races an in-flight extraction.
     pub fn maybeExtractMemories(self: *AgentLoop) !void {
         // PSEUDOCODE:
         // 1. Guards: memory store present, memact enabled, extract mode not "off",
         //    completed/stalled outcome only (failed turns produce no lessons).
         // 2. Build extraction request: user request + recent tools + final message.
-        // 3. Parse JSON array of {content, keywords, type, confidence, related_tool}.
-        // 4. Append eligible records to the store (cap 5, content >= 20 chars).
+        // 3. "sync" -> run inline; "async" (default) -> dispatch to a detached
+        //    worker thread and return immediately (no turn-completion delay).
+        // 4. Worker parses JSON array of {content, keywords, type, confidence,
+        //    related_tool} and appends eligible records to the store (cap 5,
+        //    content >= 20 chars).
         if (self.memory_store == null) return;
         if (!self.config.memact_enabled) return;
         if (std.mem.eql(u8, self.config.memact_extract, "off")) return;
@@ -1175,25 +1196,73 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
 
         const extraction_system_prompt = prompts_mod.memact_extraction_system_prompt;
 
-        var msg_blocks = try self.alloc.alloc(proto.ContentBlock, 1);
+        const sync_mode = std.mem.eql(u8, self.config.memact_extract, "sync");
+        if (sync_mode) {
+            self.runMemoryExtraction(extraction_system_prompt, request_text) catch {};
+            self.alloc.free(request_text);
+            return;
+        }
+
+        // Async mode (default): hand the prompt to a detached worker thread.
+        // The thread joins on deinit, so it never outlives the AgentLoop.
+        // The prompt buffer ownership transfers to the worker.
+        if (self.extraction_thread) |t| t.join();
+        self.extraction_thread = null;
+
+        const worker_ctx = self.alloc.create(ExtractionContext) catch {
+            self.alloc.free(request_text);
+            return;
+        };
+        worker_ctx.* = .{
+            .agent = self,
+            .system_prompt = extraction_system_prompt,
+            .request_text = request_text,
+        };
+        self.extraction_thread = std.Thread.spawn(.{}, extractionWorkerEntry, .{worker_ctx}) catch {
+            self.alloc.free(request_text);
+            self.alloc.destroy(worker_ctx);
+            self.extraction_thread = null;
+            return;
+        };
+    }
+
+    /// Self-owned context for the detached extraction worker. The prompt
+    /// buffer is owned by this struct; `agent` outlives the thread (joined
+    /// in `AgentLoop.deinit`).
+    const ExtractionContext = struct {
+        agent: *AgentLoop,
+        system_prompt: []const u8,
+        request_text: []u8,
+    };
+
+    fn extractionWorkerEntry(ctx: *ExtractionContext) void {
+        ctx.agent.runMemoryExtraction(ctx.system_prompt, ctx.request_text) catch {};
+        ctx.agent.alloc.free(ctx.request_text);
+        ctx.agent.alloc.destroy(ctx);
+    }
+
+    /// Performs the extraction backend call, parses the JSON array, and
+    /// appends up to 5 eligible records to the memory store. Shared by the
+    /// "sync" inline path and the "async" worker thread. No-op on failure.
+    /// `request_text` ownership stays with the caller.
+    fn runMemoryExtraction(self: *AgentLoop, extraction_system_prompt: []const u8, request_text: []const u8) !void {
+        var msg_blocks = self.alloc.alloc(proto.ContentBlock, 1) catch return;
         msg_blocks[0] = .{ .text = request_text };
         const user_msg = proto.Message{ .role = .user, .content = msg_blocks };
 
         // PSEUDOCODE:
-        // 1. Attempt backend send; on error, free both prompt buffers and
+        // 1. Attempt backend send; on error, free the message blocks and
         //    gracefully bail out (extraction must never break the turn).
         //    NOTE: `catch return` swallows the error, so an errdefer would
         //    not fire here — the failure path must free manually.
-        // 2. On success, free the buffers explicitly after resp is owned
+        // 2. On success, free the blocks explicitly after resp is owned
         //    by `defer resp.deinit()`.
         var resp = self.backend.send(extraction_system_prompt, &.{ user_msg }, &[_]proto.ToolDefinition{}, null, null) catch {
-            self.alloc.free(msg_blocks[0].text);
             self.alloc.free(msg_blocks);
             return;
         };
         defer resp.deinit();
         self.alloc.free(msg_blocks);
-        self.alloc.free(request_text);
 
         // Collect response text.
         var response_text = ArrayList(u8).empty;
