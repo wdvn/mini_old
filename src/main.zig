@@ -65,6 +65,11 @@ pub const plan_monitor_mod = @import("core/plan/monitor.zig");
 pub const plan_store_mod = @import("core/plan/store.zig");
 pub const plan_integration_mod = @import("core/plan/integration.zig");
 pub const cas_mod = @import("core/cas.zig");
+pub const task_types_mod = @import("core/task/types.zig");
+pub const task_store_mod = @import("core/task/store.zig");
+pub const task_history_log_mod = @import("core/task/history_log.zig");
+pub const task_retention_mod = @import("core/task/retention.zig");
+pub const task_root_mod = @import("core/task/root.zig");
 
 pub const VERSION = "1.0.0";
 
@@ -635,4 +640,9 @@ test {
     _ = plan_store_mod;
     _ = plan_integration_mod;
     _ = cas_mod;
+    _ = task_types_mod;
+    _ = task_store_mod;
+    _ = task_history_log_mod;
+    _ = task_retention_mod;
+    _ = task_root_mod;
 }
