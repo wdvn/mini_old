@@ -398,7 +398,13 @@ pub const AgentLoop = struct {
         const prj_hash = std.hash.Fnv1a_64.hash(cur_cwd);
 
         var mem_path_buf: [512]u8 = undefined;
-        const mem_base = config.memory_dir orelse (utils.getEnvSlice("MINI_HOME") orelse (std.fmt.bufPrint(&mem_path_buf, "{s}/.mini/memory", .{home_dir}) catch ".mini/memory"));
+        // PSEUDOCODE: Prefer explicit memory_dir; MINI_HOME is the config root, so
+        // append "/memory" to it; last resort is "<HOME>/.mini/memory".
+        const mem_base: []const u8 = blk: {
+            if (config.memory_dir) |md| break :blk md;
+            if (utils.getEnvSlice("MINI_HOME")) |mh| break :blk std.fmt.bufPrint(&mem_path_buf, "{s}/memory", .{mh}) catch ".mini/memory";
+            break :blk std.fmt.bufPrint(&mem_path_buf, "{s}/.mini/memory", .{home_dir}) catch ".mini/memory";
+        };
         const prj_mem_dir = std.fmt.allocPrint(alloc, "{s}/{x}", .{ mem_base, prj_hash }) catch return null;
         defer alloc.free(prj_mem_dir);
 
@@ -426,7 +432,13 @@ pub const AgentLoop = struct {
         const prj_hash = std.hash.Fnv1a_64.hash(cur_cwd);
 
         var mem_path_buf: [512]u8 = undefined;
-        const mem_base = config.memory_dir orelse (utils.getEnvSlice("MINI_HOME") orelse (std.fmt.bufPrint(&mem_path_buf, "{s}/.mini/memory", .{home_dir}) catch ".mini/memory"));
+        // PSEUDOCODE: Prefer explicit memory_dir; MINI_HOME is the config root, so
+        // append "/memory" to it; last resort is "<HOME>/.mini/memory".
+        const mem_base: []const u8 = blk: {
+            if (config.memory_dir) |md| break :blk md;
+            if (utils.getEnvSlice("MINI_HOME")) |mh| break :blk std.fmt.bufPrint(&mem_path_buf, "{s}/memory", .{mh}) catch ".mini/memory";
+            break :blk std.fmt.bufPrint(&mem_path_buf, "{s}/.mini/memory", .{home_dir}) catch ".mini/memory";
+        };
         const prj_mem_dir = std.fmt.allocPrint(alloc, "{s}/{x}", .{ mem_base, prj_hash }) catch return null;
         defer alloc.free(prj_mem_dir);
 
