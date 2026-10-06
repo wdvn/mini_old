@@ -58,6 +58,7 @@ const plan_mod = @import("../plan.zig");
 const plan_store_mod = @import("../plan/store.zig");
 const plan_integration = @import("../plan/integration.zig");
 pub const journal_mod = @import("../journal.zig");
+pub const task_manager_mod = @import("../task/manager.zig");
 pub const act_logger_mod = @import("../act_logger.zig");
 pub const signals = @import("../signals.zig");
 pub const act_queue = @import("../act_queue.zig");
@@ -198,6 +199,8 @@ pub const AgentLoop = struct {
     cas: cas_mod.CAS,
     /// Act Journal. Null if processInput has not run.
     journal: ?journal_mod.ActJournal = null,
+    /// Durable task manager (RFC-030). Null until first ensured.
+    task_mgr: ?*task_manager_mod.TaskManager = null,
     /// Act Logger (Session Replay & Diagnostics).
     act_logger: ?act_logger_mod.ActLogger = null,
     /// Snapshot tracker — tracks mini.write/patch/sh.
@@ -576,6 +579,7 @@ fn initWatchdog(alloc: Allocator, io: std.Io, coordinator: *act_queue.ActCoordin
         self.token_estimator.deinit();
         self.cas.deinit();
         if (self.journal) |*j| j.deinit();
+        if (self.task_mgr) |tm| tm.deinit();
         if (self.act_logger) |*al| al.deinit();
         if (self.last_backend_raw_error) |raw| self.alloc.free(raw);
         if (self.pg_store) |st| {
@@ -1657,6 +1661,9 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
                 self.history.compact();
             }
         }
+
+        // RFC-030: compaction changed the history shape — pin a snapshot.
+        if (self.task_mgr) |tm| tm.snapshotAfterCompaction(self.io, &self.history);
 
         // After a successful compaction, re-inject the active plan
         // progress, read-skill names, and the task reminder so the model keeps

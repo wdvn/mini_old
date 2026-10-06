@@ -10,8 +10,10 @@ pub const types = @import("types.zig");
 pub const store = @import("store.zig");
 pub const history_log = @import("history_log.zig");
 pub const retention = @import("retention.zig");
+pub const manager = @import("manager.zig");
 
 pub const TaskRecord = types.TaskRecord;
 pub const TaskStatus = types.TaskStatus;
 pub const TaskStore = store.TaskStore;
 pub const HistoryLog = history_log.HistoryLog;
+pub const TaskManager = manager.TaskManager;
