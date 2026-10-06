@@ -97,12 +97,19 @@ pub const TaskManager = struct {
         rec.project_hash = std.hash.Fnv1a_64.hash(cur_cwd);
         rec.request_hash = std.hash.Fnv1a_64.hash(request_text);
         rec.title = firstLine(self.alloc, request_text, 80) catch return;
+        // Deep-copy the id into the record so record and self.task_id own
+        // independent buffers (double-free otherwise).
+        rec.task_id = self.alloc.dupe(u8, self.task_id) catch {
+            self.alloc.free(rec.title);
+            return;
+        };
         self.store.append(io, &rec) catch {
+            self.alloc.free(rec.task_id);
             self.alloc.free(rec.title);
             return;
         };
         if (self.record) |*prev| prev.deinit(self.alloc);
-        // Keep owned copies in the record (rec.title already owned).
+        // rec now owns task_id + title strings; the manager record owns them.
         self.record = rec;
 
         self.log = HistoryLog.init(self.alloc, io, self.base_dir, self.task_id) catch null;
