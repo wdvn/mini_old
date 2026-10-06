@@ -15,6 +15,7 @@ const tools_mod = @import("../../tooling/registry.zig");
 const snapshot_mod = @import("../snapshot.zig");
 const journal_mod = @import("../journal.zig");
 const task_manager_mod = @import("../task/manager.zig");
+const task_retention_mod = @import("../task/retention.zig");
 const prompts_mod = @import("../prompts.zig");
 const media_gen_tool = @import("../../tools/media_gen.zig");
 const hooks_mod = @import("../hooks.zig");
@@ -187,6 +188,10 @@ fn ensureTaskManager(self: *AgentLoop) void {
     const base_dir = std.fmt.allocPrint(self.alloc, "{s}/{x}", .{ tasks_base, prj_hash }) catch return;
     defer self.alloc.free(base_dir);
     self.task_mgr = task_manager_mod.TaskManager.init(self.alloc, self.io, base_dir) catch null;
+    // RFC-030 §4.6: GC expired terminal task dirs (default 14 days).
+    if (self.task_mgr != null) {
+        task_retention_mod.applyRetention(self.alloc, self.io, base_dir, 14) catch {};
+    }
 }
 
 /// Initializes turn metrics, appends the user query, restores plans, and retrieves filtered tool definitions.

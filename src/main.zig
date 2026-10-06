@@ -71,6 +71,7 @@ pub const task_history_log_mod = @import("core/task/history_log.zig");
 pub const task_retention_mod = @import("core/task/retention.zig");
 pub const task_root_mod = @import("core/task/root.zig");
 pub const task_resume_mod = @import("core/task/resume.zig");
+pub const task_manager_mod = @import("core/task/manager.zig");
 
 pub const VERSION = "1.0.0";
 

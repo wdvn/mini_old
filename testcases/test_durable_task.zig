@@ -207,6 +207,47 @@ test "retention: old terminal task directories are removed" {
     try std.testing.expect(!exists);
 }
 
+test "resume: task manager full cycle persists and restores equivalent history" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "/tmp/test_mini_task_resume_cycle";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, dir) catch {};
+    defer cwd.deleteTree(io, dir) catch {};
+
+    // Phase 1: run a task, append deltas like the agent loop would.
+    {
+        var mgr = try mini.task_manager_mod.TaskManager.init(alloc, io, dir);
+        defer mgr.deinit();
+        mgr.ensureTask(io, "fix the bug");
+        try std.testing.expect(mgr.record != null);
+
+        var h = mini.history_mod.History.init(alloc);
+        defer h.deinit();
+        try h.addUser("fix the bug");
+        try h.addAssistantText("looking into it");
+        mgr.appendActDelta(io, &h);
+        try h.addUser("[Task Resumed — note]");
+        mgr.appendActDelta(io, &h);
+        mgr.finish(io, .interrupted);
+    }
+
+    // Phase 2: resume — restore must equal the persisted message sequence.
+    var store = try TaskStore.init(alloc, io, dir);
+    defer store.deinit();
+    var rec = (try store.readLatestResumable(alloc, io)).?;
+    defer rec.deinit(alloc);
+    try std.testing.expect(rec.status == .interrupted);
+
+    var restored = try HistoryLog.restoreHistory(alloc, io, dir, rec.task_id);
+    defer HistoryLog.freeRestored(alloc, restored);
+    // 3 messages persisted: user, assistant, resumed-note user.
+    try std.testing.expectEqual(@as(usize, 3), restored.len());
+    try std.testing.expectEqualStrings("fix the bug", restored.messages()[0].content[0].text);
+    try std.testing.expectEqualStrings("looking into it", restored.messages()[1].content[0].text);
+    try std.testing.expectEqualStrings("[Task Resumed — note]", restored.messages()[2].content[0].text);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
