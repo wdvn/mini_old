@@ -25,3 +25,4 @@ arxiv_*.md
 testcases/reports/*
 .mini/
 media.worktrees/
+media
