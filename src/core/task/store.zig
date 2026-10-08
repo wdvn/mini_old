@@ -91,8 +91,10 @@ pub const TaskStore = struct {
         return found;
     }
 
-    /// Reads the most recent resumable record (interrupted | failed | stalled).
-    /// Caller owns the returned record; free via `deinit`.
+    // PSEUDOCODE:
+    // 1. Read all lines from tasks.jsonl
+    // 2. Parse TaskRecord and pick the record with the latest updated_at
+    // 3. Return best record (owned by caller)
     pub fn readLatestResumable(self: *TaskStore, alloc: Allocator, io: std.Io) !?TaskRecord {
         const content = try self.readFileAlloc(io);
         defer self.alloc.free(content);
@@ -107,15 +109,10 @@ pub const TaskStore = struct {
                 .ignore_unknown_fields = true,
             }) catch continue;
             defer parsed.deinit();
-            switch (parsed.value.status) {
-                .interrupted, .failed, .stalled => {
-                    if (parsed.value.updated_at >= best_ts) {
-                        if (best) |*prev| prev.deinit(alloc);
-                        best = try dupRecord(alloc, parsed.value);
-                        best_ts = parsed.value.updated_at;
-                    }
-                },
-                else => {},
+            if (parsed.value.updated_at >= best_ts) {
+                if (best) |*prev| prev.deinit(alloc);
+                best = try dupRecord(alloc, parsed.value);
+                best_ts = parsed.value.updated_at;
             }
         }
         return best;

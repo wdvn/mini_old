@@ -283,14 +283,6 @@ fn setupTaskResume(
             stderrPrint("[resume] Task '{s}' not found in {s}/tasks.jsonl\n", .{ tid, tasks_base });
             return false;
         }
-        switch (rec.?.status) {
-            .running, .completed => {
-                stderrPrint("[resume] Task '{s}' is {s} — nothing to resume.\n", .{ tid, @tagName(rec.?.status) });
-                rec.?.deinit(alloc);
-                return false;
-            },
-            else => {},
-        }
     } else {
         rec = store.readLatestResumable(alloc, io) catch null;
         if (rec == null) {
@@ -330,12 +322,15 @@ fn setupTaskResume(
     agent.act_history_checkpoint = agent.history.len();
 
     // Interruption note as ephemeral user message (the model sees it first).
-    const note = task_resume_mod.buildInterruptionNote(alloc, &rec.?) catch |e| {
-        stderrPrint("[resume] Note build failed: {s}\n", .{@errorName(e)});
-        return true; // history restored; continue without note
-    };
-    defer alloc.free(note);
-    agent.history.addUser(note) catch {};
+    // Injected for non-completed sessions so the model is aware of in-flight work.
+    if (rec.?.status != .completed) {
+        const note = task_resume_mod.buildInterruptionNote(alloc, &rec.?) catch |e| {
+            stderrPrint("[resume] Note build failed: {s}\n", .{@errorName(e)});
+            return true; // history restored; continue without note
+        };
+        defer alloc.free(note);
+        agent.history.addUser(note) catch {};
+    }
 
     stderrPrint("[resume] Resumed task {s} ({s}) — {d} messages restored.\n", .{ rec.?.task_id, @tagName(rec.?.status), agent.history.len() });
     return true;
@@ -481,7 +476,7 @@ pub fn main(init: std.process.Init) !void {
 
         // Show restored history in the REPL so the user sees the full context.
         ui_repl.renderRestoredHistory(init.io, &agent);
-        _ = std.Io.File.stdout().writeStreamingAll(init.io, "\n") catch {};
+        ui_terminal.writeStdout("\n");
     }
 
     try dispatchExecution(alloc, init.io, &agent, &cfg, &args);
@@ -543,8 +538,12 @@ fn parseArgs(args: []const []const u8) !Args {
             i += 1;
             if (i < args.len) result.session_file = args[i];
         } else if (std.mem.eql(u8, arg, "--resume")) {
-            i += 1;
-            if (i < args.len) result.resume_task = args[i];
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+                i += 1;
+                result.resume_task = args[i];
+            } else {
+                result.continue_task = true;
+            }
         } else if (std.mem.eql(u8, arg, "--continue")) {
             result.continue_task = true;
         } else if (std.mem.eql(u8, arg, "--acp") or std.mem.eql(u8, arg, "acp")) {

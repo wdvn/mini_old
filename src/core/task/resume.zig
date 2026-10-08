@@ -50,7 +50,8 @@ pub fn buildInterruptionNote(alloc: Allocator, rec: *const TaskRecord) ![]u8 {
         .interrupted => "The previous session was interrupted (crash or Ctrl+C).",
         .failed => "The previous session ended in a failure.",
         .stalled => "The previous session stalled without reaching a final answer.",
-        else => "The previous session ended abnormally.",
+        .running => "The previous session exited while running (crash or termination).",
+        .completed => "The previous session was completed.",
     };
     return std.fmt.allocPrint(alloc, "[Task Resumed — {s}]\n{s} Your full conversation history up to the last completed step has been restored above. The completion state of any in-flight work at the moment of interruption is unknown — verify before relying on prior outcomes, then continue the task from where it stopped.\n", .{ rec.task_id, status_line });
 }

@@ -15,6 +15,7 @@ const signals = @import("../core/signals.zig");
 const proto = @import("../core/protocol.zig");
 const media_lib = @import("../lib/media.zig");
 pub const chat_stream = @import("chat_stream.zig");
+const term = @import("terminal.zig");
 
 pub const PROMPT_PREFIX = "\x1b[1;34mYou\x1b[0m > ";
 
@@ -127,6 +128,7 @@ fn runAgentTurn(
 
 /// Render the current agent history to the terminal (used for --resume display).
 pub fn renderRestoredHistory(io: std.Io, agent: *agent_mod.AgentLoop) void {
+    _ = io;
     if (comptime builtin.is_test) return;
 
     const msgs = agent.history.messages();
@@ -135,29 +137,35 @@ pub fn renderRestoredHistory(io: std.Io, agent: *agent_mod.AgentLoop) void {
     var first = true;
     for (msgs) |msg| {
         if (!first) {
-            _ = std.Io.File.stdout().writeStreamingAll(io, "\n\n") catch {};
+            term.writeStdout("\n\n");
         }
         first = false;
 
         // Role label
-        const role_label = switch (msg.role) {
+        const is_resume_note = msg.role == .user and msg.content.len > 0 and (switch (msg.content[0]) {
+            .text => |t| std.mem.startsWith(u8, t, "[Task Resumed — "),
+            else => false,
+        });
+        const role_label = if (is_resume_note)
+            "\x1b[1;33mSystem\x1b[0m > "
+        else switch (msg.role) {
             .user => "\x1b[1;34mYou\x1b[0m > ",
             .assistant => "\x1b[1;32mModel\x1b[0m > ",
         };
-        _ = std.Io.File.stdout().writeStreamingAll(io, role_label) catch {};
+        term.writeStdout(role_label);
         for (msg.content) |block| {
             switch (block) {
-                .text => |t| _ = std.Io.File.stdout().writeStreamingAll(io, t) catch {},
-                .thinking => |th| _ = std.Io.File.stdout().writeStreamingAll(io, th.thinking) catch {},
+                .text => |t| term.writeStdout(t),
+                .thinking => |th| term.writeStdout(th.thinking),
                 .image => |img| {
                     var buf: [256]u8 = undefined;
                     const label = std.fmt.bufPrint(&buf, "[attached image: {s}]", .{img.media_type}) catch "[attached image]";
-                    _ = std.Io.File.stdout().writeStreamingAll(io, label) catch {};
+                    term.writeStdout(label);
                 },
                 .tool_use => |tu| {
                     var buf: [256]u8 = undefined;
                     const label = std.fmt.bufPrint(&buf, "[tool call: {s}]", .{tu.name}) catch "[tool call]";
-                    _ = std.Io.File.stdout().writeStreamingAll(io, label) catch {};
+                    term.writeStdout(label);
                 },
                 .tool_result => |tr| {
                     var buf: [512]u8 = undefined;
@@ -165,8 +173,8 @@ pub fn renderRestoredHistory(io: std.Io, agent: *agent_mod.AgentLoop) void {
                         std.fmt.bufPrint(&buf, "[error] {s}", .{tr.content}) catch "[error]"
                     else
                         std.fmt.bufPrint(&buf, "] {s}", .{tr.content}) catch "]";
-                    _ = std.Io.File.stdout().writeStreamingAll(io, "[") catch {};
-                    _ = std.Io.File.stdout().writeStreamingAll(io, label) catch {};
+                    term.writeStdout("[");
+                    term.writeStdout(label);
                 },
             }
         }

@@ -323,6 +323,36 @@ test "repl: renderRestoredHistory renders resumed messages with role labels" {
     try std.testing.expectEqual(@as(usize, 3), agent.history.messages().len);
 }
 
+test "task store: readLatestResumable returns latest task including completed" {
+    // PSEUDOCODE:
+    // 1. Append an older interrupted task and a newer completed task to TaskStore
+    // 2. Call readLatestResumable and verify it picks the newer completed task
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "/tmp/test_mini_task_store_completed_resume";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, dir) catch {};
+    defer cwd.deleteTree(io, dir) catch {};
+
+    var store = try TaskStore.init(alloc, io, dir);
+    defer store.deinit();
+
+    var rec1 = task_types.TaskRecord.default("11111111111111111111111111111111");
+    rec1.status = .interrupted;
+    rec1.updated_at = 1000;
+    try store.append(io, &rec1);
+
+    var rec2 = task_types.TaskRecord.default("22222222222222222222222222222222");
+    rec2.status = .completed;
+    rec2.updated_at = 2000;
+    try store.append(io, &rec2);
+
+    var latest = (try store.readLatestResumable(alloc, io)).?;
+    defer latest.deinit(alloc);
+    try std.testing.expectEqualStrings("22222222222222222222222222222222", latest.task_id);
+    try std.testing.expect(latest.status == .completed);
+}
+
 
 fn freeMessages(alloc: std.mem.Allocator, msgs: []const mini.protocol_mod.Message) void {
     for (msgs) |msg| {
