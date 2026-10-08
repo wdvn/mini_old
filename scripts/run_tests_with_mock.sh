@@ -121,11 +121,11 @@ run_act52_regression() {
   journal=$(find "$regression_home/.mini/sessions" -maxdepth 1 -type f -name 'journal_*.jsonl' 2>/dev/null | head -1)
   if [[ $rc -eq 1 && -n "$journal" ]] && grep -F -q '"event_type":"task_stalled"' "$journal"; then
     act_started_count=$(grep -c '"act_id":1,"event_type":"act_started"' "$journal" || true)
-    if [[ "$act_started_count" -ge 4 ]] &&
+    if [[ "$act_started_count" -ge 3 ]] &&
        grep -F -q '"attempt":1' "$journal" &&
        grep -F -q '"attempt":2' "$journal" &&
        grep -F -q '"attempt":3' "$journal" &&
-       grep -F -q '"attempt":4' "$journal"; then
+       grep -F -q '"recovery_class":"thinking_loop"' "$journal"; then
       echo "  [PASS] Act 52 recovery regression"
       PASS=$((PASS+1))
       return

@@ -551,20 +551,18 @@ fn nextResponseRecoveryTransition(
     return proto.ActTransition{ .stall = .recovery_budget_exhausted };
 }
 
-test "Act 52 provider failure recovers twice then stalls" {
+test "Act 52 provider failure recovers then stalls on thinking loop" {
     var budget = proto.ResponseRecoveryBudget{};
 
     // Act 52, attempt 1: HTTP 500 is a provider failure.
     const provider_failure = proto.ActTransition{ .fail = .provider_error };
     try std.testing.expectEqual(proto.FailureReason.provider_error, provider_failure.fail);
 
-    // Act 52, attempts 2-3: successful HTTP 200 thinking-only responses retry the same Act.
+    // Act 52, attempt 2: successful HTTP 200 thinking-only response retries with nudge.
     const recovery_1 = (try nextResponseRecoveryTransition(.thinking_only, .natural_end, &budget)).?;
     try std.testing.expect(recovery_1 == .retry_same_act);
-    const recovery_2 = (try nextResponseRecoveryTransition(.thinking_only, .natural_end, &budget)).?;
-    try std.testing.expect(recovery_2 == .retry_same_act);
 
-    // Act 52, attempt 4: class budget exhausted; no new Act and no completion.
+    // Act 52, attempt 3: 2nd consecutive thinking-only response exhausts budget and stalls.
     const stalled = (try nextResponseRecoveryTransition(.thinking_only, .natural_end, &budget)).?;
     try std.testing.expectEqual(proto.StallReason.recovery_budget_exhausted, stalled.stall);
 }
@@ -728,7 +726,7 @@ fn handleResponseRecovery(
         loop.last_step_outcome = .transient_retry;
 
         const advisory = switch (recovery_class) {
-            .thinking_only => prompts_mod.recovery_advisory_thinking_only,
+            .thinking_only, .thinking_loop => prompts_mod.recovery_advisory_thinking_only,
             .empty_response => prompts_mod.recovery_advisory_empty_response,
             .missing_terminal => prompts_mod.recovery_advisory_missing_terminal,
             .stream_aborted => prompts_mod.recovery_advisory_stream_aborted,
@@ -766,6 +764,14 @@ fn handleResponseRecovery(
 
     loop.history.truncate(history_checkpoint);
     loop.last_agent_decision = .fail_stalled;
+    if (recovery_class == .thinking_only) {
+        loop.last_recovery_class = .thinking_loop;
+        if (main.ui_repl.current_renderer) |r| {
+            r.renderInplaceLine("\x1b[33m[agent] ⚠️ Thinking loop detected: model reasoned without taking action on consecutive attempts. Stalling.\x1b[0m\n");
+        } else if (!utils.isSubagent()) {
+            main.stderrPrint("\x1b[33m[agent] ⚠️ Thinking loop detected: model reasoned without taking action on consecutive attempts. Stalling.\x1b[0m\n", .{});
+        }
+    }
     markRecoveryExhausted(loop);
     return transition;
 }
@@ -1132,6 +1138,9 @@ pub fn executeStep(
 ) !StepResult {
     try renderStepHeader(self, act_id);
 
+    self.last_act_usage = null;
+    self.last_act_context_tokens = null;
+
     const history_checkpoint = self.act_history_checkpoint;
 
     var input_msgs_count: usize = 0;
@@ -1181,6 +1190,12 @@ pub fn executeStep(
 
     const gen_stop = response.getGenerationStop();
     self.last_generation_stop = gen_stop;
+    self.last_act_usage = if (response.usage.prompt_tokens > 0 or response.usage.completion_tokens > 0 or response.usage.reasoning_tokens > 0) .{
+        .input_tokens = response.usage.prompt_tokens,
+        .output_tokens = response.usage.completion_tokens,
+        .reasoning_tokens = response.usage.reasoning_tokens,
+    } else null;
+    self.last_act_context_tokens = @as(usize, self.token_estimator.estimateMessages(temp_input_msgs.items));
     if (self.journal) |*j| j.recordEvent(self.io, act_id, .llm_generation_ended, "LLM generation ended") catch {};
 
     if (response.http_code >= 400) {

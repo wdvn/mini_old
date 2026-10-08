@@ -76,6 +76,7 @@ pub const RecoveryClass = enum {
     stream_aborted,
     malformed_tool_call,
     truncated_tool_call,
+    thinking_loop,
 };
 
 pub const RecoveryDecision = enum {
@@ -109,7 +110,7 @@ pub const ActTransition = union(enum) {
 /// Bounded recovery for unusable responses in the current Act.
 /// This is not a task-duration or total-Act limit.
 pub const ResponseRecoveryBudget = struct {
-    thinking_only: u8 = 2,
+    thinking_only: u8 = 1,
     empty_response: u8 = 20,
     missing_terminal: u8 = 20,
     stream_aborted: u8 = 20,
@@ -128,6 +129,7 @@ pub const ResponseRecoveryBudget = struct {
             .stream_aborted => &self.stream_aborted,
             .malformed_tool_call => &self.malformed_tool_call,
             .truncated_tool_call => &self.truncated_tool_call,
+            .thinking_loop => return .stalled,
         };
         if (counter.* == 0) return .stalled;
         counter.* -= 1;
@@ -165,14 +167,16 @@ pub fn isValidJsonObject(raw: []const u8) bool {
 
 pub fn responseRecoveryClass(validity: ResponseValidity, gen_stop: GenerationStop) ?RecoveryClass {
     // PSEUDOCODE:
-    // 1. Keep transport-specific recovery classes independent.
-    // 2. Use content-shape budgets only for thinking-only and empty responses.
-    // 3. Leave valid final/action responses outside response recovery.
+    // 1. Thinking-only responses must be classified as thinking_only regardless of whether
+    //    the stream finished naturally or stopped abruptly without a terminal event.
+    // 2. Keep transport-specific recovery classes independent.
+    // 3. Use content-shape budgets only for thinking-only and empty responses.
+    // 4. Leave valid final/action responses outside response recovery.
+    if (validity == .thinking_only) return .thinking_only;
     return switch (gen_stop) {
         .stream_aborted => if (validity == .partial_text) null else .stream_aborted,
         .missing_terminal_event => if (validity == .partial_text) null else .missing_terminal,
         else => switch (validity) {
-            .thinking_only => .thinking_only,
             .empty, .whitespace_only => .empty_response,
             .malformed_tool_call => .malformed_tool_call,
             // P-INTERRUPT: a tool_call stop with a truncated tool payload
@@ -305,7 +309,7 @@ pub fn decideAgentActionFromStopReason(
 // Tests
 // ---------------------------------------------------------------------------
 
-test "thinking-only natural end retries then stalls" {
+test "thinking-only natural end retries once with nudge then stalls" {
     const alloc = std.testing.allocator;
     var response = Response.init(alloc);
     defer response.deinit();
@@ -320,8 +324,13 @@ test "thinking-only natural end retries then stalls" {
 
     var budget = ResponseRecoveryBudget{};
     try std.testing.expectEqual(RecoveryDecision.retry, budget.consume(.thinking_only));
-    try std.testing.expectEqual(RecoveryDecision.retry, budget.consume(.thinking_only));
     try std.testing.expectEqual(RecoveryDecision.stalled, budget.consume(.thinking_only));
+}
+
+test "thinking_only with missing_terminal_event maps to thinking_only recovery class" {
+    try std.testing.expectEqual(RecoveryClass.thinking_only, responseRecoveryClass(.thinking_only, .missing_terminal_event).?);
+    try std.testing.expectEqual(RecoveryClass.thinking_only, responseRecoveryClass(.thinking_only, .natural_end).?);
+    try std.testing.expectEqual(RecoveryClass.thinking_only, responseRecoveryClass(.thinking_only, .stream_aborted).?);
 }
 
 test "native tool takes precedence over final text" {
@@ -384,7 +393,7 @@ test "resumable partial transport text stays outside recovery budget" {
     try std.testing.expectEqual(@as(?RecoveryClass, null), responseRecoveryClass(.partial_text, .stream_aborted));
     try std.testing.expectEqual(@as(?RecoveryClass, null), responseRecoveryClass(.partial_text, .max_tokens));
     try std.testing.expectEqual(@as(?RecoveryClass, null), responseRecoveryClass(.partial_text, .stop_sequence));
-    try std.testing.expectEqual(RecoveryClass.missing_terminal, responseRecoveryClass(.thinking_only, .missing_terminal_event) orelse unreachable);
+    try std.testing.expectEqual(RecoveryClass.thinking_only, responseRecoveryClass(.thinking_only, .missing_terminal_event) orelse unreachable);
     try std.testing.expectEqual(RecoveryClass.stream_aborted, responseRecoveryClass(.empty, .stream_aborted) orelse unreachable);
 }
 

@@ -77,6 +77,12 @@ pub const ErrorDetail = struct {
     server_error: ?[]const u8 = null,
 };
 
+pub const DeltaUsage = struct {
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    reasoning_tokens: u64 = 0,
+};
+
 pub const StateDelta = struct {
     act_id: usize,
     /// File snapshot (for rollback).
@@ -88,6 +94,10 @@ pub const StateDelta = struct {
     agent_decision: ?[]const u8 = null,
     recovery_class: ?[]const u8 = null,
     attempt: usize = 1,
+    /// Token usage telemetry for this act.
+    usage: ?DeltaUsage = null,
+    /// Active prompt context size in tokens.
+    context_tokens: ?usize = null,
 };
 
 pub const ActEvent = struct {
@@ -520,6 +530,38 @@ test "writeLineTo appends at correct position and generates sequential content" 
     try std.testing.expectEqualStrings("line1\nline2\n", content);
 }
 
+test "recordActComplete records usage and context_tokens in delta" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/tmp/journal_usage_delta_test.jsonl";
+    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+
+    var j = try ActJournal.init(alloc, io, path);
+    defer j.deinit();
+
+    try j.recordActComplete(io, 1, .{
+        .act_id = 1,
+        .file_snapshots = &.{},
+        .stop_reason = "end_turn",
+        .generation_stop = "natural_end",
+        .response_validity = "final_text",
+        .agent_decision = "deliver_final_answer",
+        .usage = .{
+            .input_tokens = 1234,
+            .output_tokens = 567,
+            .reasoning_tokens = 89,
+        },
+        .context_tokens = 2048,
+    });
+
+    const content = try readWholeFile(alloc, io, path);
+    defer alloc.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"usage\":{\"input_tokens\":1234,\"output_tokens\":567,\"reasoning_tokens\":89}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"context_tokens\":2048") != null);
+}
+
 /// Reads whole file into allocated buffer (test helper — Zig 0.16 no longer has readFileAlloc).
 fn readWholeFile(alloc: Allocator, io: std.Io, path: []const u8) ![]u8 {
     const cwd = std.Io.Dir.cwd();
@@ -531,3 +573,4 @@ fn readWholeFile(alloc: Allocator, io: std.Io, path: []const u8) ![]u8 {
     const n = try file.readPositionalAll(io, buf, 0);
     return buf[0..n];
 }
+

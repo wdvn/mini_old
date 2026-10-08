@@ -106,4 +106,44 @@ test "session_diagnostics: detailSession formats a hermetic session cleanly" {
         std.mem.indexOf(u8, report, "crashed") != null or
         std.mem.indexOf(u8, report, "finished") != null);
     try testing.expect(std.mem.indexOf(u8, report, "HTTP 429") != null);
+    try testing.expect(std.mem.indexOf(u8, report, "Thinking Profile") != null);
 }
+
+test "session_diagnostics: computeThinkingProfile computes percentiles, retries, and slowest acts correctly" {
+    const alloc = testing.allocator;
+
+    const fixture =
+        \\{"act_id":1,"event_type":"act_started","timestamp":1000}
+        \\{"act_id":1,"event_type":"llm_generation_ended","timestamp":11000}
+        \\{"act_id":1,"event_type":"act_completed","timestamp":11100,"delta":{"act_id":1,"response_validity":"final_text","attempt":1}}
+        \\{"act_id":2,"event_type":"act_started","timestamp":20000}
+        \\{"act_id":2,"event_type":"llm_generation_ended","timestamp":90000}
+        \\{"act_id":2,"event_type":"act_completed","timestamp":90100,"delta":{"act_id":2,"response_validity":"thinking_only","attempt":2}}
+        \\{"act_id":3,"event_type":"act_started","timestamp":100000}
+        \\{"act_id":3,"event_type":"llm_generation_ended","timestamp":105000}
+        \\{"act_id":3,"event_type":"act_completed","timestamp":105100,"delta":{"act_id":3,"response_validity":"codeact","attempt":1}}
+        \\
+    ;
+
+    const profile = try session_diag.computeThinkingProfile(alloc, fixture);
+    try testing.expectEqual(@as(usize, 3), profile.total_acts);
+    try testing.expectEqual(@as(usize, 1), profile.thinking_only_count);
+    try testing.expectEqual(@as(usize, 1), profile.retry_acts_count);
+    try testing.expectEqual(@as(usize, 1), profile.acts_over_60s); // act 2 is 70s (>60s)
+
+    // Latencies: act 1 = 10s, act 2 = 70s, act 3 = 5s.
+    // Sorted: 5s, 10s, 70s
+    // p50 (idx 1): 10.0s, max: 70.0s
+    try testing.expectEqual(@as(f64, 70.0), profile.max_s);
+    try testing.expectEqual(@as(f64, 10.0), profile.p50_s);
+
+    // Top slowest acts
+    try testing.expectEqual(@as(usize, 3), profile.slowest_count);
+    try testing.expectEqual(@as(usize, 2), profile.slowest_acts[0].act_id);
+    try testing.expectEqual(@as(f64, 70.0), profile.slowest_acts[0].duration_s);
+    try testing.expectEqual(@as(usize, 1), profile.slowest_acts[1].act_id);
+    try testing.expectEqual(@as(f64, 10.0), profile.slowest_acts[1].duration_s);
+    try testing.expectEqual(@as(usize, 3), profile.slowest_acts[2].act_id);
+    try testing.expectEqual(@as(f64, 5.0), profile.slowest_acts[2].duration_s);
+}
+

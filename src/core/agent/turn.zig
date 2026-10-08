@@ -234,6 +234,8 @@ fn flushSnapshotsAndJournal(self: *AgentLoop, act_id: usize) void {
                 .agent_decision = @tagName(self.last_agent_decision),
                 .recovery_class = if (self.last_recovery_class) |class| @tagName(class) else null,
                 .attempt = self.current_act_attempt,
+                .usage = self.last_act_usage,
+                .context_tokens = self.last_act_context_tokens,
             });
             recorded_delta = true;
         }
@@ -250,6 +252,8 @@ fn flushSnapshotsAndJournal(self: *AgentLoop, act_id: usize) void {
                 .agent_decision = @tagName(self.last_agent_decision),
                 .recovery_class = if (self.last_recovery_class) |class| @tagName(class) else null,
                 .attempt = self.current_act_attempt,
+                .usage = self.last_act_usage,
+                .context_tokens = self.last_act_context_tokens,
             }) catch {};
         }
     }

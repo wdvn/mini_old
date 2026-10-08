@@ -408,6 +408,192 @@ fn printRecentEventsTail(alloc: Allocator, io: std.Io, w: *utils.BufWriter, full
     }
 }
 
+pub const SlowestAct = struct {
+    act_id: usize,
+    duration_s: f64,
+};
+
+pub const ThinkingProfile = struct {
+    total_acts: usize = 0,
+    thinking_only_count: usize = 0,
+    retry_acts_count: usize = 0,
+    acts_over_60s: usize = 0,
+    p50_s: f64 = 0.0,
+    p95_s: f64 = 0.0,
+    max_s: f64 = 0.0,
+    slowest_acts: [5]SlowestAct = [_]SlowestAct{.{ .act_id = 0, .duration_s = 0.0 }} ** 5,
+    slowest_count: usize = 0,
+};
+
+const ActTrack = struct {
+    act_id: usize,
+    first_start_ts: ?i64 = null,
+    last_end_ts: ?i64 = null,
+    is_thinking_only: bool = false,
+    max_attempt: usize = 1,
+};
+
+pub fn computeThinkingProfile(alloc: Allocator, content: []const u8) !ThinkingProfile {
+    var profile = ThinkingProfile{};
+    var map = std.AutoHashMap(usize, ActTrack).init(alloc);
+    defer map.deinit();
+
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r\t");
+        if (trimmed.len == 0) continue;
+
+        const ev = json.findString(trimmed, "event_type") orelse continue;
+        const act_id = json.findInt(trimmed, "act_id", usize) orelse continue;
+        const ts = json.findInt(trimmed, "timestamp", i64) orelse continue;
+
+        if (std.mem.eql(u8, ev, "act_started")) {
+            const entry = try map.getOrPut(act_id);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .{
+                    .act_id = act_id,
+                    .first_start_ts = ts,
+                };
+            } else {
+                if (entry.value_ptr.first_start_ts == null) {
+                    entry.value_ptr.first_start_ts = ts;
+                }
+            }
+        } else if (std.mem.eql(u8, ev, "llm_generation_ended")) {
+            const entry = try map.getOrPut(act_id);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .{ .act_id = act_id, .last_end_ts = ts };
+            } else {
+                entry.value_ptr.last_end_ts = ts;
+            }
+        } else if (std.mem.eql(u8, ev, "act_completed")) {
+            const entry = try map.getOrPut(act_id);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .{ .act_id = act_id, .last_end_ts = ts };
+            } else {
+                if (entry.value_ptr.last_end_ts == null) {
+                    entry.value_ptr.last_end_ts = ts;
+                }
+            }
+            if (std.mem.indexOf(u8, trimmed, "\"response_validity\":\"thinking_only\"") != null or
+                std.mem.indexOf(u8, trimmed, "\"recovery_class\":\"thinking_loop\"") != null)
+            {
+                entry.value_ptr.is_thinking_only = true;
+            }
+            if (json.findInt(trimmed, "attempt", usize)) |att| {
+                if (att > entry.value_ptr.max_attempt) {
+                    entry.value_ptr.max_attempt = att;
+                }
+            }
+        }
+    }
+
+    var durations = std.ArrayList(f64).empty;
+    defer durations.deinit(alloc);
+
+    var slowest_list = std.ArrayList(SlowestAct).empty;
+    defer slowest_list.deinit(alloc);
+
+    var iter = map.valueIterator();
+    while (iter.next()) |item| {
+        profile.total_acts += 1;
+        if (item.is_thinking_only) profile.thinking_only_count += 1;
+        if (item.max_attempt > 1) profile.retry_acts_count += 1;
+
+        if (item.first_start_ts) |st| {
+            if (item.last_end_ts) |et| {
+                if (et >= st) {
+                    const dur_s = @as(f64, @floatFromInt(et - st)) / 1000.0;
+                    if (dur_s > 60.0) {
+                        profile.acts_over_60s += 1;
+                    }
+                    try durations.append(alloc, dur_s);
+                    try slowest_list.append(alloc, .{
+                        .act_id = item.act_id,
+                        .duration_s = dur_s,
+                    });
+                }
+            }
+        }
+    }
+
+    if (durations.items.len > 0) {
+        std.mem.sort(f64, durations.items, {}, struct {
+            fn lt(_: void, a: f64, b: f64) bool {
+                return a < b;
+            }
+        }.lt);
+
+        profile.max_s = durations.items[durations.items.len - 1];
+        const p50_idx = (durations.items.len * 50) / 100;
+        profile.p50_s = durations.items[@min(p50_idx, durations.items.len - 1)];
+        const p95_idx = (durations.items.len * 95) / 100;
+        profile.p95_s = durations.items[@min(p95_idx, durations.items.len - 1)];
+
+        std.mem.sort(SlowestAct, slowest_list.items, {}, struct {
+            fn lt(_: void, a: SlowestAct, b: SlowestAct) bool {
+                return a.duration_s > b.duration_s;
+            }
+        }.lt);
+
+        const count = @min(5, slowest_list.items.len);
+        for (slowest_list.items[0..count], 0..) |s, i| {
+            profile.slowest_acts[i] = s;
+        }
+        profile.slowest_count = count;
+    }
+
+    return profile;
+}
+
+pub fn formatThinkingProfile(w: *utils.BufWriter, profile: ThinkingProfile) !void {
+    try w.writeAll("## Thinking Profile\n");
+    if (profile.total_acts == 0) {
+        try w.writeAll("- **Total acts**: 0 *(No act events recorded)*\n\n");
+        return;
+    }
+
+    const th_rate = if (profile.total_acts > 0)
+        (@as(f64, @floatFromInt(profile.thinking_only_count)) / @as(f64, @floatFromInt(profile.total_acts))) * 100.0
+    else
+        0.0;
+    const over60_rate = if (profile.total_acts > 0)
+        (@as(f64, @floatFromInt(profile.acts_over_60s)) / @as(f64, @floatFromInt(profile.total_acts))) * 100.0
+    else
+        0.0;
+
+    try w.print("- **Total acts**: {d}\n", .{profile.total_acts});
+    try w.print("- **Thinking-only rate**: {d}/{d} ({d:.1}%)\n", .{ profile.thinking_only_count, profile.total_acts, th_rate });
+    try w.print("- **Generation latency (p50 / p95 / max)**: {d:.1}s / {d:.1}s / {d:.1}s\n", .{ profile.p50_s, profile.p95_s, profile.max_s });
+    try w.print("- **Acts > 60s**: {d} ({d:.1}%)\n", .{ profile.acts_over_60s, over60_rate });
+    try w.print("- **Retried acts (attempt > 1)**: {d}\n", .{profile.retry_acts_count});
+
+    if (profile.slowest_count > 0) {
+        try w.writeAll("- **Top slowest acts**:\n");
+        for (profile.slowest_acts[0..profile.slowest_count]) |item| {
+            try w.print("  - `Act {d}`: {d:.1}s\n", .{ item.act_id, item.duration_s });
+        }
+    }
+    try w.writeAll("\n");
+}
+
+fn printThinkingProfile(alloc: Allocator, io: std.Io, w: *utils.BufWriter, full_path: []const u8) !void {
+    const file = std.Io.Dir.cwd().openFile(io, full_path, .{}) catch return;
+    defer file.close(io);
+
+    const stat = file.stat(io) catch return;
+    const size: usize = @intCast(stat.size);
+    if (size == 0) return;
+
+    const read_sz = @min(size, 10 * 1024 * 1024);
+    const buf = alloc.alloc(u8, read_sz) catch return;
+    defer alloc.free(buf);
+
+    const n = utils.readAll(io, file, buf) catch 0;
+    const profile = computeThinkingProfile(alloc, buf[0..n]) catch return;
+    try formatThinkingProfile(w, profile);
+}
+
 /// Inspect detailed session state by PID
 pub fn detailSession(alloc: Allocator, io: std.Io, pid: i32) ![]u8 {
     // PSEUDOCODE:
@@ -460,6 +646,7 @@ pub fn detailSession(alloc: Allocator, io: std.Io, pid: i32) ![]u8 {
         try w.print("- **Post-compact reinjections**: {d}\n\n", .{summary.post_compact_reinject});
     }
 
+    try printThinkingProfile(alloc, io, &w, full_path);
     try printRecentEventsTail(alloc, io, &w, full_path);
     return alloc.dupe(u8, w.list.items);
 }
