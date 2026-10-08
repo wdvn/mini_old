@@ -65,6 +65,13 @@ pub const plan_monitor_mod = @import("core/plan/monitor.zig");
 pub const plan_store_mod = @import("core/plan/store.zig");
 pub const plan_integration_mod = @import("core/plan/integration.zig");
 pub const cas_mod = @import("core/cas.zig");
+pub const task_types_mod = @import("core/task/types.zig");
+pub const task_store_mod = @import("core/task/store.zig");
+pub const task_history_log_mod = @import("core/task/history_log.zig");
+pub const task_retention_mod = @import("core/task/retention.zig");
+pub const task_root_mod = @import("core/task/root.zig");
+pub const task_resume_mod = @import("core/task/resume.zig");
+pub const task_manager_mod = @import("core/task/manager.zig");
 
 pub const VERSION = "1.0.0";
 
@@ -248,6 +255,87 @@ fn setupSession(
     return session_path;
 }
 
+/// Resolves and returns the durable tasks base directory for this project.
+fn resolveTaskResumeDir(alloc: Allocator) ?[]u8 {
+    return task_resume_mod.resolveTasksBaseDir(alloc) catch null;
+}
+
+/// RFC-030 §4.5: restores the full context of a resumable durable task into
+/// `agent.history` and injects the interruption note. Returns false when
+/// nothing can be resumed (process exits cleanly).
+fn setupTaskResume(
+    alloc: Allocator,
+    io: std.Io,
+    agent: *agent_mod.AgentLoop,
+    args: *const Args,
+) !bool {
+    const tasks_base = resolveTaskResumeDir(alloc) orelse return false;
+    defer alloc.free(tasks_base);
+
+    var store = task_store_mod.TaskStore.init(alloc, io, tasks_base) catch return false;
+    defer store.deinit();
+
+    // Pick the target record: explicit --resume <task_id> or latest resumable.
+    var rec: ?task_types_mod.TaskRecord = null;
+    if (args.resume_task) |tid| {
+        rec = store.readLatest(alloc, io, tid) catch null;
+        if (rec == null) {
+            stderrPrint("[resume] Task '{s}' not found in {s}/tasks.jsonl\n", .{ tid, tasks_base });
+            return false;
+        }
+    } else {
+        rec = store.readLatestResumable(alloc, io) catch null;
+        if (rec == null) {
+            stderrPrint("[resume] No resumable task found for this project.\n", .{});
+            return false;
+        }
+    }
+    defer rec.?.deinit(alloc);
+
+    // Restore the full history (snapshot + deltas). Ownership of the restored
+    // History transfers to the agent (deep-copied below, then freed here).
+    const restored = task_resume_mod.restoreTaskHistory(alloc, io, tasks_base, rec.?.task_id) catch |e| {
+        stderrPrint("[resume] Failed to restore task '{s}': {s}\n", .{ rec.?.task_id, @errorName(e) });
+        return false;
+    };
+    defer task_history_log_mod.HistoryLog.freeRestored(alloc, restored);
+
+    // Swap agent history to a deep copy of the restored full context (the
+    // restored struct is freed by the defer above).
+    agent.history.deinit();
+    agent.history = history_mod.History{
+        .alloc = agent.alloc,
+        .msgs = .empty,
+        .max_messages = restored.max_messages,
+        .last_compaction_act_id = restored.last_compaction_act_id,
+    };
+    for (restored.messages()) |msg| {
+        const content_copy = try history_mod.History.cloneContent(agent.alloc, msg.content);
+        try agent.history.msgs.append(agent.alloc, .{
+            .role = msg.role,
+            .content = content_copy,
+            .tier = msg.tier,
+        });
+    }
+
+    // Baseline for retry-rollback machinery: end of restored prefix.
+    agent.act_history_checkpoint = agent.history.len();
+
+    // Interruption note as ephemeral user message (the model sees it first).
+    // Injected for non-completed sessions so the model is aware of in-flight work.
+    if (rec.?.status != .completed) {
+        const note = task_resume_mod.buildInterruptionNote(alloc, &rec.?) catch |e| {
+            stderrPrint("[resume] Note build failed: {s}\n", .{@errorName(e)});
+            return true; // history restored; continue without note
+        };
+        defer alloc.free(note);
+        agent.history.addUser(note) catch {};
+    }
+
+    stderrPrint("[resume] Resumed task {s} ({s}) — {d} messages restored.\n", .{ rec.?.task_id, @tagName(rec.?.status), agent.history.len() });
+    return true;
+}
+
 fn readPromptFile(alloc: Allocator, io: std.Io, prompt_file: []const u8) ![]u8 {
     const cwd = std.Io.Dir.cwd();
     const file = cwd.openFile(io, prompt_file, .{}) catch |e| {
@@ -382,6 +470,15 @@ pub fn main(init: std.process.Init) !void {
         stderrPrint("[main] Warning: Unable to save session file: {s}\n", .{@errorName(e)});
     };
 
+    // RFC-030: durable task resume (--resume <task_id> / --continue).
+    if (args.resume_task != null or args.continue_task) {
+        if (!try setupTaskResume(alloc, init.io, &agent, &args)) return; // nothing to resume → exit
+
+        // Show restored history in the REPL so the user sees the full context.
+        ui_repl.renderRestoredHistory(init.io, &agent);
+        ui_terminal.writeStdout("\n");
+    }
+
     try dispatchExecution(alloc, init.io, &agent, &cfg, &args);
 }
 
@@ -399,6 +496,8 @@ const Args = struct {
     hook_command: ?[]const u8 = null,
     session: ?[]const u8 = null,
     session_file: ?[]const u8 = null,
+    resume_task: ?[]const u8 = null,
+    continue_task: bool = false,
     acp: bool = false,
     no_mcp: bool = false,
     mcp_config: ?[]const u8 = null,
@@ -438,6 +537,15 @@ fn parseArgs(args: []const []const u8) !Args {
         } else if (std.mem.eql(u8, arg, "--session-file")) {
             i += 1;
             if (i < args.len) result.session_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--resume")) {
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+                i += 1;
+                result.resume_task = args[i];
+            } else {
+                result.continue_task = true;
+            }
+        } else if (std.mem.eql(u8, arg, "--continue")) {
+            result.continue_task = true;
         } else if (std.mem.eql(u8, arg, "--acp") or std.mem.eql(u8, arg, "acp")) {
             result.acp = true;
         } else if (std.mem.eql(u8, arg, "--no-mcp")) {
@@ -531,6 +639,8 @@ fn printHelp() void {
         \\  --system <file>        Use file as system prompt
         \\  -m, --mode <mode>      Execution mode: codeact (CodeAct JS engine), tools (JSON), auto
         \\  --session <id>         Auto load/save session at ~/.mini/sessions/<id>.json
+        \\  --resume <task_id>     Resume an interrupted durable task (full context)
+        \\  --continue             Resume the most recent resumable task
         \\  --session-file <path>  Specify direct JSON session file path
         \\  --acp                  Run in ACP server mode (Agent Client Protocol over stdin/stdout)
         \\  --install-cron <expr>  Create automated Linux cronjob (requires -e)
@@ -635,4 +745,9 @@ test {
     _ = plan_store_mod;
     _ = plan_integration_mod;
     _ = cas_mod;
+    _ = task_types_mod;
+    _ = task_store_mod;
+    _ = task_history_log_mod;
+    _ = task_retention_mod;
+    _ = task_root_mod;
 }

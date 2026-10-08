@@ -106,6 +106,69 @@ test "js_provider: load from file path providers/agnes.js via initFromSourceWith
     try testing.expectEqualStrings("Thinking step via Agnes adapter", reasoning.?);
 }
 
+test "js_provider: load from file path providers/apodex.js via initFromSourceWithProfile" {
+    // PSEUDOCODE:
+    // 1. Initialize JsProviderAdapter from providers/apodex.js
+    // 2. Assert profile properties (name, protocol, echo_policy, tags, reasoning_param)
+    // 3. Test extractReasoning with both standard and nested proxy fields
+    // 4. Test extractContent with non-empty content and empty string
+    // 5. Test transformRequest filters unsupported reasoning_effort
+    const alloc = testing.allocator;
+    const path = "providers/apodex.js";
+
+    const profile = mini.backends.provider_mod.getProfile("generic");
+    var adapter = try js_provider.JsProviderAdapter.initFromSourceWithProfile(alloc, path, profile);
+    defer adapter.deinit();
+
+    try testing.expectEqualStrings("Apodex", adapter.profile.name);
+    try testing.expectEqual(mini.backends.provider_mod.WireProtocol.chat_completions, adapter.profile.protocol);
+    try testing.expectEqual(mini.backends.provider_mod.EchoPolicy.drop, adapter.profile.echo_policy);
+    try testing.expectEqual(mini.backends.provider_mod.ThinkingTagSet.english_only, adapter.profile.thinking_tags);
+    try testing.expectEqual(mini.backends.provider_mod.ReasoningParamFormat.top_level_effort, adapter.profile.reasoning_param);
+
+    // 1. Standard delta.reasoning_content
+    const chunk_std =
+        \\{"choices":[{"delta":{"reasoning_content":"Standard reasoning chunk"}}]}
+    ;
+    const reasoning1 = adapter.extractReasoning(alloc, chunk_std);
+    try testing.expect(reasoning1 != null);
+    defer alloc.free(reasoning1.?);
+    try testing.expectEqualStrings("Standard reasoning chunk", reasoning1.?);
+
+    // 2. Nested detail.reasoning_content
+    const chunk_nested =
+        \\{"choices":[{"delta":{"detail":{"reasoning_content":"Proxy reasoning chunk"}}}]}
+    ;
+    const reasoning2 = adapter.extractReasoning(alloc, chunk_nested);
+    try testing.expect(reasoning2 != null);
+    defer alloc.free(reasoning2.?);
+    try testing.expectEqualStrings("Proxy reasoning chunk", reasoning2.?);
+
+    // 3. Extract text content
+    const chunk_text =
+        \\{"choices":[{"delta":{"content":"Hello from Apodex"}}]}
+    ;
+    const content = adapter.extractContent(alloc, chunk_text);
+    try testing.expect(content != null);
+    defer alloc.free(content.?);
+    try testing.expectEqualStrings("Hello from Apodex", content.?);
+
+    // 4. Empty content returns null
+    const chunk_empty =
+        \\{"choices":[{"delta":{"content":""}}]}
+    ;
+    const no_content = adapter.extractContent(alloc, chunk_empty);
+    try testing.expect(no_content == null);
+
+    // 5. Transform request removes reasoning_effort: "none"
+    const req_json =
+        \\{"model":"apodex/apodex-1.1-mini:free","messages":[],"reasoning_effort":"none"}
+    ;
+    const transformed = try adapter.transformRequest(alloc, req_json);
+    defer alloc.free(transformed);
+    try testing.expect(std.mem.indexOf(u8, transformed, "reasoning_effort") == null);
+}
+
 test "js_provider: leading comments and helper declarations before export default" {
     const alloc = testing.allocator;
 

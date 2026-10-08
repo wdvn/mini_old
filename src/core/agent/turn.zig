@@ -14,6 +14,8 @@ const main = @import("../../main.zig");
 const tools_mod = @import("../../tooling/registry.zig");
 const snapshot_mod = @import("../snapshot.zig");
 const journal_mod = @import("../journal.zig");
+const task_manager_mod = @import("../task/manager.zig");
+const task_retention_mod = @import("../task/retention.zig");
 const prompts_mod = @import("../prompts.zig");
 const media_gen_tool = @import("../../tools/media_gen.zig");
 const hooks_mod = @import("../hooks.zig");
@@ -170,6 +172,28 @@ fn ensureJournalAndSnapshotTracker(self: *AgentLoop) void {
     }
 }
 
+/// Lazily initializes the durable task manager (RFC-030).
+/// Root dir: $MINI_HOME/tasks/<project_hash> (default ~/.mini/tasks/...).
+fn ensureTaskManager(self: *AgentLoop) void {
+    if (self.task_mgr != null) return;
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cur_cwd = if (std.c.getcwd(&cwd_buf, cwd_buf.len)) |ptr| std.mem.sliceTo(ptr, 0) else ".";
+    const prj_hash = std.hash.Fnv1a_64.hash(cur_cwd);
+    var base_buf: [512]u8 = undefined;
+    const tasks_base: []const u8 = blk: {
+        if (utils.getEnvSlice("MINI_HOME")) |mh| break :blk std.fmt.bufPrint(&base_buf, "{s}/tasks", .{mh}) catch "/tmp/mini_tasks";
+        const home_dir = utils.getEnvSlice("HOME") orelse ".";
+        break :blk std.fmt.bufPrint(&base_buf, "{s}/.mini/tasks", .{home_dir}) catch "/tmp/mini_tasks";
+    };
+    const base_dir = std.fmt.allocPrint(self.alloc, "{s}/{x}", .{ tasks_base, prj_hash }) catch return;
+    defer self.alloc.free(base_dir);
+    self.task_mgr = task_manager_mod.TaskManager.init(self.alloc, self.io, base_dir) catch null;
+    // RFC-030 §4.6: GC expired terminal task dirs (default 14 days).
+    if (self.task_mgr != null) {
+        task_retention_mod.applyRetention(self.alloc, self.io, base_dir, 14) catch {};
+    }
+}
+
 /// Initializes turn metrics, appends the user query, restores plans, and retrieves filtered tool definitions.
 pub fn prepareTurnState(
     self: *AgentLoop,
@@ -186,6 +210,12 @@ pub fn prepareTurnState(
     resetTurnMetrics(self, user_text);
     const tool_defs = resolveTurnToolDefinitions(self, turn_alloc, user_text);
     ensureJournalAndSnapshotTracker(self);
+    // RFC-030: start the durable task + persist the user prompt as delta 0.
+    ensureTaskManager(self);
+    if (self.task_mgr) |tm| {
+        tm.ensureTask(self.io, user_text);
+        tm.appendActDelta(self.io, &self.history);
+    }
     return tool_defs;
 }
 
@@ -620,6 +650,9 @@ fn executeSingleActAttempt(
         r.resetErrorSignature();
     }
 
+    // RFC-030: persist history delta at the act boundary (quiescent point).
+    if (self.task_mgr) |tm| tm.appendActDelta(self.io, &self.history);
+
     if (transition == .retry_same_act) {
         // PSEUDOCODE:
         // 1. Recovery is still a completed provider attempt.
@@ -782,6 +815,17 @@ pub fn executeTurnWorker(
 
     self.coordinator.finishAct(act_id, outcome == .completed);
     self.coordinator.notifyTurnComplete();
+
+    // RFC-030: terminal durable-task status (also flushes any pending delta).
+    if (self.task_mgr) |tm| {
+        tm.appendActDelta(self.io, &self.history);
+        tm.finish(self.io, switch (outcome) {
+            .completed => .completed,
+            .stalled, .blocked => .stalled,
+            .failed => .failed,
+            .cancelled => .interrupted,
+        });
+    }
 
     // End-of-turn LLM extraction of durable memories.
     // "async" (default): dispatches a detached worker and returns immediately,

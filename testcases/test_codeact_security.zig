@@ -43,6 +43,7 @@ test {
     _ = @import("test_parse.zig");
     _ = @import("test_parse2.zig");
     _ = @import("test_rfc000_validation.zig");
+    _ = @import("test_durable_task.zig");
 }
 
 // ---------------------------------------------------------------------------

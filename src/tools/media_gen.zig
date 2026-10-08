@@ -234,8 +234,8 @@ fn cleanBaseUrl(raw: []const u8) []const u8 {
 
 fn makeFailedMediaResult(alloc: Allocator, msg: []const u8) !MediaResult {
     return MediaResult{
-        .path = "",
-        .media_type = "",
+        .path = try alloc.dupe(u8, ""),
+        .media_type = try alloc.dupe(u8, ""),
         .bytes = 0,
         .ok = false,
         .message = try alloc.dupe(u8, msg),
@@ -244,8 +244,8 @@ fn makeFailedMediaResult(alloc: Allocator, msg: []const u8) !MediaResult {
 
 fn makeFailedMediaResultFmt(alloc: Allocator, comptime fmt: []const u8, args: anytype) !MediaResult {
     return MediaResult{
-        .path = "",
-        .media_type = "",
+        .path = try alloc.dupe(u8, ""),
+        .media_type = try alloc.dupe(u8, ""),
         .bytes = 0,
         .ok = false,
         .message = try std.fmt.allocPrint(alloc, fmt, args),
