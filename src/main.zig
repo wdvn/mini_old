@@ -478,6 +478,10 @@ pub fn main(init: std.process.Init) !void {
     // RFC-030: durable task resume (--resume <task_id> / --continue).
     if (args.resume_task != null or args.continue_task) {
         if (!try setupTaskResume(alloc, init.io, &agent, &args)) return; // nothing to resume → exit
+
+        // Show restored history in the REPL so the user sees the full context.
+        ui_repl.renderRestoredHistory(init.io, &agent);
+        _ = std.Io.File.stdout().writeStreamingAll(init.io, "\n") catch {};
     }
 
     try dispatchExecution(alloc, init.io, &agent, &cfg, &args);

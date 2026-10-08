@@ -193,9 +193,15 @@ pub const ReasoningAndMediaSettings = struct {
     image_gen_provider: []const u8,
     image_gen_model: []const u8,
     image_gen_size: []const u8,
+    image_gen_url: ?[]const u8,
+    image_gen_key: ?[]const u8,
+    image_gen_api_header: []const u8,
     video_gen_enabled: bool,
     video_gen_model: []const u8,
     video_gen_provider: []const u8,
+    video_gen_url: ?[]const u8,
+    video_gen_key: ?[]const u8,
+    video_gen_api_header: []const u8,
     media_output_dir: ?[]const u8,
     video_poll_timeout_secs: u32,
 };
@@ -237,9 +243,15 @@ pub fn resolveReasoningAndMediaSettings(env_map: *const std.process.Environ.Map,
         .image_gen_provider = img_prov,
         .image_gen_model = env_map.get("MINI_IMAGE_GEN_MODEL") orelse "gpt-image-1",
         .image_gen_size = env_map.get("MINI_IMAGE_GEN_SIZE") orelse "1024x1024",
+        .image_gen_url = env_map.get("MINI_IMAGE_GEN_URL") orelse env_map.get("OPENAI_COMPAT_URL"),
+        .image_gen_key = env_map.get("MINI_IMAGE_GEN_KEY") orelse env_map.get("OPENAI_COMPAT_API_KEY"),
+        .image_gen_api_header = env_map.get("MINI_IMAGE_GEN_API_HEADER") orelse "Authorization",
         .video_gen_enabled = if (env_map.get("MINI_VIDEO_GEN_ENABLED")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false,
         .video_gen_model = env_map.get("MINI_VIDEO_GEN_MODEL") orelse "sora-2",
         .video_gen_provider = vid_prov,
+        .video_gen_url = env_map.get("MINI_VIDEO_GEN_URL") orelse env_map.get("OPENAI_COMPAT_URL"),
+        .video_gen_key = env_map.get("MINI_VIDEO_GEN_KEY") orelse env_map.get("OPENAI_COMPAT_API_KEY"),
+        .video_gen_api_header = env_map.get("MINI_VIDEO_GEN_API_HEADER") orelse "Authorization",
         .media_output_dir = env_map.get("MINI_MEDIA_OUTPUT_DIR"),
         .video_poll_timeout_secs = if (env_map.get("MINI_VIDEO_POLL_TIMEOUT_SECS")) |s| std.fmt.parseInt(u32, s, 10) catch 300 else 300,
     };
@@ -396,13 +408,22 @@ pub fn applyReasoningMediaPlanningToConfig(
     cfg.image_input_enabled = r.image_input_enabled;
     cfg.image_input_max_per_turn = r.image_input_max_per_turn;
     cfg.image_input_max_bytes = r.image_input_max_bytes;
+    // PSEUDOCODE:
+    // 1. Copy image generation and video generation settings from r to cfg.
+    // 2. Ensure image_gen_api_header and video_gen_api_header are explicitly set to prevent uninitialized memory access.
     cfg.image_gen_enabled = r.image_gen_enabled;
     cfg.image_gen_provider = r.image_gen_provider;
     cfg.image_gen_model = r.image_gen_model;
     cfg.image_gen_size = r.image_gen_size;
+    cfg.image_gen_url = r.image_gen_url;
+    cfg.image_gen_key = r.image_gen_key;
+    cfg.image_gen_api_header = r.image_gen_api_header;
     cfg.video_gen_enabled = r.video_gen_enabled;
     cfg.video_gen_model = r.video_gen_model;
     cfg.video_gen_provider = r.video_gen_provider;
+    cfg.video_gen_url = r.video_gen_url;
+    cfg.video_gen_key = r.video_gen_key;
+    cfg.video_gen_api_header = r.video_gen_api_header;
     cfg.media_output_dir = r.media_output_dir;
     cfg.video_poll_timeout_secs = r.video_poll_timeout_secs;
     cfg.act_timeout_secs = p.act_timeout_secs;

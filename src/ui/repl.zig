@@ -3,6 +3,7 @@
 //! Fully decouples the user interface, slash command handlers (/help, /model, /artifact, /clear),
 //! and streaming markdown / thinking text from the composition root.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const agent_mod = @import("../core/agent.zig");
@@ -124,6 +125,53 @@ fn runAgentTurn(
     });
 }
 
+/// Render the current agent history to the terminal (used for --resume display).
+pub fn renderRestoredHistory(io: std.Io, agent: *agent_mod.AgentLoop) void {
+    if (comptime builtin.is_test) return;
+
+    const msgs = agent.history.messages();
+    if (msgs.len == 0) return;
+
+    var first = true;
+    for (msgs) |msg| {
+        if (!first) {
+            _ = std.Io.File.stdout().writeStreamingAll(io, "\n\n") catch {};
+        }
+        first = false;
+
+        // Role label
+        const role_label = switch (msg.role) {
+            .user => "\x1b[1;34mYou\x1b[0m > ",
+            .assistant => "\x1b[1;32mModel\x1b[0m > ",
+        };
+        _ = std.Io.File.stdout().writeStreamingAll(io, role_label) catch {};
+        for (msg.content) |block| {
+            switch (block) {
+                .text => |t| _ = std.Io.File.stdout().writeStreamingAll(io, t) catch {},
+                .thinking => |th| _ = std.Io.File.stdout().writeStreamingAll(io, th.thinking) catch {},
+                .image => |img| {
+                    var buf: [256]u8 = undefined;
+                    const label = std.fmt.bufPrint(&buf, "[attached image: {s}]", .{img.media_type}) catch "[attached image]";
+                    _ = std.Io.File.stdout().writeStreamingAll(io, label) catch {};
+                },
+                .tool_use => |tu| {
+                    var buf: [256]u8 = undefined;
+                    const label = std.fmt.bufPrint(&buf, "[tool call: {s}]", .{tu.name}) catch "[tool call]";
+                    _ = std.Io.File.stdout().writeStreamingAll(io, label) catch {};
+                },
+                .tool_result => |tr| {
+                    var buf: [512]u8 = undefined;
+                    const label = if (tr.is_error)
+                        std.fmt.bufPrint(&buf, "[error] {s}", .{tr.content}) catch "[error]"
+                    else
+                        std.fmt.bufPrint(&buf, "] {s}", .{tr.content}) catch "]";
+                    _ = std.Io.File.stdout().writeStreamingAll(io, "[") catch {};
+                    _ = std.Io.File.stdout().writeStreamingAll(io, label) catch {};
+                },
+            }
+        }
+    }
+}
 /// Run interactive REPL loop.
 pub fn runRepl(alloc: Allocator, io: std.Io, agent: *agent_mod.AgentLoop, version: []const u8) !void {
     signals.initSignalHandlers();

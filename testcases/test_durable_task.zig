@@ -13,6 +13,7 @@ const task_types = mini.task_types_mod;
 const task_store_mod = mini.task_store_mod;
 const history_log_mod = mini.task_history_log_mod;
 const retention_mod = mini.task_retention_mod;
+const ui_repl = mini.ui_repl;
 
 const TaskStore = task_store_mod.TaskStore;
 const HistoryLog = history_log_mod.HistoryLog;
@@ -257,6 +258,71 @@ fn textMessage(alloc: std.mem.Allocator, text: []const u8) !mini.protocol_mod.Me
     blocks[0] = .{ .text = try alloc.dupe(u8, text) };
     return .{ .role = .user, .content = blocks };
 }
+
+
+test "repl: renderRestoredHistory renders resumed messages with role labels" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "/tmp/test_mini_task_resume_render";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, dir) catch {};
+    defer cwd.deleteTree(io, dir) catch {};
+
+    // Create a task with a few messages.
+    {
+        var mgr = try mini.task_manager_mod.TaskManager.init(alloc, io, dir);
+        defer mgr.deinit();
+        mgr.ensureTask(io, "render test");
+        var h = mini.history_mod.History.init(alloc);
+        defer h.deinit();
+        try h.addUser("fix the bug");
+        try h.addAssistantText("looking into it");
+        try h.addUser("second question");
+        mgr.appendActDelta(io, &h);
+        mgr.finish(io, .interrupted);
+    }
+
+    // Restore history
+    var store = try mini.task_store_mod.TaskStore.init(alloc, io, dir);
+    defer store.deinit();
+    var rec = (try store.readLatestResumable(alloc, io)).?;
+    defer rec.deinit(alloc);
+    var restored = try mini.task_history_log_mod.HistoryLog.restoreHistory(alloc, io, dir, rec.task_id);
+    defer mini.task_history_log_mod.HistoryLog.freeRestored(alloc, restored);
+
+    // PSEUDOCODE:
+    // 1. Initialize environment map and load Config via Config.load.
+    // 2. Initialize AgentLoop with loaded Config.
+    // 3. Populate agent history with restored messages.
+    // 4. Call ui_repl.renderRestoredHistory and verify history length is 3.
+    var env_map = std.process.Environ.Map.init(alloc);
+    defer env_map.deinit();
+    try env_map.put("OPENAI_COMPAT_URL", "http://127.0.0.1:1/v1");
+    var cfg = try mini.config_mod.Config.load(alloc, &env_map, io);
+    defer cfg.deinit(alloc);
+
+    var agent = try mini.agent_mod.AgentLoop.init(alloc, io, &cfg);
+    defer agent.deinit();
+    agent.history.deinit();
+    agent.history = mini.history_mod.History{
+        .alloc = alloc,
+        .msgs = .empty,
+        .max_messages = restored.max_messages,
+        .last_compaction_act_id = restored.last_compaction_act_id,
+    };
+    for (restored.messages()) |msg| {
+        const content_copy = try mini.history_mod.History.cloneContent(alloc, msg.content);
+        try agent.history.msgs.append(alloc, .{
+            .role = msg.role,
+            .content = content_copy,
+            .tier = msg.tier,
+        });
+    }
+
+    ui_repl.renderRestoredHistory(io, &agent);
+    try std.testing.expectEqual(@as(usize, 3), agent.history.messages().len);
+}
+
 
 fn freeMessages(alloc: std.mem.Allocator, msgs: []const mini.protocol_mod.Message) void {
     for (msgs) |msg| {
