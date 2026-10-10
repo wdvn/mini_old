@@ -267,6 +267,8 @@ pub const AgentLoop = struct {
     act_history_checkpoint: usize = 0,
     last_recovery_class: ?proto.RecoveryClass = null,
     last_failure_reason: ?proto.FailureReason = null,
+    last_act_usage: ?journal_mod.DeltaUsage = null,
+    last_act_context_tokens: ?usize = null,
 
     current_user_request: ?[]const u8 = null,
 

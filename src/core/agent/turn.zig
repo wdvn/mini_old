@@ -160,9 +160,14 @@ pub fn resolveTurnToolDefinitionsInner(
 
 fn ensureJournalAndSnapshotTracker(self: *AgentLoop) void {
     if (self.journal == null) {
-        var path_buf: [256]u8 = undefined;
-        const home_dir = utils.getEnvSlice("HOME") orelse ".";
-        const journal_path = std.fmt.bufPrint(&path_buf, "{s}/.mini/sessions/journal_{d}.jsonl", .{ home_dir, std.c.getpid() }) catch "/tmp/mini_journal.jsonl";
+        var path_buf: [512]u8 = undefined;
+        const journal_path = blk: {
+            if (utils.getEnvSlice("MINI_HOME")) |mh| {
+                if (mh.len > 0) break :blk std.fmt.bufPrint(&path_buf, "{s}/sessions/journal_{d}.jsonl", .{ mh, std.c.getpid() }) catch "/tmp/mini_journal.jsonl";
+            }
+            const home_dir = utils.getEnvSlice("HOME") orelse ".";
+            break :blk std.fmt.bufPrint(&path_buf, "{s}/.mini/sessions/journal_{d}.jsonl", .{ home_dir, std.c.getpid() }) catch "/tmp/mini_journal.jsonl";
+        };
         self.journal = journal_mod.ActJournal.init(self.alloc, self.io, journal_path) catch null;
     }
 
@@ -234,6 +239,8 @@ fn flushSnapshotsAndJournal(self: *AgentLoop, act_id: usize) void {
                 .agent_decision = @tagName(self.last_agent_decision),
                 .recovery_class = if (self.last_recovery_class) |class| @tagName(class) else null,
                 .attempt = self.current_act_attempt,
+                .usage = self.last_act_usage,
+                .context_tokens = self.last_act_context_tokens,
             });
             recorded_delta = true;
         }
@@ -250,6 +257,8 @@ fn flushSnapshotsAndJournal(self: *AgentLoop, act_id: usize) void {
                 .agent_decision = @tagName(self.last_agent_decision),
                 .recovery_class = if (self.last_recovery_class) |class| @tagName(class) else null,
                 .attempt = self.current_act_attempt,
+                .usage = self.last_act_usage,
+                .context_tokens = self.last_act_context_tokens,
             }) catch {};
         }
     }

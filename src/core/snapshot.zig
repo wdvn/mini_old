@@ -31,6 +31,8 @@ pub const ActTelemetry = struct {
     agent_decision: []const u8 = "request_continuation",
     recovery_class: ?[]const u8 = null,
     attempt: usize = 1,
+    usage: ?journal_mod.DeltaUsage = null,
+    context_tokens: ?usize = null,
 };
 
 /// A single file snapshot tracked in the tracker.
@@ -154,6 +156,8 @@ pub const SnapshotTracker = struct {
             .agent_decision = telemetry.agent_decision,
             .recovery_class = telemetry.recovery_class,
             .attempt = telemetry.attempt,
+            .usage = telemetry.usage,
+            .context_tokens = telemetry.context_tokens,
         }) catch {};
     }
 };

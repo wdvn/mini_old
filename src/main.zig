@@ -417,7 +417,7 @@ pub fn main(init: std.process.Init) !void {
     // 1. Convert the native argument vector once.
     // 2. Run hidden managed-process guardians before application initialization.
     // 3. Initialize normal signal handling and application resources otherwise.
-    var gpa = std.heap.DebugAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{ .stack_trace_frames = 16 }){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 

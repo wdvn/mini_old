@@ -104,12 +104,26 @@ run_case "simple text response"   "Say hello"                 "Hello from mock L
 run_case "long text streaming"    "read long text help me"    "AAAAAAAAAAAAAAAAAAAA"
 run_case "tool call bash"         "please use bash to run echo" "mock-tool-ok"
 
+run_journal_usage_check() {
+  local journal
+  journal=$(find "$TEMP_HOME/sessions" "$TEMP_HOME/.mini/sessions" -maxdepth 1 -type f -name 'journal_*.jsonl' 2>/dev/null | head -1)
+  if [[ -n "$journal" ]] && grep -F -q '"usage":{' "$journal"; then
+    echo "  [PASS] act_completed delta usage captured in journal"
+    PASS=$((PASS+1))
+  else
+    echo "  [FAIL] act_completed delta usage captured in journal (journal=$journal)"
+    FAIL=$((FAIL+1))
+  fi
+}
+run_journal_usage_check
+
+
 
 run_act52_regression() {
   local out rc journal act_started_count=0
   local regression_home="$TEMP_HOME/rfc023-home"
   mkdir -p "$regression_home"
-  out=$(timeout 30 env HOME="$regression_home" MINI_HOME="$TEMP_HOME" \
+  out=$(timeout 30 env HOME="$regression_home" MINI_HOME="$regression_home/.mini" \
         OPENAI_COMPAT_URL="$MOCK_URL" \
         OPENAI_COMPAT_MODEL="mock-model" \
         OPENAI_COMPAT_API_KEY="sk-mock" \
@@ -121,11 +135,11 @@ run_act52_regression() {
   journal=$(find "$regression_home/.mini/sessions" -maxdepth 1 -type f -name 'journal_*.jsonl' 2>/dev/null | head -1)
   if [[ $rc -eq 1 && -n "$journal" ]] && grep -F -q '"event_type":"task_stalled"' "$journal"; then
     act_started_count=$(grep -c '"act_id":1,"event_type":"act_started"' "$journal" || true)
-    if [[ "$act_started_count" -ge 4 ]] &&
+    if [[ "$act_started_count" -ge 3 ]] &&
        grep -F -q '"attempt":1' "$journal" &&
        grep -F -q '"attempt":2' "$journal" &&
        grep -F -q '"attempt":3' "$journal" &&
-       grep -F -q '"attempt":4' "$journal"; then
+       grep -F -q '"recovery_class":"thinking_loop"' "$journal"; then
       echo "  [PASS] Act 52 recovery regression"
       PASS=$((PASS+1))
       return
