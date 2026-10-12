@@ -955,7 +955,7 @@ fn executeSkillList(alloc: Allocator) ![]u8 {
     return buf.toOwnedSlice();
 }
 
-fn executeSkills(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
+pub fn executeSkills(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     // PSEUDOCODE:
     // 1. Determine requested operation (detail vs list).
     // 2. Dispatch to dedicated sub-handler.
