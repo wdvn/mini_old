@@ -733,6 +733,11 @@ fn handleResponseRecovery(
             .malformed_tool_call => prompts_mod.recovery_advisory_malformed_tool_call,
             .truncated_tool_call => prompts_mod.recovery_advisory_truncated_tool_call,
         };
+
+        if (recovery_class == .thinking_only and gen_stop != .max_tokens) {
+            _ = try loop.history.addAssistantResponse(response);
+        }
+
         try loop.history.addUser(advisory);
 
         // P0-B: when a thinking-only response was truncated at max_tokens, append a

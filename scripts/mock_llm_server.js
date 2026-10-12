@@ -50,6 +50,27 @@ const CASES = {
     }),
     finish: 'tool_calls',
   },
+  // Case: thinking-only response (issue #25: nudge + cap retry; issue #24: usage in journal)
+  thinking_only: {
+    match: (b) => {
+      if (!Array.isArray(b.messages)) return false;
+      return b.messages.some((m) =>
+        m.role === 'user' && typeof m.content === 'string' &&
+        (m.content.toLowerCase().includes('think-only') ||
+         m.content.toLowerCase().includes('thinking only'))
+      );
+    },
+    sse: (reqBody) => ({
+      id: 'mock-thinking', object: 'chat.completion.chunk', created: Date.now() / 1000 | 0,
+      model: reqBody.model || 'mock-model',
+      choices: [{ index: 0, delta: {
+        role: 'assistant',
+        reasoning_content: 'Reasoning deeply but emitting no tool call or final answer.',
+      }, finish_reason: null }],
+    }),
+    finish: 'stop',
+  },
+
   // Case: requests calling generate_video tool
   video_call: {
     match: (b) => {
