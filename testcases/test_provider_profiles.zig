@@ -189,6 +189,7 @@ test "provider: DeepSeek request body omits reasoning_effort and echoes reasonin
         false,
         false, // disable_reasoning_effort
         "medium", // reasoning_effort requested, but profile should omit it!
+        null, // reasoning_max_tokens
         false,
         "System prompt",
         msgs.items,
@@ -227,6 +228,7 @@ test "provider: OpenAI request body emits reasoning_effort and drops reasoning_c
         true, // use_completion_tokens
         false,
         "high",
+        null, // reasoning_max_tokens
         false,
         "",
         msgs.items,
@@ -259,6 +261,7 @@ test "provider: xAI request body formats nested reasoning object" {
         false,
         false,
         "medium",
+        null, // reasoning_max_tokens
         false,
         "",
         &msgs,
@@ -293,6 +296,7 @@ test "provider: Qwen request body emits reasoning_effort and uses max_tokens" {
         false, // use_completion_tokens (profile also has false)
         false,
         "medium",
+        null, // reasoning_max_tokens
         false,
         "",
         msgs.items,

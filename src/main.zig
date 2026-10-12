@@ -14,6 +14,7 @@ pub const config_mod = @import("core/config.zig");
 pub const agent_mod = @import("core/agent.zig");
 pub const protocol_mod = @import("core/protocol.zig");
 pub const history_mod = @import("core/history.zig");
+pub const skills_mod = @import("core/skills.zig");
 pub const json_mod = @import("core/json.zig");
 pub const backends = struct {
     pub const openai_mod = @import("backends/openai.zig");
@@ -22,7 +23,10 @@ pub const backends = struct {
     pub const provider_mod = @import("backends/provider.zig");
     pub const js_provider = @import("backends/js_provider.zig");
     pub const thinking_filter_mod = @import("backends/thinking_filter.zig");
+    pub const capabilities_mod = @import("backends/capabilities.zig");
 };
+pub const capabilities_mod = backends.capabilities_mod;
+pub const journal_mod = @import("core/journal.zig");
 pub const tools_mod = @import("tooling/registry.zig");
 pub const session_diagnostics = @import("tools/session_diagnostics.zig");
 pub const act_logger_mod = @import("core/act_logger.zig");
@@ -77,6 +81,7 @@ pub const VERSION = "1.0.0";
 
 /// Terminate after managed children and background jobs have been cleaned up.
 fn exitAfterProcessCleanup(status: u8) noreturn {
+    capabilities_mod.deinitGlobalCache();
     process_manager.deinitGlobal();
     std.process.exit(status);
 }
@@ -432,6 +437,7 @@ pub fn main(init: std.process.Init) !void {
     }
     signals_mod.initSignalHandlers();
     defer process_manager.deinitGlobal();
+    defer capabilities_mod.deinitGlobalCache();
     const args = try parseArgs(args_raw[1..]);
     if (handleHelpOrVersion(&args)) return;
 
@@ -707,6 +713,7 @@ test {
     _ = @import("core/history/compat.zig");
     _ = @import("core/history/backup.zig");
     _ = @import("backends/openai.zig");
+    _ = @import("backends/capabilities.zig");
     _ = @import("core/journal.zig");
     _ = @import("core/protocol.zig");
     _ = @import("core/json.zig");

@@ -169,7 +169,7 @@ test "media_ingest: openai backend serializes image blocks in chat completions a
     try testing.expect(std.mem.indexOf(u8, cc_body, "data:image/png;base64,ZmFrZV9iNjRfaW1hZ2VfZGF0YQ==") != null);
 
     // 2. Responses API
-    const resp_body = try openai_backend.buildResponsesRequestBody(alloc, "gpt-5.6-terra", 1024, false, null, "Sys", &msgs, &tools, mini.backends.provider_mod.getProfile("openai"));
+    const resp_body = try openai_backend.buildResponsesRequestBody(alloc, "gpt-5.6-terra", 1024, false, null, null, "Sys", &msgs, &tools, mini.backends.provider_mod.getProfile("openai"));
     defer alloc.free(resp_body);
 
     try testing.expect(std.mem.indexOf(u8, resp_body, "\"type\":\"input_image\"") != null);

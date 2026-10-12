@@ -183,6 +183,8 @@ pub fn resolveLoopAndExecutionSettings(env_map: *const std.process.Environ.Map) 
 pub const ReasoningAndMediaSettings = struct {
     reasoning_effort: ?[]const u8,
     reasoning_effort_disabled: bool,
+    reasoning_max_tokens: ?u32,
+    slow_turn_threshold_secs: u32,
     thinking_budget_tokens: ?u32,
     max_tokens_continue_cap: usize,
     dynamic_thinking_enabled: bool,
@@ -215,6 +217,18 @@ pub fn resolveReasoningAndMediaSettings(env_map: *const std.process.Environ.Map,
         }
         break :blk null;
     };
+    const reasoning_max_tokens: ?u32 = blk: {
+        if (env_map.get("MINI_REASONING_MAX_TOKENS")) |s| {
+            if (std.fmt.parseInt(u32, s, 10)) |val| break :blk val else |_| {}
+        }
+        break :blk null;
+    };
+    const slow_turn_threshold_secs: u32 = blk: {
+        if (env_map.get("MINI_SLOW_TURN_THRESHOLD_SECS")) |s| {
+            if (std.fmt.parseInt(u32, s, 10)) |val| break :blk val else |_| {}
+        }
+        break :blk 120;
+    };
     const thinking_budget: ?u32 = blk: {
         if (env_map.get("MINI_THINKING_BUDGET")) |s| {
             if (std.fmt.parseInt(u32, s, 10)) |val| {
@@ -233,6 +247,8 @@ pub fn resolveReasoningAndMediaSettings(env_map: *const std.process.Environ.Map,
     return .{
         .reasoning_effort = reasoning_effort,
         .reasoning_effort_disabled = if (env_map.get("MINI_REASONING_EFFORT_DISABLED")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false,
+        .reasoning_max_tokens = reasoning_max_tokens,
+        .slow_turn_threshold_secs = slow_turn_threshold_secs,
         .thinking_budget_tokens = thinking_budget,
         .max_tokens_continue_cap = if (env_map.get("MINI_MAX_TOKENS_CONTINUE_CAP")) |s| std.fmt.parseInt(usize, s, 10) catch 3 else 3,
         .dynamic_thinking_enabled = if (env_map.get("MINI_DYNAMIC_THINKING")) |v| !std.mem.eql(u8, v, "0") and !std.mem.eql(u8, v, "false") else true,
@@ -401,6 +417,8 @@ pub fn applyReasoningMediaPlanningToConfig(
 ) void {
     cfg.reasoning_effort = r.reasoning_effort;
     cfg.reasoning_effort_disabled = r.reasoning_effort_disabled;
+    cfg.reasoning_max_tokens = r.reasoning_max_tokens;
+    cfg.slow_turn_threshold_secs = r.slow_turn_threshold_secs;
     cfg.thinking_budget_tokens = r.thinking_budget_tokens;
     cfg.thinking_temperature = 1.0;
     cfg.max_tokens_continue_cap = r.max_tokens_continue_cap;

@@ -45,7 +45,9 @@ test {
     _ = @import("test_parse2.zig");
     _ = @import("test_rfc000_validation.zig");
     _ = @import("test_durable_task.zig");
+    _ = @import("test_skills_multitier.zig");
 }
+
 
 // ---------------------------------------------------------------------------
 // In-memory event counter hook listener (M3)
@@ -294,5 +296,23 @@ test "security: per-act VM isolation — global variables do not leak across 2 e
     try std.testing.expect(!res2.is_error);
     try std.testing.expectEqualStrings("leaked: undefined", std.mem.trim(u8, res2.stdout, "\n"));
 }
+
+test "codeact: mini.skill binding exists and executes" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var engine = try quickjs.Engine.init(alloc, io);
+    defer engine.deinit();
+
+    var res = try engine.eval(
+\\ if (typeof mini.skill !== 'function') throw new Error("mini.skill is not a function");
+\\ const s = mini.skill("nonexistent");
+\\ console.log("skill result:", s);
+    , "test_skill.js");
+    defer res.deinit();
+    try std.testing.expect(!res.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "skill result:") != null);
+}
+
 
 // ---------------------------------------------------------------------------

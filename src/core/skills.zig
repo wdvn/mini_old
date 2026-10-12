@@ -30,7 +30,7 @@ const MAX_SKILLS = 32;
 const MAX_DESC_LEN = 512;
 
 /// Limit on SKILL.md file size (bytes).
-const MAX_SKILL_FILE = 64 * 1024;
+pub const MAX_SKILL_FILE = 256 * 1024;
 
 /// Metadata for a skill parsed from frontmatter.
 pub const SkillInfo = struct {
@@ -40,6 +40,22 @@ pub const SkillInfo = struct {
     description: []const u8,
     /// Absolute path to SKILL.md.
     path: []const u8,
+    /// Absolute path to skill directory.
+    dir_path: []const u8,
+    /// Optional version (from frontmatter `version`).
+    version: ?[]const u8 = null,
+    /// Optional author (from frontmatter `author`).
+    author: ?[]const u8 = null,
+    /// Optional platforms (from frontmatter `platforms`).
+    platforms: ?[]const u8 = null,
+    /// Optional required tools (from frontmatter `requires_tools`).
+    requires_tools: ?[]const u8 = null,
+    /// True if references/ subdirectory exists.
+    has_references: bool = false,
+    /// True if templates/ subdirectory exists.
+    has_templates: bool = false,
+    /// True if scripts/ subdirectory exists.
+    has_scripts: bool = false,
 };
 
 /// Loaded skills list (arena-allocated, freed via `deinitSkills`).
@@ -117,8 +133,9 @@ fn scanSkillsFromDir(arena_alloc: Allocator, io: std.Io, dir_path: []const u8, s
         if (entry.kind != .directory) continue;
 
         // Read <dir>/<name>/SKILL.md
-        const skill_path = std.fmt.allocPrint(arena_alloc, "{s}/{s}/SKILL.md", .{ dir_path, entry.name }) catch continue;
-        const info = parseSkillFile(arena_alloc, io, skill_path, entry.name) catch continue;
+        const skill_dir = std.fmt.allocPrint(arena_alloc, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+        const skill_path = std.fmt.allocPrint(arena_alloc, "{s}/SKILL.md", .{skill_dir}) catch continue;
+        const info = parseSkillFile(arena_alloc, io, skill_path, skill_dir, entry.name) catch continue;
 
         // Check if this skill name already exists (Project overrides Global)
         var overwritten = false;
@@ -153,12 +170,23 @@ fn readSkillFileContent(alloc: Allocator, io: std.Io, path: []const u8) ![]u8 {
     return buf[0..n];
 }
 
-fn parseSkillFrontmatter(alloc: Allocator, content: []const u8, default_name: []const u8, desc_buf: *std.ArrayList(u8)) []const u8 {
+/// Parsed metadata from YAML frontmatter.
+pub const ParsedMeta = struct {
+    name: []const u8,
+    version: ?[]const u8 = null,
+    author: ?[]const u8 = null,
+    platforms: ?[]const u8 = null,
+    requires_tools: ?[]const u8 = null,
+};
+
+fn parseSkillFrontmatter(alloc: Allocator, content: []const u8, default_name: []const u8, desc_buf: *std.ArrayList(u8)) ParsedMeta {
     // PSEUDOCODE:
     // 1. Check for YAML frontmatter opening "---".
-    // 2. Parse lines for name and single-line/multiline description.
-    var name: []const u8 = default_name;
-    if (!std.mem.startsWith(u8, content, "---\n")) return name;
+    // 2. Parse lines for name, description, and rich metadata fields.
+    var meta: ParsedMeta = .{
+        .name = default_name,
+    };
+    if (!std.mem.startsWith(u8, content, "---\n")) return meta;
 
     const body_start = std.mem.indexOfPos(u8, content, 4, "\n---") orelse content.len;
     var lines = std.mem.splitScalar(u8, content[4..body_start], '\n');
@@ -179,7 +207,7 @@ fn parseSkillFrontmatter(alloc: Allocator, content: []const u8, default_name: []
             }
         }
         if (std.mem.startsWith(u8, trimmed, "name:")) {
-            name = std.mem.trim(u8, trimmed[5..], " \t\"'");
+            meta.name = std.mem.trim(u8, trimmed[5..], " \t\"'");
         } else if (std.mem.startsWith(u8, trimmed, "description:")) {
             const rest = std.mem.trim(u8, trimmed[12..], " \t\"'");
             if (std.mem.eql(u8, rest, ">") or std.mem.eql(u8, rest, ">-") or std.mem.eql(u8, rest, "|") or std.mem.eql(u8, rest, "|-") or rest.len == 0) {
@@ -188,35 +216,81 @@ fn parseSkillFrontmatter(alloc: Allocator, content: []const u8, default_name: []
                 const to_copy = @min(rest.len, MAX_DESC_LEN);
                 desc_buf.appendSlice(alloc, rest[0..to_copy]) catch {};
             }
+        } else if (std.mem.startsWith(u8, trimmed, "version:")) {
+            meta.version = std.mem.trim(u8, trimmed[8..], " \t\"'");
+        } else if (std.mem.startsWith(u8, trimmed, "author:")) {
+            meta.author = std.mem.trim(u8, trimmed[7..], " \t\"'");
+        } else if (std.mem.startsWith(u8, trimmed, "platforms:")) {
+            meta.platforms = std.mem.trim(u8, trimmed[10..], " \t\"'");
+        } else if (std.mem.startsWith(u8, trimmed, "requires_tools:")) {
+            meta.requires_tools = std.mem.trim(u8, trimmed[15..], " \t\"'");
         }
     }
-    return name;
+    return meta;
+}
+
+fn checkSubdirExists(io: std.Io, dir_path: []const u8, sub: []const u8) bool {
+    const cwd = std.Io.Dir.cwd();
+    var parent = cwd.openDir(io, dir_path, .{}) catch return false;
+    defer parent.close(io);
+    var child = parent.openDir(io, sub, .{}) catch return false;
+    defer child.close(io);
+    return true;
+}
+
+/// Sanitize sub-path relative to skill root directory to prevent directory traversal attacks.
+pub fn sanitizeSkillSubPath(alloc: Allocator, dir_path: []const u8, sub_path: []const u8) ![]u8 {
+    // PSEUDOCODE:
+    // 1. Guard against empty, absolute paths (starting with / or \), or windows drive separator (:).
+    // 2. Reject any null byte.
+    // 3. Tokenize by / and \ to ensure no segment is '..'.
+    // 4. Return joined path: dir_path/sub_path.
+    if (sub_path.len == 0) return error.PathTraversalDetected;
+    if (sub_path[0] == '/' or sub_path[0] == '\\') return error.PathTraversalDetected;
+    if (std.mem.indexOfScalar(u8, sub_path, ':') != null) return error.PathTraversalDetected;
+    if (std.mem.indexOfScalar(u8, sub_path, 0) != null) return error.PathTraversalDetected;
+
+    var it = std.mem.tokenizeAny(u8, sub_path, "/\\");
+    while (it.next()) |part| {
+        if (std.mem.eql(u8, part, "..")) return error.PathTraversalDetected;
+    }
+
+    return std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, sub_path });
 }
 
 /// Parse frontmatter of SKILL.md.
 /// Spec agentskills.io: `name` must match parent directory name (`dir_name`).
-fn parseSkillFile(alloc: Allocator, io: std.Io, path: []const u8, dir_name: []const u8) !SkillInfo {
+fn parseSkillFile(alloc: Allocator, io: std.Io, path: []const u8, skill_dir: []const u8, dir_name: []const u8) !SkillInfo {
     // PSEUDOCODE:
-    // 1. Read file content.
-    // 2. Parse frontmatter name and description.
+    // 1. Read file content up to MAX_SKILL_FILE.
+    // 2. Parse frontmatter name, description, and rich metadata.
     // 3. Validate name matches dir_name.
-    // 4. Return duped SkillInfo.
+    // 4. Detect subdirectories (references, templates, scripts).
+    // 5. Return duped SkillInfo.
     const content = try readSkillFileContent(alloc, io, path);
     defer alloc.free(content);
 
     var desc_buf = std.ArrayList(u8).empty;
     defer desc_buf.deinit(alloc);
 
-    var name = parseSkillFrontmatter(alloc, content, dir_name, &desc_buf);
-    if (!std.mem.eql(u8, name, dir_name)) {
-        main.stderrPrint("[skills] Warning: skill name '{s}' in {s} does not match directory name '{s}', using directory name.\n", .{ name, path, dir_name });
-        name = dir_name;
+    var meta = parseSkillFrontmatter(alloc, content, dir_name, &desc_buf);
+    if (!std.mem.eql(u8, meta.name, dir_name)) {
+        main.stderrPrint("[skills] Warning: skill name '{s}' in {s} does not match directory name '{s}', using directory name.\n", .{ meta.name, path, dir_name });
+        meta.name = dir_name;
     }
 
     return .{
-        .name = try alloc.dupe(u8, name),
+        .name = try alloc.dupe(u8, meta.name),
         .description = try alloc.dupe(u8, desc_buf.items),
         .path = try alloc.dupe(u8, path),
+        .dir_path = try alloc.dupe(u8, skill_dir),
+        .version = if (meta.version) |v| try alloc.dupe(u8, v) else null,
+        .author = if (meta.author) |a| try alloc.dupe(u8, a) else null,
+        .platforms = if (meta.platforms) |p| try alloc.dupe(u8, p) else null,
+        .requires_tools = if (meta.requires_tools) |rt| try alloc.dupe(u8, rt) else null,
+        .has_references = checkSubdirExists(io, skill_dir, "references"),
+        .has_templates = checkSubdirExists(io, skill_dir, "templates"),
+        .has_scripts = checkSubdirExists(io, skill_dir, "scripts"),
     };
 }
 
@@ -341,3 +415,47 @@ test "buildSkillsBlock empty when no skills" {
     const result = try buildSkillsBlock(testing.allocator);
     try testing.expect(result == null);
 }
+
+test "parseSkillFrontmatter extended metadata" {
+    const content =
+        \\---
+        \\name: kubernetes-ops
+        \\description: Deploy and troubleshoot k8s clusters.
+        \\version: 1.2.0
+        \\author: Infra Team
+        \\platforms: linux, darwin
+        \\requires_tools: bash, http_request
+        \\---
+        \\# Instructions
+    ;
+    var desc_buf = std.ArrayList(u8).empty;
+    defer desc_buf.deinit(testing.allocator);
+    const meta = parseSkillFrontmatter(testing.allocator, content, "kubernetes-ops", &desc_buf);
+
+    try testing.expectEqualStrings("kubernetes-ops", meta.name);
+    try testing.expectEqualStrings("Deploy and troubleshoot k8s clusters.", desc_buf.items);
+    try testing.expectEqualStrings("1.2.0", meta.version orelse "");
+    try testing.expectEqualStrings("Infra Team", meta.author orelse "");
+    try testing.expectEqualStrings("linux, darwin", meta.platforms orelse "");
+    try testing.expectEqualStrings("bash, http_request", meta.requires_tools orelse "");
+}
+
+test "sanitizeSkillSubPath prevents path traversal" {
+    const dir_path = "/home/user/.mini/skills/my-skill";
+
+    // Valid sub-paths
+    const valid1 = try sanitizeSkillSubPath(testing.allocator, dir_path, "references/api.md");
+    defer testing.allocator.free(valid1);
+    try testing.expectEqualStrings("/home/user/.mini/skills/my-skill/references/api.md", valid1);
+
+    const valid2 = try sanitizeSkillSubPath(testing.allocator, dir_path, "templates/spec.md");
+    defer testing.allocator.free(valid2);
+    try testing.expectEqualStrings("/home/user/.mini/skills/my-skill/templates/spec.md", valid2);
+
+    // Malicious traversal attempts
+    try testing.expectError(error.PathTraversalDetected, sanitizeSkillSubPath(testing.allocator, dir_path, "../secret.txt"));
+    try testing.expectError(error.PathTraversalDetected, sanitizeSkillSubPath(testing.allocator, dir_path, "references/../../secret.txt"));
+    try testing.expectError(error.PathTraversalDetected, sanitizeSkillSubPath(testing.allocator, dir_path, "/etc/passwd"));
+    try testing.expectError(error.PathTraversalDetected, sanitizeSkillSubPath(testing.allocator, dir_path, ""));
+}
+

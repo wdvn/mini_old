@@ -81,6 +81,10 @@ pub const Config = struct {
     reasoning_effort: ?[]const u8 = null,
     /// Soft off-switch, set to true to force omitting reasoning params.
     reasoning_effort_disabled: bool = false,
+    /// Reasoning max tokens budget (OpenAI Responses / Anthropic style). Null = not explicitly capped.
+    reasoning_max_tokens: ?u32 = null,
+    /// Slow turn generation threshold in seconds (0 = disabled, default: 120).
+    slow_turn_threshold_secs: u32 = 120,
     /// Anthropic thinking budget (tokens). Null = extended thinking disabled.
     thinking_budget_tokens: ?u32 = null,
     /// Anthropic thinking temperature (fixed 1.0 when thinking is enabled).
@@ -292,6 +296,8 @@ pub const JsonConfig = struct {
     // Reasoning & Thinking
     reasoning_effort: ?[]const u8 = null,
     reasoning_effort_disabled: ?bool = null,
+    reasoning_max_tokens: ?u32 = null,
+    slow_turn_threshold_secs: ?u32 = null,
     thinking_budget_tokens: ?u32 = null,
     thinking_temperature: ?f32 = null,
     max_tokens_continue_cap: ?usize = null,

@@ -47,6 +47,8 @@ pub const ActEventType = enum {
     skill_loaded,
     /// Plan/skill/task context re-injected after MemAct compaction.
     post_compact_reinject,
+    /// Act generation latency exceeded slow turn threshold.
+    act_generation_slow,
 };
 
 pub const FileSnapshot = struct {

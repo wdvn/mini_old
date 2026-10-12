@@ -122,16 +122,34 @@ pub const LineEditor = struct {
         self.draft.deinit(self.alloc);
         self.buf.deinit(self.alloc);
         self.paste_buf.deinit(self.alloc);
-        for (self.undo_stack[0..self.undo_len]) |s| self.alloc.free(s);
-        for (self.redo_stack[0..self.redo_len]) |s| self.alloc.free(s);
-        for (self.kill_ring[0..self.kill_len]) |s| self.alloc.free(s);
+        
+        var u: usize = 0;
+        var ui: usize = if (self.undo_head >= self.undo_len) self.undo_head - self.undo_len else UNDO_DEPTH - (self.undo_len - self.undo_head);
+        while (u < self.undo_len) : (u += 1) {
+            self.alloc.free(self.undo_stack[ui]);
+            ui = (ui + 1) % UNDO_DEPTH;
+        }
+        
+        var r: usize = 0;
+        var ri: usize = if (self.redo_head >= self.redo_len) self.redo_head - self.redo_len else UNDO_DEPTH - (self.redo_len - self.redo_head);
+        while (r < self.redo_len) : (r += 1) {
+            self.alloc.free(self.redo_stack[ri]);
+            ri = (ri + 1) % UNDO_DEPTH;
+        }
+        
+        var k: usize = 0;
+        var ki: usize = if (self.kill_head >= self.kill_len) self.kill_head - self.kill_len else KILL_RING_DEPTH - (self.kill_len - self.kill_head);
+        while (k < self.kill_len) : (k += 1) {
+            self.alloc.free(self.kill_ring[ki]);
+            ki = (ki + 1) % KILL_RING_DEPTH;
+        }
     }
 
     // -----------------------------------------------------------------------
     // Undo / Redo
     // -----------------------------------------------------------------------
 
-    fn pushUndo(self: *LineEditor) void {
+    pub fn pushUndo(self: *LineEditor) void {
         if (self.buf.items.len > UNDO_SNAPSHOT_CAP) return;
         const snap = self.alloc.dupe(u8, self.buf.items) catch return;
         if (self.undo_len == UNDO_DEPTH) {
@@ -148,7 +166,12 @@ pub const LineEditor = struct {
     }
 
     fn clearRedo(self: *LineEditor) void {
-        for (self.redo_stack[0..self.redo_len]) |s| self.alloc.free(s);
+        var r: usize = 0;
+        var ri: usize = if (self.redo_head >= self.redo_len) self.redo_head - self.redo_len else UNDO_DEPTH - (self.redo_len - self.redo_head);
+        while (r < self.redo_len) : (r += 1) {
+            self.alloc.free(self.redo_stack[ri]);
+            ri = (ri + 1) % UNDO_DEPTH;
+        }
         self.redo_len = 0;
         self.redo_head = 0;
     }
@@ -173,7 +196,7 @@ pub const LineEditor = struct {
         self.redo_head = (self.redo_head + 1) % UNDO_DEPTH;
     }
 
-    fn applyUndo(self: *LineEditor) bool {
+    pub fn applyUndo(self: *LineEditor) bool {
         const entry = self.popUndo() orelse return false;
         defer self.alloc.free(entry.snap);
         self.pushRedo();
@@ -210,7 +233,7 @@ pub const LineEditor = struct {
     // Kill ring
     // -----------------------------------------------------------------------
 
-    fn killPush(self: *LineEditor, text: []const u8) void {
+    pub fn killPush(self: *LineEditor, text: []const u8) void {
         const dup = self.alloc.dupe(u8, text) catch return;
         if (self.kill_len == KILL_RING_DEPTH) {
             self.alloc.free(self.kill_ring[self.kill_head]);

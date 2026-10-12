@@ -23,6 +23,7 @@ const AgentLoop = loop_mod.AgentLoop;
 const prompts_mod = @import("../prompts.zig");
 const history_mod = @import("../history.zig");
 const agent_loop_monitor = @import("loop_monitor.zig");
+const capabilities = @import("../../backends/capabilities.zig");
 
 pub const StepResult = proto.ActTransition;
 
@@ -201,6 +202,7 @@ pub fn modulateReasoningEffort(loop: *AgentLoop, act_id: usize) void {
 
     var effective_effort: ?[]const u8 = loop.config.reasoning_effort;
     var effective_budget: ?u32 = loop.config.thinking_budget_tokens;
+    var effective_reasoning_max: ?u32 = loop.config.reasoning_max_tokens;
 
     // Priority 1: Explicit JS override via mini.setThinking
     if (js_bindings.consumePendingThinkingOverride()) |override| {
@@ -227,6 +229,34 @@ pub fn modulateReasoningEffort(loop: *AgentLoop, act_id: usize) void {
         effective_budget = decision.budget;
     }
 
+    // Lookup model capability (from cache or /models)
+    if (loop.backend == .openai and loop.config.openai_compat_url != null) {
+        if (capabilities.fetchOrLookupCapability(
+            loop.alloc,
+            loop.io,
+            loop.config.openai_compat_url.?,
+            loop.config.openai_compat_key orelse "",
+            loop.config.openai_compat_api_header,
+            loop.backend.model(),
+        )) |cap| {
+            effective_effort = cap.clipEffort(effective_effort);
+            if (cap.reasoning_max_tokens) |rmt| {
+                if (effective_reasoning_max == null or effective_reasoning_max.? > rmt) {
+                    effective_reasoning_max = rmt;
+                }
+            }
+        }
+    }
+
+    // Guard reasoning_max_tokens if set
+    if (effective_reasoning_max) |rmt| {
+        effective_reasoning_max = capabilities.ModelCapability.guardReasoningMaxTokens(
+            rmt,
+            loop.config.max_tokens,
+            loop.backend == .claude,
+        );
+    }
+
     // PSEUDOCODE: Clamp thinking budget to 85% of max_tokens so the response
     // always keeps >=15% headroom for answer / tool-call payload.
     effective_budget = capThinkingBudget(loop.config.max_tokens, effective_budget);
@@ -236,6 +266,7 @@ pub fn modulateReasoningEffort(loop: *AgentLoop, act_id: usize) void {
 
     loop.backend.setReasoningEffort(effective_effort);
     loop.backend.setThinkingBudget(effective_budget);
+    loop.backend.setReasoningMaxTokens(effective_reasoning_max);
     chat_stream.active_effort = effective_effort;
 }
 
@@ -733,7 +764,15 @@ fn handleResponseRecovery(
             .malformed_tool_call => prompts_mod.recovery_advisory_malformed_tool_call,
             .truncated_tool_call => prompts_mod.recovery_advisory_truncated_tool_call,
         };
+
+        if (recovery_class == .thinking_only and gen_stop != .max_tokens) {
+            _ = try loop.history.addAssistantResponse(response);
+        }
+
         try loop.history.addUser(advisory);
+        if (!utils.isSubagent()) {
+            main.stderrPrint("\x1b[33m[agent] ⚠️ {s}\x1b[0m\n", .{advisory});
+        }
 
         // P0-B: when a thinking-only response was truncated at max_tokens, append a
         // short UTF-8-safe tail of the reasoning so the model resumes instead of
@@ -1167,6 +1206,7 @@ pub fn executeStep(
     defer if (p4_note) |n| self.alloc.free(n);
     defer if (p4_blocks) |b| self.alloc.free(b);
 
+    const gen_start_ms = utils.milliTimestamp();
     var response = try self.sendToBackend(
         act_id,
         self.config.system_prompt,
@@ -1175,6 +1215,23 @@ pub fn executeStep(
         text_cb,
         think_cb,
     );
+    const gen_end_ms = utils.milliTimestamp();
+    const gen_duration_ms: u64 = if (gen_end_ms >= gen_start_ms) @intCast(gen_end_ms - gen_start_ms) else 0;
+
+    if (self.config.slow_turn_threshold_secs > 0 and gen_duration_ms >= @as(u64, self.config.slow_turn_threshold_secs) * 1000) {
+        if (self.journal) |*j| {
+            var desc_buf: [128]u8 = undefined;
+            const desc = std.fmt.bufPrint(&desc_buf, "Generation latency {d}ms exceeded threshold {d}s", .{ gen_duration_ms, self.config.slow_turn_threshold_secs }) catch "Generation latency exceeded threshold";
+            j.recordEvent(self.io, act_id, .act_generation_slow, desc) catch {};
+        }
+        main.stderrPrint("\x1b[33m[agent] ⚠ Slow generation: act {d} took {d}.{d}s (threshold: {d}s)\x1b[0m\n", .{
+            act_id,
+            gen_duration_ms / 1000,
+            (gen_duration_ms % 1000) / 100,
+            self.config.slow_turn_threshold_secs,
+        });
+    }
+
     main.resetThinkState();
     if (signals.isInterrupted() or self.coordinator.isTimedOut()) {
         response.deinit();

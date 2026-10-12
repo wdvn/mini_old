@@ -153,6 +153,121 @@ run_act52_regression() {
 run_act52_regression
 
 
+# Issue #25 E2E: thinking-only response gets a nudge advisory, then caps at thinking_loop stall
+run_thinking_only_nudge() {
+  local out rc journal
+  local regression_home="$TEMP_HOME/thinking-only-home"
+  mkdir -p "$regression_home"
+  out=$(timeout 60 env HOME="$regression_home" MINI_HOME="$TEMP_HOME" \
+        OPENAI_COMPAT_URL="$MOCK_URL" \
+        OPENAI_COMPAT_MODEL="mock-model" \
+        OPENAI_COMPAT_API_KEY="sk-mock" \
+        OPENAI_PROTOCOL=chat \
+        MINI_EXECUTION_MODE=auto \
+        MINI_NO_HISTORY=1 \
+        "$BIN" -e "think-only task" 2>&1)
+  rc=$?
+  journal=$(find "$regression_home/.mini/sessions" -maxdepth 1 -type f -name 'journal_*.jsonl' 2>/dev/null | head -1)
+  local act_started=0
+  if [[ -n "$journal" ]] && grep -F -q '"event_type":"task_stalled"' "$journal" && \
+     grep -F -q '"recovery_class":"thinking_loop"' "$journal"; then
+    act_started=$(grep -c '"event_type":"act_started"' "$journal" || true)
+    if [[ "$act_started" -ge 2 ]] && echo "$out" | grep -F -q "internal reasoning/thinking only"; then
+      echo "  [PASS] issue #25: thinking-only nudge advisory + capped 2 acts -> thinking_loop stall"
+      PASS=$((PASS+1))
+      return
+    fi
+  fi
+  echo "  [FAIL] issue #25: thinking-only nudge + cap regression (rc=$rc, journal=$journal, act_started=$act_started)"
+  FAIL=$((FAIL+1))
+  [[ -n "$journal" ]] && tail -n 15 "$journal" | sed 's/^/         | /'
+  echo "$out" | head -15 | sed 's/^/         | /'
+}
+run_thinking_only_nudge
+
+
+# Issue #24 E2E: usage + context_tokens recorded in act_completed delta
+run_issue24_usage_delta() {
+  local out rc journal
+  local usage_home="$TEMP_HOME/usage-home"
+  mkdir -p "$usage_home"
+  out=$(timeout 60 env HOME="$usage_home" MINI_HOME="$TEMP_HOME" \
+        OPENAI_COMPAT_URL="$MOCK_URL" \
+        OPENAI_COMPAT_MODEL="mock-model" \
+        OPENAI_COMPAT_API_KEY="sk-mock" \
+        OPENAI_PROTOCOL=chat \
+        MINI_EXECUTION_MODE=auto \
+        MINI_NO_HISTORY=1 \
+        "$BIN" -e "usage test" 2>&1)
+  rc=$?
+  journal=$(find "$usage_home/.mini/sessions" -maxdepth 1 -type f -name 'journal_*.jsonl' 2>/dev/null | head -1)
+  if [[ -n "$journal" ]] && grep -F -q '"usage":' "$journal" && \
+     grep -F -q '"reasoning_tokens"' "$journal"; then
+    echo "  [PASS] issue #24: usage (input/output/reasoning_tokens) recorded in act_completed delta"
+    PASS=$((PASS+1))
+    return
+  fi
+  echo "  [FAIL] issue #24: usage not recorded in journal (rc=$rc, journal=$journal)"
+  FAIL=$((FAIL+1))
+  [[ -n "$journal" ]] && tail -n 12 "$journal" | sed 's/^/         | /'
+  echo "$out" | head -15 | sed 's/^/         | /'
+}
+run_issue24_usage_delta
+
+# Issue #27 E2E: slow generation alert when turn latency >= threshold
+run_issue27_slow_alert() {
+  local out rc journal
+  local slow_home="$TEMP_HOME/slow-home"
+  mkdir -p "$slow_home"
+  out=$(timeout 30 env HOME="$slow_home" MINI_HOME="$TEMP_HOME" \
+        OPENAI_COMPAT_URL="$MOCK_URL" \
+        OPENAI_COMPAT_MODEL="mock-model" \
+        OPENAI_COMPAT_API_KEY="sk-mock" \
+        OPENAI_PROTOCOL=chat \
+        MINI_SLOW_TURN_THRESHOLD_SECS=1 \
+        MINI_EXECUTION_MODE=auto \
+        MINI_NO_HISTORY=1 \
+        "$BIN" -e "slow generation test" 2>&1)
+  rc=$?
+  journal=$(find "$slow_home/.mini/sessions" -maxdepth 1 -type f -name 'journal_*.jsonl' 2>/dev/null | head -1)
+  if [[ -n "$journal" ]] && grep -F -q '"event_type":"act_generation_slow"' "$journal" && \
+     echo "$out" | grep -F -q "Slow generation"; then
+    echo "  [PASS] issue #27: slow generation alert in stderr + act_generation_slow recorded in journal"
+    PASS=$((PASS+1))
+    return
+  fi
+  echo "  [FAIL] issue #27: slow generation alert not detected (rc=$rc, journal=$journal)"
+  FAIL=$((FAIL+1))
+  [[ -n "$journal" ]] && tail -n 12 "$journal" | sed 's/^/         | /'
+  echo "$out" | head -15 | sed 's/^/         | /'
+}
+run_issue27_slow_alert
+
+# Issue #27 E2E: model capability lookup clips effort into supported_efforts and respects mandatory
+run_issue27_capability_clip() {
+  local out rc
+  out=$(timeout 30 env MINI_HOME="$TEMP_HOME" \
+        OPENAI_COMPAT_URL="$MOCK_URL" \
+        OPENAI_COMPAT_MODEL="~o3-mini" \
+        OPENAI_COMPAT_API_KEY="sk-mock" \
+        OPENAI_PROTOCOL=chat \
+        MINI_REASONING_EFFORT="none" \
+        MINI_EXECUTION_MODE=auto \
+        MINI_NO_HISTORY=1 \
+        "$BIN" -e "check o3 capability" 2>&1)
+  rc=$?
+  if echo "$out" | grep -F -q "o3-mini effort clipped to: low"; then
+    echo "  [PASS] issue #27: model capability lookup (/models) clipped effort to 'low' for mandatory model ~o3-mini"
+    PASS=$((PASS+1))
+    return
+  fi
+  echo "  [FAIL] issue #27: capability clipping failed (expected clipped effort to low)"
+  FAIL=$((FAIL+1))
+  echo "$out" | cat | sed 's/^/         | /'
+}
+run_issue27_capability_clip
+
+echo ""
 # Media vision ingestion testcase
 printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89' > "$TEMP_HOME/test_img.png"
 run_case "media vision ingestion" "@image:$TEMP_HOME/test_img.png Describe this" "[Vision Verified] Image received"

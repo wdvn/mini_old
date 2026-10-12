@@ -18,6 +18,7 @@
 //!   - mini.artifact(name, content, metadata?)
 //!   - mini.env(varName)
 //!   - mini.setThinking(levelOrTokens)
+//!   - mini.skill(name, file_path?)
 //!   - mini.workspaceRoot, mini.sessionId
 
 const std = @import("std");
@@ -1145,6 +1146,57 @@ fn jsMiniMedia(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c
     return makeMediaResult(ctx, res);
 }
 
+
+// ---------------------------------------------------------------------------
+// mini.skill(name, file_path?)
+// ---------------------------------------------------------------------------
+fn jsMiniSkill(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    // PSEUDOCODE:
+    // 1. Validate argument count and types (name must be string, optional file_path must be string).
+    // 2. Dispatch policy and auditing hooks.
+    // 3. Format JSON input and delegate to registry.executeSkills.
+    // 4. Return result string.
+    _ = this_val;
+    const engine = getEngine(ctx) orelse return JS_UNDEFINED;
+    engine.renewActivity();
+    if (argc < 1) return c.JS_ThrowTypeError(ctx, "mini.skill requires skill name argument");
+
+    const name_slice = jsStringSlice(ctx, argv[0], engine.alloc) orelse
+        return c.JS_ThrowTypeError(ctx, "skill name must be a string");
+    defer engine.alloc.free(name_slice);
+
+    const file_path_slice = if (argc >= 2 and c.JS_IsUndefined(argv[1]) == 0 and c.JS_IsNull(argv[1]) == 0)
+        jsStringSlice(ctx, argv[1], engine.alloc)
+    else
+        null;
+    defer if (file_path_slice) |f| engine.alloc.free(f);
+
+    const payload = if (file_path_slice) |sub|
+        std.fmt.allocPrint(engine.alloc, "{{\"operation\":\"detail\",\"name\":\"{s}\",\"file_path\":\"{s}\"}}", .{ name_slice, sub }) catch return JS_EXCEPTION
+    else
+        std.fmt.allocPrint(engine.alloc, "{{\"operation\":\"detail\",\"name\":\"{s}\"}}", .{name_slice}) catch return JS_EXCEPTION;
+    defer engine.alloc.free(payload);
+
+    if (guardAndDispatchPre(engine, ctx, "skills", payload, "skills blocked by policy")) |err_val| {
+        return err_val;
+    }
+
+    const output = registry.executeSkills(engine.alloc, engine.io, payload) catch |err| {
+        return c.JS_ThrowInternalError(ctx, "skill error: %s", @errorName(err).ptr);
+    };
+    defer engine.alloc.free(output);
+
+    hooks.dispatch(engine.alloc, engine.io, .{
+        .event = "post-tool-use",
+        .tool_name = "skills",
+        .input_json = payload,
+        .tool_result = output,
+        .is_error = false,
+    });
+
+    return c.JS_NewStringLen(ctx, output.ptr, output.len);
+}
+
 /// Register global `mini` object into JSContext
 pub fn registerBindings(engine: *Engine) !void {
     const ctx = engine.ctx.?;
@@ -1161,6 +1213,7 @@ pub fn registerBindings(engine: *Engine) !void {
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "patch", c.JS_NewCFunction(ctx, jsMiniPatch, "patch", 4));
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "exists", c.JS_NewCFunction(ctx, jsMiniExists, "exists", 1));
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "stat", c.JS_NewCFunction(ctx, jsMiniStat, "stat", 1));
+    _ = c.JS_SetPropertyStr(ctx, mini_obj, "skill", c.JS_NewCFunction(ctx, jsMiniSkill, "skill", 2));
 
     // 2. shell & jobs (OpenHands Pattern)
     _ = c.JS_SetPropertyStr(ctx, mini_obj, "sh", c.JS_NewCFunction(ctx, jsMiniSh, "sh", 2));
@@ -1190,3 +1243,4 @@ pub fn registerBindings(engine: *Engine) !void {
 
     _ = c.JS_SetPropertyStr(ctx, global_obj, "mini", mini_obj);
 }
+

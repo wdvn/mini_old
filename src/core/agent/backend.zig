@@ -76,4 +76,13 @@ pub const Backend = union(enum) {
             else => {},
         }
     }
+
+    /// Sets dynamic reasoning max tokens (or null).
+    pub fn setReasoningMaxTokens(self: *Backend, max_tokens: ?u32) void {
+        switch (self.*) {
+            .openai => |*c| c.setReasoningMaxTokens(max_tokens),
+            .claude => |*c| c.setThinkingBudget(max_tokens),
+            else => {},
+        }
+    }
 };

@@ -196,6 +196,8 @@ pub fn applyThinkingAndMemActJsonConfig(cfg: *const JsonConfig, env_map: *std.pr
     var count: usize = 0;
     if (cfg.reasoning_effort) |val| count += setEnvDefault(env_map, "MINI_REASONING_EFFORT", val);
     if (cfg.reasoning_effort_disabled) |val| count += setEnvBool(env_map, "MINI_REASONING_EFFORT_DISABLED", val);
+    if (cfg.reasoning_max_tokens) |val| count += setEnvInt(u32, env_map, "MINI_REASONING_MAX_TOKENS", val);
+    if (cfg.slow_turn_threshold_secs) |val| count += setEnvInt(u32, env_map, "MINI_SLOW_TURN_THRESHOLD_SECS", val);
     if (cfg.thinking_budget_tokens) |val| count += setEnvInt(u32, env_map, "MINI_THINKING_BUDGET", val);
     if (cfg.thinking_temperature) |val| count += setEnvFloat(env_map, "MINI_THINKING_TEMPERATURE", val);
     if (cfg.max_tokens_continue_cap) |val| count += setEnvInt(usize, env_map, "MINI_MAX_TOKENS_CONTINUE_CAP", val);

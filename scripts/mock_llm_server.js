@@ -50,6 +50,27 @@ const CASES = {
     }),
     finish: 'tool_calls',
   },
+  // Case: thinking-only response (issue #25: nudge + cap retry; issue #24: usage in journal)
+  thinking_only: {
+    match: (b) => {
+      if (!Array.isArray(b.messages)) return false;
+      return b.messages.some((m) =>
+        m.role === 'user' && typeof m.content === 'string' &&
+        (m.content.toLowerCase().includes('think-only') ||
+         m.content.toLowerCase().includes('thinking only'))
+      );
+    },
+    sse: (reqBody) => ({
+      id: 'mock-thinking', object: 'chat.completion.chunk', created: Date.now() / 1000 | 0,
+      model: reqBody.model || 'mock-model',
+      choices: [{ index: 0, delta: {
+        role: 'assistant',
+        reasoning_content: 'Reasoning deeply but emitting no tool call or final answer.',
+      }, finish_reason: null }],
+    }),
+    finish: 'stop',
+  },
+
   // Case: requests calling generate_video tool
   video_call: {
     match: (b) => {
@@ -115,7 +136,36 @@ const CASES = {
     }),
     finish: 'stop',
   },
+  // Case: slow turn latency generation (Issue #27)
+  slow_generation: {
+    match: (b) => {
+      if (!Array.isArray(b.messages)) return false;
+      const lastUser = [...b.messages].reverse().find(m => m.role === 'user');
+      return !!lastUser && typeof lastUser.content === 'string' && lastUser.content.toLowerCase().includes('slow generation test');
+    },
+    delayMs: 1200,
+    sse: (reqBody) => ({
+      id: 'mock-slow', object: 'chat.completion.chunk', created: Date.now() / 1000 | 0,
+      model: reqBody.model || 'mock-model',
+      choices: [{ index: 0, delta: { role: 'assistant', content: 'Slow generation completed successfully' }, finish_reason: null }],
+    }),
+    finish: 'stop',
+  },
+  // Case: o3-mini capability effort echo (Issue #27)
+  o3_mini: {
+    match: (b) => b.model === 'o3-mini',
+    sse: (reqBody) => {
+      const effort = reqBody.reasoning_effort || (reqBody.reasoning && reqBody.reasoning.effort) || 'missing';
+      return {
+        id: 'mock-o3', object: 'chat.completion.chunk', created: Date.now() / 1000 | 0,
+        model: reqBody.model || 'o3-mini',
+        choices: [{ index: 0, delta: { role: 'assistant', content: 'o3-mini effort clipped to: ' + effort }, finish_reason: null }],
+      };
+    },
+    finish: 'stop',
+  },
 };
+
 
 function sseChunk(obj) { return 'data: ' + JSON.stringify(obj) + '\n\n'; }
 
@@ -129,6 +179,35 @@ const server = http.createServer((req, res) => {
     if (url.pathname === '/health') {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       res.end('OK\n');
+      return;
+    }
+    if (url.pathname === '/v1/models' || url.pathname === '/models') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        object: 'list',
+        data: [
+          {
+            id: 'mock-model',
+            object: 'model',
+            max_tokens: 4096,
+            supported_efforts: ['low', 'medium', 'high'],
+            reasoning: {
+              mandatory: false,
+              supported_efforts: ['low', 'medium', 'high'],
+              max_tokens: 2048,
+            },
+          },
+          {
+            id: 'o3-mini',
+            object: 'model',
+            max_tokens: 8192,
+            reasoning: {
+              mandatory: true,
+              supported_efforts: ['low', 'medium', 'high'],
+            },
+          },
+        ],
+      }));
       return;
     }
     if (url.pathname === '/v1/images/generations' || url.pathname === '/images/generations') {
@@ -195,26 +274,34 @@ const server = http.createServer((req, res) => {
         return;
       }
     }
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
-    if (parsed.stream === false) {
-      // Non-streaming response
-      res.end(JSON.stringify({
-        id: 'mock-ns', object: 'chat.completion', created: Date.now() / 1000 | 0,
-        model: parsed.model || 'mock-model',
-        choices: [{ index: 0, message: { role: 'assistant', content: 'NONSTREAM-OK' }, finish_reason: chosen.finish }],
-        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
-      }));
-      return;
+    const sendResponse = () => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+      if (parsed.stream === false) {
+        // Non-streaming response
+        res.end(JSON.stringify({
+          id: 'mock-ns', object: 'chat.completion', created: Date.now() / 1000 | 0,
+          model: parsed.model || 'mock-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'NONSTREAM-OK' }, finish_reason: chosen.finish }],
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        }));
+        return;
+      }
+      // SSE streaming: role chunk → content chunk → finish chunk → [DONE]
+      const rb = chosen.sse(parsed);
+      res.write(sseChunk(rb));
+      const finishChunk = { id: rb.id, object: 'chat.completion.chunk', created: rb.created, model: rb.model,
+        choices: [{ index: 0, delta: {}, finish_reason: chosen.finish }] };
+      res.write(sseChunk(finishChunk));
+      res.write(sseChunk({ id: rb.id, object: 'chat.completion.chunk', created: rb.created, model: rb.model,
+        choices: [], usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 } }));
+      res.end('data: [DONE]\n\n');
+    };
+
+    if (chosen.delayMs) {
+      setTimeout(sendResponse, chosen.delayMs);
+    } else {
+      sendResponse();
     }
-    // SSE streaming: role chunk → content chunk → finish chunk → [DONE]
-    const rb = chosen.sse(parsed);
-    res.write(sseChunk(rb));
-    const finishChunk = { id: rb.id, object: 'chat.completion.chunk', created: rb.created, model: rb.model,
-      choices: [{ index: 0, delta: {}, finish_reason: chosen.finish }] };
-    res.write(sseChunk(finishChunk));
-    res.write(sseChunk({ id: rb.id, object: 'chat.completion.chunk', created: rb.created, model: rb.model,
-      choices: [], usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 } }));
-    res.end('data: [DONE]\n\n');
   });
 });
 server.listen(PORT, '127.0.0.1', () => console.log('[mock] listening on 127.0.0.1:' + PORT));
