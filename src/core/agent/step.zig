@@ -1172,6 +1172,7 @@ pub fn executeStep(
     defer if (p4_note) |n| self.alloc.free(n);
     defer if (p4_blocks) |b| self.alloc.free(b);
 
+    const gen_start_ms = utils.milliTimestamp();
     var response = try self.sendToBackend(
         act_id,
         self.config.system_prompt,
@@ -1180,6 +1181,23 @@ pub fn executeStep(
         text_cb,
         think_cb,
     );
+    const gen_end_ms = utils.milliTimestamp();
+    const gen_duration_ms: u64 = if (gen_end_ms >= gen_start_ms) @intCast(gen_end_ms - gen_start_ms) else 0;
+
+    if (self.config.slow_turn_threshold_secs > 0 and gen_duration_ms >= @as(u64, self.config.slow_turn_threshold_secs) * 1000) {
+        if (self.journal) |*j| {
+            var desc_buf: [128]u8 = undefined;
+            const desc = std.fmt.bufPrint(&desc_buf, "Generation latency {d}ms exceeded threshold {d}s", .{ gen_duration_ms, self.config.slow_turn_threshold_secs }) catch "Generation latency exceeded threshold";
+            j.recordEvent(self.io, act_id, .act_generation_slow, desc) catch {};
+        }
+        main.stderrPrint("\x1b[33m[agent] ⚠ Slow generation: act {d} took {d}.{d}s (threshold: {d}s)\x1b[0m\n", .{
+            act_id,
+            gen_duration_ms / 1000,
+            (gen_duration_ms % 1000) / 100,
+            self.config.slow_turn_threshold_secs,
+        });
+    }
+
     main.resetThinkState();
     if (signals.isInterrupted() or self.coordinator.isTimedOut()) {
         response.deinit();

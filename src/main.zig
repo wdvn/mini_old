@@ -23,6 +23,7 @@ pub const backends = struct {
     pub const provider_mod = @import("backends/provider.zig");
     pub const js_provider = @import("backends/js_provider.zig");
     pub const thinking_filter_mod = @import("backends/thinking_filter.zig");
+    pub const capabilities_mod = @import("backends/capabilities.zig");
 };
 pub const tools_mod = @import("tooling/registry.zig");
 pub const session_diagnostics = @import("tools/session_diagnostics.zig");
@@ -708,6 +709,7 @@ test {
     _ = @import("core/history/compat.zig");
     _ = @import("core/history/backup.zig");
     _ = @import("backends/openai.zig");
+    _ = @import("backends/capabilities.zig");
     _ = @import("core/journal.zig");
     _ = @import("core/protocol.zig");
     _ = @import("core/json.zig");

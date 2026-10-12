@@ -31,6 +31,7 @@ const http_lib = @import("../lib/http_request.zig");
 const main = @import("../main.zig");
 const utils = @import("../core/utils.zig");
 const provider = @import("provider.zig");
+const capabilities = @import("capabilities.zig");
 const JsProviderAdapter = @import("js_provider.zig").JsProviderAdapter;
 const ThinkingFilter = @import("thinking_filter.zig").Filter;
 
@@ -94,6 +95,8 @@ pub const Client = struct {
     cached_protocol: ?ProtocolMode,
     /// Dynamic reasoning effort override for next request ("minimal" | "low" | "medium" | "high" | "none" | null).
     active_reasoning_effort: ?[]const u8,
+    /// Dynamic reasoning max tokens override for next request (null = use effort or default).
+    active_reasoning_max_tokens: ?u32 = null,
     /// Provider key for wire protocol quirks normalization.
     provider_key: []const u8 = "generic",
     /// Explicit trusted adapter source; never loaded from model output.
@@ -124,6 +127,11 @@ pub const Client = struct {
         self.active_reasoning_effort = effort;
     }
 
+    /// Set dynamic reasoning max tokens override.
+    pub fn setReasoningMaxTokens(self: *Client, max_tokens: ?u32) void {
+        self.active_reasoning_max_tokens = max_tokens;
+    }
+
     /// Idle watchdog timeout scaled by active reasoning effort.
     /// low/minimal → tight window (routine acts finish fast); high → generous.
     fn effectiveIdleTimeout(self: *const Client) u32 {
@@ -148,12 +156,13 @@ pub const Client = struct {
 
     /// Initialize client with explicit provider key and protocol mode.
     pub fn initWithProvider(alloc: Allocator, base_url: []const u8, api_key: []const u8, api_header: []const u8, model: []const u8, max_tokens: u32, protocol_mode: ProtocolMode, provider_key: []const u8) Client {
+        const norm_model = capabilities.normalizeModelAlias(model);
         return .{
             .alloc = alloc,
             .base_url = base_url,
             .api_key = api_key,
             .api_header = api_header,
-            .model = model,
+            .model = norm_model,
             .max_tokens = max_tokens,
             .use_completion_tokens = false,
             .disable_reasoning_effort = false,
@@ -161,6 +170,7 @@ pub const Client = struct {
             .protocol_mode = protocol_mode,
             .cached_protocol = null,
             .active_reasoning_effort = null,
+            .active_reasoning_max_tokens = null,
             .provider_key = provider_key,
         };
     }
@@ -206,9 +216,9 @@ pub const Client = struct {
     ) ![]const u8 {
         // PSEUDOCODE: Build protocol-appropriate JSON request body and run adapter transform.
         const native_body = if (active_protocol == .responses)
-            try buildResponsesRequestBody(self.alloc, self.model, self.max_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, system_prompt, msgs, tools, profile)
+            try buildResponsesRequestBody(self.alloc, self.model, self.max_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, self.active_reasoning_max_tokens, system_prompt, msgs, tools, profile)
         else
-            try buildRequestBodyWithProfile(self.alloc, profile, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, self.disable_stream_options, system_prompt, msgs, tools);
+            try buildRequestBodyWithProfile(self.alloc, profile, self.model, self.max_tokens, self.use_completion_tokens, self.disable_reasoning_effort, self.active_reasoning_effort, self.active_reasoning_max_tokens, self.disable_stream_options, system_prompt, msgs, tools);
         defer self.alloc.free(native_body);
         return try self.transformBody(adapter, native_body);
     }
@@ -388,11 +398,18 @@ fn appendResponsesReasoning(
     w: *utils.BufWriter,
     disable_reasoning_effort: bool,
     reasoning_effort: ?[]const u8,
+    reasoning_max_tokens: ?u32,
+    max_tokens: u32,
     profile: provider.ProviderProfile,
 ) !void {
     // PSEUDOCODE: Write Responses API reasoning object if provider supports it.
+    // If reasoning_max_tokens is given, emit {"max_tokens": ...}.
+    // Otherwise emit {"effort": ...}. Never emit both at once.
     if (disable_reasoning_effort or profile.reasoning_param == .unsupported) return;
-    if (reasoning_effort) |effort| {
+    if (reasoning_max_tokens) |rmt| {
+        const guarded_rmt = @min(rmt, max_tokens);
+        try w.print(",\"reasoning\":{{\"max_tokens\":{d}}}", .{guarded_rmt});
+    } else if (reasoning_effort) |effort| {
         if (!std.mem.eql(u8, effort, "none")) {
             try w.print(",\"reasoning\":{{\"effort\":\"{s}\"}}", .{effort});
         }
@@ -482,6 +499,7 @@ pub fn buildResponsesRequestBody(
     max_tokens: u32,
     disable_reasoning_effort: bool,
     reasoning_effort: ?[]const u8,
+    reasoning_max_tokens: ?u32,
     system_prompt: []const u8,
     msgs: []const proto.Message,
     tools: []const proto.ToolDefinition,
@@ -490,10 +508,9 @@ pub fn buildResponsesRequestBody(
     var buf = utils.BufWriter.init(alloc);
     errdefer buf.deinit();
     const w = &buf;
-    _ = max_tokens;
 
     try w.print("{{\"model\":\"{s}\",\"stream\":true", .{model});
-    try appendResponsesReasoning(w, disable_reasoning_effort, reasoning_effort, profile);
+    try appendResponsesReasoning(w, disable_reasoning_effort, reasoning_effort, reasoning_max_tokens, max_tokens, profile);
 
     if (system_prompt.len > 0) {
         const escaped_sys = try json.escape(alloc, system_prompt);
@@ -514,10 +531,19 @@ fn resolveReasoningEffortStr(
     profile: provider.ProviderProfile,
     disable_reasoning_effort: bool,
     reasoning_effort: ?[]const u8,
+    reasoning_max_tokens: ?u32,
+    max_tokens: u32,
     buf: *[64]u8,
 ) []const u8 {
     // PSEUDOCODE: Format reasoning_effort or reasoning object string based on profile.
     if (disable_reasoning_effort or profile.reasoning_param == .unsupported) return "";
+    if (reasoning_max_tokens) |rmt| {
+        const guarded_rmt = @min(rmt, max_tokens);
+        return switch (profile.reasoning_param) {
+            .nested_reasoning_object, .top_level_effort => std.fmt.bufPrint(buf, "\"reasoning\":{{\"max_tokens\":{d}}},", .{guarded_rmt}) catch "",
+            .unsupported => "",
+        };
+    }
     const effort = reasoning_effort orelse return "";
     if (std.mem.eql(u8, effort, "none")) return "";
     return switch (profile.reasoning_param) {
@@ -682,6 +708,7 @@ pub fn buildRequestBodyWithProfile(
     use_completion_tokens: bool,
     disable_reasoning_effort: bool,
     reasoning_effort: ?[]const u8,
+    reasoning_max_tokens: ?u32,
     disable_stream_options: bool,
     system_prompt: []const u8,
     msgs: []const proto.Message,
@@ -692,7 +719,7 @@ pub fn buildRequestBodyWithProfile(
     const w = &buf;
 
     var reasoning_buf: [64]u8 = undefined;
-    const reasoning_effort_str = resolveReasoningEffortStr(profile, disable_reasoning_effort, reasoning_effort, &reasoning_buf);
+    const reasoning_effort_str = resolveReasoningEffortStr(profile, disable_reasoning_effort, reasoning_effort, reasoning_max_tokens, max_tokens, &reasoning_buf);
     const effective_stream_opts = !disable_stream_options and profile.supports_stream_options;
     const stream_opts_str = if (effective_stream_opts) ",\"stream_options\":{\"include_usage\":true}" else "";
 
@@ -742,6 +769,7 @@ pub fn buildRequestBody(
         use_completion_tokens,
         disable_reasoning_effort,
         reasoning_effort,
+        null,
         disable_stream_options,
         system_prompt,
         msgs,
@@ -1835,7 +1863,7 @@ test "openai auto-negotiation: buildResponsesRequestBody format" {
         .{ .name = "bash", .description = "Run shell", .input_schema_json = "{\"type\":\"object\"}" },
     };
 
-    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, null, "System instructions", &msgs, &tools, provider.getProfile("openai"));
+    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, null, null, "System instructions", &msgs, &tools, provider.getProfile("openai"));
     defer alloc.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-5.6-terra\"") != null);
@@ -1931,7 +1959,7 @@ test "openai auto-negotiation: buildResponsesRequestBody multi-turn with functio
         .{ .name = "bash", .description = "Run shell", .input_schema_json = "{\"type\":\"object\"}" },
     };
 
-    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-luna", 4096, false, null, "System prompt", &msgs, &tools, provider.getProfile("openai"));
+    const body = try buildResponsesRequestBody(alloc, "gpt-5.6-luna", 4096, false, null, null, "System prompt", &msgs, &tools, provider.getProfile("openai"));
     defer alloc.free(body);
 
     // Verify correct input format generated: user msg -> assistant text -> assistant function_call -> function_call_output
@@ -2019,19 +2047,25 @@ test "openai dynamic reasoning_effort in buildResponsesRequestBody" {
     const tools = [_]proto.ToolDefinition{};
 
     // 1. With reasoning_effort = "low"
-    const body_low = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "low", "", &msgs, &tools, provider.getProfile("openai"));
+    const body_low = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "low", null, "", &msgs, &tools, provider.getProfile("openai"));
     defer alloc.free(body_low);
     try testing.expect(std.mem.indexOf(u8, body_low, "\"reasoning\":{\"effort\":\"low\"}") != null);
 
     // 2. With reasoning_effort = "high"
-    const body_high = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "high", "", &msgs, &tools, provider.getProfile("openai"));
+    const body_high = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "high", null, "", &msgs, &tools, provider.getProfile("openai"));
     defer alloc.free(body_high);
     try testing.expect(std.mem.indexOf(u8, body_high, "\"reasoning\":{\"effort\":\"high\"}") != null);
 
     // 3. With default null (falls back to medium)
-    const body_default = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, null, "", &msgs, &tools, provider.getProfile("openai"));
+    const body_default = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, null, null, "", &msgs, &tools, provider.getProfile("openai"));
     defer alloc.free(body_default);
     try testing.expect(std.mem.indexOf(u8, body_default, "\"reasoning\":{\"effort\":\"medium\"}") != null);
+
+    // 4. With reasoning_max_tokens set: emits {"max_tokens": ...} and omits effort (never both at once)
+    const body_rmt = try buildResponsesRequestBody(alloc, "gpt-5.6-terra", 4096, false, "high", 2048, "", &msgs, &tools, provider.getProfile("openai"));
+    defer alloc.free(body_rmt);
+    try testing.expect(std.mem.indexOf(u8, body_rmt, "\"reasoning\":{\"max_tokens\":2048}") != null);
+    try testing.expect(std.mem.indexOf(u8, body_rmt, "\"effort\"") == null);
 }
 
 test "openai stream: Responses API embedded type in data without event prefix (OpenRouter style)" {
@@ -2083,7 +2117,7 @@ test "openai buildResponsesRequestBody: unsupported reasoning_param omits reason
 
     // Profile-pinned .unsupported reasoning_param (deepseek) must never
     // emit any reasoning field, even when forced onto the Responses API.
-    const body = try buildResponsesRequestBody(alloc, "deepseek-chat", 4096, false, "high", "", &msgs, &tools, provider.getProfile("deepseek"));
+    const body = try buildResponsesRequestBody(alloc, "deepseek-chat", 4096, false, "high", null, "", &msgs, &tools, provider.getProfile("deepseek"));
     defer alloc.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "reasoning") == null);

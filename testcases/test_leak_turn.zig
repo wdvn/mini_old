@@ -1,67 +1,62 @@
+//! test_leak_turn.zig — Memory leak verification on exit (Issue #23).
+//!
+//! Asserts that AgentLoop, Config, and LineEditor clean up all allocated memory
+//! through DebugAllocator(.{ .stack_trace_frames = 16 }) yielding LeakState.no_leak.
+
 const std = @import("std");
-const config_mod = @import("../src/core/config.zig");
-const agent_mod = @import("../src/core/agent/loop.zig");
-const ui_repl = @import("../src/ui/repl.zig");
+const mini = @import("mini");
+const config_mod = mini.config_mod;
+const agent_mod = mini.agent_mod;
+const ui_editor = mini.editor_mod;
 
-test "issue #23: AgentLoop init/deinit leaves no DebugAllocator leak (empty stack trace case)" {
+test "issue #23: AgentLoop and Config init/deinit leave no DebugAllocator leak" {
     // PSEUDOCODE:
-    // 1. Wrap everything in DebugAllocator with 16 stack frames so real leaks
-    //    carry diagnostic stack traces (issue #23 complains about "(empty stack trace)").
-    // 2. Init config + agent the same way main() does.
-    // 3. Deinit everything and assert .no_leak.
+    // 1. Wrap allocations in DebugAllocator with 16 stack trace frames.
+    // 2. Initialize and deinitialize environ, config, and agent in an inner block.
+    // 3. Assert gpa.deinit() returns .no_leak.
     var gpa = std.heap.DebugAllocator(.{ .stack_trace_frames = 16 }){};
     const alloc = gpa.allocator();
 
-    const io = std.Io.File.stdout();
-    var environ = try std.process.getEnvMap(alloc);
-    defer environ.deinit();
+    {
+        const io = std.testing.io;
+        var env_map = std.process.Environ.Map.init(alloc);
+        defer env_map.deinit();
+        try env_map.put("OPENAI_COMPAT_URL", "http://127.0.0.1:1/v1");
 
-    var cfg = try config_mod.Config.init(alloc, io, environ, null);
-    defer cfg.deinit(alloc);
+        var cfg = try config_mod.Config.load(alloc, &env_map, io);
+        defer cfg.deinit(alloc);
 
-    var agent = try agent_mod.AgentLoop.init(alloc, io, &cfg);
-    defer agent.deinit();
-
-    try std.testing.expectEqual(
-        std.heap.DebugAllocator(.{ .stack_trace_frames = 16 }).LeakState.no_leak,
-        gpa.deinit(),
-    );
-}
-
-test "issue #23: leak detector reports stack traces (diagnostics baseline)" {
-    // PSEUDOCODE:
-    // 1. Confirm DebugAllocator captures stack traces for a real leak so the
-    //    "(empty stack trace)" symptom in the issue is distinguishable from
-    //    intentional process-exit arenas.
-    // 2. Deliberately drop an allocation.
-    var gpa = std.heap.DebugAllocator(.{ .stack_trace_frames = 16 }){};
-    const alloc = gpa.allocator();
-
-    const dropped = try alloc.dupe(u8, "deliberately dropped for diagnostics");
-    _ = dropped; // intentionally dropped
-
-    try std.testing.expectEqual(
-        std.heap.DebugAllocator(.{ .stack_trace_frames = 16 }).LeakState.leak,
-        gpa.deinit(),
-    );
-}
-
-test "AgentLoop deinit leak test" {
-    var gpa = std.heap.DebugAllocator(.{ .stack_trace_frames = 16 }){};
-    defer {
-        const leaked = gpa.deinit();
-        if (leaked == .leak) std.debug.print("Memory leaked!\n", .{});
+        var agent = try agent_mod.AgentLoop.init(alloc, io, &cfg);
+        defer agent.deinit();
     }
+
+    try std.testing.expectEqual(std.heap.Check.ok, gpa.deinit());
+}
+
+test "issue #23: LineEditor init/deinit leaves no DebugAllocator leak with edits and kills" {
+    // PSEUDOCODE:
+    // 1. Create LineEditor with DebugAllocator.
+    // 2. Perform insertions, undos, and kill_ring pushes past circular buffer wrap-around.
+    // 3. Deinit LineEditor and assert gpa.deinit() returns .no_leak.
+    var gpa = std.heap.DebugAllocator(.{ .stack_trace_frames = 16 }){};
     const alloc = gpa.allocator();
-    
-    // Simulate init
-    const io = std.Io.File.stdout();
-    var environ = try std.process.getEnvMap(alloc);
-    defer environ.deinit();
 
-    var cfg = try config_mod.Config.init(alloc, io, environ, null);
-    defer cfg.deinit(alloc);
+    {
+        var editor = ui_editor.LineEditor.init(alloc);
+        defer editor.deinit();
 
-    var agent = try agent_mod.AgentLoop.init(alloc, io, &cfg);
-    defer agent.deinit();
+        for (0..20) |i| {
+            var buf: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "kill item {d}", .{i}) catch unreachable;
+            editor.killPush(s);
+        }
+
+        try editor.buf.appendSlice(alloc, "test edit buffer");
+        editor.pushUndo();
+        try editor.buf.appendSlice(alloc, " extra");
+        editor.pushUndo();
+        _ = editor.applyUndo();
+    }
+
+    try std.testing.expectEqual(std.heap.Check.ok, gpa.deinit());
 }

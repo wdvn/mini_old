@@ -174,6 +174,22 @@ pub fn build(b: *std.Build) void {
     const test_connect_step = b.step("test-connect", "Run connect/interrupt regression tests only");
     test_connect_step.dependOn(&run_connect_tests.step);
 
+    // 3e. Leak detection tests (issue #23)
+    const leak_mod = b.createModule(.{
+        .root_source_file = b.path("testcases/test_leak_turn.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    leak_mod.addImport("mini", test_mod);
+    leak_mod.addIncludePath(qjs_path);
+    leak_mod.linkLibrary(qjs_lib);
+    leak_mod.addOptions("build_info", build_info);
+    const leak_tests = b.addTest(.{ .root_module = leak_mod });
+    const run_leak_tests = b.addRunArtifact(leak_tests);
+    const test_leak_step = b.step("test-leak", "Run issue #23 memory leak regression tests");
+    test_leak_step.dependOn(&run_leak_tests.step);
+
     // 4. Linux parent-death regression for managed process groups
     const parent_death_exe = b.addExecutable(.{
         .name = "test-process-parent-death",
@@ -218,6 +234,7 @@ pub fn build(b: *std.Build) void {
     test_unit_step.dependOn(&run_ws_ctx_tests.step);
     test_unit_step.dependOn(&run_deferred_tests.step);
     test_unit_step.dependOn(&run_connect_tests.step);
+    test_unit_step.dependOn(&run_leak_tests.step);
     test_unit_step.dependOn(&run_parent_death.step);
 
     // 3. E2E tests with mock LLM server
