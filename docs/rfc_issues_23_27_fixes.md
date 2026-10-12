@@ -4,11 +4,11 @@
 
 | Issue | Title | Status |
 |-------|-------|--------|
-| #23 | memory leak on exit: DebugAllocator leak errors with empty stack traces | 🟡 In progress - needs investigation |
+| #23 | memory leak on exit: DebugAllocator leak errors with empty stack traces | ✅ Done (LineEditor.deinit kill_ring circular unroll fixed; tests pass with Check.ok) |
 | #24 | journal: lưu usage (input/output/reasoning_tokens) vào delta của act_completed | ✅ Done |
 | #25 | agent: nudge + cap retry cho response thinking_only (missing_terminal_event) | ✅ Done |
 | #26 | ui: session_diagnostics thêm section "Thinking profile" từ journal hiện có | ✅ Done |
-| #27 | agent: thinking budget + cảnh báo latency cho turns generation > threshold | 🔴 Not started |
+| #27 | agent: thinking budget + cảnh báo latency cho turns generation > threshold | ✅ Done (latency warning, capabilities cache, effort clipping, max_tokens guard, alias normalization) |
 | #28 | backend: decision-model adapter | ⏭ Deferred (blocked on #27 per issue description) |
 
 ## Evidence for #24/#25/#26 being done

@@ -190,6 +190,22 @@ pub fn build(b: *std.Build) void {
     const test_leak_step = b.step("test-leak", "Run issue #23 memory leak regression tests");
     test_leak_step.dependOn(&run_leak_tests.step);
 
+    // 3f. Capabilities testcases (issue #27)
+    const capabilities_mod = b.createModule(.{
+        .root_source_file = b.path("testcases/test_capabilities.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    capabilities_mod.addImport("mini", test_mod);
+    capabilities_mod.addIncludePath(qjs_path);
+    capabilities_mod.linkLibrary(qjs_lib);
+    capabilities_mod.addOptions("build_info", build_info);
+    const capabilities_tests = b.addTest(.{ .root_module = capabilities_mod });
+    const run_capabilities_tests = b.addRunArtifact(capabilities_tests);
+    const test_capabilities_step = b.step("test-capabilities", "Run issue #27 model capabilities tests");
+    test_capabilities_step.dependOn(&run_capabilities_tests.step);
+
     // 4. Linux parent-death regression for managed process groups
     const parent_death_exe = b.addExecutable(.{
         .name = "test-process-parent-death",
@@ -235,6 +251,7 @@ pub fn build(b: *std.Build) void {
     test_unit_step.dependOn(&run_deferred_tests.step);
     test_unit_step.dependOn(&run_connect_tests.step);
     test_unit_step.dependOn(&run_leak_tests.step);
+    test_unit_step.dependOn(&run_capabilities_tests.step);
     test_unit_step.dependOn(&run_parent_death.step);
 
     // 3. E2E tests with mock LLM server

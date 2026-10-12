@@ -15,5 +15,6 @@ test "issue #23: AgentLoop init/deinit leaves no DebugAllocator leak (empty stac
         var agent = try agent_mod.AgentLoop.init(alloc, io, &cfg);
         defer agent.deinit();
     }
-    try std.testing.expectEqual(std.heap.DebugAllocator(.{ .stack_trace_frames = 16 }).LeakState.no_leak, gpa.deinit());
+    try std.testing.expectEqual(std.heap.Check.ok, gpa.deinit());
 }
+

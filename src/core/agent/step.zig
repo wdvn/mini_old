@@ -23,6 +23,7 @@ const AgentLoop = loop_mod.AgentLoop;
 const prompts_mod = @import("../prompts.zig");
 const history_mod = @import("../history.zig");
 const agent_loop_monitor = @import("loop_monitor.zig");
+const capabilities = @import("../../backends/capabilities.zig");
 
 pub const StepResult = proto.ActTransition;
 
@@ -201,6 +202,7 @@ pub fn modulateReasoningEffort(loop: *AgentLoop, act_id: usize) void {
 
     var effective_effort: ?[]const u8 = loop.config.reasoning_effort;
     var effective_budget: ?u32 = loop.config.thinking_budget_tokens;
+    var effective_reasoning_max: ?u32 = loop.config.reasoning_max_tokens;
 
     // Priority 1: Explicit JS override via mini.setThinking
     if (js_bindings.consumePendingThinkingOverride()) |override| {
@@ -227,6 +229,34 @@ pub fn modulateReasoningEffort(loop: *AgentLoop, act_id: usize) void {
         effective_budget = decision.budget;
     }
 
+    // Lookup model capability (from cache or /models)
+    if (loop.backend == .openai and loop.config.openai_compat_url != null) {
+        if (capabilities.fetchOrLookupCapability(
+            loop.alloc,
+            loop.io,
+            loop.config.openai_compat_url.?,
+            loop.config.openai_compat_key orelse "",
+            loop.config.openai_compat_api_header,
+            loop.backend.model(),
+        )) |cap| {
+            effective_effort = cap.clipEffort(effective_effort);
+            if (cap.reasoning_max_tokens) |rmt| {
+                if (effective_reasoning_max == null or effective_reasoning_max.? > rmt) {
+                    effective_reasoning_max = rmt;
+                }
+            }
+        }
+    }
+
+    // Guard reasoning_max_tokens if set
+    if (effective_reasoning_max) |rmt| {
+        effective_reasoning_max = capabilities.ModelCapability.guardReasoningMaxTokens(
+            rmt,
+            loop.config.max_tokens,
+            loop.backend == .claude,
+        );
+    }
+
     // PSEUDOCODE: Clamp thinking budget to 85% of max_tokens so the response
     // always keeps >=15% headroom for answer / tool-call payload.
     effective_budget = capThinkingBudget(loop.config.max_tokens, effective_budget);
@@ -236,6 +266,7 @@ pub fn modulateReasoningEffort(loop: *AgentLoop, act_id: usize) void {
 
     loop.backend.setReasoningEffort(effective_effort);
     loop.backend.setThinkingBudget(effective_budget);
+    loop.backend.setReasoningMaxTokens(effective_reasoning_max);
     chat_stream.active_effort = effective_effort;
 }
 
@@ -739,6 +770,9 @@ fn handleResponseRecovery(
         }
 
         try loop.history.addUser(advisory);
+        if (!utils.isSubagent()) {
+            main.stderrPrint("\x1b[33m[agent] ⚠️ {s}\x1b[0m\n", .{advisory});
+        }
 
         // P0-B: when a thinking-only response was truncated at max_tokens, append a
         // short UTF-8-safe tail of the reasoning so the model resumes instead of

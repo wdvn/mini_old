@@ -207,9 +207,9 @@ pub const CapabilityCache = struct {
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
-            self.alloc.free(entry.value_ptr.id);
+            if (entry.value_ptr.id.len > 0) self.alloc.free(entry.value_ptr.id);
             for (entry.value_ptr.supported_efforts) |eff| self.alloc.free(eff);
-            self.alloc.free(entry.value_ptr.supported_efforts);
+            if (entry.value_ptr.supported_efforts.len > 0) self.alloc.free(entry.value_ptr.supported_efforts);
         }
         self.entries.deinit(self.alloc);
     }
@@ -225,6 +225,12 @@ pub const CapabilityCache = struct {
         const norm = normalizeModelAlias(model);
         while (!self.mu.tryLock()) {}
         defer self.mu.unlock();
+        if (self.entries.fetchRemove(norm)) |old| {
+            self.alloc.free(old.key);
+            if (old.value.id.len > 0) self.alloc.free(old.value.id);
+            for (old.value.supported_efforts) |eff| self.alloc.free(eff);
+            if (old.value.supported_efforts.len > 0) self.alloc.free(old.value.supported_efforts);
+        }
         const key_dup = try self.alloc.dupe(u8, norm);
         errdefer self.alloc.free(key_dup);
         try self.entries.put(self.alloc, key_dup, cap);
@@ -286,32 +292,175 @@ pub fn fetchOrLookupCapability(
         break :blk std.fmt.bufPrint(&url_buf, "{s}/models", .{clean}) catch return null;
     };
 
-    var headers_buf: [2]http_lib.Header = undefined;
-    var header_count: usize = 0;
-    if (api_key.len > 0) {
-        var auth_buf: [256]u8 = undefined;
-        const auth_val: []const u8 = if (std.mem.eql(u8, api_header, "Authorization"))
-            std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch api_key
-        else
-            api_key;
-        headers_buf[0] = .{ .name = api_header, .value = auth_val };
-        header_count += 1;
-    }
+    var headers_json_buf: [512]u8 = undefined;
+    const headers_json: ?[]const u8 = if (api_key.len > 0) blk: {
+        if (std.mem.eql(u8, api_header, "Authorization")) {
+            break :blk std.fmt.bufPrint(&headers_json_buf, "{{\"Authorization\":\"Bearer {s}\"}}", .{api_key}) catch null;
+        } else {
+            break :blk std.fmt.bufPrint(&headers_json_buf, "{{\"{s}\":\"{s}\"}}", .{ api_header, api_key }) catch null;
+        }
+    } else null;
 
-    const resp = http_lib.fetch(alloc, io, .{
+    var resp = http_lib.fetch(alloc, io, .{
         .url = models_url,
-        .method = .GET,
-        .headers = headers_buf[0..header_count],
+        .method = "GET",
+        .headers_json = headers_json,
         .timeout_s = 5,
-    }) catch return null;
+    }) catch {
+        if (alloc.dupe(u8, model_id)) |id_dup| {
+            cache.put(model_id, .{ .id = id_dup }) catch self_err: {
+                alloc.free(id_dup);
+                break :self_err;
+            };
+        } else |_| {}
+        return null;
+    };
     defer resp.deinit(alloc);
 
-    if (resp.status != 200) return null;
+    if (resp.status != 200) {
+        if (alloc.dupe(u8, model_id)) |id_dup| {
+            cache.put(model_id, .{ .id = id_dup }) catch self_err: {
+                alloc.free(id_dup);
+                break :self_err;
+            };
+        } else |_| {}
+        return null;
+    }
 
     if (parseModelCapabilityFromJson(alloc, resp.body, model_id)) |cap| {
         cache.put(model_id, cap) catch {};
         return cap;
     }
 
+    if (alloc.dupe(u8, model_id)) |id_dup| {
+        cache.put(model_id, .{ .id = id_dup }) catch self_err: {
+            alloc.free(id_dup);
+            break :self_err;
+        };
+    } else |_| {}
     return null;
 }
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+test "capabilities: normalizeModelAlias strips prefixes and suffixes" {
+    try std.testing.expectEqualStrings("gpt-4o", normalizeModelAlias("~gpt-4o"));
+    try std.testing.expectEqualStrings("o3-mini", normalizeModelAlias("o3-mini~high"));
+    try std.testing.expectEqualStrings("o3-mini", normalizeModelAlias("openai/~o3-mini"));
+    try std.testing.expectEqualStrings("openai/gpt-4o", normalizeModelAlias("~openai/gpt-4o"));
+    try std.testing.expectEqualStrings("o1", normalizeModelAlias("o1~medium"));
+    try std.testing.expectEqualStrings("gpt-4o-mini", normalizeModelAlias("gpt-4o-mini"));
+}
+
+test "capabilities: clipEffort respects supported_efforts and mandatory" {
+    const supp = [_][]const u8{ "low", "medium", "high" };
+
+    // 1. Non-mandatory
+    const cap_opt = ModelCapability{
+        .id = "mock-opt",
+        .supports_reasoning = true,
+        .reasoning_mandatory = false,
+        .supported_efforts = &supp,
+    };
+    try std.testing.expectEqualStrings("high", cap_opt.clipEffort("high").?);
+    try std.testing.expectEqualStrings("low", cap_opt.clipEffort("unsupported").?);
+    try std.testing.expectEqualStrings("none", cap_opt.clipEffort("none").?);
+    try std.testing.expect(cap_opt.clipEffort(null) == null);
+
+    // 2. Mandatory
+    const cap_man = ModelCapability{
+        .id = "mock-man",
+        .supports_reasoning = true,
+        .reasoning_mandatory = true,
+        .supported_efforts = &supp,
+    };
+    try std.testing.expectEqualStrings("medium", cap_man.clipEffort("medium").?);
+    try std.testing.expectEqualStrings("low", cap_man.clipEffort("none").?);
+    try std.testing.expectEqualStrings("low", cap_man.clipEffort(null).?);
+}
+
+test "capabilities: guardReasoningMaxTokens enforces Anthropic and OpenAI constraints" {
+    // Anthropic: strictly < max_tokens
+    try std.testing.expectEqual(@as(u32, 3072), ModelCapability.guardReasoningMaxTokens(4096, 4096, true));
+    try std.testing.expectEqual(@as(u32, 2000), ModelCapability.guardReasoningMaxTokens(2000, 4096, true));
+    try std.testing.expectEqual(@as(u32, 3072), ModelCapability.guardReasoningMaxTokens(5000, 4096, true));
+
+    // OpenAI: <= max_tokens
+    try std.testing.expectEqual(@as(u32, 4096), ModelCapability.guardReasoningMaxTokens(4096, 4096, false));
+    try std.testing.expectEqual(@as(u32, 4096), ModelCapability.guardReasoningMaxTokens(5000, 4096, false));
+    try std.testing.expectEqual(@as(u32, 2048), ModelCapability.guardReasoningMaxTokens(2048, 4096, false));
+}
+
+test "capabilities: parseModelCapabilityFromJson extracts model fields" {
+    const alloc = std.testing.allocator;
+    const json_str =
+        \\{
+        \\  "object": "list",
+        \\  "data": [
+        \\    {
+        \\      "id": "gpt-4o",
+        \\      "max_tokens": 4096
+        \\    },
+        \\    {
+        \\      "id": "o3-mini",
+        \\      "max_tokens": 8192,
+        \\      "reasoning": {
+        \\        "mandatory": true,
+        \\        "max_tokens": 4096,
+        \\        "supported_efforts": ["low", "medium", "high"]
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    // Matching o3-mini via alias
+    const cap = parseModelCapabilityFromJson(alloc, json_str, "~o3-mini~high");
+    try std.testing.expect(cap != null);
+    defer {
+        alloc.free(cap.?.id);
+        for (cap.?.supported_efforts) |eff| alloc.free(eff);
+        alloc.free(cap.?.supported_efforts);
+    }
+    try std.testing.expectEqualStrings("o3-mini", cap.?.id);
+    try std.testing.expect(cap.?.reasoning_mandatory);
+    try std.testing.expectEqual(@as(?u32, 8192), cap.?.max_tokens);
+    try std.testing.expectEqual(@as(?u32, 4096), cap.?.reasoning_max_tokens);
+    try std.testing.expectEqual(@as(usize, 3), cap.?.supported_efforts.len);
+}
+
+test "capabilities: CapabilityCache put, get, and deinit leak-free" {
+    const alloc = std.testing.allocator;
+    var cache = CapabilityCache.init(alloc);
+    defer cache.deinit();
+
+    const id1 = try alloc.dupe(u8, "o3-mini");
+    const eff = try alloc.alloc([]const u8, 1);
+    eff[0] = try alloc.dupe(u8, "low");
+
+    try cache.put("o3-mini", .{
+        .id = id1,
+        .supports_reasoning = true,
+        .reasoning_mandatory = true,
+        .supported_efforts = eff,
+    });
+
+    const found = cache.get("~o3-mini");
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("o3-mini", found.?.id);
+
+    // Overwrite with new entry (verifies fetchRemove doesn't leak old entry)
+    const id2 = try alloc.dupe(u8, "o3-mini");
+    try cache.put("~o3-mini", .{
+        .id = id2,
+        .supports_reasoning = false,
+        .supported_efforts = &.{},
+    });
+
+    const updated = cache.get("o3-mini");
+    try std.testing.expect(updated != null);
+    try std.testing.expect(!updated.?.supports_reasoning);
+}
+

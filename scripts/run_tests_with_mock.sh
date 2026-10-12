@@ -200,6 +200,59 @@ run_issue24_usage_delta() {
 }
 run_issue24_usage_delta
 
+# Issue #27 E2E: slow generation alert when turn latency >= threshold
+run_issue27_slow_alert() {
+  local out rc journal
+  local slow_home="$TEMP_HOME/slow-home"
+  mkdir -p "$slow_home"
+  out=$(timeout 30 env HOME="$slow_home" MINI_HOME="$TEMP_HOME" \
+        OPENAI_COMPAT_URL="$MOCK_URL" \
+        OPENAI_COMPAT_MODEL="mock-model" \
+        OPENAI_COMPAT_API_KEY="sk-mock" \
+        OPENAI_PROTOCOL=chat \
+        MINI_SLOW_TURN_THRESHOLD_SECS=1 \
+        MINI_EXECUTION_MODE=auto \
+        MINI_NO_HISTORY=1 \
+        "$BIN" -e "slow generation test" 2>&1)
+  rc=$?
+  journal=$(find "$slow_home/.mini/sessions" -maxdepth 1 -type f -name 'journal_*.jsonl' 2>/dev/null | head -1)
+  if [[ -n "$journal" ]] && grep -F -q '"event_type":"act_generation_slow"' "$journal" && \
+     echo "$out" | grep -F -q "Slow generation"; then
+    echo "  [PASS] issue #27: slow generation alert in stderr + act_generation_slow recorded in journal"
+    PASS=$((PASS+1))
+    return
+  fi
+  echo "  [FAIL] issue #27: slow generation alert not detected (rc=$rc, journal=$journal)"
+  FAIL=$((FAIL+1))
+  [[ -n "$journal" ]] && tail -n 12 "$journal" | sed 's/^/         | /'
+  echo "$out" | head -15 | sed 's/^/         | /'
+}
+run_issue27_slow_alert
+
+# Issue #27 E2E: model capability lookup clips effort into supported_efforts and respects mandatory
+run_issue27_capability_clip() {
+  local out rc
+  out=$(timeout 30 env MINI_HOME="$TEMP_HOME" \
+        OPENAI_COMPAT_URL="$MOCK_URL" \
+        OPENAI_COMPAT_MODEL="~o3-mini" \
+        OPENAI_COMPAT_API_KEY="sk-mock" \
+        OPENAI_PROTOCOL=chat \
+        MINI_REASONING_EFFORT="none" \
+        MINI_EXECUTION_MODE=auto \
+        MINI_NO_HISTORY=1 \
+        "$BIN" -e "check o3 capability" 2>&1)
+  rc=$?
+  if echo "$out" | grep -F -q "o3-mini effort clipped to: low"; then
+    echo "  [PASS] issue #27: model capability lookup (/models) clipped effort to 'low' for mandatory model ~o3-mini"
+    PASS=$((PASS+1))
+    return
+  fi
+  echo "  [FAIL] issue #27: capability clipping failed (expected clipped effort to low)"
+  FAIL=$((FAIL+1))
+  echo "$out" | cat | sed 's/^/         | /'
+}
+run_issue27_capability_clip
+
 echo ""
 # Media vision ingestion testcase
 printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89' > "$TEMP_HOME/test_img.png"
