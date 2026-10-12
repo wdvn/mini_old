@@ -279,9 +279,9 @@ pub const definitions = [_]proto.ToolDefinition{
     },
     .{
         .name = "skills",
-        .description = "Inspect available skills (from ~/.mini/skills) and tools. operation=\"list\" lists all, operation=\"detail\" with name=<skill|tool> shows details. Skills are pre-written guidelines (SKILL.md); tools are executable functions.",
+        .description = "Inspect available skills (from ~/.mini/skills) and tools. operation=\"list\" lists all, operation=\"detail\" with name=<skill|tool> shows details. Optional file_path loads sub-resources (references/, templates/, scripts/).",
         .input_schema_json =
-        \\{"type":"object","properties":{"operation":{"type":"string","enum":["list","detail"],"description":"list or detail"},"name":{"type":"string","description":"Skill or tool name (for detail)"}},"required":[]}
+        \\{"type":"object","properties":{"operation":{"type":"string","enum":["list","detail"],"description":"list or detail"},"name":{"type":"string","description":"Skill or tool name (for detail)"},"file_path":{"type":"string","description":"Optional sub-path relative to skill folder (e.g. 'references/api.md', 'templates/spec.md')"}},"required":[]}
         ,
     },
     .{
@@ -802,14 +802,14 @@ fn containsCI(text: []const u8, kw: []const u8) bool {
 // Skills tool (lists skills from ~/.mini/skills + tools)
 // ---------------------------------------------------------------------------
 
-/// Read SKILL.md (or RULES.md) of a skill.
+/// Read SKILL.md (or sub-resource) of a skill.
 /// Returns null if unable to read.
 fn readSkillFile(alloc: Allocator, io: std.Io, skill_path: []const u8) ?[]u8 {
     const cwd = std.Io.Dir.cwd();
     const file = cwd.openFile(io, skill_path, .{}) catch return null;
     defer file.close(io);
     const stat = file.stat(io) catch return null;
-    if (stat.size == 0 or stat.size > 128 * 1024) return null;
+    if (stat.size == 0 or stat.size > skills_mod.MAX_SKILL_FILE) return null;
     const buf = alloc.alloc(u8, @intCast(stat.size)) catch return null;
     const n = utils.readAll(io, file, buf) catch {
         alloc.free(buf);
@@ -818,24 +818,78 @@ fn readSkillFile(alloc: Allocator, io: std.Io, skill_path: []const u8) ?[]u8 {
     return buf[0..n];
 }
 
+fn appendSubdirFiles(w: *utils.BufWriter, io: std.Io, dir_path: []const u8, sub: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    var parent = cwd.openDir(io, dir_path, .{}) catch return;
+    defer parent.close(io);
+    var child = parent.openDir(io, sub, .{ .iterate = true }) catch return;
+    defer child.close(io);
+
+    var it = child.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind == .file) {
+            try w.print("  - `{s}/{s}`\n", .{ sub, entry.name });
+        }
+    }
+}
+
+fn formatSkillDetail(alloc: Allocator, io: std.Io, s: *const skills_mod.SkillInfo, content: []const u8) ![]u8 {
+    var buf = utils.BufWriter.init(alloc);
+    errdefer buf.deinit();
+
+    try buf.print("## Skill: {s}\n\nPath: `{s}`\n", .{ s.name, s.path });
+    if (s.version) |v| try buf.print("Version: {s}\n", .{v});
+    if (s.author) |a| try buf.print("Author: {s}\n", .{a});
+    if (s.platforms) |p| try buf.print("Platforms: {s}\n", .{p});
+    if (s.requires_tools) |rt| try buf.print("Requires Tools: {s}\n", .{rt});
+    try buf.writeAll("\n");
+
+    if (s.has_references or s.has_templates or s.has_scripts) {
+        try buf.writeAll("### Available Sub-Resources:\n");
+        if (s.has_references) try appendSubdirFiles(&buf, io, s.dir_path, "references");
+        if (s.has_templates) try appendSubdirFiles(&buf, io, s.dir_path, "templates");
+        if (s.has_scripts) try appendSubdirFiles(&buf, io, s.dir_path, "scripts");
+        try buf.writeAll("*(To view any sub-resource, call `skills` with `operation=\"detail\"` and `file_path=\"<relative-path>\"`)*\n\n");
+    }
+
+    try buf.writeAll(content);
+    return buf.toOwnedSlice();
+}
+
 fn executeSkillDetail(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
     // PSEUDOCODE:
-    // 1. Extract required 'name' argument.
-    // 2. Search matched skill file in ~/.mini/skills and return content.
-    // 3. Fallback to tool definitions in registry.
+    // 1. Extract required 'name' argument and optional 'file_path'.
+    // 2. Search matched skill in skills_mod.
+    // 3. If file_path provided, sanitize sub-path and return sub-resource content.
+    // 4. If file_path omitted, return SKILL.md content + sub-resource manifest.
+    // 5. Fallback to tool definitions in registry.
     const name = json.findString(input_json, "name") orelse
         return std.fmt.allocPrint(alloc, "Error: 'name' field required for detail operation", .{});
+    const file_path = json.findString(input_json, "file_path");
 
     if (skills_mod.getSkills()) |skills| {
-        for (skills) |s| {
+        for (skills) |*s| {
             if (std.mem.eql(u8, s.name, name)) {
+                if (file_path) |sub| {
+                    if (sub.len > 0) {
+                        const target_path = skills_mod.sanitizeSkillSubPath(alloc, s.dir_path, sub) catch {
+                            return std.fmt.allocPrint(alloc, "Security error: invalid or unauthorized sub-path '{s}'", .{sub});
+                        };
+                        defer alloc.free(target_path);
+                        if (readSkillFile(alloc, io, target_path)) |content| {
+                            defer alloc.free(content);
+                            return std.fmt.allocPrint(
+                                alloc,
+                                "## Skill Resource: {s} ({s})\n\n{s}",
+                                .{ s.name, sub, content },
+                            );
+                        }
+                        return std.fmt.allocPrint(alloc, "Resource '{s}' not found in skill '{s}'.", .{ sub, s.name });
+                    }
+                }
                 if (readSkillFile(alloc, io, s.path)) |content| {
                     defer alloc.free(content);
-                    return std.fmt.allocPrint(
-                        alloc,
-                        "## Skill: {s}\n\nPath: `{s}`\n\n{s}",
-                        .{ s.name, s.path, content },
-                    );
+                    return formatSkillDetail(alloc, io, s, content);
                 }
                 return std.fmt.allocPrint(alloc, "Skill '{s}' exists but could not read `{s}`.", .{ s.name, s.path });
             }
@@ -853,6 +907,7 @@ fn executeSkillDetail(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u
     }
     return std.fmt.allocPrint(alloc, "Skill or tool '{s}' not found.", .{name});
 }
+
 
 fn appendMcpToolsList(w: *utils.BufWriter) !void {
     // PSEUDOCODE: Lock registry mutex, inspect registered MCP tools, and print active list.
@@ -1045,3 +1100,51 @@ test "registry: plan-aware tool filtering" {
     }
     try std.testing.expect(!has_bash);
 }
+
+test "registry: executeSkills sub-resource resolution and path traversal" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "skills/test-subres/references");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "skills/test-subres/SKILL.md",
+        .data =
+            \\---
+            \\name: test-subres
+            \\description: Testing sub resources
+            \\---
+            \\# Main Guide
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "skills/test-subres/references/spec.md",
+        .data = "# Reference Specification Content",
+    });
+
+    const real_tmp_path = try tmp.dir.realPathFileAlloc(io, "skills", alloc);
+    defer alloc.free(real_tmp_path);
+
+    var env_map = std.process.Environ.Map.init(alloc);
+    defer env_map.deinit();
+    try env_map.put("MINI_HOME", real_tmp_path[0 .. real_tmp_path.len - "/skills".len]);
+
+    const loaded = skills_mod.loadSkills(alloc, io, &env_map);
+    defer skills_mod.deinitSkills();
+    try std.testing.expect(loaded >= 1);
+
+    // 1. Query with valid file_path
+    const query_valid = "{\"operation\":\"detail\",\"name\":\"test-subres\",\"file_path\":\"references/spec.md\"}";
+    const out_valid = try executeSkills(alloc, io, query_valid);
+    defer alloc.free(out_valid);
+    try std.testing.expect(std.mem.indexOf(u8, out_valid, "Reference Specification Content") != null);
+
+    // 2. Query with path traversal attack
+    const query_bad = "{\"operation\":\"detail\",\"name\":\"test-subres\",\"file_path\":\"../secret.txt\"}";
+    const out_bad = try executeSkills(alloc, io, query_bad);
+    defer alloc.free(out_bad);
+    try std.testing.expect(std.mem.indexOf(u8, out_bad, "Security error") != null);
+}
+
