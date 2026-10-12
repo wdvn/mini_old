@@ -44,7 +44,9 @@ test {
     _ = @import("test_parse2.zig");
     _ = @import("test_rfc000_validation.zig");
     _ = @import("test_durable_task.zig");
+    _ = @import("test_skills_multitier.zig");
 }
+
 
 // ---------------------------------------------------------------------------
 // In-memory event counter hook listener (M3)
