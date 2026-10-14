@@ -73,11 +73,11 @@ test "media_gen: capability gates in registry.isPermitted" {
 test "media_gen: image_attach attaches image for turn and clearTurnAttachments resets" {
     const alloc = testing.allocator;
     const cwd = std.Io.Dir.cwd();
-    const test_dir = "zig-cache/tmp_test_media_gen";
+    const test_dir = "/tmp/test_mini_media_gen";
     cwd.createDirPath(testing.io, test_dir) catch {};
     defer cwd.deleteTree(testing.io, test_dir) catch {};
 
-    const test_img = "zig-cache/tmp_test_media_gen/sample.png";
+    const test_img = "/tmp/test_mini_media_gen/sample.png";
     const f = try cwd.createFile(testing.io, test_img, .{});
     defer f.close(testing.io);
     // Write valid 1x1 PNG
@@ -173,11 +173,11 @@ test "media_gen: CodeAct JS VM binding mini.media policy enforcement" {
 test "media_gen: CodeAct mini.media attach integrates with turn attachments" {
     const alloc = testing.allocator;
     const cwd = std.Io.Dir.cwd();
-    const test_dir = "zig-cache/tmp_test_media_codeact";
+    const test_dir = "/tmp/test_mini_media_codeact";
     cwd.createDirPath(testing.io, test_dir) catch {};
     defer cwd.deleteTree(testing.io, test_dir) catch {};
 
-    const test_img = "zig-cache/tmp_test_media_codeact/sample.png";
+    const test_img = "/tmp/test_mini_media_codeact/sample.png";
     const f = try cwd.createFile(testing.io, test_img, .{});
     defer f.close(testing.io);
     try f.writeStreamingAll(testing.io, "\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89");

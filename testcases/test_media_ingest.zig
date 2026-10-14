@@ -46,17 +46,17 @@ test "media_ingest: sniffMimeFromMagic detects formats and blocks polyglots" {
 test "media_ingest: parsePromptImages parses escaped paths and cleans prompt" {
     const alloc = testing.allocator;
     const cwd = std.Io.Dir.cwd();
-    const test_dir = "zig-cache/tmp_test_ingest";
+    const test_dir = "/tmp/test_mini_ingest";
     cwd.createDirPath(testing.io, test_dir) catch {};
     defer cwd.deleteTree(testing.io, test_dir) catch {};
 
-    const img1_name = "zig-cache/tmp_test_ingest/test_img1.png";
+    const img1_name = "/tmp/test_mini_ingest/test_img1.png";
     const f1 = try cwd.createFile(testing.io, img1_name, .{});
     defer f1.close(testing.io);
     // Write valid PNG header + IHDR
     try f1.writeStreamingAll(testing.io, "\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x10\x00\x00\x00\x10\x08\x06\x00\x00\x00");
 
-    const img2_name = "zig-cache/tmp_test_ingest/my test img2.gif";
+    const img2_name = "/tmp/test_mini_ingest/my test img2.gif";
     const f2 = try cwd.createFile(testing.io, img2_name, .{});
     defer f2.close(testing.io);
     // Write valid GIF

@@ -44,6 +44,7 @@ testcases/            — all test files (standalone, integration, benchmarks, .
 - Every `.zig` module must have a top-level doc-comment `//!` describing its responsibilities.
 - Do not add external dependencies unless discussed in a proposal — open a proposal first if necessary.
 - All test files (scratch experiments, standalone tests, benchmarks...) must be placed in `testcases/` and named `test_*.zig` (do not leave test files in the root directory).
+- Test-generated files (temp dirs, fixtures, scratch artifacts) must be created under `/tmp` (e.g. `/tmp/test_mini_<name>`, or `std.testing.tmpDir` which auto-cleans) and cleaned up via `defer` — never relative paths inside the project root (no `zig-cache/tmp_*`, no stray dirs/files in the repo).
 - Proposals/design docs belong in `docs/`, format: `rfc_NNN_<name>_proposal.md` (RFCs sequentially numbered, snake_case; e.g. `rfc_005_<topic>_proposal.md`). Reference docs retain standard snake_case naming.
 
 ## Code-Writing Workflow (MANDATORY)
