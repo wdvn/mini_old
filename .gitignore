@@ -26,3 +26,4 @@ testcases/reports/*
 .mini/
 .worktrees/
 media
+releases/
