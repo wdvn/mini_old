@@ -1,6 +1,6 @@
 # RFC-031: Multi-Tier Skills Architecture & Rich Metadata Specification
 
-- **Status**: Proposed
+- **Status**: Implemented
 - **Author**: Antigravity Pair Programming
 - **Date**: 2026-10-12
 - **Area**: Core / Tooling / Runtime

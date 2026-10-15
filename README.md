@@ -420,11 +420,12 @@ Run multiple subagents concurrently for independent tasks.
 
 ### skills
 
-List or inspect tool details.
+List or inspect skills and tool details. `operation="detail"` on a skill reads its `SKILL.md` and lists available sub-resources; `file_path` loads a sub-resource (e.g. `references/`, `templates/`, `scripts/`) with path-traversal protection. Also available in CodeAct as `mini.skill(name, file_path?)`.
 
 ```json
 { "operation": "list" }
 { "operation": "detail", "name": "bash" }
+{ "operation": "detail", "name": "kubernetes-ops", "file_path": "references/api_spec.md" }
 ```
 
 ### artifact_write / artifact_read / artifact_list
@@ -467,7 +468,10 @@ Each project can contain an `.agent/` folder at its workspace root to manage loc
 ├── config.json             # Project runtime configuration (model, tool allowlist, etc.)
 ├── skills/                 # Skills adhering to Agent Skills standard (agentskills.io)
 │   ├── codebase-analysis/
-│   │   └── SKILL.md
+│   │   ├── SKILL.md        # Entrypoint (YAML frontmatter: name, description, version, author, platforms, requires_tools)
+│   │   ├── references/     # Optional: deep technical specs, schemas
+│   │   ├── templates/      # Optional: output skeletons, prompt templates
+│   │   └── scripts/        # Optional: deterministic helper scripts
 │   └── root-cause-analysis/
 │       └── SKILL.md
 └── commands/               # Custom Slash Commands for REPL
@@ -475,7 +479,7 @@ Each project can contain an `.agent/` folder at its workspace root to manage loc
     └── deploy.md           # Invoked via /deploy
 ```
 
-- **Skills Discovery**: Agent automatically discovers and loads skills from `.agent/skills/` (workspace) alongside `~/.mini/skills/` (global).
+- **Skills Discovery**: Agent automatically discovers and loads skills from `.agent/skills/` (workspace) alongside `~/.mini/skills/` (global). Each skill supports a multi-tier layout — `SKILL.md` entrypoint plus optional `references/`, `templates/`, and `scripts/` sub-directories, with rich frontmatter metadata (`version`, `author`, `platforms`, `requires_tools`); see [RFC-031](docs/rfc_031_multi_tier_skills_proposal.md).
 - **Custom Commands**: Any markdown file in `.agent/commands/<name>.md` becomes a `/<name>` command in REPL mode.
 
 ## MCP (Model Context Protocol)
