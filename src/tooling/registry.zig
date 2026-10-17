@@ -650,17 +650,20 @@ fn toolSearchNoMatch(alloc: Allocator, query: []const u8, candidates: []const pr
             try ranked.append(alloc, .{ .name = cd.name, .dist = d });
         }
     }
-    // Insertion sort by (dist, name).
-    for (1..ranked.items.len) |i| {
-        var j = i;
-        while (j > 0) : (j -= 1) {
-            const a = ranked.items[j - 1];
-            const b = ranked.items[j];
-            if (b.dist < a.dist or (b.dist == a.dist and std.mem.lessThan(u8, b.name, a.name))) {
-                const tmp = ranked.items[j];
-                ranked.items[j] = ranked.items[j - 1];
-                ranked.items[j - 1] = tmp;
-            } else break;
+    // Insertion sort by (dist, name); skip when list has 0/1 items
+    // (1..0 underflows on usize).
+    if (ranked.items.len > 1) {
+        for (1..ranked.items.len) |i| {
+            var j = i;
+            while (j > 0) : (j -= 1) {
+                const a = ranked.items[j - 1];
+                const b = ranked.items[j];
+                if (b.dist < a.dist or (b.dist == a.dist and std.mem.lessThan(u8, b.name, a.name))) {
+                    const tmp = ranked.items[j];
+                    ranked.items[j] = ranked.items[j - 1];
+                    ranked.items[j - 1] = tmp;
+                } else break;
+            }
         }
     }
 
