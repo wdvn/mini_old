@@ -510,53 +510,78 @@ pub fn isDeferredTool(name: []const u8) bool {
 }
 
 /// Search hidden tool schemas (built-in deferred + MCP tools).
-/// Returns a JSON array of full definitions; matched tools are promoted.
+/// Returns a JSON array of full definitions ranked by relevance; matched tools are
+/// promoted. When nothing matches, returns a JSON object with a hint and a short
+/// list of closest tool names.
 fn executeToolSearch(alloc: Allocator, input_json: []const u8) ![]u8 {
     // PSEUDOCODE:
     // 1. Read query / limit from input JSON.
     // 2. Collect candidate definitions: built-in deferred tools not sent yet, then MCP tools.
-    // 3. Keep case-insensitive substring matches on name or description, capped by limit.
+    // 3. Score every candidate (name hit > description hit; word-boundary beats substring);
+    //    drop zero scores, sort by score desc, cap by limit.
     // 4. Promote every match so it stays visible for later acts.
-    // 5. Serialize matches as a JSON array of {name, description, input_schema}.
+    // 5. Zero matches -> hint + closest-candidate tool names (CI Levenshtein <= 3 on names).
     const query = json.findString(input_json, "query") orelse "";
     const limit: usize = blk: {
         const raw = json.findString(input_json, "limit") orelse "10";
         break :blk std.fmt.parseInt(usize, raw, 10) catch 10;
     };
 
-    var matches: std.ArrayListUnmanaged(proto.ToolDefinition) = .empty;
+    const Scored = struct { def: proto.ToolDefinition, score: usize };
+    var cands: std.ArrayListUnmanaged(proto.ToolDefinition) = .empty;
+    defer cands.deinit(alloc);
+    var matches: std.ArrayListUnmanaged(Scored) = .empty;
     defer matches.deinit(alloc);
 
     for (definitions) |td| {
         if (!isDeferredTool(td.name)) continue;
         if (isToolPromoted(td.name)) continue;
-        if (!toolMatchesQuery(td, query)) continue;
-        if (matches.items.len >= limit) break;
-        matches.append(alloc, td) catch break;
+        cands.append(alloc, td) catch break;
+        const score = toolQueryScore(td, query);
+        if (score > 0) matches.append(alloc, .{ .def = td, .score = score }) catch break;
     }
 
     while (!g_registry_mutex.tryLock()) {}
     const mgr = g_mcp;
     g_registry_mutex.unlock();
-    if (matches.items.len < limit) {
-        if (mgr) |m| {
-            const mcp_tools = m.getToolDefinitions(alloc);
-            defer if (mcp_tools.len > 0) alloc.free(mcp_tools);
-            for (mcp_tools) |mt| {
-                if (isToolPromoted(mt.name)) continue;
-                if (!toolMatchesQuery(mt, query)) continue;
-                if (matches.items.len >= limit) break;
-                matches.append(alloc, mt) catch break;
-            }
+    if (mgr) |m| {
+        const mcp_tools = m.getToolDefinitions(alloc);
+        defer if (mcp_tools.len > 0) alloc.free(mcp_tools);
+        for (mcp_tools) |mt| {
+            if (isToolPromoted(mt.name)) continue;
+            cands.append(alloc, mt) catch break;
+            const score = toolQueryScore(mt, query);
+            if (score > 0) matches.append(alloc, .{ .def = mt, .score = score }) catch break;
         }
     }
 
-    for (matches.items) |mt| promoteTool(mt.name);
+    if (matches.items.len == 0) {
+        return toolSearchNoMatch(alloc, query, cands.items);
+    }
+
+    // Rank: score desc, name asc as tie-break (insertion sort; lists are short).
+    for (1..matches.items.len) |i| {
+        var j = i;
+        while (j > 0) : (j -= 1) {
+            const a = matches.items[j - 1];
+            const b = matches.items[j];
+            const reorder = b.score > a.score or
+                (b.score == a.score and std.mem.lessThan(u8, b.def.name, a.def.name));
+            if (!reorder) break;
+            const tmp = matches.items[j];
+            matches.items[j] = matches.items[j - 1];
+            matches.items[j - 1] = tmp;
+        }
+    }
+    const keep = @min(matches.items.len, limit);
+
+    for (matches.items[0..keep]) |sm| promoteTool(sm.def.name);
 
     var out = utils.BufWriter.init(alloc);
     defer out.deinit();
     try out.writeAll("[");
-    for (matches.items, 0..) |mt, i| {
+    for (matches.items[0..keep], 0..) |sm, i| {
+        const mt = sm.def;
         if (i > 0) try out.writeAll(",");
         const e_name = try json.escape(alloc, mt.name);
         defer alloc.free(e_name);
@@ -571,10 +596,124 @@ fn executeToolSearch(alloc: Allocator, input_json: []const u8) ![]u8 {
     return alloc.dupe(u8, out.list.items);
 }
 
-/// Case-insensitive substring match against tool name or description.
-fn toolMatchesQuery(td: proto.ToolDefinition, query: []const u8) bool {
-    if (query.len == 0) return true;
-    return containsCI(td.name, query) or containsCI(td.description, query);
+/// Relevance score of a tool for the query (0 = no match).
+/// PSEUDOCODE:
+/// 1. Whole query case-insensitive substring: name hit (100) beats description hit (30).
+/// 2. Otherwise split the query into tokens and take the strongest token signal:
+///    name word-boundary (80) > name substring (60) > description substring (20).
+/// 3. Token word-boundary = token appears at a non-alphanumeric boundary in the name,
+///    approximated by checking the token and its underscore/hyphen variants.
+fn toolQueryScore(td: proto.ToolDefinition, query: []const u8) usize {
+    if (query.len == 0) return 0;
+    if (containsCI(td.name, query)) return 100;
+    var best: usize = 0;
+    var tok_it = std.mem.tokenizeAny(u8, query, " \t_");
+    while (tok_it.next()) |tok| {
+        if (tok.len == 0) continue;
+        var s: usize = 0;
+        if (containsCI(td.name, tok)) {
+            s = if (tokenAtWordBoundaryCI(td.name, tok)) 80 else 60;
+        } else if (containsCI(td.description, tok)) {
+            s = 20;
+        }
+        if (s > best) best = s;
+    }
+    return best;
+}
+
+/// True when the token starts at a word boundary inside text (case-insensitive).
+/// Boundaries are positions preceded by a non-alphanumeric char (e.g. "_", "-").
+fn tokenAtWordBoundaryCI(text: []const u8, token: []const u8) bool {
+    if (token.len >= text.len) return containsCI(text, token);
+    var i: usize = 0;
+    while (i + token.len <= text.len) : (i += 1) {
+        if (!containsCI(text[i .. i + token.len], token)) continue;
+        const at_start = i == 0;
+        const preceded_by_sep = i > 0 and !std.ascii.isAlphanumeric(text[i - 1]);
+        if (at_start or preceded_by_sep) return true;
+    }
+    return false;
+}
+
+/// Zero-match response for tool_search: a JSON object with a recovery hint and a
+/// short list of closest tool names (case-insensitive Levenshtein distance <= 3).
+fn toolSearchNoMatch(alloc: Allocator, query: []const u8, candidates: []const proto.ToolDefinition) ![]u8 {
+    // PSEUDOCODE:
+    // 1. Rank candidate tool names by CI Levenshtein distance to the query.
+    // 2. Keep names within distance 3 (at most 5).
+    // 3. Emit {"no_match":true, "hint":"...", "closest_names":[...]} JSON.
+    var ranked: std.ArrayListUnmanaged(struct { name: []const u8, dist: u32 }) = .empty;
+    defer ranked.deinit(alloc);
+    for (candidates) |cd| {
+        const d = try levenshteinCICapped(alloc, cd.name, query, 4);
+        if (d <= 3) {
+            try ranked.append(alloc, .{ .name = cd.name, .dist = d });
+        }
+    }
+    // Insertion sort by (dist, name).
+    for (1..ranked.items.len) |i| {
+        var j = i;
+        while (j > 0) : (j -= 1) {
+            const a = ranked.items[j - 1];
+            const b = ranked.items[j];
+            if (b.dist < a.dist or (b.dist == a.dist and std.mem.lessThan(u8, b.name, a.name))) {
+                const tmp = ranked.items[j];
+                ranked.items[j] = ranked.items[j - 1];
+                ranked.items[j - 1] = tmp;
+            } else break;
+        }
+    }
+
+    var out = utils.BufWriter.init(alloc);
+    defer out.deinit();
+    try out.writeAll("{\"no_match\":true,\"hint\":\"");
+    try out.print("no hidden tool matches '{s}': search by tool-name prefix or keyword, then call the tool by its full name", .{query});
+    try out.writeAll("\",\"closest_names\":[");
+    const show = @min(ranked.items.len, 5);
+    for (ranked.items[0..show], 0..) |r, i| {
+        if (i > 0) try out.writeAll(",");
+        const e = try json.escape(alloc, r.name);
+        defer alloc.free(e);
+        try out.print("\"{s}\"", .{e});
+    }
+    try out.writeAll("]}");
+    return alloc.dupe(u8, out.list.items);
+}
+
+/// PSEUDOCODE:
+/// 1. Fast reject: distance is always >= |a.len - b.len|; if that exceeds cap, return cap + 1.
+/// 2. Two-row Levenshtein DP over the two inputs, comparing chars case-insensitively
+///    (rows allocated on the heap: both inputs are user-free-text and unbounded).
+/// 3. Early-exit as soon as the row minimum exceeds cap (ranking bound only).
+fn levenshteinCICapped(alloc: Allocator, a: []const u8, b: []const u8, cap: u32) Allocator.Error!u32 {
+    // PSEUDOCODE:
+    // 1. If |a.len - b.len| > cap, distance > cap by construction.
+    const big = if (a.len >= b.len) a.len else b.len;
+    const small = if (a.len >= b.len) b.len else a.len;
+    if (big - small > cap) return cap + 1;
+
+    const n = b.len;
+    var prev = try alloc.alloc(u32, n + 1);
+    defer alloc.free(prev);
+    var cur = try alloc.alloc(u32, n + 1);
+    defer alloc.free(cur);
+    for (0..(n + 1)) |i| prev[i] = @intCast(i);
+    var rows: usize = 1;
+    while (rows <= a.len) : (rows += 1) {
+        cur[0] = @intCast(rows);
+        var row_min = cur[0];
+        for (1..(n + 1)) |j| {
+            const cost: u32 = if (std.ascii.toLower(a[rows - 1]) == std.ascii.toLower(b[j - 1])) 0 else 1;
+            const v = @min(@min(prev[j] + 1, cur[j - 1] + 1), prev[j - 1] + cost);
+            cur[j] = v;
+            if (v < row_min) row_min = v;
+        }
+        if (row_min > cap) return cap + 1;
+        const t = prev;
+        prev = cur;
+        cur = t;
+    }
+    return if (prev[n] > cap) cap + 1 else prev[n];
 }
 
 /// Keyword triggers for extended tools (sent conditionally).

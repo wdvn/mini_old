@@ -21,7 +21,8 @@
 //! ```
 //!
 //! ## Limits
-//!   - Output truncated at 128KB
+//!   - Output truncated at 128KB per stream, flagged with a truncation marker
+//!     recommending the command be narrowed (e.g. piped through head/grep)
 //!   - Working directory: process CWD
 
 const std = @import("std");
@@ -130,8 +131,11 @@ pub fn executeTool(alloc: Allocator, io: std.Io, input_json: []const u8) ![]u8 {
 // 5. If POLL.HUP and not POLL.IN, break (EOF)
 // 6. Read available bytes into buf (or discard sink) and append to hooks
 // 7. Check signals.isInterrupted() and break if set
-fn drainPipe(io: std.Io, pipe: std.Io.File, buf: []u8) usize {
+// Returns the number of stored bytes plus whether the stream was truncated
+// (data available while the buffer was full).
+fn drainPipe(io: std.Io, pipe: std.Io.File, buf: []u8) struct { len: usize, truncated: bool } {
     var stored: usize = 0;
+    var truncated: bool = false;
     while (true) {
         if (signals.isInterrupted()) break;
 
@@ -168,15 +172,18 @@ fn drainPipe(io: std.Io, pipe: std.Io.File, buf: []u8) usize {
             var sink: [4096]u8 = undefined;
             const n = pipe.readStreaming(io, &.{&sink}) catch break;
             if (n == 0) break;
+            truncated = true;
             hooks.appendExecutionOutput(sink[0..n]);
         }
     }
-    return stored;
+    return .{ .len = stored, .truncated = truncated };
 }
 
 /// Wrapper for stderr thread — matching Thread.spawn signature.
-fn drainStderrThread(io: std.Io, pipe: std.Io.File, buf: []u8, len_out: *usize) void {
-    len_out.* = drainPipe(io, pipe, buf);
+fn drainStderrThread(io: std.Io, pipe: std.Io.File, buf: []u8, len_out: *usize, trunc_out: *bool) void {
+    const r = drainPipe(io, pipe, buf);
+    len_out.* = r.len;
+    trunc_out.* = r.truncated;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,26 +260,30 @@ fn spawnBashChild(io: std.Io, command: []const u8, stdin_str: ?[]const u8) !std.
     return child;
 }
 
-fn drainChildPipesConcurrently(io: std.Io, child: *std.process.Child, stdout_buf: []u8, stderr_buf: []u8, stdolen: *usize, stdelen: *usize) void {
+fn drainChildPipesConcurrently(io: std.Io, child: *std.process.Child, stdout_buf: []u8, stderr_buf: []u8, stdolen: *usize, stdelen: *usize, stdout_trunc: *bool, stderr_trunc: *bool) void {
     // PSEUDOCODE: Read stderr in worker thread while main thread reads stdout.
     const stderr_thread = if (child.stderr) |err_pipe|
-        std.Thread.spawn(.{}, drainStderrThread, .{ io, err_pipe, stderr_buf, stdelen }) catch null
+        std.Thread.spawn(.{}, drainStderrThread, .{ io, err_pipe, stderr_buf, stdelen, stderr_trunc }) catch null
     else
         null;
 
     if (child.stdout) |out_pipe| {
-        stdolen.* = drainPipe(io, out_pipe, stdout_buf);
+        const r = drainPipe(io, out_pipe, stdout_buf);
+        stdolen.* = r.len;
+        stdout_trunc.* = r.truncated;
     }
 
     if (stderr_thread) |t| {
         t.join();
     } else if (child.stderr) |err_pipe| {
-        stdelen.* = drainPipe(io, err_pipe, stderr_buf);
+        const r = drainPipe(io, err_pipe, stderr_buf);
+        stdelen.* = r.len;
+        stderr_trunc.* = r.truncated;
     }
 }
 
-fn formatCommandOutput(alloc: Allocator, stdout_slice: []const u8, stderr_slice: []const u8, exit_code: u8) ![]u8 {
-    // PSEUDOCODE: Assemble stdout, newline delimiter, stderr, or fallback exit status into result slice.
+fn formatCommandOutput(alloc: Allocator, stdout_slice: []const u8, stderr_slice: []const u8, exit_code: u8, stdout_truncated: bool, stderr_truncated: bool) ![]u8 {
+    // PSEUDOCODE: Assemble stdout, newline delimiter, stderr, truncation markers, or fallback exit status into result slice.
     var result = utils.BufWriter.init(alloc);
     errdefer result.deinit();
     const w = &result;
@@ -283,6 +294,11 @@ fn formatCommandOutput(alloc: Allocator, stdout_slice: []const u8, stderr_slice:
     if (stderr_slice.len > 0) {
         if (stdout_slice.len > 0) try w.writeByte('\n');
         try w.writeAll(stderr_slice);
+    }
+    if (stdout_truncated or stderr_truncated) {
+        // Mark silent 128KB caps so the agent knows output was narrowed.
+        const streams = if (stdout_truncated and stderr_truncated) "both streams" else if (stdout_truncated) "stdout" else "stderr";
+        try w.print("\n[{s} truncated at {d}KB - narrow the command or pipe through head/grep]", .{ streams, MAX_OUTPUT / 1024 });
     }
     if (exit_code != 0 and result.list.items.len == 0) {
         try w.print("Exit code: {d}", .{exit_code});
@@ -312,7 +328,9 @@ fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: 
 
     var stdolen: usize = 0;
     var stdelen: usize = 0;
-    drainChildPipesConcurrently(io, &child, stdout_buf, stderr_buf, &stdolen, &stdelen);
+    var stdout_trunc: bool = false;
+    var stderr_trunc: bool = false;
+    drainChildPipesConcurrently(io, &child, stdout_buf, stderr_buf, &stdolen, &stdelen, &stdout_trunc, &stderr_trunc);
 
     if (signals.isInterrupted()) forceKillCurrent();
 
@@ -329,5 +347,5 @@ fn executeCommand(alloc: Allocator, io: std.Io, command: []const u8, stdin_str: 
         .signal => |sig| return std.fmt.allocPrint(alloc, "Killed by signal {d}", .{@intFromEnum(sig)}),
         else => 1,
     };
-    return formatCommandOutput(alloc, stdout_buf[0..stdolen], stderr_buf[0..stdelen], exit_code);
+    return formatCommandOutput(alloc, stdout_buf[0..stdolen], stderr_buf[0..stdelen], exit_code, stdout_trunc, stderr_trunc);
 }
