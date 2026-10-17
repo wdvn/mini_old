@@ -537,6 +537,9 @@ pub const McpClientManager = struct {
                 if (env_obj[i] != ' ' and env_obj[i] != '\t' and env_obj[i] != '\n' and env_obj[i] != '\r') break;
             }
 
+            // skip whitespace after colon
+            while (i < env_obj.len and (env_obj[i] == ' ' or env_obj[i] == '\t' or env_obj[i] == '\n' or env_obj[i] == '\r')) : (i += 1) {}
+
             // value must be a quoted string
             if (i >= env_obj.len or env_obj[i] != '"') break;
             const val_start = i + 1;
