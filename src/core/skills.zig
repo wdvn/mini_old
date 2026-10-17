@@ -24,7 +24,7 @@ const Allocator = std.mem.Allocator;
 const utils = @import("utils.zig");
 const prompts_mod = @import("prompts.zig");
 /// Maximum number of skills injected into prompt.
-const MAX_SKILLS = 64;
+const MAX_SKILLS = 1000;
 
 /// Limit on description size injected into prompt (bytes).
 const MAX_DESC_LEN = 512;
