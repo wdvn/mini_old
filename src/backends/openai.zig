@@ -99,18 +99,45 @@ pub const Client = struct {
     active_reasoning_max_tokens: ?u32 = null,
     /// Provider key for wire protocol quirks normalization.
     provider_key: []const u8 = "generic",
-    /// Explicit trusted adapter source; never loaded from model output.
-    provider_js: ?[]const u8 = null,
+    /// List of explicit trusted adapter sources; never loaded from model output.
+    /// Each entry is a JS source string or file path.
+    provider_js_list: []const []const u8 = &.{},
+    /// Loaded JS provider adapters (one per source in provider_js_list).
+    adapters: []*JsProviderAdapter = &.{},
+    /// Active adapter selected by select() hook (null = no adapter active).
+    active_adapter: ?*JsProviderAdapter = null,
 
-    fn loadAdapter(self: *const Client) !?*JsProviderAdapter {
-        return if (self.provider_js) |source|
-            try JsProviderAdapter.initFromSourceWithProfile(
-                self.alloc,
-                source,
-                provider.resolveProfile(self.provider_key, self.base_url),
-            )
-        else
-            null;
+    fn loadAdapters(self: *const Client) !struct { adapters: []*JsProviderAdapter, active: ?*JsProviderAdapter } {
+        if (self.provider_js_list.len == 0) return .{ .adapters = &.{}, .active = null };
+        const alloc = self.alloc;
+        var list = std.ArrayListUnmanaged(*JsProviderAdapter).empty;
+        errdefer {
+            for (list.items) |a| a.deinit();
+            list.deinit(alloc);
+        }
+        const profile_base = provider.resolveProfile(self.provider_key, self.base_url);
+        var profile_json_buf: [512]u8 = undefined;
+        const profile_json = providerProfileToJson(&profile_json_buf, profile_base);
+        for (self.provider_js_list) |source| {
+            const adapter = JsProviderAdapter.initFromSourceWithProfile(alloc, source, profile_base) catch |err| {
+                main.stderrPrint("[js_provider] Failed to load adapter: {s}\n", .{@errorName(err)});
+                continue;
+            };
+            try list.append(alloc, adapter);
+        }
+        if (list.items.len == 0) {
+            return .{ .adapters = &.{}, .active = null };
+        }
+        const adapters_slice = try list.toOwnedSlice(alloc);
+        errdefer alloc.free(adapters_slice);
+        var active: ?*JsProviderAdapter = null;
+        for (adapters_slice) |adapter| {
+            if (adapter.select(alloc, self.model, self.base_url, profile_json)) {
+                active = adapter;
+                break;
+            }
+        }
+        return .{ .adapters = adapters_slice, .active = active };
     }
 
     fn transformBody(self: *const Client, adapter: ?*JsProviderAdapter, body: []const u8) ![]const u8 {
@@ -173,6 +200,41 @@ pub const Client = struct {
             .active_reasoning_max_tokens = null,
             .provider_key = provider_key,
         };
+    }
+
+
+    /// Serialize ProviderProfile to JSON for passing to JS provider select() hook.
+    fn providerProfileToJson(buf: *[512]u8, profile: provider.ProviderProfile) []const u8 {
+        const proto_str = switch (profile.protocol) {
+            .chat_completions => "chat_completions",
+            .responses => "responses",
+            .auto => "auto",
+        };
+        const rf_str = switch (profile.reasoning_field) {
+            .reasoning_content => "reasoning_content",
+            .reasoning => "reasoning",
+            .both => "both",
+        };
+        const echo_str = switch (profile.echo_policy) {
+            .drop => "drop",
+            .echo_required => "echo_required",
+            .echo_optional => "echo_optional",
+        };
+        const tags_str = switch (profile.thinking_tags) {
+            .english_only => "english_only",
+            .english_and_chinese => "english_and_chinese",
+            .none => "none",
+        };
+        const rp_str = switch (profile.reasoning_param) {
+            .top_level_effort => "top_level_effort",
+            .nested_reasoning_object => "nested_reasoning_object",
+            .unsupported => "unsupported",
+        };
+        return std.fmt.bufPrint(buf, "{{\"protocol\":\"{s}\",\"reasoning_field\":\"{s}\",\"echo_policy\":\"{s}\",\"thinking_tags\":\"{s}\",\"reasoning_param\":\"{s}\",\"supports_stream_options\":{s},\"use_completion_tokens\":{s}}}", .{
+            proto_str, rf_str, echo_str, tags_str, rp_str,
+            if (profile.supports_stream_options) "true" else "false",
+            if (profile.use_completion_tokens) "true" else "false",
+        }) catch "{}";
     }
 
     /// Send messages to API and receive streaming response.
@@ -352,8 +414,12 @@ pub const Client = struct {
         text_cb: ?*const fn ([]const u8) void,
         think_cb: ?*const fn ([]const u8) void,
     ) !proto.Response {
-        const adapter = try self.loadAdapter();
-        defer if (adapter) |a| a.deinit();
+        const adapters_result = try self.loadAdapters();
+        defer {
+            for (adapters_result.adapters) |a| a.deinit();
+            self.alloc.free(adapters_result.adapters);
+        }
+        const adapter = adapters_result.active;
         const profile = if (adapter) |a| a.profile else provider.resolveProfile(self.provider_key, self.base_url);
         var active_protocol = self.resolveActiveProtocol(profile);
 
@@ -1424,11 +1490,16 @@ const testing = std.testing;
 
 test "js_provider: client loads configured adapter and transforms outgoing body" {
     var client = Client.init(testing.allocator, "http://localhost/v1", "", "Authorization", "mock", 100);
-    client.provider_js =
-        \\export default { protocol: "chat_completions", transformRequest(req) { req.model = "adapted"; return req; } };
-    ;
-    const adapter = (try client.loadAdapter()).?;
-    defer adapter.deinit();
+    const js_source = "export default { protocol: \"chat_completions\", transformRequest(req) { req.model = \"adapted\"; return req; } }";
+    client.provider_js_list = &.{
+        js_source,
+    };
+    const result = try client.loadAdapters();
+    defer {
+        for (result.adapters) |a| a.deinit();
+        testing.allocator.free(result.adapters);
+    }
+    const adapter = result.active orelse return error.NoActiveAdapter;
     try testing.expectEqual(provider.WireProtocol.chat_completions, adapter.profile.protocol);
     const body = try client.transformBody(adapter, "{\"model\":\"original\"}");
     defer testing.allocator.free(body);

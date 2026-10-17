@@ -141,6 +141,7 @@ pub const JsProviderAdapter = struct {
     fn_transform_request: ?c.JSValue = null,
     fn_generate_image: ?c.JSValue = null,
     fn_generate_video: ?c.JSValue = null,
+    fn_select: ?c.JSValue = null,
     profile: ProviderProfile,
     name_owned: ?[]const u8 = null,
     deadline_ms: i64 = 0,
@@ -514,6 +515,13 @@ pub const JsProviderAdapter = struct {
         } else {
             c.JS_FreeValue(ctx, fn_gv);
         }
+
+        const fn_sel = c.JS_GetPropertyStr(ctx, obj, "select");
+        if (isFunction(ctx, fn_sel)) {
+            self.fn_select = fn_sel;
+        } else {
+            c.JS_FreeValue(ctx, fn_sel);
+        }
     }
 
     fn parseExportedObject(self: *JsProviderAdapter) !void {
@@ -723,6 +731,41 @@ pub const JsProviderAdapter = struct {
         return error.JsGenerateVideoFailed;
     }
 
+    /// Query JS provider whether it can handle a request.
+    /// Calls select(model, url, profile_json) hook if defined; returns true if the
+    /// hook returns true, false otherwise. If no select hook is defined, returns true
+    /// (provider is willing to handle any request — backward-compatible default).
+    pub fn select(self: *JsProviderAdapter, alloc: Allocator, model: []const u8, url: []const u8, profile_json: []const u8) bool {
+        self.beginCall();
+        const fn_hook = self.fn_select orelse return true;
+        if (model.len == 0) return true;
+
+        const model_z = alloc.dupeZ(u8, model) catch return true;
+        defer alloc.free(model_z);
+        const model_val = c.JS_NewString(self.ctx, model_z.ptr);
+        defer c.JS_FreeValue(self.ctx, model_val);
+
+        const url_z = alloc.dupeZ(u8, url) catch return true;
+        defer alloc.free(url_z);
+        const url_val = c.JS_NewString(self.ctx, url_z.ptr);
+        defer c.JS_FreeValue(self.ctx, url_val);
+
+        const profile_val = parseJsonZeroTerminated(self.ctx, alloc, profile_json, "<profile>") orelse return true;
+        defer c.JS_FreeValue(self.ctx, profile_val);
+
+        var args = [_]c.JSValue{ model_val, url_val, profile_val };
+        const ret_val = c.JS_Call(self.ctx, fn_hook, self.export_obj, 3, &args);
+        defer c.JS_FreeValue(self.ctx, ret_val);
+
+        if (isException(ret_val)) {
+            const exc = c.JS_GetException(self.ctx);
+            c.JS_FreeValue(self.ctx, exc);
+            return false;
+        }
+
+        return c.JS_ToBool(self.ctx, ret_val) != 0;
+    }
+
     pub fn deinit(self: *JsProviderAdapter) void {
         const ctx = self.ctx;
         if (self.fn_extract_reasoning) |f| c.JS_FreeValue(ctx, f);
@@ -730,6 +773,7 @@ pub const JsProviderAdapter = struct {
         if (self.fn_transform_request) |f| c.JS_FreeValue(ctx, f);
         if (self.fn_generate_image) |f| c.JS_FreeValue(ctx, f);
         if (self.fn_generate_video) |f| c.JS_FreeValue(ctx, f);
+        if (self.fn_select) |f| c.JS_FreeValue(ctx, f);
         c.JS_FreeValue(ctx, self.export_obj);
 
         c.JS_FreeContext(ctx);

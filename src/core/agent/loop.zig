@@ -346,7 +346,7 @@ pub const AgentLoop = struct {
                     proto_mode,
                     config.openai_provider,
                 );
-                client.provider_js = config.openai_provider_js;
+                if (config.openai_provider_js) |src| { client.provider_js_list = &.{src}; }
                 break :blk .{ .openai = client };
             }
             if (config.anthropic_key) |key| {
@@ -984,7 +984,7 @@ fn recordSkillLoaded(self: *AgentLoop, tool_name: []const u8, input_json: ?[]con
                 proto_mode,
                 cfg.openai_provider,
             ) };
-            self.backend.openai.provider_js = cfg.openai_provider_js;
+            if (cfg.openai_provider_js) |src| { self.backend.openai.provider_js_list = &.{src}; }
         } else if (std.mem.eql(u8, backend_name, "claude")) {
             const key = cfg.anthropic_key orelse {
                 main.stderrPrint("[agent] ANTHROPIC_API_KEY is not configured\n", .{});

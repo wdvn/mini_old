@@ -514,15 +514,66 @@ pub const McpClientManager = struct {
         return try argv.toOwnedSlice(alloc);
     }
 
+    fn populateEnvMap(map: *std.process.Environ.Map, config_json: []const u8) !void {
+        const env_obj = json.findObject(config_json, "env") orelse return;
+
+        var i: usize = 1; // skip {
+        while (i < env_obj.len) {
+            if (env_obj[i] != '"') {
+                i += 1;
+                continue;
+            }
+            const key_start = i + 1;
+            const key_end = std.mem.indexOfScalarPos(u8, env_obj, key_start, '"') orelse break;
+            const key = env_obj[key_start..key_end];
+            i = key_end + 1;
+
+            // skip whitespace and colon
+            while (i < env_obj.len) : (i += 1) {
+                if (env_obj[i] == ':') {
+                    i += 1;
+                    break;
+                }
+                if (env_obj[i] != ' ' and env_obj[i] != '\t' and env_obj[i] != '\n' and env_obj[i] != '\r') break;
+            }
+
+            // value must be a quoted string
+            if (i >= env_obj.len or env_obj[i] != '"') break;
+            const val_start = i + 1;
+            const val_end = std.mem.indexOfScalarPos(u8, env_obj, val_start, '"') orelse break;
+            const val = env_obj[val_start..val_end];
+            i = val_end + 1;
+
+            try map.put(key, val);
+        }
+    }
+
     fn spawnServer(self: *McpClientManager, name: []const u8, command: []const u8, config_json: []const u8) !void {
         // PSEUDOCODE:
         // 1. Build argv from command and args array
-        // 2. Spawn child process with piped stdin/stdout
-        // 3. Complete handshake and discover tools
+        // 2. If config specifies "env", clone parent env_map and apply overrides
+        // 3. Spawn child process with piped stdin/stdout
+        // 4. Complete handshake and discover tools
         const argv_slice = try parseArgvList(self.alloc, command, config_json);
+
+        var child_env_map_opt: ?std.process.Environ.Map = null;
+        defer if (child_env_map_opt) |*m| m.deinit();
+
+        if (json.findObject(config_json, "env") != null) {
+            const base_map = main.getEnvironMap();
+            var child_map = if (base_map) |bm|
+                try bm.clone(self.alloc)
+            else
+                std.process.Environ.Map.init(self.alloc);
+            errdefer child_map.deinit();
+
+            try populateEnvMap(&child_map, config_json);
+            child_env_map_opt = child_map;
+        }
 
         const child = try std.process.spawn(main.g_io, .{
             .argv = argv_slice,
+            .environ_map = if (child_env_map_opt) |*m| m else null,
             .stdin = .pipe,
             .stdout = .pipe,
         });
