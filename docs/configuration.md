@@ -1,23 +1,108 @@
 # Configuration & Environment Variables Reference
 
-## 1. Configuration Architecture & Precedence
+## 1. Two-Tier Configuration Architecture: Global vs. Project
 
-`mini-agent` uses a layered configuration system designed for flexible local development and production automation. Configuration values are resolved in the following strict order of precedence (highest to lowest):
+`mini-agent` uses a two-tier configuration hierarchy that cleanly separates machine-wide user defaults from repository-specific settings. This enables developers to establish global defaults across all tasks while maintaining strict, version-controlled project rules and tool permissions.
 
-1. **CLI Arguments**: Command-line flags (e.g. `--model`, `--mode`, `--session`) take absolute precedence.
-2. **Shell Environment Variables**: Variables explicitly exported in the current shell environment (`export OPENAI_COMPAT_URL=...`).
-3. **Explicit Dotenv File**: File specified via `MINI_ENV_FILE` or `--env-file`.
-4. **Project Workspace Dotenv**: Local `./.env` in the current working directory.
-5. **Project JSON Configuration**: `./.agent/config.json` in the active workspace.
-6. **Global User Dotenv**: `~/.mini/.env` (or `$MINI_HOME/.env`).
-7. **Global User Configuration**: `~/.mini/config.json`.
-8. **Provider Profiles**: Active provider JSON defaults from `~/.mini/providers/<name>.json` or builtin definitions.
-9. **Hardcoded Defaults**: Safe fallbacks defined in `src/core/config/types.zig`.
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ Global Level (~/.mini/ or $MINI_HOME)                                  │
+│  - User-wide credentials (~/.mini/.env)                                │
+│  - Machine-wide settings (~/.mini/config.json)                         │
+│  - Universal agent behavior rules (~/.mini/AGENTS.md)                  │
+│  - Global skills library (~/.mini/skills/)                             │
+│  - Global MCP server definitions (~/.mini/mcp.json)                    │
+│  - Project-isolated stores (~/.mini/memory/<hash>/, ~/.mini/tasks/)    │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ Overridden / Supplemented by
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ Project Workspace Level (<workspace_root>/ & .agent/)                  │
+│  - Project environment overrides (./.env, .agent/.env)                 │
+│  - Project runtime settings (.agent/config.json)                       │
+│  - Project guidelines & conventions (AGENTS.md, .agent/AGENTS.md)      │
+│  - Project-specific skills (.agent/skills/ -> overrides global)        │
+│  - Project custom slash commands (.agent/commands/<name>.md)           │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ Overridden by
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ Runtime Process & CLI Level                                            │
+│  - Shell environment variables (export OPENAI_COMPAT_URL=...)          │
+│  - Explicit dotenv file ($MINI_ENV_FILE)                               │
+│  - Command-line flags (--model, --mode, --session, --resume)           │
+└────────────────────────────────────────────────────────────────────────┘
+```
 
-> [!NOTE]
-> Environment variables already set in the parent process shell are **never overwritten** by variables defined in `.env` files.
+### 1.1. Tier Comparison Matrix
+
+| Component | Global Level (`~/.mini/`) | Project Workspace Level (`.agent/` & `<root>/`) | Precedence & Inheritance Behavior |
+|---|---|---|---|
+| **Environment (`.env`)** | `~/.mini/.env` | `<workspace_root>/.env`<br>`.agent/.env` | **Override**: Project `.env` values override Global `.env`. Shell variables take absolute precedence over both. |
+| **JSON Config** | `~/.mini/config.json` | `.agent/config.json` | **Override**: Settings in `.agent/config.json` override keys in `~/.mini/config.json`. |
+| **Instructions (`AGENTS.md`)** | `~/.mini/AGENTS.md` | `<workspace_root>/AGENTS.md`<br>`.agent/AGENTS.md` | **Additive / Concatenated**: All files are read and appended together into `<RULE[AGENTS.md]>` in the system prompt. |
+| **Skills Library** | `~/.mini/skills/<name>/` | `.agent/skills/<name>/` | **Override**: Skills in `.agent/skills/` with matching names completely override global skills of the same name. |
+| **Slash Commands** | `~/.mini/commands/<name>.md` | `.agent/commands/<name>.md` | **Registered**: Project commands become `/<name>` in REPL; global commands serve as defaults. |
+| **MCP Servers** | `~/.mini/mcp.json` | Configured via `MINI_MCP_CONFIG` | **Direct**: Defaults to `~/.mini/mcp.json` unless overridden by environment variable or project JSON config. |
+| **Memory & Graph** | `~/.mini/memory/<hash>/` | Keyed by workspace root hash | **Isolated**: Data is stored under `~/.mini/`, but strictly partitioned by the SHA-256 hash of the workspace directory. |
+| **Checkpoints & Tasks** | `~/.mini/tasks/<task_id>/` | Bounded to `workspace_root` | **Global Store, Local Scope**: Task directories live in `~/.mini/tasks/` but store the canonical workspace path. |
 
 ---
+
+### 1.2. Configuration Resolution Order
+
+When resolving configuration settings, `mini-agent` evaluates sources in the following strict order (highest to lowest priority):
+
+1. **CLI Arguments**: Command-line flags (e.g. `--model`, `--mode`, `--session`) take absolute precedence.
+2. **Shell Environment Variables**: Variables explicitly exported in the current shell process (`export OPENAI_COMPAT_URL=...`).
+3. **Explicit Dotenv File**: File specified via `MINI_ENV_FILE` or `--env-file`.
+4. **Project Workspace Dotenv**: Local `./.env` in the current working directory.
+5. **Project Agent Dotenv**: `.agent/.env` in the workspace.
+6. **Project JSON Configuration**: `.agent/config.json` in the active workspace.
+7. **Global User Dotenv**: `~/.mini/.env` (or `$MINI_HOME/.env`).
+8. **Global User Configuration**: `~/.mini/config.json`.
+9. **Provider Profiles**: Active provider JSON defaults from `~/.mini/providers/<name>.json` or builtin definitions.
+10. **Hardcoded Defaults**: Safe fallbacks defined in `src/core/config/types.zig`.
+
+> [!NOTE]
+> Environment variables already present in the active shell environment are **never overwritten** by values loaded from `.env` or `config.json` files.
+
+---
+
+### 1.3. Project JSON Configuration Schema (`.agent/config.json`)
+
+Projects can define a `.agent/config.json` to lock in repository-specific settings (such as model, allowed tools, execution mode, or reasoning tokens) without requiring team members to configure shell variables manually:
+
+```json
+{
+  "execution_mode": "auto",
+  "openai_compat_model": "gpt-4o",
+  "tool_allowlist": "bash,file_read,file_write,file_edit,glob,grep",
+  "max_tokens": 8192,
+  "dynamic_thinking_enabled": true,
+  "reasoning_effort": "high",
+  "memact_enabled": true,
+  "memact_top_k": 8,
+  "enable_structured_planning": true,
+  "plan_drift_detection": true,
+  "action_loop_consecutive_cap": 3,
+  "action_loop_readonly_trip_cap": 10
+}
+```
+
+This file is typically committed to version control so all agents operating on the codebase adhere to identical runtime constraints.
+
+---
+
+### 1.4. Rule Inheritance & Aggregation (`AGENTS.md`)
+
+Unlike configurations where local values override global keys, behavioral rules follow an **additive inheritance model**:
+
+1. **Workspace Root Rules**: `<workspace_root>/AGENTS.md` (or `CLAUDE.md`) is read first, establishing project coding conventions and repository layout instructions.
+2. **Agent Directory Rules**: `.agent/AGENTS.md` is appended, specifying agent-specific operational constraints and workflows.
+3. **Global Machine Rules**: `~/.mini/AGENTS.md` is appended last, adding universal preferences (e.g. personal style preferences, sensitive data redaction policies).
+
+All discovered rules are concatenated and enclosed in `<RULE[AGENTS.md]>` tags directly inside the system prompt before every turn.
 
 ## 2. Environment Variables Reference
 

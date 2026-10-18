@@ -1,13 +1,13 @@
-# Tools, Skills & Model Context Protocol (MCP) Manual
+# Built-in Tools Reference
 
-## 1. Built-in Tools Reference
+`mini-agent` includes 15 native tools implemented in Zig. In standard JSON tool-calling mode, the model receives JSON schemas and emits structured tool invocations. In CodeAct mode, the same tools are available through the `mini.*` JavaScript runtime bridge.
 
-`mini-agent` includes 15 built-in native tools. When running in standard JSON tool mode, the language model receives tool schemas and issues calls matching the specifications below. In CodeAct mode, the same tools are called via the `mini.*` JavaScript API.
+All tools pass through the centralized policy guard in `src/tooling/registry.zig`, which strictly enforces allowlist and blocklist rules (`MINI_TOOL_ALLOWLIST`, `MINI_TOOL_BLOCKLIST`).
 
 ---
 
-### 1.1. `bash`
-Executes a shell command on the host system and returns standard output and standard error.
+## 1. `bash`
+Executes a shell command on the host system via `/bin/sh -c` and returns combined standard output and standard error.
 
 - **Input Schema**:
   ```json
@@ -26,14 +26,14 @@ Executes a shell command on the host system and returns standard output and stan
   - Maximum output capture: 64 KB (head-truncated if exceeded).
   - Timeout: 120 seconds default.
 - **Safety Filters**: Blocks dangerous commands matching blacklist patterns:
-  - `rm -rf /` or root directory deletion.
+  - `rm -rf /` or root filesystem deletion.
   - Fork bombs (`:(){ :|:& };:`).
   - Direct block device manipulation (`dd if=... of=/dev/sd*`, `mkfs.*`).
-  - Shutdown/reboot operations.
+  - System power operations (`shutdown`, `reboot`, `init 0`).
 
 ---
 
-### 1.2. `file_read`
+## 2. `file_read`
 Reads content from a file with line-number indexing and pagination support.
 
 - **Input Schema**:
@@ -51,11 +51,11 @@ Reads content from a file with line-number indexing and pagination support.
 - **Constraints**:
   - Maximum file size: 10 MB.
   - Maximum lines returned per call: 2000.
-  - Rejects binary files.
+  - Binary files are automatically rejected.
 
 ---
 
-### 1.3. `file_write`
+## 3. `file_write`
 Creates a new file or overwrites an existing file with the provided content.
 
 - **Input Schema**:
@@ -70,13 +70,13 @@ Creates a new file or overwrites an existing file with the provided content.
   }
   ```
 - **Safety & Guarantees**:
-  - Automatically creates intermediate directories.
+  - Automatically creates intermediate parent directories.
   - Automatically captures a SHA-256 CAS snapshot of the previous version before modifying the file.
   - Denies writes targeting system directories (`/etc`, `/proc`, `/sys`, `/dev`).
 
 ---
 
-### 1.4. `file_edit`
+## 4. `file_edit`
 Performs an exact string replacement within an existing file.
 
 - **Input Schema**:
@@ -97,7 +97,7 @@ Performs an exact string replacement within an existing file.
 
 ---
 
-### 1.5. `glob`
+## 5. `glob`
 Finds files matching wildcard patterns relative to a target directory.
 
 - **Input Schema**:
@@ -115,8 +115,8 @@ Finds files matching wildcard patterns relative to a target directory.
 
 ---
 
-### 1.6. `grep`
-Searches text across files in a directory using literal or regex patterns.
+## 6. `grep`
+Searches text across files in a directory using literal strings or regular expressions.
 
 - **Input Schema**:
   ```json
@@ -136,7 +136,7 @@ Searches text across files in a directory using literal or regex patterns.
 
 ---
 
-### 1.7. `http_request`
+## 7. `http_request`
 Performs an outbound HTTP request using Zig's native `std.http.Client` (`src/lib/http_request.zig`).
 
 - **Input Schema**:
@@ -156,8 +156,8 @@ Performs an outbound HTTP request using Zig's native `std.http.Client` (`src/lib
 
 ---
 
-### 1.8. `invoke_subagent` & `batch_invoke_subagents`
-Spawns one or more isolated child subagents to execute discrete tasks.
+## 8. `invoke_subagent` & `batch_invoke_subagents`
+Spawns one or more isolated child subagents to execute discrete sub-tasks.
 
 - **`invoke_subagent` Schema**:
   ```json
@@ -186,7 +186,7 @@ Spawns one or more isolated child subagents to execute discrete tasks.
 
 ---
 
-### 1.9. `artifact_write`, `artifact_read`, `artifact_list`
+## 9. `artifact_write`, `artifact_read`, `artifact_list`
 Manages session deliverables (plans, diffs, walkthroughs, diagrams) saved to disk.
 
 - **Storage Path**: `~/.mini/artifacts/<session_id>/<name>`
@@ -206,7 +206,7 @@ Manages session deliverables (plans, diffs, walkthroughs, diagrams) saved to dis
 
 ---
 
-### 1.10. `session_diagnostics`
+## 10. `session_diagnostics`
 Analyzes session execution logs and health telemetry.
 
 - **Input Schema**:
@@ -225,7 +225,7 @@ Analyzes session execution logs and health telemetry.
 
 ---
 
-### 1.11. `skills`
+## 11. `skills`
 Discovers and inspects registered skills adhering to the Multi-Tier Skills standard.
 
 - **Input Schema**:
@@ -242,7 +242,7 @@ Discovers and inspects registered skills adhering to the Multi-Tier Skills stand
 
 ---
 
-### 1.12. `tool_search`
+## 12. `tool_search`
 Meta-tool for deferred tool discovery. When `MINI_DEFERRED_TOOLS=1`, non-core tool schemas are omitted from the initial system prompt to save context tokens. The model calls `tool_search` to discover tools matching specific keywords.
 
 - **Input Schema**:
@@ -258,7 +258,7 @@ Meta-tool for deferred tool discovery. When `MINI_DEFERRED_TOOLS=1`, non-core to
 
 ---
 
-### 1.13. `codeact`
+## 13. `codeact`
 Directly evaluates an arbitrary JavaScript snippet in the embedded QuickJS engine.
 
 - **Input Schema**:
@@ -271,116 +271,3 @@ Directly evaluates an arbitrary JavaScript snippet in the embedded QuickJS engin
     "required": ["code"]
   }
   ```
-
----
-
-## 2. Multi-Tier Skills Specification (RFC-031)
-
-`mini-agent` implements the **Multi-Tier Skills Specification**, elevating skills from flat markdown files into structured capability packages.
-
-### 2.1. Directory Hierarchy
-
-A skill resides in either:
-- **Project Workspace**: `.agent/skills/<skill_name>/`
-- **Global User Directory**: `~/.mini/skills/<skill_name>/`
-
-```
-<skill_name>/
-├── SKILL.md                 # Required: Main entrypoint and operational guide
-├── references/              # Optional: Deep reference documents, schemas, specs
-│   ├── api_spec.md
-│   └── architecture_diagram.svg
-├── templates/               # Optional: Reusable prompt skeletons, report structures
-│   └── checklist_template.md
-└── scripts/                 # Optional: Deterministic helper scripts (sh, py, js)
-    └── validate_env.sh
-```
-
-### 2.2. YAML Frontmatter Schema
-
-`SKILL.md` must begin with YAML frontmatter:
-
-```yaml
----
-name: kubernetes-ops
-description: Deploy, monitor, and troubleshoot Kubernetes clusters via kubectl and helm.
-version: 1.2.0
-author: Infrastructure Team
-platforms:
-  - linux
-  - darwin
-requires_tools:
-  - bash
----
-
-# Kubernetes Operations Playbook
-...
-```
-
-- `name`: Unique alphanumeric identifier.
-- `description`: Summary indexed by the agent loop for dynamic tool/skill loading.
-- `version`: Semantic version string.
-- `platforms`: List of supported operating systems (`linux`, `darwin`, `windows`).
-- `requires_tools`: Tools that must be permitted by policy for this skill to operate.
-
-### 2.3. Sub-Resource Security Sandbox
-
-When accessing sub-resources (via `skills` tool or `mini.skill(name, file_path)`):
-- The path must be relative and resolve inside `references/`, `templates/`, or `scripts/`.
-- Attempts to use parent traversal (`../`) or absolute paths are rejected with a security error.
-- Files exceeding 256 KB are blocked from single-call loading to protect the context window.
-
----
-
-## 3. Custom Slash Commands
-
-Projects can define custom slash commands in `.agent/commands/`.
-
-Any file matching `.agent/commands/<name>.md` becomes available as a `/<name>` command in the interactive REPL:
-
-```markdown
-<!-- .agent/commands/review.md -->
-Perform a thorough code review on the git diff of the current branch against main.
-Focus on:
-1. Logic errors and edge cases
-2. Memory safety and leak hazards
-3. Adherence to project conventions
-Output findings categorized as Blocker, Major, or Minor.
-```
-
-Typing `/review` in the REPL automatically injects this prompt into the conversation turn.
-
----
-
-## 4. Model Context Protocol (MCP)
-
-`mini-agent` integrates as an **MCP Client**, connecting to external tool providers over standard input/output using JSON-RPC 2.0.
-
-### 4.1. Configuration (`mcp.json`)
-
-Stored at `~/.mini/mcp.json` (or configured via `MINI_MCP_CONFIG`):
-
-```json
-{
-  "servers": {
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/workspace"]
-    },
-    "database": {
-      "command": "python3",
-      "args": ["-m", "mcp_server_sqlite", "--db-path", "app.db"],
-      "env": {
-        "SQLITE_TIMEOUT": "5000"
-      }
-    }
-  }
-}
-```
-
-### 4.2. Tool Namespace & Dispatch
-
-- Tools discovered from an MCP server are automatically prefixed as `<server>__<tool>`. For example, `filesystem__read_file` or `database__query`.
-- Tool calls are routed through `src/tooling/mcp.zig`, serialized to JSON-RPC `tools/call` requests over stdio, and the response is normalized back into `proto.ToolResult`.
-- All MCP calls adhere to the global allowlist/blocklist policy rules.
-- Disable all MCP servers for a run using the `--no-mcp` CLI flag.

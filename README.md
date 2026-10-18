@@ -20,7 +20,9 @@ For in-depth architectural and developer documentation, consult the dedicated ma
 | 📐 [**System Architecture**](docs/architecture.md) | Architectural topology, component decomposition, state machines, and threading model. |
 | ⚡ [**CodeAct Runtime & JS VM**](docs/codeact_runtime.md) | QuickJS sandboxing, Per-Act VM isolation, and complete `mini.*` JavaScript API reference. |
 | ⚙️ [**Configuration & Environment**](docs/configuration.md) | Precedence hierarchy, `.env` file loading, and complete environment variables dictionary. |
-| 🛠️ [**Tools, Skills & MCP**](docs/tools_and_skills.md) | 15 built-in tools, RFC-031 multi-tier skills specification, custom slash commands, and MCP. |
+| 🛠️ [**Built-in Tools Reference**](docs/tools.md) | 15 built-in native tools, JSON schemas, operational limits, and safety filters. |
+| 🎯 [**Agent Skills & Commands**](docs/skills.md) | RFC-031 multi-tier skills standard, directory layout, YAML frontmatter, and custom slash commands. |
+| 🔌 [**Model Context Protocol (MCP)**](docs/mcp.md) | External tool integration over stdio JSON-RPC 2.0, `mcp.json` schema, and policy guards. |
 | 🧠 [**Memory, Graph & Planning**](docs/memory_and_planning.md) | MemAct long-term store, Reactive Compaction, Procedural Graph (CSR/CSC), and DAG plans. |
 | 🔌 [**AI Backends & Wire Protocols**](docs/backends_and_providers.md) | OpenAI Dual-Protocol Auto-Negotiation, Claude Messages API, Ollama, and provider profiles. |
 | 💾 [**Durable Tasks & Sessions**](docs/durable_tasks_and_sessions.md) | RFC-030 durable checkpoints, cross-session resume (`--resume`), WAL journaling, and CAS. |
@@ -233,7 +235,7 @@ Full API specifications and error handling rules: [CodeAct Runtime Manual](docs/
 | `tool_search` | Meta | Performs deferred keyword discovery for extended tool capabilities. |
 | `codeact` | Runtime | Direct JavaScript evaluation inside QuickJS. |
 
-Detailed JSON schemas and operational constraints: [Tools & Skills Manual](docs/tools_and_skills.md).
+Detailed JSON schemas and operational constraints: [Built-in Tools Reference](docs/tools.md).
 
 ---
 
@@ -276,12 +278,31 @@ Within interactive REPL mode, commands start with `/`:
 
 ---
 
+## Configuration Architecture: Global vs. Project
+
+`mini-agent` features a two-tier configuration system that separates machine-wide user defaults from repository-specific constraints:
+
+| Scope | Location | Role & Contents | Precedence & Overrides |
+|---|---|---|---|
+| **Global Level** | `~/.mini/`<br>(or `$MINI_HOME`) | Machine-wide user credentials (`~/.mini/.env`), settings (`config.json`), universal rules (`AGENTS.md`), global skills (`skills/`), custom slash commands (`commands/`), and persistent stores (`memory/`, `tasks/`, `cas/`, `sessions/`). | Serves as user defaults across all projects. |
+| **Project Workspace** | `<workspace_root>/`<br>`.agent/` | Project environment (`./.env`, `.agent/.env`), repository settings (`.agent/config.json`), project instructions (`AGENTS.md`, `.agent/AGENTS.md`), project skills (`.agent/skills/`), and custom commands (`.agent/commands/`). | **Overrides Global**: Project settings & skills override global counterparts. Rules (`AGENTS.md`) are **concatenated / inherited**. |
+
+### Key Inheritance & Resolution Rules
+
+- **Settings Overrides**: Keys in `.agent/config.json` override keys in `~/.mini/config.json`.
+- **Environment Overrides**: `<workspace_root>/.env` and `.agent/.env` override `~/.mini/.env`. Active shell environment variables take absolute priority over all `.env` files.
+- **Rule Inheritance (`AGENTS.md`)**: Rules are **additive**. The agent aggregates `<workspace_root>/AGENTS.md` + `.agent/AGENTS.md` + `~/.mini/AGENTS.md` directly into the system prompt.
+- **Skills Precedence**: A project skill in `.agent/skills/<name>/` completely overrides a global skill of the same name in `~/.mini/skills/<name>/`.
+- **Storage Isolation**: Long-term memory and procedural graphs (`~/.mini/memory/<project_hash>/`) are partitioned by the SHA-256 hash of the workspace directory.
+
+---
+
 ## Configuration Cheatsheet
 
-Configuration values resolve hierarchically: **CLI Flags** > **Shell Environment** > **`$MINI_ENV_FILE`** > **`./.env`** > **`~/.mini/.env`** > **Defaults**.
+Configuration values resolve hierarchically: **CLI Flags** > **Shell Environment** > **`$MINI_ENV_FILE`** > **`<workspace_root>/.env`** > **`.agent/.env`** > **`~/.mini/.env`** > **`config.json`** > **Defaults**.
 
 ```ini
-# ~/.mini/.env or ./.env
+# ~/.mini/.env (Global) or ./.env (Project)
 
 # AI Backend
 OPENAI_COMPAT_URL=https://api.openai.com/v1
@@ -307,7 +328,7 @@ MINI_MEMACT_PG_ENABLED=1
 MINI_MEMACT_PG_AUTO_POPULATE=1
 ```
 
-Exhaustive configuration reference: [Configuration Guide](docs/configuration.md).
+Exhaustive configuration reference & JSON schema: [Configuration Guide](docs/configuration.md).
 
 ---
 

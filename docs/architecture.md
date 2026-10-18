@@ -169,7 +169,19 @@ Following RFC-030, tasks survive crashes, interruptions, and power loss:
 - **Resumption**: Running `mini --resume <task_id>` or `mini --continue` loads the full conversation history up to the last successful act and continues without redundant re-planning.
 - **Atomic Journaling (WAL)**: `journal_<pid>.jsonl` records structured act events, token consumption metrics, and execution latencies.
 
-### 3.8. UI Terminal & Stream FSM (`src/ui/`)
+### 3.8. Two-Tier Configuration & Context Discovery (`src/core/config/`)
+
+The configuration subsystem enforces a clean two-tier separation between user-wide defaults and project-specific constraints:
+
+- **Global Tier (`~/.mini/`)**: Holds user-wide credentials (`~/.mini/.env`), default runtime options (`~/.mini/config.json`), universal behavioral guidelines (`~/.mini/AGENTS.md`), global skills (`~/.mini/skills/`), and persistent stores (`memory/`, `tasks/`, `cas/`, `sessions/`).
+- **Project Workspace Tier (`<workspace_root>/` & `.agent/`)**:
+  - Automatically identifies repository root via `MINI_WORKSPACE_ROOT`, `MINI_AGENT_FOLDER`, or markers (`build.zig`, `package.json`, `Cargo.toml`, `go.mod`).
+  - Reads project environment (`./.env`, `.agent/.env`) and project options (`.agent/config.json`), overriding global values.
+  - Implements **additive rule inheritance**: Aggregates `<workspace_root>/AGENTS.md` + `.agent/AGENTS.md` + `~/.mini/AGENTS.md` into `<RULE[AGENTS.md]>` in the system prompt.
+  - Prioritizes project skills (`.agent/skills/`), overriding global skills with matching names.
+  - Partitions long-term memory and knowledge graphs by workspace root hash (`~/.mini/memory/<project_hash>/`).
+
+### 3.9. UI Terminal & Stream FSM (`src/ui/`)
 
 - **Line Editor (`ui/editor.zig`)**: Custom byte-based editor supporting UTF-8 character widths, history traversal (↑/↓), word navigation, and an incremental parser for ANSI bracketed paste mode.
 - **Streaming FSM (`ui/chat_stream.zig`)**: Finite-state machine that processes tokens in real-time, cleanly switching between thinking blocks, code evaluation progress spinners, live diff blocks, and markdown text.
