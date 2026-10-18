@@ -4,7 +4,7 @@ Instructions for AI coding agents working on the **mini-agent** repository. Read
 
 ## Project Overview
 
-- **Language**: Zig 0.16.0, standard library only (exceptions: libcurl dynamic link, QuickJS/CodeAct static link).
+- **Language**: Zig 0.16.0, standard library only (exception: QuickJS/CodeAct static link; networking uses pure Zig std.http with zero external libcurl dependency).
 - **Type**: Terminal-based AI agent with a Code-Centric architecture (agent writes JS running inside an embedded CodeAct VM, calling tools via the `mini.*` object).
 - **Layout**:
 

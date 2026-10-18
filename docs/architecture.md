@@ -4,9 +4,9 @@
 
 `mini-agent` is an autonomous, terminal-based AI coding agent built with a **Code-Centric** execution model. Instead of relying on repetitive, isolated JSON tool invocations, the agent writes JavaScript programs executed inside an embedded, sandboxed QuickJS Virtual Machine. Tool interactions occur through a high-performance C-ABI bridge exposed as the `mini.*` runtime namespace.
 
-The system is implemented entirely in **Zig 0.16.0** using only the standard library, linked with:
+The system is implemented entirely in **Zig 0.16.0** using the standard library and:
 - **QuickJS** (statically linked): ES2023+ JavaScript engine for CodeAct execution.
-- **libcurl** (dynamically linked): Robust HTTP/2 and TLS transport for LLM providers and web queries.
+- **Pure Zig HTTP/TLS** (`std.http.Client` & `src/lib/http_request.zig`): High-performance, streaming HTTP/1.1 and TLS transport built into the Zig standard library with zero external networking dependencies (no `libcurl`).
 
 All runtime functionality—including the REPL line editor with bracketed paste, event-sourced memory, DAG-based plan orchestration, durable task checkpoints, and an Agent Client Protocol (ACP) server—compiles into a single self-contained binary with zero external runtime dependencies.
 

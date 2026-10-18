@@ -222,7 +222,7 @@ Full API specifications and error handling rules: [CodeAct Runtime Manual](docs/
 | `file_edit` | Filesystem | Performs exact, unique string replacement. |
 | `glob` | Search | Finds paths matching wildcard patterns. |
 | `grep` | Search | Searches text using literal strings or regular expressions. |
-| `http_request` | Network | Outbound HTTP requests via libcurl with timeout and size bounds. |
+| `http_request` | Network | Outbound HTTP requests via pure Zig `std.http.Client` with timeout and size bounds. |
 | `invoke_subagent` | Multi-Agent | Spawns an isolated child agent to complete a dedicated sub-task. |
 | `batch_invoke_subagents` | Multi-Agent | Executes multiple subagents in parallel for independent tasks. |
 | `artifact_write` | Deliverables | Persists plans, diffs, or reports to session storage with live-preview hooks. |

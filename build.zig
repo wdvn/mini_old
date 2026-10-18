@@ -8,9 +8,8 @@
 //! ## Cross-compile
 //!   zig build -Dtarget=x86_64-linux-gnu
 //!   zig build -Dtarget=aarch64-linux-gnu
-//!
-//! ## Dependencies (dynamic linking)
-//!   libcurl    — HTTPS requests to AI APIs and web search
+//! ## Dependencies
+//!   QuickJS    — embedded JavaScript VM (CodeAct, statically linked)
 //!   libsqlite3 — (reserved for future history persistence)
 
 const std = @import("std");

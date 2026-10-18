@@ -137,7 +137,7 @@ Searches text across files in a directory using literal or regex patterns.
 ---
 
 ### 1.7. `http_request`
-Performs an outbound HTTP request using libcurl.
+Performs an outbound HTTP request using Zig's native `std.http.Client` (`src/lib/http_request.zig`).
 
 - **Input Schema**:
   ```json

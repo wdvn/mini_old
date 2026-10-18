@@ -175,7 +175,7 @@ Sends a termination signal to a background process group.
 ### 3.4. Networking & HTTP APIs
 
 #### `mini.http(method, url, opts?)`
-Performs an HTTP request using the internal libcurl engine.
+Performs an HTTP request using Zig's native standard library HTTP client (`src/lib/http_request.zig`).
 - **Arguments**:
   - `method` (`string`): `"GET" | "POST" | "PUT" | "DELETE" | "HEAD"`.
   - `url` (`string`): Fully qualified URL.
