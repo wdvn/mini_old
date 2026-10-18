@@ -241,23 +241,6 @@ pub const Config = struct {
     pub const resolveReasoningAndMediaSettings = resolvers.resolveReasoningAndMediaSettings;
     pub const resolvePlanningAndWatchdogSettings = resolvers.resolvePlanningAndWatchdogSettings;
 
-    // PSEUDOCODE:
-    // 1. Stop unless the active execution mode is explicitly CodeAct.
-    // 2. Stop when CodeAct instructions were already appended.
-    // 3. Combine the current system prompt with the dedicated instructions.
-    // 4. Replace and release the previous owned prompt buffer.
-    pub fn appendCodeActInstructions(self: *Config, alloc: Allocator) void {
-        if (self.execution_mode != .codeact) return;
-        if (std.mem.indexOf(u8, self.system_prompt, "## CodeAct Execution Instructions") != null) return;
-
-        const combined = std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{
-            self.system_prompt,
-            prompts_mod.codeact_execution_instructions,
-        }) catch return;
-        if (self.system_prompt_buf) |buf| alloc.free(buf);
-        self.system_prompt_buf = combined;
-        self.system_prompt = combined;
-    }
 
     /// Releases allocated memory (system_prompt_buf + skills arena).
     pub fn deinit(self: *Config, alloc: Allocator) void {

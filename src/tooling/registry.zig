@@ -225,9 +225,18 @@ pub fn executeTool(alloc: Allocator, io: std.Io, name: []const u8, input_json: [
 pub const definitions = [_]proto.ToolDefinition{
     .{
         .name = "codeact",
-        .description = "Execute JavaScript in an embedded CodeAct VM with mini.* global API (mini.sh, mini.read, mini.write, mini.patch, mini.http, mini.sessions, mini.sessionDetail, mini.sessionKill, mini.setThinking). Use for automating complex multi-step logic or data processing.",
+        .description = "Execute JavaScript in an embedded CodeAct QuickJS VM with direct access to the global `mini` object.\n" ++
+            "Execution is synchronous (no top-level await, no Promises). Use console.log(...) to output findings into the observation (REQUIRED to receive data).\n" ++
+            "Batch multiple operations into a single script whenever possible.\n\n" ++
+            "Available global `mini` APIs:\n" ++
+            "- File Operations: mini.read(path, offset?, limit?), mini.write(path, content), mini.patch(path, oldStr, newStr, opts?), mini.exists(path), mini.stat(path)\n" ++
+            "- Search: mini.glob(pattern, basePath?), mini.grep(pattern, path?, opts?)\n" ++
+            "- Shell & Jobs: mini.sh(command), mini.shBackground(command), mini.jobStatus(jobId), mini.jobLogs(jobId, lines?), mini.jobKill(jobId, signal?)\n" ++
+            "- Network: mini.http(method, url, opts?) -> { status, body, headers }\n" ++
+            "- Reasoning: mini.setThinking(\"low\"|\"medium\"|\"high\"|\"none\"|tokens)\n" ++
+            "- Artifacts & Skills: mini.artifact(name, content), mini.skill(name, file_path?), mini.env(name)",
         .input_schema_json =
-        \\{"type":"object","properties":{"code":{"type":"string","description":"JavaScript code to execute in CodeAct VM"}},"required":["code"]}
+        \\{"type":"object","properties":{"code":{"type":"string","description":"JavaScript code to execute synchronously in the CodeAct VM. Must use console.log(...) to return outputs in the observation. Accesses the global mini.* API."}},"required":["code"]}
         ,
     },
     .{
@@ -348,11 +357,11 @@ pub const definitions = [_]proto.ToolDefinition{
 /// (cat/sed/find/rg) or CodeAct (mini.read/mini.glob/mini.grep) instead.
 /// Internal dispatch for these names is still supported in executeTool().
 const core_tools = [_][]const u8{
-    "bash",           "file_write",          "file_edit",
-    "http_request",   "invoke_subagent",     "batch_invoke_subagents",
-    "skills",         "session_diagnostics", "artifact_write",
-    "artifact_read",  "artifact_list",       "generate_image",
-    "generate_video", "image_attach",
+    "codeact",        "bash",                "file_write",
+    "file_edit",      "http_request",        "invoke_subagent",
+    "batch_invoke_subagents", "skills",      "session_diagnostics",
+    "artifact_write", "artifact_read",       "artifact_list",
+    "generate_image", "generate_video",      "image_attach",
 };
 
 /// Tools always sent in deferred mode (never hidden behind tool_search).
@@ -363,9 +372,10 @@ const essential_tools = [_][]const u8{
 
 /// Built-in tools that are hidden until promoted.
 const deferred_tools = [_][]const u8{
-    "invoke_subagent", "batch_invoke_subagents", "session_diagnostics",
-    "artifact_write",  "artifact_read",          "artifact_list",
-    "generate_image",  "generate_video",         "image_attach",
+    "codeact",         "invoke_subagent", "batch_invoke_subagents",
+    "session_diagnostics", "artifact_write",  "artifact_read",
+    "artifact_list",       "generate_image",  "generate_video",
+    "image_attach",
 };
 
 /// Grow-only session promotion set, stored in a static buffer.

@@ -481,6 +481,5 @@ pub fn load(alloc: Allocator, env_map: *const std.process.Environ.Map, io: std.I
     applyBackendAndMemActToConfig(&cfg, env_map, &b, &m, sp_result);
     applyLoopAndSessionToConfig(&cfg, env_map, &l);
     applyReasoningMediaPlanningToConfig(&cfg, &r, &p);
-    cfg.appendCodeActInstructions(alloc);
     return cfg;
 }

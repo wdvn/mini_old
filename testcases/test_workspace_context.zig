@@ -63,51 +63,54 @@ test "workspace_context: loadSystemPrompt injects context and loads root AGENTS.
     try std.testing.expect(std.mem.indexOf(u8, sp.text, "mini-agent") != null);
 }
 
-test "system prompt: codeact instructions require executable mini JavaScript" {
+test "system prompt: remains decoupled from codeact instructions across all modes" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
-    var env_map = std.process.Environ.Map.init(alloc);
-    defer env_map.deinit();
-
-    try env_map.put("OPENAI_COMPAT_URL", "http://127.0.0.1:1/v1");
-    try env_map.put("MINI_EXECUTION_MODE", "codeact");
-
-    var cfg = try config_mod.Config.load(alloc, &env_map, io);
-    defer cfg.deinit(alloc);
-
-    const prompt = cfg.system_prompt;
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "TOOL EXECUTION IS CODEACT-ONLY") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not call tools by describing them in Markdown text") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "single executable JavaScript block") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "call a real `mini.*` function") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not copy placeholder paths or arguments") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Direct synchronous invocation is required") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not use top-level `await`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not assume `mini.*` returns a Promise") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "`tool_call` is not executable CodeAct syntax") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "path/to/file") == null);
-}
-
-test "system prompt: codeact instructions are enabled only for codeact mode" {
-    const alloc = std.testing.allocator;
-    const io = std.testing.io;
-
-    for ([_]struct { mode: config_mod.ExecutionMode, expected: bool }{
-        .{ .mode = .codeact, .expected = true },
-        .{ .mode = .tools, .expected = false },
-        .{ .mode = .auto, .expected = false },
-    }) |case| {
+    for ([_]config_mod.ExecutionMode{ .codeact, .tools, .auto }) |mode| {
         var env_map = std.process.Environ.Map.init(alloc);
         defer env_map.deinit();
 
         try env_map.put("OPENAI_COMPAT_URL", "http://127.0.0.1:1/v1");
-        try env_map.put("MINI_EXECUTION_MODE", @tagName(case.mode));
+        try env_map.put("MINI_EXECUTION_MODE", @tagName(mode));
 
         var cfg = try config_mod.Config.load(alloc, &env_map, io);
         defer cfg.deinit(alloc);
 
-        const has_instructions = std.mem.indexOf(u8, cfg.system_prompt, "## CodeAct Execution Instructions") != null;
-        try std.testing.expectEqual(case.expected, has_instructions);
+        const prompt = cfg.system_prompt;
+        try std.testing.expect(std.mem.indexOf(u8, prompt, "## CodeAct Execution Instructions") == null);
+        try std.testing.expect(std.mem.indexOf(u8, prompt, "TOOL EXECUTION IS CODEACT-ONLY") == null);
+        try std.testing.expect(std.mem.indexOf(u8, prompt, "`tool_call` is not executable CodeAct syntax") == null);
     }
+}
+
+test "codeact tool definition encapsulates mini.* API and execution constraints" {
+    const tools_mod = mini.tools_mod;
+
+    var codeact_def_opt: ?mini.proto.ToolDefinition = null;
+    for (&tools_mod.definitions) |td| {
+        if (std.mem.eql(u8, td.name, "codeact")) {
+            codeact_def_opt = td;
+            break;
+        }
+    }
+
+    try std.testing.expect(codeact_def_opt != null);
+    const def = codeact_def_opt.?;
+
+    // Description must contain synchronous constraint and console.log observation requirement
+    try std.testing.expect(std.mem.indexOf(u8, def.description, "synchronous") != null);
+    try std.testing.expect(std.mem.indexOf(u8, def.description, "console.log") != null);
+
+    // Description must contain core mini.* API references
+    try std.testing.expect(std.mem.indexOf(u8, def.description, "mini.read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, def.description, "mini.write") != null);
+    try std.testing.expect(std.mem.indexOf(u8, def.description, "mini.patch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, def.description, "mini.sh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, def.description, "mini.glob") != null);
+    try std.testing.expect(std.mem.indexOf(u8, def.description, "mini.grep") != null);
+
+    // Input schema must require code argument
+    try std.testing.expect(std.mem.indexOf(u8, def.input_schema_json, "\"code\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, def.input_schema_json, "\"required\":[\"code\"]") != null);
 }

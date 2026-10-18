@@ -128,7 +128,16 @@ pub fn resolveTurnToolDefinitionsInner(
     deferred: bool,
 ) []const proto.ToolDefinition {
     const raw_tool_defs = switch (self.config.execution_mode) {
-        .codeact => &[_]proto.ToolDefinition{},
+        .codeact => blk: {
+            var list = std.ArrayListUnmanaged(proto.ToolDefinition).empty;
+            for (&tools_mod.definitions) |td| {
+                if (std.mem.eql(u8, td.name, "codeact") and tools_mod.isPermitted(td.name)) {
+                    list.append(turn_alloc, td) catch {};
+                    break;
+                }
+            }
+            break :blk list.items;
+        },
         .tools => blk: {
             const src: []const proto.ToolDefinition = if (deferred)
                 tools_mod.resolveDeferredTools(turn_alloc)

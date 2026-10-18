@@ -195,7 +195,6 @@ fn setupConfig(alloc: Allocator, io: std.Io, env_map: *std.process.Environ.Map, 
             exitAfterProcessCleanup(1);
         };
     }
-    cfg.appendCodeActInstructions(alloc);
     if (args.hook_command) |hcmd| cfg.hook_command = hcmd;
     hooks_mod.setHookCommand(cfg.hook_command);
     if (hooks_mod.getHookCommand()) |hcmd| {
