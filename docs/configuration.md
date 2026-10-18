@@ -2,13 +2,12 @@
 
 ## 1. Two-Tier Configuration Architecture: Global vs. Project
 
-`mini-agent` uses a two-tier configuration hierarchy that cleanly separates machine-wide user defaults from repository-specific settings. This enables developers to establish global defaults across all tasks while maintaining strict, version-controlled project rules and tool permissions.
+`mini-agent` uses a two-tier configuration hierarchy that cleanly separates machine-wide user defaults from repository-specific settings. All global settings (including API keys, model selections, and agent parameters) are unified into `~/.mini/config.json`, while project-specific settings and instructions reside in `.agent/` and project dotenv files.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │ Global Level (~/.mini/ or $MINI_HOME)                                  │
-│  - User-wide credentials (~/.mini/.env)                                │
-│  - Machine-wide settings (~/.mini/config.json)                         │
+│  - Unified machine-wide config & API keys (~/.mini/config.json)        │
 │  - Universal agent behavior rules (~/.mini/AGENTS.md)                  │
 │  - Global skills library (~/.mini/skills/)                             │
 │  - Global MCP server definitions (~/.mini/mcp.json)                    │
@@ -38,8 +37,8 @@
 
 | Component | Global Level (`~/.mini/`) | Project Workspace Level (`.agent/` & `<root>/`) | Precedence & Inheritance Behavior |
 |---|---|---|---|
-| **Environment (`.env`)** | `~/.mini/.env` | `<workspace_root>/.env`<br>`.agent/.env` | **Override**: Project `.env` values override Global `.env`. Shell variables take absolute precedence over both. |
-| **JSON Config** | `~/.mini/config.json` | `.agent/config.json` | **Override**: Settings in `.agent/config.json` override keys in `~/.mini/config.json`. |
+| **Configuration File** | `~/.mini/config.json` | `.agent/config.json` | **Override**: Settings in `.agent/config.json` override keys in `~/.mini/config.json`. |
+| **Environment (`.env`)** | *(Merged into `~/.mini/config.json`)* | `<workspace_root>/.env`<br>`.agent/.env` | **Override**: Project `.env` values override Global `config.json`. Shell variables take absolute precedence over both. |
 | **Instructions (`AGENTS.md`)** | `~/.mini/AGENTS.md` | `<workspace_root>/AGENTS.md`<br>`.agent/AGENTS.md` | **Additive / Concatenated**: All files are read and appended together into `<RULE[AGENTS.md]>` in the system prompt. |
 | **Skills Library** | `~/.mini/skills/<name>/` | `.agent/skills/<name>/` | **Override**: Skills in `.agent/skills/` with matching names completely override global skills of the same name. |
 | **Slash Commands** | `~/.mini/commands/<name>.md` | `.agent/commands/<name>.md` | **Registered**: Project commands become `/<name>` in REPL; global commands serve as defaults. |
@@ -59,17 +58,40 @@ When resolving configuration settings, `mini-agent` evaluates sources in the fol
 4. **Project Workspace Dotenv**: Local `./.env` in the current working directory.
 5. **Project Agent Dotenv**: `.agent/.env` in the workspace.
 6. **Project JSON Configuration**: `.agent/config.json` in the active workspace.
-7. **Global User Dotenv**: `~/.mini/.env` (or `$MINI_HOME/.env`).
-8. **Global User Configuration**: `~/.mini/config.json`.
-9. **Provider Profiles**: Active provider JSON defaults from `~/.mini/providers/<name>.json` or builtin definitions.
-10. **Hardcoded Defaults**: Safe fallbacks defined in `src/core/config/types.zig`.
+7. **Global User Configuration**: `~/.mini/config.json` (unifies all global defaults and credentials).
+8. **Provider Profiles**: Active provider JSON defaults from `~/.mini/providers/<name>.json` or builtin definitions.
+9. **Hardcoded Defaults**: Safe fallbacks defined in `src/core/config/types.zig`.
 
 > [!NOTE]
 > Environment variables already present in the active shell environment are **never overwritten** by values loaded from `.env` or `config.json` files.
 
 ---
 
-### 1.3. Project JSON Configuration Schema (`.agent/config.json`)
+### 1.3. Global Configuration Schema (`~/.mini/config.json`)
+
+Initialized via `./scripts/setup_home_mini.sh`, `~/.mini/config.json` provides a single file for all default backend credentials, model endpoints, and agent preferences:
+
+```json
+{
+  "openai_compat_url": "https://api.openai.com/v1",
+  "openai_compat_api_key": "sk-proj-...",
+  "openai_compat_model": "gpt-4o-mini",
+  "openai_protocol": "auto",
+  "anthropic_api_key": "sk-ant-...",
+  "claude_model": "claude-opus-4-5",
+  "ollama_host": "http://localhost:11434",
+  "ollama_model": "llama3",
+  "execution_mode": "auto",
+  "max_tokens": 8192,
+  "dynamic_thinking_enabled": true,
+  "memact_enabled": true,
+  "context_window": 128000
+}
+```
+
+---
+
+### 1.4. Project JSON Configuration Schema (`.agent/config.json`)
 
 Projects can define a `.agent/config.json` to lock in repository-specific settings (such as model, allowed tools, execution mode, or reasoning tokens) without requiring team members to configure shell variables manually:
 

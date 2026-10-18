@@ -13,7 +13,7 @@ const JsonProviderConfig = types_mod.JsonProviderConfig;
 ///   1. $MINI_ENV_FILE — explicit path
 ///   2. ./.env         — current directory
 ///   3. .agent/.env    — agent directory
-///   4. ~/.mini/.env   — user-level
+///   4. ~/.mini/.env   — user-level (legacy fallback; preferred: ~/.mini/config.json)
 pub fn loadDotEnvFiles(env_map: *std.process.Environ.Map, io: std.Io, home: ?[]const u8) void {
     // PSEUDOCODE:
     // 1. Gather candidate .env paths: MINI_ENV_FILE, .env, MINI_AGENT_FOLDER/.env, MINI_HOME/.env

@@ -125,63 +125,50 @@ else
 fi
 echo ""
 
-# 4. Initialize config.json if not present
-echo -e "${BLUE}[4/5] Checking global config file (config.json)...${NC}"
+# 4. Initialize config.json (Unified Global Configuration)
+echo -e "${BLUE}[4/5] Configuring unified global config (${MINI_HOME}/config.json)...${NC}"
 CONFIG_FILE="${MINI_HOME}/config.json"
-if [ ! -f "$CONFIG_FILE" ]; then
-    cat << 'EOF' > "$CONFIG_FILE"
+CONFIG_EXAMPLE="${MINI_HOME}/config.json.example"
+
+cat << 'EOF' > "$CONFIG_EXAMPLE"
 {
+  "openai_compat_url": "https://api.openai.com/v1",
+  "openai_compat_api_key": null,
+  "openai_compat_model": "gpt-4o-mini",
+  "openai_protocol": "auto",
+  "anthropic_api_key": null,
+  "claude_model": "claude-opus-4-5",
+  "ollama_host": "http://localhost:11434",
+  "ollama_model": "llama3",
   "execution_mode": "auto",
-  "memact_enabled": true,
   "max_tokens": 8192,
+  "dynamic_thinking_enabled": true,
+  "memact_enabled": true,
   "context_window": 128000
 }
 EOF
-    echo -e "  ${GREEN}✓ Created:${NC} $CONFIG_FILE"
+echo -e "  ${GREEN}✓ Created template:${NC} $CONFIG_EXAMPLE"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    cp "$CONFIG_EXAMPLE" "$CONFIG_FILE"
+    echo -e "  ${GREEN}✓ Initialized:${NC} $CONFIG_FILE"
 else
     echo -e "  • Already exists: $CONFIG_FILE"
 fi
+
+# Migration: if legacy ~/.mini/.env exists, archive it
+if [ -f "${MINI_HOME}/.env" ]; then
+    echo -e "  ${YELLOW}! Legacy ~/.mini/.env detected. Global configuration is now managed via config.json.${NC}"
+    mv "${MINI_HOME}/.env" "${MINI_HOME}/.env.backup.$(date +%s)"
+    echo -e "  ${GREEN}✓ Archived legacy .env to .env.backup${NC}"
+fi
+if [ -f "${MINI_HOME}/.env.example" ]; then
+    rm -f "${MINI_HOME}/.env.example"
+fi
 echo ""
 
-# 5. Initialize .env.example and mcp.json.example
-echo -e "${BLUE}[5/5] Creating template configs (.env.example, mcp.json.example)...${NC}"
-
-ENV_EXAMPLE="${MINI_HOME}/.env.example"
-cat << 'EOF' > "$ENV_EXAMPLE"
-# ==========================================
-# AI Backend Configuration for mini-agent (~/.mini/.env)
-# ==========================================
-
-# 1. OpenAI-compatible endpoint (Highest priority)
-# OPENAI_COMPAT_URL=https://api.openai.com/v1
-# OPENAI_COMPAT_API_KEY=sk-...
-# OPENAI_COMPAT_MODEL=gpt-4o-mini
-# OPENAI_COMPAT_API_HEADER=Authorization
-
-# 2. Anthropic Claude
-# ANTHROPIC_API_KEY=sk-ant-...
-# CLAUDE_MODEL=claude-opus-4-5
-
-# 3. Ollama local backend (No key required)
-# OLLAMA_HOST=http://localhost:11434
-# OLLAMA_MODEL=llama3
-
-# 4. Agent Options
-# MINI_EXECUTION_MODE=auto       # auto | codeact | tools
-# MINI_MAX_TOKENS=8192
-# MINI_MEMACT_ENABLED=1
-EOF
-echo -e "  ${GREEN}✓ Created:${NC} $ENV_EXAMPLE"
-
-# Create ~/.mini/.env if not present
-ENV_FILE="${MINI_HOME}/.env"
-if [ ! -f "$ENV_FILE" ]; then
-    cp "$ENV_EXAMPLE" "$ENV_FILE"
-    echo -e "  ${GREEN}✓ Initialized:${NC} $ENV_FILE"
-else
-    echo -e "  • Already exists: $ENV_FILE"
-fi
-
+# 5. Initialize mcp.json.example
+echo -e "${BLUE}[5/5] Creating template MCP config (mcp.json.example)...${NC}"
 MCP_EXAMPLE="${MINI_HOME}/mcp.json.example"
 cat << 'EOF' > "$MCP_EXAMPLE"
 {
@@ -295,6 +282,6 @@ echo -e "${GREEN}========================================================${NC}"
 echo -e "${GREEN}✓ ~/.mini SETUP COMPLETED SUCCESSFULLY!                 ${NC}"
 echo -e "${GREEN}========================================================${NC}"
 echo -e "To start using mini-agent across your system:"
-echo -e "  1. Configure your API keys in: ${CYAN}${MINI_HOME}/.env${NC}"
+echo -e "  1. Configure your API keys in: ${CYAN}${MINI_HOME}/config.json${NC}"
 echo -e "  2. Run the agent: ${CYAN}mini${NC} (or ${CYAN}mini -e \"...\"${NC})"
 

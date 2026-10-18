@@ -137,7 +137,7 @@ sudo cp zig-out/bin/mini /usr/local/bin/mini-agent
 
 ### 3. Configure AI Backend
 
-Configure your preferred backend in your shell or `~/.mini/.env`:
+Configure your preferred backend in `~/.mini/config.json` or your shell:
 
 ```bash
 # Option A: OpenAI-compatible (OpenAI, OpenRouter, LM Studio, vLLM, DeepSeek)
@@ -284,13 +284,13 @@ Within interactive REPL mode, commands start with `/`:
 
 | Scope | Location | Role & Contents | Precedence & Overrides |
 |---|---|---|---|
-| **Global Level** | `~/.mini/`<br>(or `$MINI_HOME`) | Machine-wide user credentials (`~/.mini/.env`), settings (`config.json`), universal rules (`AGENTS.md`), global skills (`skills/`), custom slash commands (`commands/`), and persistent stores (`memory/`, `tasks/`, `cas/`, `sessions/`). | Serves as user defaults across all projects. |
+| **Global Level** | `~/.mini/`<br>(or `$MINI_HOME`) | Machine-wide user credentials & settings (`config.json`), universal rules (`AGENTS.md`), global skills (`skills/`), custom slash commands (`commands/`), and persistent stores (`memory/`, `tasks/`, `cas/`, `sessions/`). | Serves as user defaults across all projects. |
 | **Project Workspace** | `<workspace_root>/`<br>`.agent/` | Project environment (`./.env`, `.agent/.env`), repository settings (`.agent/config.json`), project instructions (`AGENTS.md`, `.agent/AGENTS.md`), project skills (`.agent/skills/`), and custom commands (`.agent/commands/`). | **Overrides Global**: Project settings & skills override global counterparts. Rules (`AGENTS.md`) are **concatenated / inherited**. |
 
 ### Key Inheritance & Resolution Rules
 
 - **Settings Overrides**: Keys in `.agent/config.json` override keys in `~/.mini/config.json`.
-- **Environment Overrides**: `<workspace_root>/.env` and `.agent/.env` override `~/.mini/.env`. Active shell environment variables take absolute priority over all `.env` files.
+- **Environment Overrides**: `<workspace_root>/.env` and `.agent/.env` take precedence over default global settings in `~/.mini/config.json`. Active shell environment variables take absolute priority over all `.env` and `config.json` files.
 - **Rule Inheritance (`AGENTS.md`)**: Rules are **additive**. The agent aggregates `<workspace_root>/AGENTS.md` + `.agent/AGENTS.md` + `~/.mini/AGENTS.md` directly into the system prompt.
 - **Skills Precedence**: A project skill in `.agent/skills/<name>/` completely overrides a global skill of the same name in `~/.mini/skills/<name>/`.
 - **Storage Isolation**: Long-term memory and procedural graphs (`~/.mini/memory/<project_hash>/`) are partitioned by the SHA-256 hash of the workspace directory.
@@ -299,16 +299,27 @@ Within interactive REPL mode, commands start with `/`:
 
 ## Configuration Cheatsheet
 
-Configuration values resolve hierarchically: **CLI Flags** > **Shell Environment** > **`$MINI_ENV_FILE`** > **`<workspace_root>/.env`** > **`.agent/.env`** > **`~/.mini/.env`** > **`config.json`** > **Defaults**.
+Configuration values resolve hierarchically: **CLI Flags** > **Shell Environment** > **`$MINI_ENV_FILE`** > **`<workspace_root>/.env`** > **`.agent/.env`** > **`.agent/config.json`** > **`~/.mini/config.json`** > **Defaults**.
+
+### Global Configuration (`~/.mini/config.json`)
+
+```json
+{
+  "openai_compat_url": "https://api.openai.com/v1",
+  "openai_compat_api_key": "sk-...",
+  "openai_compat_model": "gpt-4o",
+  "default_backend": "openai_compat",
+  "max_turns": 30,
+  "enable_memact": true,
+  "enable_structured_planning": true
+}
+```
+
+### Project Environment Overrides (`./.env` or `.agent/.env`)
 
 ```ini
-# ~/.mini/.env (Global) or ./.env (Project)
-
-# AI Backend
-OPENAI_COMPAT_URL=https://api.openai.com/v1
-OPENAI_COMPAT_API_KEY=sk-...
-OPENAI_COMPAT_MODEL=gpt-4o
-OPENAI_PROTOCOL=auto
+# Project-specific AI model override
+OPENAI_COMPAT_MODEL=gpt-4o-mini
 
 # Agent Behavior
 MINI_EXECUTION_MODE=auto
@@ -317,15 +328,6 @@ MINI_DYNAMIC_THINKING=1
 
 # Tool Policy
 MINI_TOOL_ALLOWLIST=bash,file_read,file_write,file_edit,glob,grep
-
-# Context & Memory
-MINI_MEMACT_ENABLED=1
-MINI_MEMACT_TOP_K=8
-MINI_MEMACT_MEMORY_BUDGET=2000
-
-# Procedural Graph
-MINI_MEMACT_PG_ENABLED=1
-MINI_MEMACT_PG_AUTO_POPULATE=1
 ```
 
 Exhaustive configuration reference & JSON schema: [Configuration Guide](docs/configuration.md).

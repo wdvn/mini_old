@@ -173,7 +173,7 @@ Following RFC-030, tasks survive crashes, interruptions, and power loss:
 
 The configuration subsystem enforces a clean two-tier separation between user-wide defaults and project-specific constraints:
 
-- **Global Tier (`~/.mini/`)**: Holds user-wide credentials (`~/.mini/.env`), default runtime options (`~/.mini/config.json`), universal behavioral guidelines (`~/.mini/AGENTS.md`), global skills (`~/.mini/skills/`), and persistent stores (`memory/`, `tasks/`, `cas/`, `sessions/`).
+- **Global Tier (`~/.mini/`)**: Holds user-wide credentials and default runtime options (`~/.mini/config.json`), universal behavioral guidelines (`~/.mini/AGENTS.md`), global skills (`~/.mini/skills/`), and persistent stores (`memory/`, `tasks/`, `cas/`, `sessions/`).
 - **Project Workspace Tier (`<workspace_root>/` & `.agent/`)**:
   - Automatically identifies repository root via `MINI_WORKSPACE_ROOT`, `MINI_AGENT_FOLDER`, or markers (`build.zig`, `package.json`, `Cargo.toml`, `go.mod`).
   - Reads project environment (`./.env`, `.agent/.env`) and project options (`.agent/config.json`), overriding global values.

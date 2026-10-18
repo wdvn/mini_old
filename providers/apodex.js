@@ -4,7 +4,7 @@
 //! Normalizes reasoning extraction across standard and nested proxy fields,
 //! ensures safe text delta parsing, and cleans up unsupported request fields.
 //!
-//! Usage: Set OPENAI_COMPAT_PROVIDER=apodex in your environment (see ~/.mini/.env)
+//! Usage: Set OPENAI_COMPAT_PROVIDER=apodex in your environment or ~/.mini/config.json
 //!
 //! NOTE: Uses ES5-compatible syntax (no optional chaining) for QuickJS compatibility.
 
